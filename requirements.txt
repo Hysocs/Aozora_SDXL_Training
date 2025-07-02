@@ -1,0 +1,23 @@
+# ==========================================================
+#      Core Deep Learning & SDXL Training Libraries
+# ==========================================================
+# NOTE: Versions pinned to a known stable stack from your working environment.
+# PyTorch and its ecosystem are installed separately in install.bat.
+
+# Core Hugging Face / Diffusers ecosystem (updated versions)
+diffusers==0.33.1
+transformers==4.46.3
+accelerate==0.29.3 # This version is generally fine and stable
+safetensors==0.5.3
+
+# 8-bit optimizer and memory optimization libraries
+bitsandbytes==0.46.0
+
+# ==========================================================
+#              GUI and Helper Libraries
+# ==========================================================
+PyQt6
+Pillow==11.2.1
+tqdm==4.67.1
+numpy==1.26.0
+protobuf==4.25.3 # Pinning to a more compatible version <5.0

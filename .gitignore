@@ -1,0 +1,43 @@
+# Python bytecode and compilation artifacts
+__pycache__/
+*.pyc
+*.pyd
+*.so
+# Distribution and build artifacts
+dist/
+build/
+*.egg-info/
+
+# Virtual environments
+# Your specific portable virtual environment folder
+portable_Venv/
+# Common virtual environment folder names
+venv/
+env/
+
+# User-specific configuration (if this file contains local paths or secrets)
+# It's good practice to keep a user_config.json.example in the repo
+# if user_config.json is meant to be personalized.
+user_config.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*~ # Emacs/Vim temporary files
+
+# Operating System generated files
+.DS_Store # macOS
+Thumbs.db # Windows
+desktop.ini # Windows
+
+# VS Code specific files (optional - uncomment if you want to ignore workspace/user specific settings)
+# If you have shared project settings or recommended extensions in .vscode/,
+# you might want to commit that specific folder. Otherwise, ignore it.
+# .vscode/
+
+# Other temporary files that might be generated during training or data processing
+# If you have specific output folders for trained models, datasets, etc., add them here.
+# For example:
+# output_models/
+# processed_data/
