@@ -4,7 +4,6 @@ A user-friendly graphical interface (GUI) for fine-tuning Stable Diffusion XL (S
 
 The goal of this project is to provide a simple yet powerful way for users to fine-tune SDXL without needing to edit scripts or manage complex command-line arguments. Everything is controlled through the GUI.
 
-![AORA SDXL Trainer GUI](https://raw.githubusercontent.com/Hysocs/Aozora_SDXL_Training/main/assets/gui_v1.png)
 *(Suggestion: Take a screenshot of your GUI and replace the URL above to make the README more engaging.)*
 
 ## Features
@@ -26,24 +25,23 @@ The goal of this project is to provide a simple yet powerful way for users to fi
 
 ---
 
-## 1. Installation
+## Installation
 
 The installation is fully automated using the provided batch script.
 
-1.  **Clone the Repository:**
-    Download this project to your computer. You can do this by clicking the green "Code" button on GitHub and selecting "Download ZIP", or by using Git:
+### Clone the Repository
 
-    ```bash
+Download this project to your computer. You can do this by clicking the green "Code" button on GitHub and selecting "Download ZIP", or by using Git:
+
     git clone https://github.com/Hysocs/Aozora_SDXL_Training.git
     cd Aozora_SDXL_Training
-    ```
 
-2.  **Run the Setup Script:**
-    Navigate to the project directory and double-click `setup.bat`.
+### Run the Setup Script
 
-    You will be presented with a choice:
+Navigate to the project directory and double-click `setup.bat`.
 
-    ```text
+You will be presented with a choice:
+
     ====================================================
            SDXL Training Environment Installer
     ====================================================
@@ -54,34 +52,33 @@ The installation is fully automated using the provided batch script.
       [2] Install WITHOUT Flash Attention (For AMD or older NVIDIA cards)
 
     Enter your choice [1 or 2]:
-    ```
 
-    - **Option 1 (Flash Attention):** Recommended for modern NVIDIA GPUs (RTX 20, 30, 40 series). It significantly speeds up training and reduces VRAM usage.
-    - **Option 2 (No Flash Attention):** Choose this if you have an older NVIDIA GPU, an AMD GPU, or if the Flash Attention installation fails.
+- **Option 1 (Flash Attention):** Recommended for modern NVIDIA GPUs (RTX 20, 30, 40 series). It significantly speeds up training and reduces VRAM usage.
+- **Option 2 (No Flash Attention):** Choose this if you have an older NVIDIA GPU, an AMD GPU, or if the Flash Attention installation fails.
 
-    The script will then:
-    - Create a local Python virtual environment in a folder named `portable_Venv`.
-    - Install all necessary libraries, including PyTorch with CUDA support.
-    - Download and install Flash Attention if selected.
+The script will then:
+- Create a local Python virtual environment in a folder named `portable_Venv`.
+- Install all necessary libraries, including PyTorch with CUDA support.
+- Download and install Flash Attention if selected.
 
-    This process will take several minutes as it downloads large files. Once it's finished, you'll see a "SETUP COMPLETE!" message.
+This process will take several minutes as it downloads large files. Once it's finished, you'll see a "SETUP COMPLETE!" message.
 
 ---
 
-## 2. How to Use
+## How to Use
 
 ### Step 1: Prepare Your Data and Model
 
 Before launching the GUI, get your files in order.
 
-1.  **Base Model:** Place your base SDXL model (e.g., `Aozora-XL_vPredV1-Final.safetensors`) in the main project folder or a location you can easily navigate to.
+1. **Base Model:** Place your base SDXL model (e.g., `Aozora-XL_vPredV1-Final.safetensors`) in the main project folder or a location you can easily navigate to.
 
-2.  **Dataset:** Create a dataset folder. Inside this folder, you can have subfolders for organization. The script will search recursively for images.
-    - Each image should have a corresponding `.txt` file with the same name containing its caption.
-    - If no `.txt` file is found, the image's filename (with underscores replaced by spaces) will be used as the caption.
+2. **Dataset:** Create a dataset folder. Inside this folder, you can have subfolders for organization. The script will search recursively for images.
+   - Each image should have a corresponding `.txt` file with the same name containing its caption.
+   - If no `.txt` file is found, the image's filename (with underscores replaced by spaces) will be used as the caption.
 
-    **Example Directory Structure:**
-    ```
+**Example Directory Structure:**
+
     Aozora_SDXL_Training/
     ├── DatasetV1/
     │   ├── concept_one/
@@ -90,14 +87,13 @@ Before launching the GUI, get your files in order.
     │   │   ├── image002.webp
     │   │   └── image002.txt   (caption: "a drawing of a blue boat")
     │   └── concept_two/
-    │       └── my_character.jpg
+    │       ├── my_character.jpg
     │       └── my_character.txt (caption: "1girl, solo, best quality")
     ├── Aozora-XL_vPredV1-Final.safetensors
     ├── gui.py
     ├── train.py
     ├── setup.bat
     └── start_gui.bat
-    ```
 
 ### Step 2: Launch the GUI
 
@@ -134,8 +130,8 @@ This is where you can fine-tune what gets trained.
 
 ### Step 4: Start Training
 
-1.  **Save Config:** Click the **Save Config** button to save your current settings to `user_config.json`. This is good practice and allows you to easily load your settings next time.
-2.  **Start Training:** Click the **Start Training** button.
+1. **Save Config:** Click the **Save Config** button to save your current settings to `user_config.json`. This is good practice and allows you to easily load your settings next time.
+2. **Start Training:** Click the **Start Training** button.
 
 The log window at the bottom of the GUI will fill with information. You will first see the latent caching process (if needed), followed by the main training loop with a progress bar.
 
