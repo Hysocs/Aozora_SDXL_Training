@@ -1,4 +1,4 @@
-# AORA SDXL Trainer
+# aozora SDXL Trainer
 
 A user-friendly graphical interface (GUI) for fine-tuning Stable Diffusion XL (SDXL) models. This tool is built on a powerful, memory-efficient training script that allows for targeted layer training, latent caching, and easy configuration management.
 
@@ -97,7 +97,7 @@ Before launching the GUI, get your files in order.
 
 ### Step 2: Launch the GUI
 
-Double-click the `start_gui.bat` file. This will activate the local Python environment and open the AORA Trainer GUI.
+Double-click the `start_gui.bat` file. This will activate the local Python environment and open the aozora Trainer GUI.
 
 ### Step 3: Configure Training
 
