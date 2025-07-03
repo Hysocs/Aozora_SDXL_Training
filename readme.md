@@ -4,7 +4,7 @@ A user-friendly graphical interface (GUI) for fine-tuning Stable Diffusion XL (S
 
 The goal of this project is to provide a simple yet powerful way for users to fine-tune SDXL without needing to edit scripts or manage complex command-line arguments. Everything is controlled through the GUI.
 
-<img src="https://i.imgur.com/u6M2eOJ.png" alt="Gui" width="500"/>
+<img src="https://i.imgur.com/u6M2eOJ.png" alt="Gui" width="750"/>
 
 ## Features
 
