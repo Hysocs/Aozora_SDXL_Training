@@ -4,9 +4,9 @@ import os
 from PyQt6 import QtWidgets, QtCore, QtGui
 import config as default_config
 
-# Aora (Sky Blue) Modern Theme Stylesheet
+# AOZORA(Sky Blue) Modern Theme Stylesheet
 STYLESHEET = """
-/* --- AORA (SKY BLUE) THEME --- */
+/* --- AOZORA(SKY BLUE) THEME --- */
 
 /* --- General Window & Font --- */
 QWidget {
@@ -175,7 +175,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("TrainingGUI")
-        self.setWindowTitle("AORA SDXL Trainer")
+        self.setWindowTitle("AOZORASDXL Trainer")
         self.setMinimumSize(QtCore.QSize(900, 750))
         self.config_path = "user_config.json"
         self.widgets = {}
@@ -200,7 +200,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.main_layout.setContentsMargins(2, 2, 2, 2)
 
         # Use a modern, clean title label instead of ASCII art
-        title_label = QtWidgets.QLabel("AORA Trainer")
+        title_label = QtWidgets.QLabel("AOZORA SDXL Trainer")
         title_label.setObjectName("TitleLabel")
         title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.main_layout.addWidget(title_label)
