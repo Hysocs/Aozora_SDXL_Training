@@ -338,11 +338,37 @@ class TrainingGUI(QtWidgets.QWidget):
         scroll_area.setWidget(scroll_content)
 
         all_unet_targets = {
-            "Attention Blocks": {"attn1": "Self-Attention", "attn2": "Cross-Attention", "mid_block.attentions": "Mid-Block Attention", "ff": "Feed-Forward Networks"},
-            "Attention Sub-Layers (Advanced)": {"to_q": "Query Projection", "to_k": "Key Projection", "to_v": "Value Projection", "to_out.0": "Output Projection"},
-            "UNet Embeddings (Non-Text)": {"time_embedding": "Time Embedding", "time_emb_proj": "Time Embedding Projection", "add_embedding": "Added Conditional Embedding"},
-            "Convolutional & ResNet Layers": {"conv_in": "Input Conv", "resnets.conv1": "ResNet Conv1", "resnets.conv2": "ResNet Conv2", "resnets.conv_shortcut": "ResNet Skip Conv", "downsamplers.0.conv": "Downsampler Convs", "upsamplers.0.conv": "Upsampler Convs", "conv_out": "Output Conv"},
-            "Normalization Layers (Experimental)": {"norm1": "ResNet GroupNorm1", "norm2": "ResNet GroupNorm2", "conv_norm_out": "Output GroupNorm"}
+            "Attention Blocks": {
+                "attn1": "Self-Attention", 
+                "attn2": "Cross-Attention", 
+                "mid_block.attentions": "Mid-Block Attention", 
+                "ff": "Feed-Forward Networks"
+            },
+            "Attention Sub-Layers (Advanced)": {
+                "to_q": "Query Projection", 
+                "to_k": "Key Projection", 
+                "to_v": "Value Projection", 
+                "to_out.0": "Output Projection"
+            },
+            "UNet Embeddings (Non-Text)": {
+                "time_embedding": "Time Embedding", 
+                "time_emb_proj": "Time Embedding Projection", 
+                "add_embedding": "Added Conditional Embedding"
+            },
+            "Convolutional & ResNet Layers": {
+                "conv_in": "Input Conv", 
+                "conv1": "ResNet Conv1",                  # <-- CORRECTED
+                "conv2": "ResNet Conv2",                  # <-- CORRECTED
+                "conv_shortcut": "ResNet Skip Conv",      # <-- CORRECTED
+                "downsamplers": "Downsampler Convs",      # <-- CORRECTED & Simplified
+                "upsamplers": "Upsampler Convs",          # <-- CORRECTED & Simplified
+                "conv_out": "Output Conv"
+            },
+            "Normalization Layers (Experimental)": {
+                "norm1": "ResNet GroupNorm1", 
+                "norm2": "ResNet GroupNorm2", 
+                "conv_norm_out": "Output GroupNorm"
+            }
         }
         for group_name, targets in all_unet_targets.items():
             label = QtWidgets.QLabel(f"<b>{group_name}</b>")
