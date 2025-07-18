@@ -183,13 +183,12 @@ class TrainingGUI(QtWidgets.QWidget):
         self.training_process = None
         self.resume_widgets_container = None
         self.tabs_loaded = set()
-        self.loaded_config = {}
+        self.current_config = {} # <<< CHANGED: This now holds the live state
         self._read_config_from_file()
         self._setup_ui()
-        self._on_tab_change(0)
+        self._on_tab_change(0) # Load initial tab
 
     def paintEvent(self, event: QtGui.QPaintEvent):
-        """Allows stylesheets to use properties like 'border' on the main window."""
         opt = QtWidgets.QStyleOption()
         opt.initFrom(self)
         painter = QtGui.QPainter(self)
@@ -199,7 +198,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.main_layout = QtWidgets.QVBoxLayout(self)
         self.main_layout.setContentsMargins(2, 2, 2, 2)
 
-        # Use a modern, clean title label instead of ASCII art
         title_label = QtWidgets.QLabel("AOZORA SDXL Trainer")
         title_label.setObjectName("TitleLabel")
         title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
@@ -215,7 +213,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log_textbox = QtWidgets.QPlainTextEdit()
         self.log_textbox.setReadOnly(True)
         self.log_textbox.setMinimumHeight(250)
-        # Add the log box with a stretch factor so it expands to fill available vertical space
         self.main_layout.addWidget(self.log_textbox, stretch=1)
 
         button_layout = QtWidgets.QHBoxLayout()
@@ -233,19 +230,22 @@ class TrainingGUI(QtWidgets.QWidget):
 
         button_layout.addWidget(self.save_button)
         button_layout.addWidget(self.restore_button)
-        button_layout.addStretch() # Pushes start/stop buttons to the right
+        button_layout.addStretch()
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         self.main_layout.addLayout(button_layout)
 
     def _on_tab_change(self, index):
-        """Lazy-loads tab content for faster startup and a cleaner UI build process."""
         tab_name = self.tab_view.tabText(index)
         if tab_name not in self.tabs_loaded:
             tab_widget = self.tab_view.widget(index)
+            # Build the UI for the new tab
             if tab_name == "1. Data & Model": self._populate_data_model_tab(tab_widget)
             elif tab_name == "2. Training Parameters": self._populate_training_params_tab(tab_widget)
             elif tab_name == "3. Layer Targeting": self._populate_layer_targeting_tab(tab_widget)
+            
+            # Apply the current configuration to all widgets. This is safe because
+            # self.current_config is always up-to-date.
             self._apply_config_to_widgets()
             self.tabs_loaded.add(tab_name)
 
@@ -284,14 +284,13 @@ class TrainingGUI(QtWidgets.QWidget):
         self._create_entry_option(core_layout, "SAVE_EVERY_N_STEPS", "Save Every N Steps:", "How often to save a checkpoint.")
         self._create_bool_option(core_layout, "RESUME_TRAINING", "Resume from Checkpoint", "Allows resuming from a checkpoint.", self.toggle_resume_widgets)
         
-        # Container for resume options, to be shown/hidden
         self.resume_widgets_container = QtWidgets.QWidget()
         resume_layout = QtWidgets.QFormLayout(self.resume_widgets_container)
         resume_layout.setContentsMargins(0, 5, 0, 0)
         self._create_path_option(resume_layout, "RESUME_MODEL_PATH", "Resume Model:", "The .safetensors checkpoint file.", "file_safetensors")
         self._create_path_option(resume_layout, "RESUME_STATE_PATH", "Resume State:", "The .pt optimizer state file.", "file_pt")
         core_layout.addRow(self.resume_widgets_container)
-        self.resume_widgets_container.hide()
+        
         left_layout.addWidget(core_group)
         left_layout.addStretch()
 
@@ -308,8 +307,7 @@ class TrainingGUI(QtWidgets.QWidget):
         adv_layout = QtWidgets.QFormLayout(adv_group)
         self._create_bool_option(adv_layout, "USE_MIN_SNR_GAMMA", "Use Min-SNR Gamma", "Recommended for v-prediction models.", self.toggle_min_snr_gamma_widget)
         self._create_entry_option(adv_layout, "MIN_SNR_GAMMA", "Min-SNR Gamma Value:", "Common range is 5.0 to 20.0.")
-        self.widgets["MIN_SNR_GAMMA"].setEnabled(False)
-
+        
         right_layout.addWidget(lr_group)
         right_layout.addWidget(adv_group)
         right_layout.addStretch()
@@ -319,7 +317,6 @@ class TrainingGUI(QtWidgets.QWidget):
     def _populate_layer_targeting_tab(self, tab):
         main_layout = QtWidgets.QVBoxLayout(tab)
         
-        # Top layout for buttons
         top_layout = QtWidgets.QHBoxLayout()
         top_layout.addStretch()
         select_all_btn = QtWidgets.QPushButton("Select All")
@@ -330,7 +327,6 @@ class TrainingGUI(QtWidgets.QWidget):
         top_layout.addWidget(deselect_all_btn)
         main_layout.addLayout(top_layout)
 
-        # Scroll area for the many layer checkboxes
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_content = QtWidgets.QWidget()
@@ -338,37 +334,11 @@ class TrainingGUI(QtWidgets.QWidget):
         scroll_area.setWidget(scroll_content)
 
         all_unet_targets = {
-            "Attention Blocks": {
-                "attn1": "Self-Attention", 
-                "attn2": "Cross-Attention", 
-                "mid_block.attentions": "Mid-Block Attention", 
-                "ff": "Feed-Forward Networks"
-            },
-            "Attention Sub-Layers (Advanced)": {
-                "to_q": "Query Projection", 
-                "to_k": "Key Projection", 
-                "to_v": "Value Projection", 
-                "to_out.0": "Output Projection"
-            },
-            "UNet Embeddings (Non-Text)": {
-                "time_embedding": "Time Embedding", 
-                "time_emb_proj": "Time Embedding Projection", 
-                "add_embedding": "Added Conditional Embedding"
-            },
-            "Convolutional & ResNet Layers": {
-                "conv_in": "Input Conv", 
-                "conv1": "ResNet Conv1",                  # <-- CORRECTED
-                "conv2": "ResNet Conv2",                  # <-- CORRECTED
-                "conv_shortcut": "ResNet Skip Conv",      # <-- CORRECTED
-                "downsamplers": "Downsampler Convs",      # <-- CORRECTED & Simplified
-                "upsamplers": "Upsampler Convs",          # <-- CORRECTED & Simplified
-                "conv_out": "Output Conv"
-            },
-            "Normalization Layers (Experimental)": {
-                "norm1": "ResNet GroupNorm1", 
-                "norm2": "ResNet GroupNorm2", 
-                "conv_norm_out": "Output GroupNorm"
-            }
+            "Attention Blocks": {"attn1": "Self-Attention", "attn2": "Cross-Attention", "mid_block.attentions": "Mid-Block Attention", "ff": "Feed-Forward Networks"},
+            "Attention Sub-Layers (Advanced)": {"to_q": "Query Projection", "to_k": "Key Projection", "to_v": "Value Projection", "to_out.0": "Output Projection"},
+            "UNet Embeddings (Non-Text)": {"time_embedding": "Time Embedding", "time_emb_proj": "Time Embedding Projection", "add_embedding": "Added Conditional Embedding"},
+            "Convolutional & ResNet Layers": {"conv_in": "Input Conv", "conv1": "ResNet Conv1", "conv2": "ResNet Conv2", "conv_shortcut": "ResNet Skip Conv", "downsamplers": "Downsampler Convs", "upsamplers": "Upsampler Convs", "conv_out": "Output Conv"},
+            "Normalization Layers (Experimental)": {"norm1": "ResNet GroupNorm1", "norm2": "ResNet GroupNorm2", "conv_norm_out": "Output GroupNorm"}
         }
         for group_name, targets in all_unet_targets.items():
             label = QtWidgets.QLabel(f"<b>{group_name}</b>")
@@ -376,9 +346,11 @@ class TrainingGUI(QtWidgets.QWidget):
             scroll_layout.addWidget(label)
             for key, text in targets.items():
                 cb = QtWidgets.QCheckBox(f"{text} (keyword: '{key}')")
-                cb.setStyleSheet("margin-left: 15px;") # Indent checkboxes
+                cb.setStyleSheet("margin-left: 15px;")
                 scroll_layout.addWidget(cb)
                 self.unet_layer_checkboxes[key] = cb
+                # <<< NEW: Live update connection
+                cb.stateChanged.connect(self._update_unet_targets_config)
         scroll_layout.addStretch()
 
         main_layout.addWidget(scroll_area)
@@ -394,6 +366,8 @@ class TrainingGUI(QtWidgets.QWidget):
         label_widget.setToolTip(tooltip_text)
         layout.addRow(label_widget, entry)
         self.widgets[key] = entry
+        # <<< NEW: Connect signal for live updates
+        entry.textChanged.connect(lambda text, k=key, w=entry: self._update_config_from_widget(k, w))
 
     def _create_path_option(self, layout, key, label, tooltip_text, file_type):
         container = QtWidgets.QWidget()
@@ -401,30 +375,35 @@ class TrainingGUI(QtWidgets.QWidget):
         hbox.setContentsMargins(0, 0, 0, 0)
         entry = QtWidgets.QLineEdit()
         button = QtWidgets.QPushButton("Browse...")
-        hbox.addWidget(entry, stretch=1) # Allow entry to expand
+        hbox.addWidget(entry, stretch=1)
         hbox.addWidget(button)
         label_widget = QtWidgets.QLabel(label)
         label_widget.setToolTip(tooltip_text)
         layout.addRow(label_widget, container)
         button.clicked.connect(lambda: self._browse_path(entry, file_type))
         self.widgets[key] = entry
+        # <<< NEW: Connect signal for live updates
+        entry.textChanged.connect(lambda text, k=key, w=entry: self._update_config_from_widget(k, w))
 
     def _browse_path(self, entry_widget, file_type):
         path = ""
+        current_path = os.path.dirname(entry_widget.text()) if entry_widget.text() else ""
         if file_type == "folder":
-            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory")
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", current_path)
         elif file_type == "file_safetensors":
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", "", "Safetensors Files (*.safetensors)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", current_path, "Safetensors Files (*.safetensors)")
         elif file_type == "file_pt":
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", "", "PyTorch State Files (*.pt)")
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)")
         if path:
-            entry_widget.setText(path)
+            entry_widget.setText(path.replace('\\', '/')) # Use consistent path separators
 
     def _create_bool_option(self, layout, key, label, tooltip_text, command=None):
         checkbox = QtWidgets.QCheckBox(label)
         checkbox.setToolTip(tooltip_text)
         layout.addRow(checkbox)
         self.widgets[key] = checkbox
+        # <<< NEW: Connect signal for live updates
+        checkbox.stateChanged.connect(lambda state, k=key, w=checkbox: self._update_config_from_widget(k, w))
         if command:
             checkbox.stateChanged.connect(command)
 
@@ -435,76 +414,109 @@ class TrainingGUI(QtWidgets.QWidget):
         label_widget.setToolTip(tooltip_text)
         layout.addRow(label_widget, dropdown)
         self.widgets[key] = dropdown
+        # <<< NEW: Connect signal for live updates
+        dropdown.currentTextChanged.connect(lambda text, k=key, w=dropdown: self._update_config_from_widget(k, w))
+    
+    # <<< NEW: This method handles live updates for UNET checkboxes specifically
+    def _update_unet_targets_config(self):
+        """Gathers checked UNET layers and updates the central config."""
+        if not self.unet_layer_checkboxes: return
+        
+        checked_keys = [k for k, cb in self.unet_layer_checkboxes.items() if cb.isChecked()]
+        self.current_config["UNET_TRAIN_TARGETS"] = checked_keys
+
+    # <<< NEW: This central method updates self.current_config from any widget change
+    def _update_config_from_widget(self, key, widget):
+        """Reads a value from a widget and updates the central config dictionary."""
+        if key not in self.current_config: return # Don't update if key doesn't exist
+        
+        value = None
+        if isinstance(widget, QtWidgets.QLineEdit):
+            value = widget.text().strip()
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            value = widget.isChecked()
+        elif isinstance(widget, QtWidgets.QComboBox):
+            value = widget.currentText()
+        
+        if value is not None:
+            self.current_config[key] = value
 
     def _read_config_from_file(self):
-        # Start with default config values
         config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
         if os.path.exists(self.config_path):
             try:
                 with open(self.config_path, 'r') as f:
                     user_config = json.load(f)
-                    # Update default config with user's saved settings
                     config.update(user_config)
             except (json.JSONDecodeError, TypeError) as e:
                 self.log(f"Warning: Could not read {self.config_path}. Error: {e}. Using default settings.")
-        self.loaded_config = config
+        self.current_config = config # <<< CHANGED
 
     def _apply_config_to_widgets(self):
-        # Apply UNET_TRAIN_TARGETS separately as they are special
-        unet_targets = self.loaded_config.get("UNET_TRAIN_TARGETS", [])
+        # Apply UNET_TRAIN_TARGETS to checkboxes
+        unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", []) # <<< CHANGED
         for key, checkbox in self.unet_layer_checkboxes.items():
             checkbox.setChecked(key in unet_targets)
 
+        # Apply all other values
         for key, widget in self.widgets.items():
-            value = self.loaded_config.get(key)
+            if key not in self.current_config: continue # <<< CHANGED
+            value = self.current_config.get(key)
             if value is None: continue
 
-            if isinstance(widget, QtWidgets.QLineEdit):
-                widget.setText(", ".join(map(str, value)) if isinstance(value, list) else str(value))
-            elif isinstance(widget, QtWidgets.QCheckBox):
-                widget.setChecked(bool(value))
-            elif isinstance(widget, QtWidgets.QComboBox):
-                index = widget.findText(str(value))
-                if index >= 0:
-                    widget.setCurrentIndex(index)
+            # Block signals while setting widget state to prevent feedback loops
+            widget.blockSignals(True)
+            try:
+                if isinstance(widget, QtWidgets.QLineEdit):
+                    widget.setText(", ".join(map(str, value)) if isinstance(value, list) else str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, QtWidgets.QComboBox):
+                    index = widget.findText(str(value))
+                    if index >= 0:
+                        widget.setCurrentIndex(index)
+            finally:
+                widget.blockSignals(False)
+
 
         # Ensure dependent widgets update their state after loading config
         if "USE_MIN_SNR_GAMMA" in self.widgets: self.toggle_min_snr_gamma_widget()
         if "RESUME_TRAINING" in self.widgets: self.toggle_resume_widgets()
 
     def save_config(self):
+        """Saves the current configuration to user_config.json."""
         config_to_save = {}
         default_map = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
 
-        # Handle UNET_TRAIN_TARGETS checkboxes
-        if self.unet_layer_checkboxes:
-            config_to_save["UNET_TRAIN_TARGETS"] = [k for k, cb in self.unet_layer_checkboxes.items() if cb.isChecked()]
-
-        for key, widget in self.widgets.items():
+        # Iterate through the live config and save values that differ from the default
+        for key, live_val in self.current_config.items():
             default_val = default_map.get(key)
-            val = None
-
-            if isinstance(widget, QtWidgets.QLineEdit):
-                val_str = widget.text().strip()
-                # This complex logic handles converting the string from a QLineEdit
-                # back into its proper type (int, float, list of ints) for JSON serialization.
-                if isinstance(default_val, list):
-                    parts = [item.strip() for item in val_str.split(',') if item.strip()]
-                    try: val = [int(p) for p in parts]
-                    except ValueError: val = parts
-                elif isinstance(default_val, (int, float)):
-                    try: val = type(default_val)(val_str)
-                    except (ValueError, TypeError): val = val_str
-                else:
-                    val = val_str
-            elif isinstance(widget, QtWidgets.QCheckBox):
-                val = widget.isChecked()
-            elif isinstance(widget, QtWidgets.QComboBox):
-                val = widget.currentText()
             
-            # Only save if the value is different from the default to keep the JSON file clean
-            if val != default_val:
-                config_to_save[key] = val
+            # This logic converts for comparison but saves the original live_val for numerical types
+            val_to_check = live_val
+            value_to_save = live_val
+            if default_val is not None:
+                if isinstance(default_val, (int, float)):
+                    try:
+                        val_to_check = int(live_val) if isinstance(default_val, int) else float(live_val)
+                    except (ValueError, TypeError):
+                        val_to_check = live_val
+                elif isinstance(default_val, list):
+                    try:
+                        parts = [item.strip() for item in str(live_val).split(',') if item.strip()]
+                        val_to_check = [int(p) if isinstance(default_val[0], int) else float(p) for p in parts]
+                        value_to_save = val_to_check  # For lists, save the converted list
+                    except (ValueError, TypeError):
+                        val_to_check = live_val
+            
+            if val_to_check != default_val:
+                config_to_save[key] = value_to_save
+        
+        # Ensure UNET targets are saved correctly (as they are managed separately)
+        unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", [])
+        if unet_targets != default_map.get("UNET_TRAIN_TARGETS"):
+            config_to_save["UNET_TRAIN_TARGETS"] = unet_targets
+
 
         with open(self.config_path, 'w') as f:
             json.dump(config_to_save, f, indent=4)
@@ -514,16 +526,20 @@ class TrainingGUI(QtWidgets.QWidget):
         if os.path.exists(self.config_path):
             os.remove(self.config_path)
             self.log(f"Removed {self.config_path}. Restoring defaults.")
+        # <<< CHANGED: Re-read defaults and apply to the entire UI
         self._read_config_from_file()
         self._apply_config_to_widgets()
 
     def toggle_all_unet_checkboxes(self, state):
         for cb in self.unet_layer_checkboxes.values():
             cb.setChecked(state)
+        # <<< NEW: This call ensures the config is updated after the bulk change.
+        self._update_unet_targets_config()
 
     def toggle_min_snr_gamma_widget(self):
         if "MIN_SNR_GAMMA" in self.widgets and "USE_MIN_SNR_GAMMA" in self.widgets:
-            self.widgets["MIN_SNR_GAMMA"].setEnabled(self.widgets["USE_MIN_SNR_GAMMA"].isChecked())
+            is_checked = self.widgets["USE_MIN_SNR_GAMMA"].isChecked()
+            self.widgets["MIN_SNR_GAMMA"].setEnabled(is_checked)
 
     def toggle_resume_widgets(self):
         if "RESUME_TRAINING" in self.widgets and self.resume_widgets_container:
@@ -547,7 +563,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.training_process.readyReadStandardOutput.connect(self.handle_stdout)
         self.training_process.finished.connect(self.training_finished)
         
-        # Use sys.executable to ensure the same Python env is used. -u is for unbuffered output.
         try:
             self.training_process.start(sys.executable, ["-u", "train.py"])
             if not self.training_process.waitForStarted(5000):
@@ -570,6 +585,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log("No active training process to stop.")
 
     def training_finished(self):
+        if not self.training_process: return
         exit_code = self.training_process.exitCode()
         status = "successfully" if exit_code == 0 else f"with an error (Code: {exit_code})"
         self.log(f"\n" + "="*50 + f"\nTraining process finished {status}.\n" + "="*50)

@@ -69,6 +69,32 @@ class TrainingConfig:
                 print(f"ERROR: Could not read or parse user_config.json: {e}. Using default settings.")
         else:
             print("INFO: user_config.json not found. Using default settings.")
+        
+        # Convert string values to proper numerical types for safety
+        float_keys = [
+            "UNET_LEARNING_RATE", "TEXT_ENCODER_LEARNING_RATE",
+            "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA"
+        ]
+        int_keys = [
+            "MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED",
+            "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS"
+        ]
+        for key in float_keys:
+            if hasattr(self, key):
+                val = getattr(self, key)
+                try:
+                    setattr(self, key, float(val))
+                except (ValueError, TypeError) as e:
+                    print(f"ERROR: Could not convert {key} to float ({val}): {e}. Falling back to default.")
+                    setattr(self, key, default_config.__dict__[key])
+        for key in int_keys:
+            if hasattr(self, key):
+                val = getattr(self, key)
+                try:
+                    setattr(self, key, int(val))
+                except (ValueError, TypeError) as e:
+                    print(f"ERROR: Could not convert {key} to int ({val}): {e}. Falling back to default.")
+                    setattr(self, key, default_config.__dict__[key])
 
 # Add this import at the top of your train.py file
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -329,6 +355,14 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
 
     print("\n" + "="*60)
     print(f"\nSaving final model to {output_path} (dtype: {save_dtype})")
+    
+    # ============================ FIX START ============================
+    # Ensure the output directory exists before attempting to save the file.
+    # This prevents the "path not found" error if a parent directory is missing.
+    output_dir = Path(output_path).parent
+    output_dir.mkdir(parents=True, exist_ok=True)
+    # ============================= FIX END =============================
+
     save_file(base_sd, output_path)
     print("[OK] Save complete.")
     del base_sd; gc.collect(); torch.cuda.empty_cache()
@@ -344,7 +378,11 @@ def custom_collate_fn_latent(batch):
 
 def save_training_checkpoint(base_model_path, models, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
-    print(f"\nSaving full model checkpoint to: {checkpoint_model_path}")
+    print(f"\n==================================================")
+    print(f"SAVING CHECKPOINT AT STEP {step}")
+    print(f"==================================================")
+    
+    # This call now uses the hardened save_model function
     save_model(
         base_model_path=base_model_path,
         output_path=checkpoint_model_path,
@@ -352,15 +390,26 @@ def save_training_checkpoint(base_model_path, models, optimizer, scheduler, step
         trained_param_names=trainable_param_names,
         save_dtype=save_dtype
     )
-    state = {
-        'step': step,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-    }
-    state_path = checkpoint_dir / f"training_state_step_{step}.pt"
-    torch.save(state, state_path)
-    print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
-    del state; gc.collect()
+    
+    state = None # Define for the finally block
+    try:
+        state = {
+            'step': step,
+            'optimizer_state_dict': optimizer.state_dict(),
+            'scheduler_state_dict': scheduler.state_dict(),
+        }
+        state_path = checkpoint_dir / f"training_state_step_{step}.pt"
+        torch.save(state, state_path)
+        print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
+    except Exception as e:
+        print(f"[ERROR] Could not save optimizer/scheduler state: {e}")
+    finally:
+        # Ensure the large state dictionary is deleted immediately
+        if state is not None:
+            del state
+        gc.collect()
+        torch.cuda.empty_cache()
+    print(f"--- Checkpoint save for step {step} finished ---\n")
 
 def main():
     config = TrainingConfig()
@@ -479,14 +528,25 @@ def main():
     te1_params = [p for n, p in text_encoder1.named_parameters() if n in te1_param_names_to_optimize]
     te2_params = [p for n, p in text_encoder2.named_parameters() if n in te2_param_names_to_optimize]
     for p in unet_params + te1_params + te2_params: p.requires_grad_(True)
-    optimizer_grouped_parameters = [
-        {"params": unet_params, "lr": config.UNET_LEARNING_RATE},
-        {"params": te1_params, "lr": config.TEXT_ENCODER_LEARNING_RATE},
-        {"params": te2_params, "lr": config.TEXT_ENCODER_LEARNING_RATE},
-    ]
-    params_to_optimize = unet_params + te1_params + te2_params
+    
+    # --- FIX APPLIED HERE ---
+    # Consolidate text encoder parameters as they share a learning rate.
+    # This simplifies the optimizer's input and avoids a known issue with Adafactor.
+    te_params = te1_params + te2_params
+
+    # Create the list of parameter groups, filtering out any that might be empty.
+    optimizer_grouped_parameters = []
+    if unet_params:
+        optimizer_grouped_parameters.append({"params": unet_params, "lr": config.UNET_LEARNING_RATE})
+    if te_params:
+        optimizer_grouped_parameters.append({"params": te_params, "lr": config.TEXT_ENCODER_LEARNING_RATE})
+
+    # This flat list of all parameters is used for gradient clipping later.
+    params_to_optimize = unet_params + te_params
+    # --- END OF FIX ---
+    
     unet_trainable_params = sum(p.numel() for p in unet_params)
-    te_trainable_params = sum(p.numel() for p in te1_params) + sum(p.numel() for p in te2_params)
+    te_trainable_params = sum(p.numel() for p in te_params) # Simplified calculation
     total_trainable_params = unet_trainable_params + te_trainable_params
     total_params = sum(p.numel() for p in unet.parameters()) + sum(p.numel() for p in text_encoder1.parameters()) + sum(p.numel() for p in text_encoder2.parameters())
     print(f"UNet params to train:      {unet_trainable_params/1e6:.2f}M with LR: {config.UNET_LEARNING_RATE}")
@@ -523,15 +583,38 @@ def main():
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     random.seed(config.SEED); torch.manual_seed(config.SEED); torch.cuda.manual_seed_all(config.SEED)
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
-    train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=(config.NUM_WORKERS > 0))
+    
+    # --- MODIFIED FOR STABILITY ---
+    pin_memory_enabled = (config.NUM_WORKERS > 0)
+    print(f"INFO: Dataloader workers: {config.NUM_WORKERS}, Pin Memory: {pin_memory_enabled}")
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_size=config.BATCH_SIZE,
+        shuffle=True,
+        collate_fn=custom_collate_fn_latent,
+        num_workers=config.NUM_WORKERS,
+        persistent_workers=(config.NUM_WORKERS > 0),
+        pin_memory=pin_memory_enabled
+    )
+    # --- END OF MODIFICATION ---
+    
     final_loss = 0.0
     unet.train(); text_encoder1.train(); text_encoder2.train()
     training_start_time = time.time()
     progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
     dataloader_iterator = iter(train_dataloader)
+    
     while global_step < config.MAX_TRAIN_STEPS:
-        try: batch = next(dataloader_iterator)
-        except StopIteration: dataloader_iterator = iter(train_dataloader); batch = next(dataloader_iterator)
+        try:
+            # --- ADDED FOR DEBUGGING ---
+            # print(f"\n[Step {global_step}] ---> Getting next batch from dataloader...")
+            batch = next(dataloader_iterator)
+        except StopIteration:
+            dataloader_iterator = iter(train_dataloader)
+            batch = next(dataloader_iterator)
+        
+        # --- ADDED FOR DEBUGGING ---
+        # print(f"[Step {global_step}] ---> Encoding text prompts...")
         text_encoder1.to(device); text_encoder2.to(device)
         with torch.no_grad():
             prompt_embeds_out = text_encoder1(batch["input_ids1"].to(device), output_hidden_states=True)
@@ -556,6 +639,9 @@ def main():
         add_time_ids_list = [list(orig_size) + list(crop_coords) + list(targ_size) for orig_size, crop_coords, targ_size in zip(original_sizes, crops_coords_top_left, target_sizes)]
         add_time_ids = torch.tensor(add_time_ids_list, device=device, dtype=prompt_embeds.dtype)
         prompt_embeds.requires_grad_(True)
+        
+        # --- ADDED FOR DEBUGGING ---
+        # print(f"[Step {global_step}] ---> Preparing for backward pass...")
         with torch.autocast(device_type=device.type, dtype=compute_dtype):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             if is_v_prediction and config.USE_MIN_SNR_GAMMA:
@@ -567,7 +653,11 @@ def main():
                 loss = (loss_per_pixel.mean(dim=list(range(1, len(loss_per_pixel.shape)))) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
+                
         (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+        # --- ADDED FOR DEBUGGING ---
+        # print(f"[Step {global_step}] ---> Backward pass complete. Optimizing...")
+
         if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
             params_to_clip = [p for p in params_to_optimize if p.grad is not None]
             if params_to_clip:
@@ -653,5 +743,20 @@ def main():
     print("\n" + "="*50); print("            TRAINING COMPLETE"); print("="*50)
 
 if __name__ == "__main__":
+    # --- ADDED FOR STABILITY AND DEBUGGING ON WINDOWS ---
+    # Ensure the multiprocessing start method is set to 'spawn', which is the
+    # default and only option on Windows, but this prevents potential conflicts.
+    import torch.multiprocessing as mp
+    try:
+        # 'fork' is not available on Windows, and 'spawn' is the default.
+        # This guard is a best practice for cross-platform compatibility
+        # and ensuring the script behaves as expected when multiprocessing.
+        mp.set_start_method('spawn', force=True)
+        print("INFO: Multiprocessing start method set to 'spawn'.")
+    except RuntimeError as e:
+        # This can happen if the context is already set, which is fine.
+        print(f"INFO: Multiprocessing context already set or an error occurred: {e}")
+    # --- END OF ADDITION ---
+
     os.environ['PYTHONUNBUFFERED'] = '1'
     main()
