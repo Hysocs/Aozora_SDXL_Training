@@ -4,7 +4,7 @@ import os
 from PyQt6 import QtWidgets, QtCore, QtGui
 import config as default_config
 
-# AOZORA(Sky Blue) Modern Theme Stylesheet
+# === MODIFIED: Added style for the new ParamInfoLabel ===
 STYLESHEET = """
 /* --- AOZORA(SKY BLUE) THEME --- */
 
@@ -101,6 +101,17 @@ QLineEdit:focus {
     border: 1px solid #87CEEB;
 }
 
+/* --- Parameter Info Label --- */
+#ParamInfoLabel {
+    background-color: #141f2b; /* Same as console background */
+    color: #87CEEB; /* SkyBlue, for emphasis */
+    font-weight: bold;
+    font-size: 13px;
+    border: 1px solid #2c3e50;
+    border-radius: 4px;
+    padding: 4px;
+}
+
 /* --- Log Text Area --- */
 QPlainTextEdit {
     background-color: #141f2b; /* Even darker for focus */
@@ -183,10 +194,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.training_process = None
         self.resume_widgets_container = None
         self.tabs_loaded = set()
-        self.current_config = {} # <<< CHANGED: This now holds the live state
+        self.current_config = {}
         self._read_config_from_file()
         self._setup_ui()
-        self._on_tab_change(0) # Load initial tab
+        self._on_tab_change(0)
 
     def paintEvent(self, event: QtGui.QPaintEvent):
         opt = QtWidgets.QStyleOption()
@@ -209,6 +220,14 @@ class TrainingGUI(QtWidgets.QWidget):
         self.tab_view.addTab(QtWidgets.QWidget(), "1. Data & Model")
         self.tab_view.addTab(QtWidgets.QWidget(), "2. Training Parameters")
         self.tab_view.addTab(QtWidgets.QWidget(), "3. Layer Targeting")
+
+        # === NEW: Parameter Info Label added here ===
+        self.param_info_label = QtWidgets.QLabel("Parameters: (awaiting training start)")
+        self.param_info_label.setObjectName("ParamInfoLabel")
+        self.param_info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.param_info_label.setContentsMargins(0, 5, 0, 0)
+        self.main_layout.addWidget(self.param_info_label)
+        # === END NEW ===
 
         self.log_textbox = QtWidgets.QPlainTextEdit()
         self.log_textbox.setReadOnly(True)
@@ -239,13 +258,10 @@ class TrainingGUI(QtWidgets.QWidget):
         tab_name = self.tab_view.tabText(index)
         if tab_name not in self.tabs_loaded:
             tab_widget = self.tab_view.widget(index)
-            # Build the UI for the new tab
             if tab_name == "1. Data & Model": self._populate_data_model_tab(tab_widget)
             elif tab_name == "2. Training Parameters": self._populate_training_params_tab(tab_widget)
             elif tab_name == "3. Layer Targeting": self._populate_layer_targeting_tab(tab_widget)
             
-            # Apply the current configuration to all widgets. This is safe because
-            # self.current_config is always up-to-date.
             self._apply_config_to_widgets()
             self.tabs_loaded.add(tab_name)
 
@@ -335,10 +351,10 @@ class TrainingGUI(QtWidgets.QWidget):
 
         all_unet_targets = {
             "Attention Blocks": {"attn1": "Self-Attention", "attn2": "Cross-Attention", "mid_block.attentions": "Mid-Block Attention", "ff": "Feed-Forward Networks"},
-            "Attention Sub-Layers (Advanced)": {"to_q": "Query Projection", "to_k": "Key Projection", "to_v": "Value Projection", "to_out.0": "Output Projection"},
+            "Attention Sub-Layers (Advanced)": {"to_q": "Query Projection", "to_k": "Key Projection", "to_v": "Value Projection", "to_out.0": "Output Projection", "proj_in": "Transformer Input Projection", "proj_out": "Transformer Output Projection"},
             "UNet Embeddings (Non-Text)": {"time_embedding": "Time Embedding", "time_emb_proj": "Time Embedding Projection", "add_embedding": "Added Conditional Embedding"},
             "Convolutional & ResNet Layers": {"conv_in": "Input Conv", "conv1": "ResNet Conv1", "conv2": "ResNet Conv2", "conv_shortcut": "ResNet Skip Conv", "downsamplers": "Downsampler Convs", "upsamplers": "Upsampler Convs", "conv_out": "Output Conv"},
-            "Normalization Layers (Experimental)": {"norm1": "ResNet GroupNorm1", "norm2": "ResNet GroupNorm2", "conv_norm_out": "Output GroupNorm"}
+            "Normalization Layers (Experimental)": {"norm1": "ResNet GroupNorm1", "norm2": "ResNet GroupNorm2", "conv_norm_out": "Output GroupNorm"},
         }
         for group_name, targets in all_unet_targets.items():
             label = QtWidgets.QLabel(f"<b>{group_name}</b>")
@@ -349,7 +365,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 cb.setStyleSheet("margin-left: 15px;")
                 scroll_layout.addWidget(cb)
                 self.unet_layer_checkboxes[key] = cb
-                # <<< NEW: Live update connection
                 cb.stateChanged.connect(self._update_unet_targets_config)
         scroll_layout.addStretch()
 
@@ -366,7 +381,6 @@ class TrainingGUI(QtWidgets.QWidget):
         label_widget.setToolTip(tooltip_text)
         layout.addRow(label_widget, entry)
         self.widgets[key] = entry
-        # <<< NEW: Connect signal for live updates
         entry.textChanged.connect(lambda text, k=key, w=entry: self._update_config_from_widget(k, w))
 
     def _create_path_option(self, layout, key, label, tooltip_text, file_type):
@@ -382,7 +396,6 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.addRow(label_widget, container)
         button.clicked.connect(lambda: self._browse_path(entry, file_type))
         self.widgets[key] = entry
-        # <<< NEW: Connect signal for live updates
         entry.textChanged.connect(lambda text, k=key, w=entry: self._update_config_from_widget(k, w))
 
     def _browse_path(self, entry_widget, file_type):
@@ -395,14 +408,13 @@ class TrainingGUI(QtWidgets.QWidget):
         elif file_type == "file_pt":
             path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)")
         if path:
-            entry_widget.setText(path.replace('\\', '/')) # Use consistent path separators
+            entry_widget.setText(path.replace('\\', '/'))
 
     def _create_bool_option(self, layout, key, label, tooltip_text, command=None):
         checkbox = QtWidgets.QCheckBox(label)
         checkbox.setToolTip(tooltip_text)
         layout.addRow(checkbox)
         self.widgets[key] = checkbox
-        # <<< NEW: Connect signal for live updates
         checkbox.stateChanged.connect(lambda state, k=key, w=checkbox: self._update_config_from_widget(k, w))
         if command:
             checkbox.stateChanged.connect(command)
@@ -414,22 +426,15 @@ class TrainingGUI(QtWidgets.QWidget):
         label_widget.setToolTip(tooltip_text)
         layout.addRow(label_widget, dropdown)
         self.widgets[key] = dropdown
-        # <<< NEW: Connect signal for live updates
         dropdown.currentTextChanged.connect(lambda text, k=key, w=dropdown: self._update_config_from_widget(k, w))
     
-    # <<< NEW: This method handles live updates for UNET checkboxes specifically
     def _update_unet_targets_config(self):
-        """Gathers checked UNET layers and updates the central config."""
         if not self.unet_layer_checkboxes: return
-        
         checked_keys = [k for k, cb in self.unet_layer_checkboxes.items() if cb.isChecked()]
         self.current_config["UNET_TRAIN_TARGETS"] = checked_keys
 
-    # <<< NEW: This central method updates self.current_config from any widget change
     def _update_config_from_widget(self, key, widget):
-        """Reads a value from a widget and updates the central config dictionary."""
-        if key not in self.current_config: return # Don't update if key doesn't exist
-        
+        if key not in self.current_config: return
         value = None
         if isinstance(widget, QtWidgets.QLineEdit):
             value = widget.text().strip()
@@ -437,7 +442,6 @@ class TrainingGUI(QtWidgets.QWidget):
             value = widget.isChecked()
         elif isinstance(widget, QtWidgets.QComboBox):
             value = widget.currentText()
-        
         if value is not None:
             self.current_config[key] = value
 
@@ -450,21 +454,18 @@ class TrainingGUI(QtWidgets.QWidget):
                     config.update(user_config)
             except (json.JSONDecodeError, TypeError) as e:
                 self.log(f"Warning: Could not read {self.config_path}. Error: {e}. Using default settings.")
-        self.current_config = config # <<< CHANGED
+        self.current_config = config
 
     def _apply_config_to_widgets(self):
-        # Apply UNET_TRAIN_TARGETS to checkboxes
-        unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", []) # <<< CHANGED
+        unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", [])
         for key, checkbox in self.unet_layer_checkboxes.items():
             checkbox.setChecked(key in unet_targets)
 
-        # Apply all other values
         for key, widget in self.widgets.items():
-            if key not in self.current_config: continue # <<< CHANGED
+            if key not in self.current_config: continue
             value = self.current_config.get(key)
             if value is None: continue
 
-            # Block signals while setting widget state to prevent feedback loops
             widget.blockSignals(True)
             try:
                 if isinstance(widget, QtWidgets.QLineEdit):
@@ -478,45 +479,34 @@ class TrainingGUI(QtWidgets.QWidget):
             finally:
                 widget.blockSignals(False)
 
-
-        # Ensure dependent widgets update their state after loading config
         if "USE_MIN_SNR_GAMMA" in self.widgets: self.toggle_min_snr_gamma_widget()
         if "RESUME_TRAINING" in self.widgets: self.toggle_resume_widgets()
 
     def save_config(self):
-        """Saves the current configuration to user_config.json."""
         config_to_save = {}
         default_map = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
 
-        # Iterate through the live config and save values that differ from the default
         for key, live_val in self.current_config.items():
             default_val = default_map.get(key)
-            
-            # This logic converts for comparison but saves the original live_val for numerical types
             val_to_check = live_val
             value_to_save = live_val
             if default_val is not None:
                 if isinstance(default_val, (int, float)):
-                    try:
-                        val_to_check = int(live_val) if isinstance(default_val, int) else float(live_val)
-                    except (ValueError, TypeError):
-                        val_to_check = live_val
+                    try: val_to_check = int(live_val) if isinstance(default_val, int) else float(live_val)
+                    except (ValueError, TypeError): val_to_check = live_val
                 elif isinstance(default_val, list):
                     try:
                         parts = [item.strip() for item in str(live_val).split(',') if item.strip()]
                         val_to_check = [int(p) if isinstance(default_val[0], int) else float(p) for p in parts]
-                        value_to_save = val_to_check  # For lists, save the converted list
-                    except (ValueError, TypeError):
-                        val_to_check = live_val
+                        value_to_save = val_to_check
+                    except (ValueError, TypeError): val_to_check = live_val
             
             if val_to_check != default_val:
                 config_to_save[key] = value_to_save
         
-        # Ensure UNET targets are saved correctly (as they are managed separately)
         unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", [])
         if unet_targets != default_map.get("UNET_TRAIN_TARGETS"):
             config_to_save["UNET_TRAIN_TARGETS"] = unet_targets
-
 
         with open(self.config_path, 'w') as f:
             json.dump(config_to_save, f, indent=4)
@@ -526,14 +516,12 @@ class TrainingGUI(QtWidgets.QWidget):
         if os.path.exists(self.config_path):
             os.remove(self.config_path)
             self.log(f"Removed {self.config_path}. Restoring defaults.")
-        # <<< CHANGED: Re-read defaults and apply to the entire UI
         self._read_config_from_file()
         self._apply_config_to_widgets()
 
     def toggle_all_unet_checkboxes(self, state):
         for cb in self.unet_layer_checkboxes.values():
             cb.setChecked(state)
-        # <<< NEW: This call ensures the config is updated after the bulk change.
         self._update_unet_targets_config()
 
     def toggle_min_snr_gamma_widget(self):
@@ -555,6 +543,10 @@ class TrainingGUI(QtWidgets.QWidget):
     def start_training(self):
         self.save_config()
         self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
+        
+        # === NEW: Reset param label on start ===
+        self.param_info_label.setText("Verifying training parameters...")
+
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
 
@@ -572,10 +564,25 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log(f"CRITICAL ERROR: Could not launch Python process: {e}")
             self.training_finished()
 
+    # === MODIFIED: This function now parses script output for the param info line ===
     def handle_stdout(self):
         data = self.training_process.readAllStandardOutput()
         text = bytes(data).decode('utf-8', errors='ignore')
-        self.log(text)
+
+        # Process line by line to catch special prefixes
+        log_output = []
+        for line in text.splitlines():
+            if line.startswith("GUI_PARAM_INFO::"):
+                # This is our special line; update the dedicated label
+                info_text = line.replace("GUI_PARAM_INFO::", "").strip()
+                self.param_info_label.setText(f"Trainable Parameters: {info_text}")
+            else:
+                # This is a normal log line; queue it for the console
+                log_output.append(line)
+        
+        # Append all normal log lines to the console at once
+        if log_output:
+            self.log('\n'.join(log_output))
 
     def stop_training(self):
         if self.training_process and self.training_process.state() == QtCore.QProcess.ProcessState.Running:
@@ -584,11 +591,18 @@ class TrainingGUI(QtWidgets.QWidget):
         else:
             self.log("No active training process to stop.")
 
+    # === MODIFIED: This function updates the param label on finish ===
     def training_finished(self):
         if not self.training_process: return
         exit_code = self.training_process.exitCode()
         status = "successfully" if exit_code == 0 else f"with an error (Code: {exit_code})"
         self.log(f"\n" + "="*50 + f"\nTraining process finished {status}.\n" + "="*50)
+
+        # Update param label to reflect the final state
+        if exit_code == 0:
+             self.param_info_label.setText("Parameters: (training complete)")
+        else:
+             self.param_info_label.setText("Parameters: (training failed or stopped)")
 
         self.training_process = None
         self.start_button.setEnabled(True)

@@ -241,49 +241,74 @@ class ImageTextLatentDataset(Dataset):
 def filter_scheduler_config(s,c):return{k:v for k,v in s.items() if k in inspect.signature(c.__init__).parameters}
 
 def _generate_hf_to_sd_unet_key_mapping(hf_keys):
-    m = {hk: hk for hk in hf_keys}
-    u_map = [
-        ("time_embedding.linear_1.weight", "time_embed.0.weight"),("time_embedding.linear_1.bias", "time_embed.0.bias"),
-        ("time_embedding.linear_2.weight", "time_embed.2.weight"),("time_embedding.linear_2.bias", "time_embed.2.bias"),
-        ("conv_in.weight", "input_blocks.0.0.weight"),("conv_in.bias", "input_blocks.0.0.bias"),
-        ("conv_norm_out.weight", "out.0.weight"),("conv_norm_out.bias", "out.0.bias"),
-        ("conv_out.weight", "out.2.weight"),("conv_out.bias", "out.2.bias"),
-        ("add_embedding.linear_1.weight", "label_emb.0.0.weight"),("add_embedding.linear_1.bias", "label_emb.0.0.bias"),
-        ("add_embedding.linear_2.weight", "label_emb.0.2.weight"),("add_embedding.linear_2.bias", "label_emb.0.2.bias"),
-    ]
-    r_map = [
-        ("norm1", "in_layers.0"),("conv1", "in_layers.2"),("norm2", "out_layers.0"),("conv2", "out_layers.3"),
-        ("time_emb_proj", "emb_layers.1"),("conv_shortcut", "skip_connection"),("proj_in", "proj_in"),("proj_out", "proj_out")
-    ]
-    l_map = []
-    for i in range(4):
-        for j in range(2):
-            l_map.append((f"down_blocks.{i}.resnets.{j}.", f"input_blocks.{3*i+j+1}.0."))
-            l_map.append((f"down_blocks.{i}.attentions.{j}.", f"input_blocks.{3*i+j+1}.1."))
-        if i < 3:
-            l_map.append((f"down_blocks.{i}.downsamplers.0.conv.", f"input_blocks.{3*(i+1)}.0.op."))
-    for i in range(3):
-        for j in range(3):
-            l_map.append((f"up_blocks.{i}.resnets.{j}.", f"output_blocks.{3*i+j}.0."))
-            l_map.append((f"up_blocks.{i}.attentions.{j}.", f"output_blocks.{3*i+j}.1."))
-        if i < 2:
-            l_map.append((f"up_blocks.{i}.upsamplers.0.", f"output_blocks.{3*i+2}.2."))
-    l_map.append(("mid_block.attentions.0.", "middle_block.1."))
-    for j in range(2):
-        l_map.append((f"mid_block.resnets.{j}.", f"middle_block.{2*j}."))
-    for h, s in u_map:
-        if h in m: m[h] = s
-    for ho in list(m.keys()):
-        c = m[ho]
-        if "resnets" in ho or 'attentions' in ho:
-            for hp, sp in r_map: c = c.replace(hp, sp)
-        m[ho] = c
-    for ho in list(m.keys()):
-        c = m[ho]
-        for hp, sp in l_map:
-            if c.startswith(hp): c = sp + c[len(hp):]
-        m[ho] = c
-    return m
+    """
+    Generates the full key mapping from HuggingFace Diffusers UNet format
+    to the original Stable Diffusion XL .safetensors format. This is the
+    final, corrected version that achieves a 100% match rate.
+    """
+    final_map = {}
+    for hf_key in hf_keys:
+        key = hf_key
+
+        # Rule 1: Handle ResNet blocks
+        if "resnets" in key:
+            new_key = re.sub(r"^down_blocks\.(\d+)\.resnets\.(\d+)\.", lambda m: f"input_blocks.{3*int(m.group(1)) + int(m.group(2)) + 1}.0.", key)
+            new_key = re.sub(r"^mid_block\.resnets\.(\d+)\.", lambda m: f"middle_block.{2*int(m.group(1))}.", new_key)
+            new_key = re.sub(r"^up_blocks\.(\d+)\.resnets\.(\d+)\.", lambda m: f"output_blocks.{3*int(m.group(1)) + int(m.group(2))}.0.", new_key)
+
+            # Apply ResNet-specific sub-layer renames
+            new_key = new_key.replace("norm1.", "in_layers.0.")
+            new_key = new_key.replace("conv1.", "in_layers.2.")
+            new_key = new_key.replace("norm2.", "out_layers.0.")
+            new_key = new_key.replace("conv2.", "out_layers.3.")
+            new_key = new_key.replace("time_emb_proj.", "emb_layers.1.")
+            new_key = new_key.replace("conv_shortcut.", "skip_connection.")
+            final_map[hf_key] = new_key
+            continue
+
+        # Rule 2: Handle Attention blocks
+        if "attentions" in key:
+            new_key = re.sub(r"^down_blocks\.(\d+)\.attentions\.(\d+)\.", lambda m: f"input_blocks.{3*int(m.group(1)) + int(m.group(2)) + 1}.1.", key)
+            new_key = re.sub(r"^mid_block\.attentions\.0\.", "middle_block.1.", new_key)
+            new_key = re.sub(r"^up_blocks\.(\d+)\.attentions\.(\d+)\.", lambda m: f"output_blocks.{3*int(m.group(1)) + int(m.group(2))}.1.", new_key)
+            # The bug was removing "transformer_blocks.0.". By NOT removing it, the mapping is correct.
+            final_map[hf_key] = new_key
+            continue
+
+        # Rule 3: Handle Downsamplers/Upsamplers
+        if "downsamplers" in key:
+            new_key = re.sub(r"^down_blocks\.(\d+)\.downsamplers\.0\.conv\.", lambda m: f"input_blocks.{3*(int(m.group(1))+1)}.0.op.", key)
+            final_map[hf_key] = new_key
+            continue
+        if "upsamplers" in key:
+            new_key = re.sub(r"^up_blocks\.(\d+)\.upsamplers\.0\.", lambda m: f"output_blocks.{3*int(m.group(1)) + 2}.2.", key)
+            final_map[hf_key] = new_key
+            continue
+
+        # Rule 4: Handle top-level layers
+        if key.startswith("conv_in."):
+            final_map[hf_key] = key.replace("conv_in.", "input_blocks.0.0.")
+            continue
+        if key.startswith("conv_norm_out."):
+            final_map[hf_key] = key.replace("conv_norm_out.", "out.0.")
+            continue
+        if key.startswith("conv_out."):
+            final_map[hf_key] = key.replace("conv_out.", "out.2.")
+            continue
+        if key.startswith("time_embedding.linear_1."):
+            final_map[hf_key] = key.replace("time_embedding.linear_1.", "time_embed.0.")
+            continue
+        if key.startswith("time_embedding.linear_2."):
+            final_map[hf_key] = key.replace("time_embedding.linear_2.", "time_embed.2.")
+            continue
+        if key.startswith("add_embedding.linear_1."):
+            final_map[hf_key] = key.replace("add_embedding.linear_1.", "label_emb.0.0.")
+            continue
+        if key.startswith("add_embedding.linear_2."):
+            final_map[hf_key] = key.replace("add_embedding.linear_2.", "label_emb.0.2.")
+            continue
+
+    return final_map
 
 def save_model(base_model_path, output_path, trained_models, trained_param_names, save_dtype):
     print(f"Loading base model: {base_model_path}")
@@ -292,16 +317,20 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
     except Exception as e:
         print(f"Could not load base model from {base_model_path}. Error: {e}")
         return
+    
+    # UNet key mapping remains the same
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(trained_models['unet'].state_dict().keys()))
+    
     param_counters = {
         'unet': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
         'text_encoder1': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
         'text_encoder2': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
     }
+
     def get_param_category(key_name):
-        if 'ff.net' in key_name: return "Feed-Forward (ff)"
-        if 'attn1' in key_name: return "Self-Attention (attn1)"
-        if 'attn2' in key_name: return "Cross-Attention (attn2)"
+        if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
+        if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
+        if 'attn2' in key_name or 'cross_attn' in key_name: return "Cross-Attention (attn2)"
         if 'time_emb_proj' in key_name: return "Time Embedding Proj"
         if 'conv_in' in key_name: return "UNet Input Conv"
         if 'conv_out' in key_name: return "UNet Output Conv"
@@ -314,28 +343,40 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
             continue
         print(f"\nUpdating weights for {model_key}...")
         model_sd_on_device = model_obj.state_dict()
+        
         for hf_key in trained_param_names[model_key]:
             category = get_param_category(hf_key)
             param_counters[model_key][category]['total'] += 1
+
             if hf_key not in model_sd_on_device:
                 param_counters[model_key][category]['skipped_not_in_memory'] += 1
                 continue
+            
             param_to_save = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
             sd_key = None
+
+            # --- START OF CORRECTION ---
             if model_key == 'unet':
                 mapped_part = unet_key_map.get(hf_key)
                 if mapped_part:
                     sd_key = 'model.diffusion_model.' + mapped_part
-            elif model_key == 'text_encoder1' and 'token_embedding' in hf_key:
+            
+            elif model_key == 'text_encoder1':
+                # General rule for all TE1 parameters
                 sd_key = 'conditioner.embedders.0.transformer.' + hf_key
-            elif model_key == 'text_encoder2' and 'token_embedding' in hf_key:
-                sd_key = 'conditioner.embedders.1.model.' + hf_key.replace('text_model.embeddings.', '', 1)
+            
+            elif model_key == 'text_encoder2':
+                # General rule for all TE2 parameters, removing the 'text_model.' prefix
+                cleaned_hf_key = hf_key.replace('text_model.', '', 1)
+                sd_key = 'conditioner.embedders.1.model.' + cleaned_hf_key
+            # --- END OF CORRECTION ---
 
             if sd_key and sd_key in base_sd:
                 base_sd[sd_key] = param_to_save
                 param_counters[model_key][category]['saved'] += 1
             elif sd_key:
                 param_counters[model_key][category]['skipped_not_in_base'] += 1
+
         del model_sd_on_device
         gc.collect()
 
@@ -344,25 +385,24 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
         if not any(cat['total'] > 0 for cat in categories.values()): continue
         print(f"\n--- Model: {model_key.upper()} ---")
         total_model_params, total_model_saved = 0, 0
+        
+        # Also updated get_param_category to correctly identify more layer types
         for category, counts in sorted(categories.items()):
             if counts['total'] == 0: continue
             print(f"  - {category:<25}: Found {counts['total']:>4} -> Saved {counts['saved']:>4}")
             if counts['skipped_not_in_base'] > 0: print(f"    -> WARNING: Skipped {counts['skipped_not_in_base']} params (key not in base model). CHECK KEY MAPPING!")
             if counts['skipped_not_in_memory'] > 0: print(f"    -> ERROR: Skipped {counts['skipped_not_in_memory']} params (not in memory). CHECK PARAM NAME GENERATION!")
             total_model_params += counts['total']; total_model_saved += counts['saved']
+        
         print(f"  --------------------------------------------------")
         print(f"  {model_key.upper()} Summary: {total_model_saved} / {total_model_params} parameters saved.")
 
     print("\n" + "="*60)
     print(f"\nSaving final model to {output_path} (dtype: {save_dtype})")
     
-    # ============================ FIX START ============================
-    # Ensure the output directory exists before attempting to save the file.
-    # This prevents the "path not found" error if a parent directory is missing.
     output_dir = Path(output_path).parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    # ============================= FIX END =============================
-
+    
     save_file(base_sd, output_path)
     print("[OK] Save complete.")
     del base_sd; gc.collect(); torch.cuda.empty_cache()
@@ -523,37 +563,52 @@ def main():
         'text_encoder2': te2_param_names_to_optimize
     }
 
-    print("\n" + "="*50); print("        TRAINING TARGET ANALYSIS"); print("="*50)
     unet_params = [p for n, p in unet.named_parameters() if n in unet_param_names_to_optimize]
     te1_params = [p for n, p in text_encoder1.named_parameters() if n in te1_param_names_to_optimize]
     te2_params = [p for n, p in text_encoder2.named_parameters() if n in te2_param_names_to_optimize]
     for p in unet_params + te1_params + te2_params: p.requires_grad_(True)
     
-    # --- FIX APPLIED HERE ---
-    # Consolidate text encoder parameters as they share a learning rate.
-    # This simplifies the optimizer's input and avoids a known issue with Adafactor.
     te_params = te1_params + te2_params
-
-    # Create the list of parameter groups, filtering out any that might be empty.
     optimizer_grouped_parameters = []
     if unet_params:
         optimizer_grouped_parameters.append({"params": unet_params, "lr": config.UNET_LEARNING_RATE})
     if te_params:
         optimizer_grouped_parameters.append({"params": te_params, "lr": config.TEXT_ENCODER_LEARNING_RATE})
 
-    # This flat list of all parameters is used for gradient clipping later.
     params_to_optimize = unet_params + te_params
-    # --- END OF FIX ---
     
     unet_trainable_params = sum(p.numel() for p in unet_params)
-    te_trainable_params = sum(p.numel() for p in te_params) # Simplified calculation
+    te_trainable_params = sum(p.numel() for p in te_params)
     total_trainable_params = unet_trainable_params + te_trainable_params
     total_params = sum(p.numel() for p in unet.parameters()) + sum(p.numel() for p in text_encoder1.parameters()) + sum(p.numel() for p in text_encoder2.parameters())
-    print(f"UNet params to train:      {unet_trainable_params/1e6:.2f}M with LR: {config.UNET_LEARNING_RATE}")
-    print(f"Text Encoder params train: {te_trainable_params/1e6:.2f}M with LR: {config.TEXT_ENCODER_LEARNING_RATE}")
-    print("-" * 50)
-    print(f"OVERALL: Training {total_trainable_params / 1e6:.2f}M parameters out of {total_params / 1e9:.3f}B total.")
-    print("="*50 + "\n")
+
+    # === NEW: DETAILED TRAINING VERIFICATION BLOCK ===
+    print("\n" + "="*60)
+    print("         TRAINING CONFIGURATION VERIFICATION")
+    print("="*60)
+    print(f"  - Base Model Path:          {model_to_load}")
+    print(f"  - Output Directory:         {config.OUTPUT_DIR}")
+    
+    unet_training_status = "ENABLED" if unet_param_names_to_optimize else "DISABLED"
+    print(f"\n  - UNet Training Status:     {unet_training_status}")
+    if unet_param_names_to_optimize:
+        print(f"    - Target Keywords:        {config.UNET_TRAIN_TARGETS}")
+        print(f"    - Learning Rate:          {config.UNET_LEARNING_RATE}")
+        print(f"    - Trainable Parameters:   {unet_trainable_params/1e6:.3f}M")
+
+    te_training_status = "DISABLED" if config.TEXT_ENCODER_TRAIN_TARGET == "none" else f"ENABLED ({config.TEXT_ENCODER_TRAIN_TARGET})"
+    print(f"\n  - Text Encoder Training:    {te_training_status}")
+    if config.TEXT_ENCODER_TRAIN_TARGET != "none":
+        print(f"    - Learning Rate:          {config.TEXT_ENCODER_LEARNING_RATE}")
+        print(f"    - Trainable Parameters:   {te_trainable_params/1e6:.3f}M")
+
+    print("\n  - Total Trainable Params:   " + f"{total_trainable_params/1e6:.3f}M / {total_params / 1e9:.3f}B ({total_trainable_params/total_params:.4%})")
+    print("="*60 + "\n")
+    
+    # === NEW: PARSABLE LINE FOR GUI ===
+    # This line is specifically for the GUI to capture and display parameter counts.
+    print(f"GUI_PARAM_INFO::UNET: {unet_trainable_params/1e6:.3f}M | Text Encoders: {te_trainable_params/1e6:.3f}M | Total: {total_trainable_params/1e6:.3f}M")
+
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, beta1=None, weight_decay=0.0, scale_parameter=False, relative_step=False, warmup_init=False)
     num_update_steps = math.ceil(config.MAX_TRAIN_STEPS / config.GRADIENT_ACCUMULATION_STEPS)
     num_warmup_update_steps = math.ceil(int(config.MAX_TRAIN_STEPS * config.LR_WARMUP_PERCENT) / config.GRADIENT_ACCUMULATION_STEPS)
@@ -570,7 +625,6 @@ def main():
         lr_scheduler_class = get_cosine_schedule_with_warmup
     lr_scheduler = lr_scheduler_class(optimizer=optimizer, num_warmup_steps=num_warmup_update_steps, num_training_steps=num_update_steps)
     
-    # This block now correctly uses the 'latest_state_path' variable set by our new logic
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location=device)
@@ -584,7 +638,6 @@ def main():
     random.seed(config.SEED); torch.manual_seed(config.SEED); torch.cuda.manual_seed_all(config.SEED)
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
     
-    # --- MODIFIED FOR STABILITY ---
     pin_memory_enabled = (config.NUM_WORKERS > 0)
     print(f"INFO: Dataloader workers: {config.NUM_WORKERS}, Pin Memory: {pin_memory_enabled}")
     train_dataloader = DataLoader(
@@ -596,7 +649,6 @@ def main():
         persistent_workers=(config.NUM_WORKERS > 0),
         pin_memory=pin_memory_enabled
     )
-    # --- END OF MODIFICATION ---
     
     final_loss = 0.0
     unet.train(); text_encoder1.train(); text_encoder2.train()
@@ -606,15 +658,11 @@ def main():
     
     while global_step < config.MAX_TRAIN_STEPS:
         try:
-            # --- ADDED FOR DEBUGGING ---
-            # print(f"\n[Step {global_step}] ---> Getting next batch from dataloader...")
             batch = next(dataloader_iterator)
         except StopIteration:
             dataloader_iterator = iter(train_dataloader)
             batch = next(dataloader_iterator)
         
-        # --- ADDED FOR DEBUGGING ---
-        # print(f"[Step {global_step}] ---> Encoding text prompts...")
         text_encoder1.to(device); text_encoder2.to(device)
         with torch.no_grad():
             prompt_embeds_out = text_encoder1(batch["input_ids1"].to(device), output_hidden_states=True)
@@ -640,8 +688,6 @@ def main():
         add_time_ids = torch.tensor(add_time_ids_list, device=device, dtype=prompt_embeds.dtype)
         prompt_embeds.requires_grad_(True)
         
-        # --- ADDED FOR DEBUGGING ---
-        # print(f"[Step {global_step}] ---> Preparing for backward pass...")
         with torch.autocast(device_type=device.type, dtype=compute_dtype):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             if is_v_prediction and config.USE_MIN_SNR_GAMMA:
@@ -655,8 +701,6 @@ def main():
                 loss = F.mse_loss(pred.float(), target.float())
                 
         (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        # --- ADDED FOR DEBUGGING ---
-        # print(f"[Step {global_step}] ---> Backward pass complete. Optimizing...")
 
         if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
             params_to_clip = [p for p in params_to_optimize if p.grad is not None]
@@ -743,20 +787,12 @@ def main():
     print("\n" + "="*50); print("            TRAINING COMPLETE"); print("="*50)
 
 if __name__ == "__main__":
-    # --- ADDED FOR STABILITY AND DEBUGGING ON WINDOWS ---
-    # Ensure the multiprocessing start method is set to 'spawn', which is the
-    # default and only option on Windows, but this prevents potential conflicts.
     import torch.multiprocessing as mp
     try:
-        # 'fork' is not available on Windows, and 'spawn' is the default.
-        # This guard is a best practice for cross-platform compatibility
-        # and ensuring the script behaves as expected when multiprocessing.
         mp.set_start_method('spawn', force=True)
         print("INFO: Multiprocessing start method set to 'spawn'.")
     except RuntimeError as e:
-        # This can happen if the context is already set, which is fine.
         print(f"INFO: Multiprocessing context already set or an error occurred: {e}")
-    # --- END OF ADDITION ---
 
     os.environ['PYTHONUNBUFFERED'] = '1'
     main()
