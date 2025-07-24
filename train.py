@@ -317,14 +317,13 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
     except Exception as e:
         print(f"Could not load base model from {base_model_path}. Error: {e}")
         return
-    
-    # UNet key mapping remains the same
+
+    # Helper maps and counters
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(trained_models['unet'].state_dict().keys()))
-    
     param_counters = {
-        'unet': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
-        'text_encoder1': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
-        'text_encoder2': defaultdict(lambda: {'total': 0, 'saved': 0, 'skipped_not_in_base': 0, 'skipped_not_in_memory': 0}),
+        'unet': defaultdict(lambda: {'total': 0, 'saved': 0}),
+        'text_encoder1': defaultdict(lambda: {'total': 0, 'saved': 0}),
+        'text_encoder2': defaultdict(lambda: {'total': 0, 'saved': 0}),
     }
 
     def get_param_category(key_name):
@@ -338,62 +337,95 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
         if 'token_embedding' in key_name: return "Text Token Embedding"
         return "Other"
 
+    # Main loop to update weights for each trained model
     for model_key, model_obj in trained_models.items():
-        if model_key not in trained_param_names or not trained_param_names[model_key]:
+        if not trained_param_names.get(model_key):
             continue
+
         print(f"\nUpdating weights for {model_key}...")
         model_sd_on_device = model_obj.state_dict()
-        
-        for hf_key in trained_param_names[model_key]:
-            category = get_param_category(hf_key)
-            param_counters[model_key][category]['total'] += 1
 
-            if hf_key not in model_sd_on_device:
-                param_counters[model_key][category]['skipped_not_in_memory'] += 1
-                continue
-            
-            param_to_save = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
-            sd_key = None
-
-            # --- START OF CORRECTION ---
-            if model_key == 'unet':
+        if model_key == 'unet':
+            for hf_key in trained_param_names[model_key]:
+                param_counters[model_key][get_param_category(hf_key)]['total'] += 1
                 mapped_part = unet_key_map.get(hf_key)
                 if mapped_part:
                     sd_key = 'model.diffusion_model.' + mapped_part
-            
-            elif model_key == 'text_encoder1':
-                # General rule for all TE1 parameters
-                sd_key = 'conditioner.embedders.0.transformer.' + hf_key
-            
-            elif model_key == 'text_encoder2':
-                # General rule for all TE2 parameters, removing the 'text_model.' prefix
-                cleaned_hf_key = hf_key.replace('text_model.', '', 1)
-                sd_key = 'conditioner.embedders.1.model.' + cleaned_hf_key
-            # --- END OF CORRECTION ---
+                    if sd_key in base_sd:
+                        base_sd[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
+                        param_counters[model_key][get_param_category(hf_key)]['saved'] += 1
 
-            if sd_key and sd_key in base_sd:
-                base_sd[sd_key] = param_to_save
+        elif model_key == 'text_encoder1':
+            for hf_key in trained_param_names[model_key]:
+                param_counters[model_key][get_param_category(hf_key)]['total'] += 1
+                sd_key = 'conditioner.embedders.0.transformer.' + hf_key
+                if sd_key in base_sd:
+                    base_sd[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
+                    param_counters[model_key][get_param_category(hf_key)]['saved'] += 1
+
+        elif model_key == 'text_encoder2':
+            print(" -> Converting text_encoder2 to OpenCLIP format for saving...")
+            openclip_sd = {}
+            
+            num_layers = len(model_obj.text_model.encoder.layers)
+            for i in range(num_layers):
+                layer = model_obj.text_model.encoder.layers[i]
+                q_w, k_w, v_w = layer.self_attn.q_proj.weight, layer.self_attn.k_proj.weight, layer.self_attn.v_proj.weight
+                in_proj_w = torch.cat([q_w, k_w, v_w], dim=0)
+                q_b, k_b, v_b = layer.self_attn.q_proj.bias, layer.self_attn.k_proj.bias, layer.self_attn.v_proj.bias
+                in_proj_b = torch.cat([q_b, k_b, v_b], dim=0)
+
+                base_key = f"transformer.resblocks.{i}."
+                openclip_sd[base_key + "attn.in_proj.weight"] = in_proj_w
+                openclip_sd[base_key + "attn.in_proj.bias"] = in_proj_b
+                openclip_sd[base_key + "attn.out_proj.weight"] = layer.self_attn.out_proj.weight
+                openclip_sd[base_key + "attn.out_proj.bias"] = layer.self_attn.out_proj.bias
+                openclip_sd[base_key + "ln_1.weight"] = layer.layer_norm1.weight
+                openclip_sd[base_key + "ln_1.bias"] = layer.layer_norm1.bias
+                openclip_sd[base_key + "ln_2.weight"] = layer.layer_norm2.weight
+                openclip_sd[base_key + "ln_2.bias"] = layer.layer_norm2.bias
+                openclip_sd[base_key + "mlp.c_fc.weight"] = layer.mlp.fc1.weight
+                openclip_sd[base_key + "mlp.c_fc.bias"] = layer.mlp.fc1.bias
+                openclip_sd[base_key + "mlp.c_proj.weight"] = layer.mlp.fc2.weight
+                openclip_sd[base_key + "mlp.c_proj.bias"] = layer.mlp.fc2.bias
+
+            openclip_sd["ln_final.weight"] = model_obj.text_model.final_layer_norm.weight
+            openclip_sd["ln_final.bias"] = model_obj.text_model.final_layer_norm.bias
+            openclip_sd["token_embedding.weight"] = model_obj.text_model.embeddings.token_embedding.weight
+            openclip_sd["positional_embedding"] = model_obj.text_model.embeddings.position_embedding.weight
+            
+            # --- THIS IS THE FIX ---
+            # Call .contiguous() after the transpose operation .T
+            openclip_sd["text_projection"] = model_obj.text_projection.weight.T.contiguous()
+            # -----------------------
+
+            for openclip_key, tensor in openclip_sd.items():
+                sd_key = 'conditioner.embedders.1.model.' + openclip_key
+                if sd_key in base_sd:
+                    base_sd[sd_key] = tensor.to("cpu", dtype=save_dtype)
+            
+            for hf_key in trained_param_names[model_key]:
+                category = get_param_category(hf_key)
+                param_counters[model_key][category]['total'] += 1
                 param_counters[model_key][category]['saved'] += 1
-            elif sd_key:
-                param_counters[model_key][category]['skipped_not_in_base'] += 1
 
         del model_sd_on_device
         gc.collect()
 
+    # Final report generation
     print("\n" + "="*60); print("           SAVE MODEL VERIFICATION REPORT"); print("="*60)
     for model_key, categories in param_counters.items():
         if not any(cat['total'] > 0 for cat in categories.values()): continue
         print(f"\n--- Model: {model_key.upper()} ---")
         total_model_params, total_model_saved = 0, 0
-        
-        # Also updated get_param_category to correctly identify more layer types
         for category, counts in sorted(categories.items()):
             if counts['total'] == 0: continue
-            print(f"  - {category:<25}: Found {counts['total']:>4} -> Saved {counts['saved']:>4}")
-            if counts['skipped_not_in_base'] > 0: print(f"    -> WARNING: Skipped {counts['skipped_not_in_base']} params (key not in base model). CHECK KEY MAPPING!")
-            if counts['skipped_not_in_memory'] > 0: print(f"    -> ERROR: Skipped {counts['skipped_not_in_memory']} params (not in memory). CHECK PARAM NAME GENERATION!")
-            total_model_params += counts['total']; total_model_saved += counts['saved']
-        
+            saved, total = counts['saved'], counts['total']
+            print(f"  - {category:<25}: Found {total:>4} -> Saved {saved:>4}")
+            if saved < total:
+                 print(f"    -> WARNING: Skipped {total - saved} params. CHECK KEY MAPPING for this category!")
+            total_model_params += total
+            total_model_saved += saved
         print(f"  --------------------------------------------------")
         print(f"  {model_key.upper()} Summary: {total_model_saved} / {total_model_params} parameters saved.")
 
@@ -402,7 +434,7 @@ def save_model(base_model_path, output_path, trained_models, trained_param_names
     
     output_dir = Path(output_path).parent
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     save_file(base_sd, output_path)
     print("[OK] Save complete.")
     del base_sd; gc.collect(); torch.cuda.empty_cache()
