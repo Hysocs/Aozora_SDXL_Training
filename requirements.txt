@@ -17,6 +17,10 @@ bitsandbytes==0.46.0
 #              GUI and Helper Libraries
 # ==========================================================
 PyQt6
+xformers
+lpips
+triton-windows
+opencv-python-headless
 Pillow==11.2.1
 tqdm==4.67.1
 numpy==1.26.0

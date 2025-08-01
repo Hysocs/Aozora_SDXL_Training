@@ -1,6 +1,7 @@
-@ECHO OFF
 CLS
 SETLOCAL ENABLEDELAYEDEXPANSION
+
+chcp 65001 >nul
 
 :: Setup for ANSI colors in the console.
 FOR /F "tokens=1,2 delims=#" %%a IN ('"PROMPT #$E# & FOR %%b IN (1) DO REM"') DO SET "ESC=%%a"
@@ -94,8 +95,9 @@ CALL "!VENV_PATH!\activate.bat"
 IF ERRORLEVEL 1 (ECHO !COLOR_RED![ERROR] Failed to activate venv.!COLOR_RESET! & GOTO:FATAL_ERROR)
 ECHO !COLOR_GREEN![SUCCESS] Virtual environment is active.!COLOR_RESET! & python --version & ECHO.
 
+SET PYTHONIOENCODING=utf-8
 ECHO !COLOR_WHITE![INFO] Upgrading pip...!COLOR_RESET!
-python -m pip install --upgrade pip >nul
+python -m pip install --upgrade pip
 ECHO.
 
 :: Check/download Flash Attention if selected
@@ -126,7 +128,7 @@ ECHO !COLOR_GREEN![SUCCESS] All other dependencies installed.!COLOR_RESET! & ECH
 :: [MODIFIED] Install the correct PyTorch stack FIRST. This is crucial.
 :: We are using the CUDA 12.1 builds as they are a stable standard.
 ECHO !COLOR_WHITE![INFO] Installing PyTorch, Torchvision, and Torchaudio... This is the most important step!!COLOR_RESET!
-python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+python -m pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu126
 IF ERRORLEVEL 1 (ECHO !COLOR_RED![ERROR] Failed to install PyTorch.!COLOR_RESET! & GOTO:FATAL_ERROR)
 ECHO !COLOR_GREEN![SUCCESS] PyTorch stack installed.!COLOR_RESET! & ECHO.
 

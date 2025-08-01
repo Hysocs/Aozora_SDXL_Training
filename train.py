@@ -1,4 +1,3 @@
-# -*- coding: utf-8 -*-
 """
 SDXL Fine-Tuning Training Script
 
@@ -24,6 +23,7 @@ import gc
 import os
 import json
 from collections import defaultdict
+import imghdr
 import random
 import time
 import shutil
@@ -45,7 +45,9 @@ import bitsandbytes
 import logging
 import warnings
 import config as default_config
-from concurrent.futures import ThreadPoolExecutor, as_completed
+import multiprocessing
+from multiprocessing import Pool, cpu_count
+import cv2
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -96,11 +98,69 @@ class TrainingConfig:
                     print(f"ERROR: Could not convert {key} to int ({val}): {e}. Falling back to default.")
                     setattr(self, key, default_config.__dict__[key])
 
-# Add this import at the top of your train.py file
-from concurrent.futures import ThreadPoolExecutor, as_completed
+def validate_image(ip, bucket_sizes):  
+    """Enhanced worker to validate a single image and extract metadata."""  
+    if "_truncated" in ip.stem:  
+        return None, None  
+    try:  
+        # Optional: Quick header check before opening (fast, catches wrong formats)  
+        file_type = imghdr.what(ip)  
+        if file_type not in ['jpeg', 'png', 'webp', 'bmp']:  # Add 'gif' etc. if needed  
+            raise ValueError(f"Invalid image format: {file_type}")  
 
+        # Verify integrity without decoding  
+        with Image.open(ip) as img:  
+            img.verify()  # Catches corrupt data; closes file pointer afterward  
+
+        # Reopen the file to load the image data, since verify() closed it  
+        with Image.open(ip) as img:  
+            img.load()  # Force loading data  
+            w, h = img.size  
+
+        # Rest as before...  
+        cp = ip.with_suffix('.txt')  
+        caption = ip.stem.replace('_', ' ')  
+        if cp.exists():  
+            with open(cp, 'r', encoding='utf-8') as f: caption = f.read().strip()  
+        
+        closest_bucket_size = next((b for b in bucket_sizes if max(w, h) <= b), max(bucket_sizes))  
+        
+        meta_info = {  
+            "ip": ip,  
+            "caption": caption,  
+            "bucket_info": (closest_bucket_size, w / h),  
+        }  
+        return meta_info, None  # Success  
+    except (IOError, OSError, Image.UnidentifiedImageError, ValueError, SyntaxError) as e:  # Added SyntaxError for verify() fails  
+        tqdm.write(f"\n[CORRUPT IMAGE DETECTED] Path: {ip}")  
+        tqdm.write(f"  └─ Reason: {e}")  
+        tqdm.write(f"  └─ Action: Renaming file to quarantine it.")  
+        try:  
+            new_stem = f"{ip.stem}_truncated"  
+            new_image_path = ip.with_name(new_stem + ip.suffix)  
+            ip.rename(new_image_path)  
+            tqdm.write(f"  └─ Renamed image to: {new_image_path.name}")  
+            caption_path = ip.with_suffix('.txt')  
+            if caption_path.exists():  
+                new_caption_path = new_image_path.with_suffix('.txt')  
+                caption_path.rename(new_caption_path)  
+                tqdm.write(f"  └─ Renamed caption to: {new_caption_path.name}")  
+        except Exception as rename_e:  
+            tqdm.write(f"  └─ [ERROR] Could not rename file: {rename_e}")  
+        return None, ip  # Failure  
+    
+def validate_wrapper(args):
+    ip, bucket_sizes = args
+    return validate_image(ip, bucket_sizes)
+    
 def precompute_and_cache_latents(data_root, bucket_sizes, tokenizer1, tokenizer2, vae, device_for_encoding, compute_dtype, batch_size, force_recache=False):
+    """
+    Refactored function to accelerate latent caching with resume capability.
+    Caches latents for images that do not already have a corresponding cached file.
+    """
     data_root_path = Path(data_root)
+    images_to_process = []
+    
     if force_recache:
         print("Force recache enabled. Deleting old cache directories...")
         for cache_dir in data_root_path.rglob(".precomputed_latents_cache"):
@@ -109,83 +169,55 @@ def precompute_and_cache_latents(data_root, bucket_sizes, tokenizer1, tokenizer2
                 shutil.rmtree(cache_dir)
 
     print("Scanning for images recursively...")
-    image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in data_root_path.rglob(f"*{ext}")]
-    if not image_paths: raise ValueError(f"No images found in {data_root} or its subdirectories.")
-    print(f"Found {len(image_paths)} potential image files. Now validating and collecting metadata using multiple threads...")
+    all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in data_root_path.rglob(f"*{ext}")]
+    if not all_image_paths:
+        raise ValueError(f"No images found in {data_root} or its subdirectories.")
 
+    if not force_recache:
+        print("Checking for existing latents to implement resume caching...")
+        existing_latent_stems = {p.stem for p in data_root_path.rglob(".precomputed_latents_cache/*.pt")}
+        
+        if existing_latent_stems:
+            images_to_process = [p for p in all_image_paths if p.stem not in existing_latent_stems]
+            print(f"Found {len(all_image_paths)} total images and {len(existing_latent_stems)} cached latents.")
+            print(f"Will now process the {len(images_to_process)} remaining images.")
+        else:
+            print("No existing latents found. Caching all images.")
+            images_to_process = all_image_paths
+    else:
+        images_to_process = all_image_paths
+
+    if not images_to_process:
+        print("All images are already cached. Nothing to do.")
+        vae.cpu(); gc.collect(); torch.cuda.empty_cache()
+        return
+
+    print(f"Found {len(images_to_process)} images to cache. Now validating and collecting metadata...")
     image_metadata = []
     
-    # --- Start of multithreaded validation ---
-    def validate_image(ip):
-        """Worker function to validate a single image and extract its metadata."""
-        if "_truncated" in ip.stem:
-            return None, None
-        try:
-            with Image.open(ip) as img:
-                img.load()
-                w, h = img.size
-            cp = ip.with_suffix('.txt')
-            caption = ip.stem.replace('_', ' ')
-            if cp.exists():
-                with open(cp, 'r', encoding='utf-8') as f: caption = f.read().strip()
-            
-            closest_bucket_size = next((b for b in bucket_sizes if max(w, h) <= b), max(bucket_sizes))
-            
-            meta_info = {
-                "ip": ip,
-                "caption": caption,
-                "bucket_info": (closest_bucket_size, w / h),
-            }
-            return meta_info, None # Success, no error
-        except (IOError, OSError, Image.UnidentifiedImageError) as e:
-            tqdm.write(f"\n[CORRUPT IMAGE DETECTED] Path: {ip}")
-            tqdm.write(f"  └─ Reason: {e}")
-            tqdm.write(f"  └─ Action: Renaming file to quarantine it.")
-            try:
-                new_stem = f"{ip.stem}_truncated"
-                new_image_path = ip.with_name(new_stem + ip.suffix)
-                ip.rename(new_image_path)
-                tqdm.write(f"  └─ Renamed image to: {new_image_path.name}")
-                caption_path = ip.with_suffix('.txt')
-                if caption_path.exists():
-                    new_caption_path = new_image_path.with_suffix('.txt')
-                    caption_path.rename(new_caption_path)
-                    tqdm.write(f"  └─ Renamed caption to: {new_caption_path.name}")
-            except Exception as rename_e:
-                tqdm.write(f"  └─ [ERROR] Could not rename file: {rename_e}")
-            return None, ip # Failure, return the problematic path
-    
-    # Use a thread pool to validate images in parallel
-    # os.cpu_count() or a fixed number like 16 are good starting points for max_workers
-    max_workers = min(32, os.cpu_count() + 4) 
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        future_to_path = {executor.submit(validate_image, ip): ip for ip in image_paths}
-        
-        # Use tqdm to show progress as futures complete
-        for future in tqdm(as_completed(future_to_path), total=len(image_paths), desc="Validating and scanning images"):
-            metadata, error_path = future.result()
-            if metadata:
-                image_metadata.append(metadata)
-    
-    # Sort metadata by image path to ensure deterministic order for tokenization
-    image_metadata.sort(key=lambda x: x['ip'])
-    
-    # Assign the 'original_index' after sorting and filtering
-    for i, meta in enumerate(image_metadata):
-        meta["original_index"] = i
-    # --- End of multithreaded validation ---
+    num_processes = cpu_count()
+    image_args = [(ip, bucket_sizes) for ip in images_to_process]
+    with Pool(processes=num_processes) as pool:
+        results = list(tqdm(pool.imap(validate_wrapper, image_args), total=len(images_to_process), desc="Validating and scanning images"))
+    image_metadata = [meta for meta, _ in results if meta]
     
     if not image_metadata:
         raise ValueError("No valid, non-corrupted images were found after scanning. Please check your dataset.")
 
-    print(f"Validation complete. Found {len(image_metadata)} valid images.")
+    image_metadata.sort(key=lambda x: x['ip'])
+    
+    for i, meta in enumerate(image_metadata):
+        meta["original_index"] = i
+
+    print(f"Validation complete. Found {len(image_metadata)} valid images to cache.")
     all_captions = [m["caption"] for m in image_metadata]
     text_inputs1 = tokenizer1(all_captions, padding="max_length", max_length=tokenizer1.model_max_length, truncation=True, return_tensors="pt")
     text_inputs2 = tokenizer2(all_captions, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
     input_ids1, input_ids2 = text_inputs1.input_ids, text_inputs2.input_ids
     
     grouped_metadata = defaultdict(list)
-    for meta in image_metadata: grouped_metadata[meta["bucket_info"][0]].append(meta)
+    for meta in image_metadata:
+        grouped_metadata[meta["bucket_info"][0]].append(meta)
     
     all_batches_to_process = []
     for bucket_size, metadata_list in grouped_metadata.items():
@@ -194,24 +226,45 @@ def precompute_and_cache_latents(data_root, bucket_sizes, tokenizer1, tokenizer2
     random.shuffle(all_batches_to_process)
     
     vae.to(device_for_encoding)
+    vae.enable_tiling()
     for bucket_size, batch_metadata in tqdm(all_batches_to_process, desc="Caching latents in shuffled batches"):
         image_batch_tensors = []
         resized_dimensions_batch = []
+        
         for meta in batch_metadata:
             img_path, aspect_ratio = meta["ip"], meta["bucket_info"][1]
+            
             w, h = (bucket_size, int(bucket_size / aspect_ratio)) if aspect_ratio > 1.0 else (int(bucket_size * aspect_ratio), bucket_size)
             w, h = max(64, (w // 8) * 8), max(64, (h // 8) * 8)
             resized_dimensions_batch.append((h, w))
-            img = Image.open(img_path).convert("RGB")
-            resized_img = img.resize((w, h), resample=Image.LANCZOS)
-            padded_img = Image.new("RGB", (bucket_size, bucket_size), (127, 127, 127))
-            paste_coords = ((bucket_size - w) // 2, (bucket_size - h) // 2)
-            padded_img.paste(resized_img, paste_coords)
-            img_tensor = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])(padded_img)
+            
+            img = cv2.imread(str(img_path))
+            if img is None:
+                tqdm.write(f"\n[BAD IMAGE LOAD] Path: {img_path}")
+                continue
+
+            img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+            resized_img = cv2.resize(img, (w, h), interpolation=cv2.INTER_AREA)
+            
+            img_tensor = torch.from_numpy(resized_img).permute(2, 0, 1).float() / 127.5 - 1.0
             image_batch_tensors.append(img_tensor)
-        img_tensor_batch = torch.stack(image_batch_tensors).to(device_for_encoding, dtype=vae.dtype)
+
+        if not image_batch_tensors:
+            continue
+            
+        padded_batch = torch.full((len(image_batch_tensors), 3, bucket_size, bucket_size), 0.0, dtype=torch.float32)
+        for i, (tensor, (h, w)) in enumerate(zip(image_batch_tensors, resized_dimensions_batch)):
+            top = (bucket_size - h) // 2
+            left = (bucket_size - w) // 2
+            padded_batch[i, :, top:top+h, left:left+w] = tensor
+
+        img_tensor_batch = padded_batch.to(device_for_encoding, dtype=vae.dtype)
+        
         with torch.no_grad():
             latents_batch = vae.encode(img_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+            if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
+                raise ValueError("NaN or Inf detected in latents—bad encoding!")
+
         for j, meta in enumerate(batch_metadata):
             original_idx = meta["original_index"]
             image_path = meta['ip']
@@ -226,6 +279,12 @@ def precompute_and_cache_latents(data_root, bucket_sizes, tokenizer1, tokenizer2
                 "original_size_as_tuple": (resized_h, resized_w),
                 "target_size_as_tuple": (resized_h, resized_w),
             }, save_path)
+            
+        del img_tensor_batch, latents_batch, padded_batch
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+    vae.disable_tiling()
     vae.cpu(); gc.collect(); torch.cuda.empty_cache()
 
 class ImageTextLatentDataset(Dataset):
@@ -236,7 +295,16 @@ class ImageTextLatentDataset(Dataset):
             raise ValueError(f"No latent files found in subdirectories of {self.data_root}. Please ensure pre-caching was successful.")
         print(f"Dataset initialized with {len(self.latent_files)} pre-cached samples from all subdirectories.")
     def __len__(self): return len(self.latent_files)
-    def __getitem__(self, i): return torch.load(self.latent_files[i], map_location="cpu")
+    def __getitem__(self, i):
+        try:
+            data = torch.load(self.latent_files[i], map_location="cpu")
+            # Quick tensor check
+            if torch.isnan(data["latents_cpu"]).any() or torch.isinf(data["latents_cpu"]).any():
+                raise ValueError("NaN/Inf in latents")
+            return data
+        except Exception as e:
+            print(f"WARNING: Skipping bad .pt file {self.latent_files[i]}: {e}")
+            return None  # Or raise to crash early
 
 def filter_scheduler_config(s,c):return{k:v for k,v in s.items() if k in inspect.signature(c.__init__).parameters}
 
@@ -452,9 +520,9 @@ def save_training_checkpoint(base_model_path, models, optimizer, scheduler, step
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\n==================================================")
     print(f"SAVING CHECKPOINT AT STEP {step}")
-    print(f"==================================================")
+    print("="*50)
     
-    # This call now uses the hardened save_model function
+    # Call save_model to save model weights
     save_model(
         base_model_path=base_model_path,
         output_path=checkpoint_model_path,
@@ -463,7 +531,7 @@ def save_training_checkpoint(base_model_path, models, optimizer, scheduler, step
         save_dtype=save_dtype
     )
     
-    state = None # Define for the finally block
+    state = None  # Initialize for finally block
     try:
         state = {
             'step': step,
@@ -473,16 +541,27 @@ def save_training_checkpoint(base_model_path, models, optimizer, scheduler, step
         state_path = checkpoint_dir / f"training_state_step_{step}.pt"
         torch.save(state, state_path)
         print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
+        
+        # Explicitly delete state to free memory immediately
+        del state
+        state = None
+        
     except Exception as e:
         print(f"[ERROR] Could not save optimizer/scheduler state: {e}")
+        
     finally:
-        # Ensure the large state dictionary is deleted immediately
+        # Aggressive memory cleanup
         if state is not None:
             del state
-        gc.collect()
-        torch.cuda.empty_cache()
+        gc.collect()  # Force garbage collection
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()  # Clear CUDA memory
+            torch.cuda.ipc_collect()  # Collect any remaining CUDA memory fragments
+            torch.cuda.synchronize()  # Ensure all CUDA operations are complete
+        print(f"[CLEANUP] Memory cleared: VRAM {torch.cuda.memory_allocated()/1e9:.2f}GB / {torch.cuda.get_device_properties(0).total_memory/1e9:.2f}GB")
+    
     print(f"--- Checkpoint save for step {step} finished ---\n")
-
+    
 def main():
     config = TrainingConfig()
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -493,24 +572,24 @@ def main():
     if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
     compute_dtype = torch.bfloat16 if config.MIXED_PRECISION == "bfloat16" else torch.float16
     print(f"Using compute dtype: {compute_dtype}, Device: {device}")
-    caches_exist = any(Path(config.INSTANCE_DATA_DIR).rglob(".precomputed_latents_cache/*.pt"))
-    if config.FORCE_RECACHE_LATENTS or not caches_exist:
-        print("Caching required. Loading minimal components for VAE...")
-        temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=compute_dtype, use_safetensors=True)
-        precompute_and_cache_latents(
-            data_root=config.INSTANCE_DATA_DIR,
-            bucket_sizes=config.BUCKET_SIZES,
-            tokenizer1=temp_pipe.tokenizer,
-            tokenizer2=temp_pipe.tokenizer_2,
-            vae=temp_pipe.vae,
-            device_for_encoding=device,
-            compute_dtype=compute_dtype,
-            batch_size=config.CACHING_BATCH_SIZE,
-            force_recache=config.FORCE_RECACHE_LATENTS
-        )
-        del temp_pipe; gc.collect(); torch.cuda.empty_cache()
-    else:
-        print("Latent caches are up-to-date. Skipping caching.")
+    
+    # --- MODIFIED CACHING LOGIC ---
+    # The caching logic is now self-contained and will resume if possible
+    print("Caching required. Loading minimal components for VAE...")
+    temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=compute_dtype, use_safetensors=True)
+    precompute_and_cache_latents(
+        data_root=config.INSTANCE_DATA_DIR,
+        bucket_sizes=config.BUCKET_SIZES,
+        tokenizer1=temp_pipe.tokenizer,
+        tokenizer2=temp_pipe.tokenizer_2,
+        vae=temp_pipe.vae,
+        device_for_encoding=device,
+        compute_dtype=compute_dtype,
+        batch_size=config.CACHING_BATCH_SIZE,
+        force_recache=config.FORCE_RECACHE_LATENTS
+    )
+    del temp_pipe; gc.collect(); torch.cuda.empty_cache()
+    # --- END OF MODIFIED CACHING LOGIC ---
 
     # --- MODIFIED RESUME LOGIC ---
     global_step = 0
@@ -536,18 +615,6 @@ def main():
 
     print(f"\nLoading model from: {model_to_load}")
     pipeline_temp = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=compute_dtype, use_safetensors=True)
-    unet, text_encoder1, text_encoder2 = pipeline_temp.unet, pipeline_temp.text_encoder, pipeline_temp.text_encoder_2
-    scheduler_config = pipeline_temp.scheduler.config
-    del pipeline_temp.vae, pipeline_temp.tokenizer, pipeline_temp.tokenizer_2, pipeline_temp
-    gc.collect(); torch.cuda.empty_cache()
-    print("--> Full training pipeline prepaired.")
-    print(f"\nLoading model from: {model_to_load}")
-    print("This may take a moment...")
-    load_start_time = time.time()
-    pipeline_temp = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=compute_dtype, use_safetensors=True)
-    load_end_time = time.time()
-    print(f"--> Model loaded into memory in {load_end_time - load_start_time:.2f} seconds.")
-    print("Extracting and preparing UNet and Text Encoders...")
     unet, text_encoder1, text_encoder2 = pipeline_temp.unet, pipeline_temp.text_encoder, pipeline_temp.text_encoder_2
     scheduler_config = pipeline_temp.scheduler.config
     print("Unloading unnecessary components (VAE, tokenizers)...")
@@ -726,7 +793,7 @@ def main():
                 alphas_cumprod = noise_scheduler.alphas_cumprod.to(device)
                 snr = alphas_cumprod[timesteps] / (1 - alphas_cumprod[timesteps])
                 snr_gamma = torch.tensor(config.MIN_SNR_GAMMA, device=device)
-                snr_loss_weights = (torch.stack([snr, snr_gamma.expand(snr.shape)], dim=1).min(dim=1)[0] / snr.clamp(min=1.0)).detach()
+                snr_loss_weights = (torch.stack([snr, snr_gamma.expand(snr.shape)], dim=1).min(dim=1)[0] / snr.clamp(min=1e-8)).detach()
                 loss_per_pixel = F.mse_loss(pred.float(), target.float(), reduction="none")
                 loss = (loss_per_pixel.mean(dim=list(range(1, len(loss_per_pixel.shape)))) * snr_loss_weights).mean()
             else:
