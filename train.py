@@ -491,34 +491,33 @@ def main():
     dataloader_iterator = iter(train_dataloader)
     
     while global_step < config.MAX_TRAIN_STEPS:
+        data_start = time.time()
         try: batch = next(dataloader_iterator)
         except StopIteration: dataloader_iterator = iter(train_dataloader); batch = next(dataloader_iterator)
         if not batch: continue
+        data_time = time.time() - data_start
         
+        transfer_start = time.time()
         latents = batch["latents"].to(device, dtype=config.compute_dtype)
         prompt_embeds = batch["prompt_embeds"].to(device, dtype=config.compute_dtype)
         pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device, dtype=config.compute_dtype)
-
+        transfer_time = time.time() - transfer_start
+        
         noise = torch.randn_like(latents)
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         
         is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
         if is_v_prediction:
-            # This print statement will only run on the very first step of training
-            if global_step == 0:
-                print("\n--> CONFIRMED: Training with v-prediction target.\n")
             target = noise_scheduler.get_velocity(latents, noise, timesteps)
         else:
-            # This will run if v-prediction is NOT active
-            if global_step == 0:
-                print("\n--> CONFIRMED: Training with noise (eps) target.\n")
             target = noise
         
         original_sizes, target_sizes = batch["original_sizes"], batch["target_sizes"]
         crops_coords_top_left = [(0, 0) for _ in original_sizes]
         add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
         
+        forward_start = time.time()
         with torch.autocast(device_type=device.type, dtype=config.compute_dtype):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             
@@ -528,13 +527,21 @@ def main():
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
-                
+        forward_time = time.time() - forward_start
+        
+        backward_start = time.time(); torch.cuda.synchronize()
         (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-
+        torch.cuda.synchronize(); backward_time = time.time() - backward_start
+        
+        optim_start = time.time()
         if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
             torch.nn.utils.clip_grad_norm_([p for p in params_to_optimize if p.grad is not None], config.CLIP_GRAD_NORM)
             optimizer.step(); lr_scheduler.step(); optimizer.zero_grad(set_to_none=True)
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+        optim_time = time.time() - optim_start
+
+        # Print timings every step (or every N steps to reduce spam)
+        print(f"Step {global_step}: Data={data_time:.2f}s, Transfer={transfer_time:.2f}s, Forward={forward_time:.2f}s, Backward={backward_time:.2f}s, Optim={optim_time:.2f}s")
 
         progress_bar.update(1); global_step += 1
         
