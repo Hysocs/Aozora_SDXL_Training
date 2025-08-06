@@ -468,6 +468,9 @@ def main():
         print(f"[OK] Resumed training from step {global_step}.")
 
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
+    if config.USE_ZERO_TERMINAL_SNR:
+        from diffusers.training_utils import rescale_zero_terminal_snr
+        noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=(config.NUM_WORKERS > 0), pin_memory=True)
     
@@ -477,7 +480,16 @@ def main():
     
     training_method = "Standard MSE Loss"
     if is_v_prediction_model and config.USE_MIN_SNR_GAMMA:
-        training_method = f"Min-SNR Gamma (gamma: {config.MIN_SNR_GAMMA})"
+        if config.MIN_SNR_VARIANT == "debiased":
+            training_method = f"Debiased Estimation (gamma: {config.MIN_SNR_GAMMA})"
+        elif config.MIN_SNR_VARIANT == "corrected":
+            training_method = f"Corrected Min-SNR Gamma for v-Pred (gamma: {config.MIN_SNR_GAMMA})"
+        else:
+            training_method = f"Min-SNR Gamma (gamma: {config.MIN_SNR_GAMMA})"
+    if config.USE_ZERO_TERMINAL_SNR:
+        training_method += " + Zero-Terminal SNR Rescaling"
+    if config.USE_IP_NOISE_GAMMA:
+        training_method += f" + IP Noise Gamma ({config.IP_NOISE_GAMMA})"
 
     print("\n" + "="*50)
     print("         STARTING TRAINING   ")
@@ -505,6 +517,8 @@ def main():
         
         noise = torch.randn_like(latents)
         timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+        if config.USE_IP_NOISE_GAMMA:
+            latents = latents + config.IP_NOISE_GAMMA * torch.randn_like(latents)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         
         is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
@@ -523,7 +537,12 @@ def main():
             
             if is_v_prediction and config.USE_MIN_SNR_GAMMA:
                 snr = noise_scheduler.alphas_cumprod.to(device)[timesteps] / (1 - noise_scheduler.alphas_cumprod.to(device)[timesteps])
-                snr_loss_weights = (torch.stack([snr, torch.full_like(snr, config.MIN_SNR_GAMMA)], dim=1).min(dim=1)[0] / snr).detach()
+                if config.MIN_SNR_VARIANT == "debiased":
+                    snr_loss_weights = torch.minimum(torch.ones_like(snr), config.MIN_SNR_GAMMA / torch.sqrt(snr)).detach()
+                elif config.MIN_SNR_VARIANT == "corrected":
+                    snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / (snr + 1)).detach()
+                else:
+                    snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / snr).detach()
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
@@ -559,7 +578,7 @@ def main():
     save_model(config.SINGLE_FILE_CHECKPOINT_PATH, output_path, unet, unet_param_names_to_optimize, config.compute_dtype)
     print(f"--> Final model saved to {output_path}")
     print("\nTRAINING COMPLETE")
-
+    
 if __name__ == "__main__":
     try:
         multiprocessing.set_start_method('spawn', force=True)

@@ -246,6 +246,10 @@ class TrainingGUI(QtWidgets.QWidget):
         adv_layout.setContentsMargins(5, 0, 5, 5)
         self._create_bool_option(adv_layout, "USE_MIN_SNR_GAMMA", "Use Min-SNR Gamma", "Recommended for v-prediction models.", self.toggle_min_snr_gamma_widget)
         self._create_entry_option(adv_layout, "MIN_SNR_GAMMA", "Min-SNR Gamma Value:", "Common range is 5.0 to 20.0.")
+        self._create_dropdown_option(adv_layout, "MIN_SNR_VARIANT", "Min-SNR Variant:", ["standard", "corrected", "debiased"], "Select the Min-SNR weighting variant (requires Min-SNR enabled).")
+        self._create_bool_option(adv_layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR Rescaling", "Rescales noise schedule for better dynamic range in v-pred.", None)
+        self._create_bool_option(adv_layout, "USE_IP_NOISE_GAMMA", "Use Input Perturbation Noise", "Adds Gaussian noise to latents for regularization.", self.toggle_ip_noise_gamma_widget)
+        self._create_entry_option(adv_layout, "IP_NOISE_GAMMA", "IP Noise Gamma Value:", "Common range is 0.05 to 0.25.")
         right_layout.addWidget(adv_group)
         right_layout.addStretch()
 
@@ -378,7 +382,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 try:
                     if isinstance(widget, QtWidgets.QLineEdit): widget.setText(", ".join(map(str, value)) if isinstance(value, list) else str(value))
                     elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentIndex(widget.findText(str(value)))
+                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
                 finally:
                     widget.blockSignals(False)
 
@@ -387,6 +391,8 @@ class TrainingGUI(QtWidgets.QWidget):
             self.toggle_min_snr_gamma_widget()
         if "RESUME_TRAINING" in self.widgets:
             self.toggle_resume_widgets()
+        if "USE_IP_NOISE_GAMMA" in self.widgets:
+            self.toggle_ip_noise_gamma_widget()
 
 
     # === REWRITTEN: This function now correctly handles typing and saving ---
@@ -461,9 +467,15 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_unet_targets_config()
 
     def toggle_min_snr_gamma_widget(self):
-        if "MIN_SNR_GAMMA" in self.widgets and "USE_MIN_SNR_GAMMA" in self.widgets:
+        if all(key in self.widgets for key in ["MIN_SNR_GAMMA", "USE_MIN_SNR_GAMMA", "MIN_SNR_VARIANT"]):
             is_enabled = self.widgets["USE_MIN_SNR_GAMMA"].isChecked()
             self.widgets["MIN_SNR_GAMMA"].setEnabled(is_enabled)
+            self.widgets["MIN_SNR_VARIANT"].setEnabled(is_enabled)
+
+    def toggle_ip_noise_gamma_widget(self):
+        if "IP_NOISE_GAMMA" in self.widgets and "USE_IP_NOISE_GAMMA" in self.widgets:
+            is_enabled = self.widgets["USE_IP_NOISE_GAMMA"].isChecked()
+            self.widgets["IP_NOISE_GAMMA"].setEnabled(is_enabled)
 
     def toggle_resume_widgets(self):
         if "RESUME_MODEL_PATH" in self.widgets and "RESUME_TRAINING" in self.widgets:

@@ -54,3 +54,7 @@ UNET_TRAIN_TARGETS = [
 # --- Advanced ---
 USE_MIN_SNR_GAMMA = True
 MIN_SNR_GAMMA = 20.0
+MIN_SNR_VARIANT = "standard"  # "standard", "corrected", "debiased"
+USE_ZERO_TERMINAL_SNR = True  # Rescales the noise schedule to force SNR=0 at final timestep for better dynamic range
+USE_IP_NOISE_GAMMA = True  # Adds Gaussian noise to input latents for regularization
+IP_NOISE_GAMMA = 0.1  # Value for IP noise gamma (common range: 0.05-0.25)
