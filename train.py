@@ -31,6 +31,7 @@ import config as default_config
 import multiprocessing
 from multiprocessing import Pool, cpu_count
 
+
 # --- Global Settings ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
@@ -381,6 +382,37 @@ def save_training_checkpoint(base_model_path, unet, optimizer, scheduler, step, 
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
     
+def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
+    """
+    Rescales betas to have zero terminal SNR.
+    Based on https://arxiv.org/pdf/2305.08891.pdf (Appendix C).
+    Args:
+        betas (torch.Tensor): The betas for the noise schedule.
+    Returns:
+        torch.Tensor: Rescaled betas.
+    """
+    # Convert betas to alphas_bar_sqrt
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
+    alphas_bar_sqrt = alphas_cumprod.sqrt()
+
+    # Store old values
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+
+    # Shift so the last timestep is zero
+    alphas_bar_sqrt -= alphas_bar_sqrt_T
+
+    # Scale so the first timestep is back to the old value
+    alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
+
+    # Convert alphas_bar_sqrt to betas
+    alphas_bar = alphas_bar_sqrt ** 2
+    alphas = alphas_bar / F.pad(alphas_bar[:-1], (1, 0), value=1.0)
+    betas = 1 - alphas
+
+    return betas
+   
 def main():
     config = TrainingConfig()
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -450,7 +482,8 @@ def main():
     optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": config.UNET_LEARNING_RATE}]
     unet_trainable_params = sum(p.numel() for p in params_to_optimize)
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M")
-
+    print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M params | LR: {config.UNET_LEARNING_RATE:.2e} | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
+    
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
     num_update_steps = math.ceil(config.MAX_TRAIN_STEPS / config.GRADIENT_ACCUMULATION_STEPS)
     num_warmup_update_steps = math.ceil(num_update_steps * config.LR_WARMUP_PERCENT)
@@ -469,7 +502,6 @@ def main():
 
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
-        from diffusers.training_utils import rescale_zero_terminal_snr
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=(config.NUM_WORKERS > 0), pin_memory=True)
@@ -490,6 +522,8 @@ def main():
         training_method += " + Zero-Terminal SNR Rescaling"
     if config.USE_IP_NOISE_GAMMA:
         training_method += f" + IP Noise Gamma ({config.IP_NOISE_GAMMA})"
+    if config.USE_RESIDUAL_SHIFTING:
+        training_method += " + Residual Shifting (High-Noise Timestep Sampling with Curved Schedules)"
 
     print("\n" + "="*50)
     print("         STARTING TRAINING   ")
@@ -516,7 +550,13 @@ def main():
         transfer_time = time.time() - transfer_start
         
         noise = torch.randn_like(latents)
-        timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+        if config.USE_RESIDUAL_SHIFTING:
+            # Modified for high-noise timestep sampling (bias towards higher noise levels for residual shifting efficiency)
+            min_timestep = int(0.5 * noise_scheduler.config.num_train_timesteps)  # Start from mid-to-high noise
+            timesteps = torch.randint(min_timestep, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
+            # For curved schedules, we could adjust betas here, but as a placeholder, we use the biased sampling
+        else:
+            timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
         if config.USE_IP_NOISE_GAMMA:
             latents = latents + config.IP_NOISE_GAMMA * torch.randn_like(latents)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -578,7 +618,7 @@ def main():
     save_model(config.SINGLE_FILE_CHECKPOINT_PATH, output_path, unet, unet_param_names_to_optimize, config.compute_dtype)
     print(f"--> Final model saved to {output_path}")
     print("\nTRAINING COMPLETE")
-    
+
 if __name__ == "__main__":
     try:
         multiprocessing.set_start_method('spawn', force=True)

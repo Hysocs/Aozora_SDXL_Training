@@ -58,3 +58,6 @@ MIN_SNR_VARIANT = "standard"  # "standard", "corrected", "debiased"
 USE_ZERO_TERMINAL_SNR = True  # Rescales the noise schedule to force SNR=0 at final timestep for better dynamic range
 USE_IP_NOISE_GAMMA = True  # Adds Gaussian noise to input latents for regularization
 IP_NOISE_GAMMA = 0.1  # Value for IP noise gamma (common range: 0.05-0.25)
+USE_RESIDUAL_SHIFTING = False
+USE_COND_DROPOUT = True
+COND_DROPOUT_PROB = 0.1  # Common range: 0.05-0.15; higher for diverse datasets
