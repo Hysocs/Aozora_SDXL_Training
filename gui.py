@@ -333,7 +333,13 @@ class TrainingGUI(QtWidgets.QWidget):
             "Attention Sub-Layers (Advanced)": {"to_q": "Query Projection", "to_k": "Key Projection", "to_v": "Value Projection", "to_out.0": "Output Projection", "proj_in": "Transformer Input Projection", "proj_out": "Transformer Output Projection"},
             "UNet Embeddings (Non-Text)": {"time_embedding": "Time Embedding", "time_emb_proj": "Time Embedding Projection", "add_embedding": "Added Conditional Embedding"},
             "Convolutional & ResNet Layers": {"conv_in": "Input Conv", "conv1": "ResNet Conv1", "conv2": "ResNet Conv2", "conv_shortcut": "ResNet Skip Conv", "downsamplers": "Downsampler Convs", "upsamplers": "Upsampler Convs", "conv_out": "Output Conv"},
-            "Normalization Layers (Experimental)": {"norm1": "ResNet GroupNorm1", "norm2": "ResNet GroupNorm2", "conv_norm_out": "Output GroupNorm"},
+            "Normalization Layers (Experimental)": {
+                "norm": "Attention GroupNorm",
+                "norm1": "ResNet GroupNorm1",
+                "norm2": "ResNet GroupNorm2",
+                "norm3": "Transformer Norm3",
+                "conv_norm_out": "Output GroupNorm"
+            },
         }
         for group_name, targets in all_unet_targets.items():
             label = QtWidgets.QLabel(f"<b>{group_name}</b>")

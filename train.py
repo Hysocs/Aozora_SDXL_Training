@@ -475,14 +475,38 @@ def main():
     unet_param_names_to_optimize = { name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS) }
     params_to_optimize = [p for n, p in unet.named_parameters() if n in unet_param_names_to_optimize]
     for p in params_to_optimize: p.requires_grad_(True)
+    all_unet_params = {name for name, _ in unet.named_parameters()}
+    untrained_params = all_unet_params - unet_param_names_to_optimize
     
+    print("\n" + "="*60)
+    print("           DETAILED UNET COMPOSITION ANALYSIS")
+    print("="*60)
+    
+    total_param_count = 0
+    for name, param in unet.named_parameters():
+        total_param_count += param.numel()
+        
+    total_buffer_count = 0
+    print("--- Buffers (Non-Trainable State Tensors) ---")
+    for name, buffer in unet.named_buffers():
+        print(f"  - {name:<85} | Count: {buffer.numel()}")
+        total_buffer_count += buffer.numel()
+    
+    print("\n" + "-"*60)
+    print(f"Total Parameters Count: {total_param_count} (~{total_param_count/1e6:.3f}M)")
+    print(f"Total Buffers Count:    {total_buffer_count} (~{total_buffer_count/1e6:.3f}M)")
+    grand_total = total_param_count + total_buffer_count
+    print(f"Grand Total (Params + Buffers): {grand_total} (~{grand_total/1e6:.3f}M)")
+    print("="*60 + "\n")
     if not params_to_optimize:
         raise ValueError("No parameters were selected for training. Please specify valid UNET_TRAIN_TARGETS.")
 
     optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": config.UNET_LEARNING_RATE}]
     unet_trainable_params = sum(p.numel() for p in params_to_optimize)
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M")
-    print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M params | LR: {config.UNET_LEARNING_RATE:.2e} | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
+    
+    unet_total_params_count = sum(p.numel() for p in unet.parameters())
+    print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | LR: {config.UNET_LEARNING_RATE:.2e} | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
     
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
     num_update_steps = math.ceil(config.MAX_TRAIN_STEPS / config.GRADIENT_ACCUMULATION_STEPS)
