@@ -543,16 +543,48 @@ class TrainingGUI(QtWidgets.QWidget):
         self.save_config()
         self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
         self.param_info_label.setText("Verifying training parameters...")
-        self.start_button.setEnabled(False); self.stop_button.setEnabled(True)
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+
         self.training_process = QtCore.QProcess(self)
         self.training_process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
         self.training_process.readyReadStandardOutput.connect(self.handle_stdout)
         self.training_process.finished.connect(self.training_finished)
+
+        # --- IMPROVEMENTS START HERE ---
+
+        # 1. Set the working directory explicitly to the script's location.
+        #    This ensures that files like 'user_config.json' and 'train.py' are found reliably.
+        script_path = os.path.dirname(os.path.abspath(__file__))
+        self.training_process.setWorkingDirectory(script_path)
+        self.log(f"INFO: Set working directory for training process to: {script_path}")
+
+        # 2. Create a clean environment for the child process.
+        #    This helps prevent conflicts with other Python/CUDA libraries on your system.
+        env = QtCore.QProcessEnvironment.systemEnvironment()
+        
+        # Get the Python path from the current executable to ensure it's prioritized.
+        python_dir = os.path.dirname(sys.executable)
+        
+        # Prepend the script's python directory and its Scripts subdirectory to the system PATH.
+        # This ensures it finds the correct python.exe and any installed packages first.
+        original_path = env.value("Path")
+        new_path = f"{python_dir};{os.path.join(python_dir, 'Scripts')};{original_path}"
+        env.insert("Path", new_path)
+        
+        self.training_process.setProcessEnvironment(env)
+        self.log("INFO: Configured isolated environment for the training process.")
+
+        # --- IMPROVEMENTS END HERE ---
+
         try:
+            # Launch the process
             self.training_process.start(sys.executable, ["-u", "train.py"])
+
             if not self.training_process.waitForStarted(5000):
                 self.log(f"ERROR: Failed to start training process: {self.training_process.errorString()}")
                 self.training_finished()
+                
         except Exception as e:
             self.log(f"CRITICAL ERROR: Could not launch Python process: {e}")
             self.training_finished()

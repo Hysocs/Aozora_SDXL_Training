@@ -316,14 +316,13 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
         if key.startswith("add_embedding.linear_2."): final_map[hf_key] = key.replace("add_embedding.linear_2.", "label_emb.0.2."); continue
     return final_map
 
-def save_model(base_model_path, output_path, unet, trained_unet_param_names, save_dtype):
-    print(f"Loading base model: {base_model_path}")
-    try:
-        base_sd = load_file(base_model_path, device="cpu")
-    except Exception as e:
-        print(f"Could not load base model from {base_model_path}. Error: {e}")
-        return
-
+# MODIFIED a new argument `base_sd` to replace `base_model_path`
+def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
+    """
+    Saves the model by updating a provided in-memory state dictionary.
+    """
+    # The base model is now passed as a dictionary, no need to load from disk.
+    
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     param_counters = defaultdict(lambda: {'total': 0, 'saved': 0})
 
@@ -335,7 +334,9 @@ def save_model(base_model_path, output_path, unet, trained_unet_param_names, sav
 
     print("\nUpdating weights for UNet...")
     model_sd_on_device = unet.state_dict()
-    for hf_key in trained_unet_param_names:
+    
+    # Create a copy to avoid modifying the dictionary while iterating
+    for hf_key in list(trained_unet_param_names):
         category = get_param_category(hf_key)
         param_counters[category]['total'] += 1
         mapped_part = unet_key_map.get(hf_key)
@@ -360,14 +361,20 @@ def save_model(base_model_path, output_path, unet, trained_unet_param_names, sav
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     save_file(base_sd, output_path)
     print(f"[OK] Save complete: {output_path}")
-    del base_sd; gc.collect(); torch.cuda.empty_cache()
+    # Do not delete base_sd here as it's managed outside the function now
+    gc.collect(); torch.cuda.empty_cache()
+    
+    # Return the updated state dictionary
+    return base_sd
 
-def save_training_checkpoint(base_model_path, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
+# MODIFIED to accept and return the state dictionary
+def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
     
-    save_model(
-        base_model_path=base_model_path,
+    # Pass the in-memory state dict to save_model
+    updated_state_dict = save_model(
+        base_sd=base_model_state_dict,
         output_path=checkpoint_model_path,
         unet=unet,
         trained_unet_param_names=trainable_param_names,
@@ -381,6 +388,9 @@ def save_training_checkpoint(base_model_path, unet, optimizer, scheduler, step, 
         'scheduler_state_dict': scheduler.state_dict(),
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
+    
+    # Return the updated dictionary for the next save cycle
+    return updated_state_dict
     
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     """
@@ -629,17 +639,39 @@ def main():
         progress_bar.update(1); global_step += 1
         
         if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
-            save_training_checkpoint(config.SINGLE_FILE_CHECKPOINT_PATH, unet, optimizer, lr_scheduler, global_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype)
-        
+            # Pass the in-memory state dict and get the updated version back
+            updated_state_dict = save_training_checkpoint(
+                base_model_state_dict=base_model_state_dict,
+                unet=unet, 
+                optimizer=optimizer, 
+                scheduler=lr_scheduler, 
+                step=global_step, 
+                checkpoint_dir=CHECKPOINT_DIR, 
+                trainable_param_names=unet_param_names_to_optimize, 
+                save_dtype=config.compute_dtype
+            )
+            # Update the in-memory state for the next save operation
+            base_model_state_dict = updated_state_dict
+            
+            # CRITICAL: We no longer update model_to_load from a file path
+            # model_to_load = str(new_checkpoint_path) # <-- REMOVE OR COMMENT OUT THIS LINE
+
         if global_step >= config.MAX_TRAIN_STEPS: break
 
     progress_bar.close()
     print("--> Training finished.")
-    
+
     print("\nSaving final model...")
-    base_fn = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_unet_step{global_step}"
+    # MODIFIED: Use the final in-memory state for the final save
+    base_fn = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_step_{global_step}"
     output_path = OUTPUT_DIR / f"{base_fn}.safetensors"
-    save_model(config.SINGLE_FILE_CHECKPOINT_PATH, output_path, unet, unet_param_names_to_optimize, config.compute_dtype)
+    save_model(
+        base_sd=base_model_state_dict,
+        output_path=output_path,
+        unet=unet,
+        trained_unet_param_names=unet_param_names_to_optimize,
+        save_dtype=config.compute_dtype
+    )
     print(f"--> Final model saved to {output_path}")
     print("\nTRAINING COMPLETE")
 
