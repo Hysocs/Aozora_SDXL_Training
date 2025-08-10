@@ -21,6 +21,7 @@ xformers
 lpips
 triton-windows
 opencv-python-headless
+lion-pytorch
 Pillow==11.2.1
 tqdm==4.67.1
 numpy==1.26.0

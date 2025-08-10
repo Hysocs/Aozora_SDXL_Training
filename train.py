@@ -24,7 +24,6 @@ from transformers import (
     get_linear_schedule_with_warmup,
     get_cosine_schedule_with_warmup,
 )
-import bitsandbytes
 import logging
 import warnings
 import config as default_config
@@ -40,12 +39,10 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 class TrainingConfig:
     def __init__(self):
-        # Load defaults first
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
         
-        # Override with user_config.json if it exists
         user_config_path = Path("user_config.json")
         if user_config_path.exists():
             print(f"INFO: Loading user configuration from {user_config_path}")
@@ -60,7 +57,6 @@ class TrainingConfig:
         else:
             print("INFO: user_config.json not found. Using default settings.")
         
-        # Ensure numerical types
         float_keys = ["UNET_LEARNING_RATE", "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         
@@ -75,7 +71,41 @@ class TrainingConfig:
                 try: setattr(self, key, int(val))
                 except (ValueError, TypeError): setattr(self, key, default_config.__dict__[key])
 
-# --- NEW: Aspect Ratio Bucketing & Image Processing ---
+class DataPrefetcher:
+    """Overlaps host→GPU transfer of the next batch with the GPU work on the current batch."""
+    def __init__(self, loader, device, dtype):
+        self.loader = iter(loader)
+        self.device = device
+        self.dtype = dtype
+        self.stream = torch.cuda.Stream()
+        self.preload()
+
+    def preload(self):
+        try:
+            self.next_batch = next(self.loader)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            if self.next_batch:
+                # This dict comprehension will move all tensor values to the GPU asynchronously
+                self.next_batch = {
+                    k: v.to(self.device, dtype=self.dtype if v.is_floating_point() else None, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                    for k, v in self.next_batch.items()
+                }
+
+    def next(self):
+        torch.cuda.current_stream().wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is not None:
+            # We record the event to ensure that the tensor is not used before it's ready
+            for k, v in batch.items():
+                if isinstance(v, torch.Tensor):
+                    v.record_stream(torch.cuda.current_stream())
+            self.preload()
+        return batch
+
 class AspectRatioBucketing:
     """Creates and manages buckets based on aspect ratio and total pixel area."""
     def __init__(self, target_area, aspect_ratios, stride=64):
@@ -316,13 +346,8 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
         if key.startswith("add_embedding.linear_2."): final_map[hf_key] = key.replace("add_embedding.linear_2.", "label_emb.0.2."); continue
     return final_map
 
-# MODIFIED a new argument `base_sd` to replace `base_model_path`
 def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
-    """
-    Saves the model by updating a provided in-memory state dictionary.
-    """
-    # The base model is now passed as a dictionary, no need to load from disk.
-    
+    """Saves the model by updating a provided in-memory state dictionary."""
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     param_counters = defaultdict(lambda: {'total': 0, 'saved': 0})
 
@@ -335,7 +360,6 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     print("\nUpdating weights for UNet...")
     model_sd_on_device = unet.state_dict()
     
-    # Create a copy to avoid modifying the dictionary while iterating
     for hf_key in list(trained_unet_param_names):
         category = get_param_category(hf_key)
         param_counters[category]['total'] += 1
@@ -361,18 +385,13 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     save_file(base_sd, output_path)
     print(f"[OK] Save complete: {output_path}")
-    # Do not delete base_sd here as it's managed outside the function now
     gc.collect(); torch.cuda.empty_cache()
-    
-    # Return the updated state dictionary
     return base_sd
 
-# MODIFIED to accept and return the state dictionary
 def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
     
-    # Pass the in-memory state dict to save_model
     updated_state_dict = save_model(
         base_sd=base_model_state_dict,
         output_path=checkpoint_model_path,
@@ -388,42 +407,25 @@ def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, 
         'scheduler_state_dict': scheduler.state_dict(),
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
-    
-    # Return the updated dictionary for the next save cycle
     return updated_state_dict
     
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
-    """
-    Rescales betas to have zero terminal SNR.
-    Based on https://arxiv.org/pdf/2305.08891.pdf (Appendix C).
-    Args:
-        betas (torch.Tensor): The betas for the noise schedule.
-    Returns:
-        torch.Tensor: Rescaled betas.
-    """
-    # Convert betas to alphas_bar_sqrt
+    """Rescales betas to have zero terminal SNR from https://arxiv.org/pdf/2305.08891.pdf"""
     alphas = 1.0 - betas
     alphas_cumprod = torch.cumprod(alphas, dim=0)
     alphas_bar_sqrt = alphas_cumprod.sqrt()
-
-    # Store old values
     alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
     alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
-
-    # Shift so the last timestep is zero
     alphas_bar_sqrt -= alphas_bar_sqrt_T
-
-    # Scale so the first timestep is back to the old value
     alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
-
-    # Convert alphas_bar_sqrt to betas
     alphas_bar = alphas_bar_sqrt ** 2
     alphas = alphas_bar / F.pad(alphas_bar[:-1], (1, 0), value=1.0)
     betas = 1 - alphas
-
     return betas
    
 def main():
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
     config = TrainingConfig()
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
@@ -433,6 +435,9 @@ def main():
     if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
     config.compute_dtype = torch.bfloat16 if config.MIXED_PRECISION == "bfloat16" else torch.float16
     print(f"Using compute dtype: {config.compute_dtype}, Device: {device}")
+    
+    use_scaler = config.compute_dtype == torch.float16
+    scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
     
     print("Loading all components for embedding and latent generation...")
     temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype, use_safetensors=True)
@@ -447,7 +452,6 @@ def main():
     )
     del temp_pipe; gc.collect(); torch.cuda.empty_cache()
 
-    # --- RESUME LOGIC ---
     global_step = 0
     model_to_load = config.SINGLE_FILE_CHECKPOINT_PATH
     latest_state_path = None
@@ -466,17 +470,26 @@ def main():
     unet = pipeline_temp.unet
     scheduler_config = pipeline_temp.scheduler.config
     scheduler_config['prediction_type'] = 'v_prediction'
+    # Load the base model state dict into CPU memory *once*
+    print("Loading base model state_dict into memory...")
+    base_model_state_dict = load_file(model_to_load)
     del pipeline_temp.vae, pipeline_temp.tokenizer, pipeline_temp.tokenizer_2, pipeline_temp.text_encoder, pipeline_temp.text_encoder_2, pipeline_temp
     gc.collect(); torch.cuda.empty_cache()
     
-    # --- ADDED: Attempt to enable flash attention ---
     if hasattr(unet, 'enable_xformers_memory_efficient_attention'):
         try:
+            # Your proven fastest method
             unet.enable_xformers_memory_efficient_attention()
-            print("INFO: xformers memory-efficient attention is enabled.")
+            print("INFO: xFormers memory-efficient attention is enabled.")
         except Exception as e:
-            print(f"WARNING: Could not enable xformers. Training will proceed without it. Error: {e}")
-    # --- END OF ADDED SECTION ---
+            # Fallback to the PyTorch 2.0 implementation if xFormers is not available
+            print(f"WARNING: Could not enable xFormers. Error: {e}. Falling back to PyTorch 2.0's SDPA.")
+            try:
+                from diffusers.models.attention_processor import AttnProcessor2_0
+                unet.set_attn_processor(AttnProcessor2_0())
+                print("INFO: PyTorch 2.0's SDPA is enabled.")
+            except Exception as e2:
+                print(f"WARNING: Could not enable any attention optimization. Training will be slower. Error: {e2}")
 
     unet.to(device).requires_grad_(False)
     if hasattr(unet, 'enable_gradient_checkpointing'): unet.enable_gradient_checkpointing()
@@ -485,40 +498,18 @@ def main():
     unet_param_names_to_optimize = { name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS) }
     params_to_optimize = [p for n, p in unet.named_parameters() if n in unet_param_names_to_optimize]
     for p in params_to_optimize: p.requires_grad_(True)
-    all_unet_params = {name for name, _ in unet.named_parameters()}
-    untrained_params = all_unet_params - unet_param_names_to_optimize
     
-    print("\n" + "="*60)
-    print("           DETAILED UNET COMPOSITION ANALYSIS")
-    print("="*60)
-    
-    total_param_count = 0
-    for name, param in unet.named_parameters():
-        total_param_count += param.numel()
-        
-    total_buffer_count = 0
-    print("--- Buffers (Non-Trainable State Tensors) ---")
-    for name, buffer in unet.named_buffers():
-        print(f"  - {name:<85} | Count: {buffer.numel()}")
-        total_buffer_count += buffer.numel()
-    
-    print("\n" + "-"*60)
-    print(f"Total Parameters Count: {total_param_count} (~{total_param_count/1e6:.3f}M)")
-    print(f"Total Buffers Count:    {total_buffer_count} (~{total_buffer_count/1e6:.3f}M)")
-    grand_total = total_param_count + total_buffer_count
-    print(f"Grand Total (Params + Buffers): {grand_total} (~{grand_total/1e6:.3f}M)")
-    print("="*60 + "\n")
     if not params_to_optimize:
         raise ValueError("No parameters were selected for training. Please specify valid UNET_TRAIN_TARGETS.")
 
     optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": config.UNET_LEARNING_RATE}]
     unet_trainable_params = sum(p.numel() for p in params_to_optimize)
-    print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M")
-    
     unet_total_params_count = sum(p.numel() for p in unet.parameters())
+    print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M")
     print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | LR: {config.UNET_LEARNING_RATE:.2e} | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
     
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
+
     num_update_steps = math.ceil(config.MAX_TRAIN_STEPS / config.GRADIENT_ACCUMULATION_STEPS)
     num_warmup_update_steps = math.ceil(num_update_steps * config.LR_WARMUP_PERCENT)
 
@@ -540,107 +531,80 @@ def main():
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=(config.NUM_WORKERS > 0), pin_memory=True)
     
-    # --- ADDED: Announce training details ---
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
-    model_type_str = "v_prediction" if is_v_prediction_model else "eps (noise prediction)"
-    
-    training_method = "Standard MSE Loss"
-    if is_v_prediction_model and config.USE_MIN_SNR_GAMMA:
-        if config.MIN_SNR_VARIANT == "debiased":
-            training_method = f"Debiased Estimation (gamma: {config.MIN_SNR_GAMMA})"
-        elif config.MIN_SNR_VARIANT == "corrected":
-            training_method = f"Corrected Min-SNR Gamma for v-Pred (gamma: {config.MIN_SNR_GAMMA})"
-        else:
-            training_method = f"Min-SNR Gamma (gamma: {config.MIN_SNR_GAMMA})"
-    if config.USE_ZERO_TERMINAL_SNR:
-        training_method += " + Zero-Terminal SNR Rescaling"
-    if config.USE_IP_NOISE_GAMMA:
-        training_method += f" + IP Noise Gamma ({config.IP_NOISE_GAMMA})"
-    if config.USE_RESIDUAL_SHIFTING:
-        training_method += " + Residual Shifting (High-Noise Timestep Sampling with Curved Schedules)"
-
-    print("\n" + "="*50)
-    print("         STARTING TRAINING   ")
-    print(f"  - Model Prediction Type: {model_type_str}")
-    print(f"  - Training Method:       {training_method}")
-    print("="*50 + "\n")
-    # --- END OF ADDED SECTION ---
     
     unet.train()
     progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
-    dataloader_iterator = iter(train_dataloader)
     
+    prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
+    batch = prefetcher.next()
+
     while global_step < config.MAX_TRAIN_STEPS:
-        data_start = time.time()
-        try: batch = next(dataloader_iterator)
-        except StopIteration: dataloader_iterator = iter(train_dataloader); batch = next(dataloader_iterator)
-        if not batch: continue
-        data_time = time.time() - data_start
+        if batch is None:
+            prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
+            batch = prefetcher.next()
+            if not batch: continue
+
+        data_fetch_time = time.time()
         
-        transfer_start = time.time()
-        latents = batch["latents"].to(device, dtype=config.compute_dtype)
-        prompt_embeds = batch["prompt_embeds"].to(device, dtype=config.compute_dtype)
-        pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(device, dtype=config.compute_dtype)
-        transfer_time = time.time() - transfer_start
+        # Tensors are already on the correct device and dtype from the prefetcher
+        latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
         
         noise = torch.randn_like(latents)
         if config.USE_RESIDUAL_SHIFTING:
-            # Modified for high-noise timestep sampling (bias towards higher noise levels for residual shifting efficiency)
-            min_timestep = int(0.5 * noise_scheduler.config.num_train_timesteps)  # Start from mid-to-high noise
+            min_timestep = int(0.5 * noise_scheduler.config.num_train_timesteps)
             timesteps = torch.randint(min_timestep, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
-            # For curved schedules, we could adjust betas here, but as a placeholder, we use the biased sampling
         else:
             timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
-        if config.USE_IP_NOISE_GAMMA:
-            latents = latents + config.IP_NOISE_GAMMA * torch.randn_like(latents)
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         
-        is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
-        if is_v_prediction:
-            target = noise_scheduler.get_velocity(latents, noise, timesteps)
-        else:
-            target = noise
+        if config.USE_IP_NOISE_GAMMA > 0:
+            latents = latents + config.IP_NOISE_GAMMA * torch.randn_like(latents)
+        
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_prediction_model else noise
         
         original_sizes, target_sizes = batch["original_sizes"], batch["target_sizes"]
         crops_coords_top_left = [(0, 0) for _ in original_sizes]
         add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
         
         forward_start = time.time()
-        with torch.autocast(device_type=device.type, dtype=config.compute_dtype):
+        with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             
-            if is_v_prediction and config.USE_MIN_SNR_GAMMA:
+            if is_v_prediction_model and config.USE_MIN_SNR_GAMMA > 0:
                 snr = noise_scheduler.alphas_cumprod.to(device)[timesteps] / (1 - noise_scheduler.alphas_cumprod.to(device)[timesteps])
-                if config.MIN_SNR_VARIANT == "debiased":
-                    snr_loss_weights = torch.minimum(torch.ones_like(snr), config.MIN_SNR_GAMMA / torch.sqrt(snr)).detach()
-                elif config.MIN_SNR_VARIANT == "corrected":
-                    snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / (snr + 1)).detach()
-                else:
-                    snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / snr).detach()
+                snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / snr).detach()
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
         forward_time = time.time() - forward_start
         
-        backward_start = time.time(); torch.cuda.synchronize()
-        (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        torch.cuda.synchronize(); backward_time = time.time() - backward_start
+        backward_start = time.time()
+        scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+        backward_time = time.time() - backward_start
         
         optim_start = time.time()
         if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+            scaler.unscale_(optimizer)
             torch.nn.utils.clip_grad_norm_([p for p in params_to_optimize if p.grad is not None], config.CLIP_GRAD_NORM)
-            optimizer.step(); lr_scheduler.step(); optimizer.zero_grad(set_to_none=True)
+            scaler.step(optimizer)
+            scaler.update()
+            lr_scheduler.step()
+            optimizer.zero_grad(set_to_none=True)
             progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
         optim_time = time.time() - optim_start
 
-        # Print timings every step (or every N steps to reduce spam)
-        print(f"Step {global_step}: Data={data_time:.2f}s, Transfer={transfer_time:.2f}s, Forward={forward_time:.2f}s, Backward={backward_time:.2f}s, Optim={optim_time:.2f}s")
-
-        progress_bar.update(1); global_step += 1
+        # The 'Data' time now represents how long it took to get the pre-fetched batch.
+        # The true data loading/transfer is happening in the background.
+        print(f"Step {global_step}: Data={data_fetch_time - optim_start:.3f}s, Forward={forward_time:.3f}s, Backward={backward_time:.3f}s, Optim={optim_time:.3f}s")
+        
+        progress_bar.update(1)
+        global_step += 1
+        
+        batch = prefetcher.next()
         
         if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
-            # Pass the in-memory state dict and get the updated version back
-            updated_state_dict = save_training_checkpoint(
+            base_model_state_dict = save_training_checkpoint(
                 base_model_state_dict=base_model_state_dict,
                 unet=unet, 
                 optimizer=optimizer, 
@@ -650,11 +614,6 @@ def main():
                 trainable_param_names=unet_param_names_to_optimize, 
                 save_dtype=config.compute_dtype
             )
-            # Update the in-memory state for the next save operation
-            base_model_state_dict = updated_state_dict
-            
-            # CRITICAL: We no longer update model_to_load from a file path
-            # model_to_load = str(new_checkpoint_path) # <-- REMOVE OR COMMENT OUT THIS LINE
 
         if global_step >= config.MAX_TRAIN_STEPS: break
 
@@ -662,7 +621,6 @@ def main():
     print("--> Training finished.")
 
     print("\nSaving final model...")
-    # MODIFIED: Use the final in-memory state for the final save
     base_fn = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_step_{global_step}"
     output_path = OUTPUT_DIR / f"{base_fn}.safetensors"
     save_model(
