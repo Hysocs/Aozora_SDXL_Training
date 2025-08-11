@@ -538,6 +538,8 @@ def main():
     
     prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
     batch = prefetcher.next()
+    ema_loss = None
+    ema_decay = 0.99  # Adjust this (e.g., 0.999 for slower smoothing)
 
     while global_step < config.MAX_TRAIN_STEPS:
         if batch is None:
@@ -577,6 +579,12 @@ def main():
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
+
+            if ema_loss is None:
+                ema_loss = loss.item()
+            else:
+                ema_loss = ema_decay * ema_loss + (1 - ema_decay) * loss.item() 
+
         forward_time = time.time() - forward_start
         
         backward_start = time.time()
@@ -591,7 +599,13 @@ def main():
             scaler.update()
             lr_scheduler.step()
             optimizer.zero_grad(set_to_none=True)
-            progress_bar.set_postfix({"loss": f"{loss.item():.4f}", "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}"})
+            progress_bar.set_postfix({
+                "loss": f"{loss.item():.4f}",
+                "ema_loss": f"{ema_loss:.4f}",
+                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
+                "timesteps_min_max": f"{timesteps.min().item()}-{timesteps.max().item()}",
+                "mem_gb": f"{torch.cuda.memory_reserved() / 1e9:.2f}"
+            })
         optim_time = time.time() - optim_start
 
         # The 'Data' time now represents how long it took to get the pre-fetched batch.
