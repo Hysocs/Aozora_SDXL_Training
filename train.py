@@ -29,7 +29,7 @@ import warnings
 import config as default_config
 import multiprocessing
 from multiprocessing import Pool, cpu_count
-
+import argparse
 
 # --- Global Settings ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -39,24 +39,48 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 class TrainingConfig:
     def __init__(self):
+        # First, load all default values
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
         
-        user_config_path = Path("user_config.json")
-        if user_config_path.exists():
+        # --- MODIFIED SECTION START ---
+        # Use argparse to accept a configuration file path from the command line
+        parser = argparse.ArgumentParser(description="Load a specific training configuration.")
+        parser.add_argument("--config", type=str, help="Path to the user configuration JSON file.")
+        args, _ = parser.parse_known_args()
+
+        user_config_path = Path(args.config) if args.config else None
+
+        if user_config_path and user_config_path.exists():
             print(f"INFO: Loading user configuration from {user_config_path}")
             try:
                 with open(user_config_path, 'r') as f:
                     user_config = json.load(f)
+                # Override defaults with values from the specified config file
                 for key, value in user_config.items():
                     if hasattr(self, key):
                         setattr(self, key, value)
             except (json.JSONDecodeError, TypeError) as e:
-                print(f"ERROR: Could not read or parse user_config.json: {e}. Using default settings.")
+                print(f"ERROR: Could not read or parse {user_config_path}: {e}. Using default settings.")
         else:
-            print("INFO: user_config.json not found. Using default settings.")
-        
+            # Fallback to look for the default user config if no argument is passed
+            default_user_path = Path("user_config.json")
+            if default_user_path.exists():
+                 print(f"INFO: No --config specified. Found and loaded default {default_user_path}")
+                 try:
+                    with open(default_user_path, 'r') as f:
+                        user_config = json.load(f)
+                    for key, value in user_config.items():
+                        if hasattr(self, key):
+                            setattr(self, key, value)
+                 except (json.JSONDecodeError, TypeError) as e:
+                    print(f"ERROR: Could not read or parse {default_user_path}: {e}. Using default settings.")
+            else:
+                 print("INFO: No configuration file specified or found. Using default settings.")
+        # --- MODIFIED SECTION END ---
+
+        # Type conversion for numeric values
         float_keys = ["UNET_LEARNING_RATE", "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         

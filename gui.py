@@ -593,42 +593,80 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save = {}
         with open(self.default_path, 'r') as f:
             default_map = json.load(f)
-        for key, default_val in default_map.items():
-            live_val = self.current_config.get(key)
+
+        # --- REVISED LOGIC ---
+        # Iterate over all items in the current UI state to preserve all settings from loaded presets.
+        for key, live_val in self.current_config.items():
             if live_val is None:
-                self.log(f"Info: No value found for '{key}' in current UI state. Skipping.")
+                self.log(f"Info: No value for '{key}' in UI state. Skipping.")
                 continue
+
+            # Get the default value primarily for type inference
+            default_val = default_map.get(key)
             converted_val = None
+
             try:
-                if key == "UNET_TRAIN_TARGETS": converted_val = live_val
-                elif isinstance(default_val, bool): converted_val = bool(live_val)
-                elif isinstance(default_val, int): converted_val = int(str(live_val)) if str(live_val).strip() else 0
-                elif isinstance(default_val, float): converted_val = float(str(live_val)) if str(live_val).strip() else 0.0
-                elif key == "BUCKET_ASPECT_RATIOS":
-                    raw_list_str = str(live_val).strip().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
-                    converted_val = [float(p.strip()) for p in raw_list_str.split(',') if p.strip()]
-                else: converted_val = str(live_val)
+                if key == "UNET_TRAIN_TARGETS":
+                    converted_val = live_val
+                elif default_val is not None:
+                    # Use the type of the default value to guide conversion
+                    if isinstance(default_val, bool):
+                        converted_val = bool(live_val)
+                    elif isinstance(default_val, int):
+                        converted_val = int(str(live_val)) if str(live_val).strip() else 0
+                    elif isinstance(default_val, float):
+                        converted_val = float(str(live_val)) if str(live_val).strip() else 0.0
+                    elif isinstance(default_val, list):
+                        raw_list_str = str(live_val).strip().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
+                        converted_val = [float(p.strip()) for p in raw_list_str.split(',') if p.strip()]
+                    else: # Fallback to string
+                        converted_val = str(live_val)
+                elif isinstance(live_val, list): # Handle lists not in default (like UNET_TRAIN_TARGETS)
+                     converted_val = live_val
+                else: # For keys not in default map, convert to string
+                    converted_val = str(live_val)
+                
                 config_to_save[key] = converted_val
             except (ValueError, TypeError) as e:
-                self.log(f"Warning: Could not convert value for '{key}'. It will not be saved. Error: {e}")
+                self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
+
         index = self.config_dropdown.currentIndex()
         selected_display = self.config_dropdown.currentText()
         selected_key = self.config_dropdown.itemData(index)
-        if selected_display == "Default" or selected_display == "User Config":
+
+        save_path = ""
+        is_new_user_config = False
+
+        # Determine the correct file path to save to
+        if selected_display == "Default":
+            # When saving "Default", always create/overwrite "user_config.json"
             save_path = self.config_path
-            if selected_display == "Default":
-                self.log("Saving changes from Default to User Config...")
+            self.log("Saving changes from 'Default' to 'user_config.json'...")
+            is_new_user_config = True
+        elif selected_display == "User Config":
+            # Saving "User Config" overwrites itself
+             save_path = self.config_path
         else:
+            # Saving a preset overwrites the preset file
             save_path = os.path.join(self.config_dir, f"{selected_key}.json")
+
         try:
             with open(save_path, 'w') as f:
                 json.dump(config_to_save, f, indent=4)
-            self.log(f"Successfully saved all current settings to {os.path.basename(save_path)}")
+            self.log(f"Successfully saved all settings to {os.path.basename(save_path)}")
+
+            # Update the in-memory presets dictionary if a preset was saved
             if selected_key is not None:
-                with open(save_path, 'r') as f:
-                    self.presets[selected_key] = json.load(f)
-            if os.path.basename(save_path) == "user_config.json" and "User Config" not in [self.config_dropdown.itemText(i) for i in range(self.config_dropdown.count())]:
+                self.presets[selected_key] = config_to_save
+
+            # If we just created the user config for the first time, add it to the dropdown
+            if is_new_user_config and "User Config" not in [self.config_dropdown.itemText(i) for i in range(self.config_dropdown.count())]:
                 self.config_dropdown.insertItem(1, "User Config")
+            
+            # If we just saved a new user config, make it the active selection
+            if is_new_user_config:
+                 self.config_dropdown.setCurrentText("User Config")
+
         except Exception as e:
             self.log(f"CRITICAL ERROR: Could not write to {save_path}. Error: {e}")
     def restore_defaults(self):
@@ -671,9 +709,32 @@ class TrainingGUI(QtWidgets.QWidget):
             scrollbar.setValue(scrollbar.maximum())
     def log(self, message):
         self.append_log(message.strip(), replace=False)
+
     def start_training(self):
-        self.save_config()
+        # First, save the current UI settings to the appropriate file on disk
+        self.save_config() 
         self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
+
+        # --- MODIFIED SECTION START ---
+        # Determine the path of the configuration file to use for the training run
+        index = self.config_dropdown.currentIndex()
+        selected_display = self.config_dropdown.currentText()
+        selected_key = self.config_dropdown.itemData(index)
+
+        config_path_for_training = ""
+        if selected_display == "Default" or selected_display == "User Config":
+            config_path_for_training = self.config_path # Path to "user_config.json"
+        else:
+            # Path to a preset like "rtx3060_90.json"
+            config_path_for_training = os.path.join(self.config_dir, f"{selected_key}.json")
+        
+        # Verify that the configuration file actually exists before trying to use it
+        if not os.path.exists(config_path_for_training):
+            self.log(f"CRITICAL ERROR: Configuration file not found at {config_path_for_training}. Aborting start.")
+            self.training_finished() # Resets button states
+            return
+        # --- MODIFIED SECTION END ---
+            
         self.param_info_label.setText("Verifying training parameters...")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
@@ -681,31 +742,24 @@ class TrainingGUI(QtWidgets.QWidget):
         self.training_process.setProcessChannelMode(QtCore.QProcess.ProcessChannelMode.MergedChannels)
         self.training_process.readyReadStandardOutput.connect(self.handle_stdout)
         self.training_process.finished.connect(self.training_finished)
-        # --- IMPROVEMENTS START HERE ---
-        # 1. Set the working directory explicitly to the script's location.
-        # This ensures that files like 'user_config.json' and 'train.py' are found reliably.
+        
         script_path = os.path.dirname(os.path.abspath(__file__))
         self.training_process.setWorkingDirectory(script_path)
         self.log(f"INFO: Set working directory for training process to: {script_path}")
-        # 2. Create a clean environment for the child process.
-        # This helps prevent conflicts with other Python/CUDA libraries on your system.
+        
         env = QtCore.QProcessEnvironment.systemEnvironment()
-       
-        # Get the Python path from the current executable to ensure it's prioritized.
         python_dir = os.path.dirname(sys.executable)
-       
-        # Prepend the script's python directory and its Scripts subdirectory to the system PATH.
-        # This ensures it finds the correct python.exe and any installed packages first.
         original_path = env.value("Path")
         new_path = f"{python_dir};{os.path.join(python_dir, 'Scripts')};{original_path}"
         env.insert("Path", new_path)
-       
         self.training_process.setProcessEnvironment(env)
         self.log("INFO: Configured isolated environment for the training process.")
-        # --- IMPROVEMENTS END HERE ---
+
         try:
-            # Launch the process
-            self.training_process.start(sys.executable, ["-u", "train.py"])
+            # Launch the training script, passing the correct config file path as an argument
+            self.log(f"INFO: Starting train.py with configuration: {config_path_for_training}")
+            self.training_process.start(sys.executable, ["-u", "train.py", "--config", config_path_for_training])
+
             if not self.training_process.waitForStarted(5000):
                 self.log(f"ERROR: Failed to start training process: {self.training_process.errorString()}")
                 self.training_finished()
@@ -713,6 +767,7 @@ class TrainingGUI(QtWidgets.QWidget):
         except Exception as e:
             self.log(f"CRITICAL ERROR: Could not launch Python process: {e}")
             self.training_finished()
+
     def handle_stdout(self):
         text = bytes(self.training_process.readAllStandardOutput()).decode('utf-8', errors='ignore')
         for line in text.splitlines():
