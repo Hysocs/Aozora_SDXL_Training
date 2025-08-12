@@ -6,6 +6,7 @@ from PyQt6 import QtWidgets, QtCore, QtGui
 import config as default_config
 
 # --- STYLESHEET (Dark Purple Theme) ---
+# --- STYLESHEET (Dark Purple Theme) ---
 STYLESHEET = """
 /* --- DARK VIOLET THEME --- */
 QWidget {
@@ -64,6 +65,14 @@ QLineEdit {
     border-radius: 4px;
 }
 QLineEdit:focus { border: 1px solid #ab97e6; }
+
+/* --- ADD THIS RULE --- */
+QLineEdit:disabled {
+    background-color: #242233; /* A muted, slightly lighter dark background */
+    color: #7a788c;           /* Muted grey/purple text */
+    border: 1px solid #383552; /* A less prominent border */
+}
+
 #ParamInfoLabel {
     background-color: #1a1926;
     color: #ab97e6;
@@ -224,29 +233,56 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QHBoxLayout(parent_widget)
         layout.setSpacing(20)
         layout.setContentsMargins(15, 5, 15, 15)
+
+        # --- Left Column ---
         left_vbox = QtWidgets.QVBoxLayout()
+
         paths_group = QtWidgets.QGroupBox("File & Directory Paths")
         paths_layout = QtWidgets.QFormLayout(paths_group)
         self._create_path_option(paths_layout, "SINGLE_FILE_CHECKPOINT_PATH", "Base Model (.safetensors)", "Path to the base SDXL model.", "file_safetensors")
         self._create_path_option(paths_layout, "INSTANCE_DATA_DIR", "Dataset Directory", "Folder containing training images.", "folder")
         self._create_path_option(paths_layout, "OUTPUT_DIR", "Output Directory", "Folder where checkpoints will be saved.", "folder")
         left_vbox.addWidget(paths_group)
+
         batch_group = QtWidgets.QGroupBox("Batching & DataLoaders")
         batch_layout = QtWidgets.QFormLayout(batch_group)
         self._create_entry_option(batch_layout, "CACHING_BATCH_SIZE", "Caching Batch Size", "Adjust based on VRAM (e.g., 2-4).")
-        self._create_entry_option(batch_layout, "BATCH_SIZE", "Training Batch Size", "Almost always 1 for this script.")
-        self.widgets["BATCH_SIZE"].setEnabled(False)
+
+        # --- MODIFIED SECTION START ---
+        # Create the batch size option with an updated tooltip explaining why it's disabled.
+        self._create_entry_option(batch_layout, "BATCH_SIZE", "Training Batch Size", "Batches are not supported; this is fixed to 1.")
+        
+        # Get a direct reference to the QLineEdit widget for batch size.
+        batch_size_widget = self.widgets.get("BATCH_SIZE")
+
+        if batch_size_widget:
+            # Set the text to "1" to explicitly show the default value.
+            batch_size_widget.setText("1")
+            
+            # Disable the widget to make it non-editable (greyed out).
+            batch_size_widget.setEnabled(False)
+            
+            # Ensure the underlying configuration value is also set to 1.
+            # This guarantees consistency between the UI and the training script.
+            self.current_config["BATCH_SIZE"] = 1
+        # --- MODIFIED SECTION END ---
+
         self._create_entry_option(batch_layout, "NUM_WORKERS", "Dataloader Workers", "Set to 0 on Windows if you have issues.")
         self._create_bool_option(batch_layout, "FORCE_RECACHE_LATENTS", "Force Recache Latents", "Re-creates VAE latent caches on next run.")
         left_vbox.addWidget(batch_group)
         left_vbox.addStretch()
+
+        # --- Right Column ---
         right_vbox = QtWidgets.QVBoxLayout()
+
         bucket_group = QtWidgets.QGroupBox("Aspect Ratio Bucketing")
         bucket_layout = QtWidgets.QFormLayout(bucket_group)
         self._create_entry_option(bucket_layout, "TARGET_PIXEL_AREA", "Target Pixel Area", "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.")
         self._create_entry_option(bucket_layout, "BUCKET_ASPECT_RATIOS", "Aspect Ratios (comma-sep)", "e.g., 1.0, 1.5, 0.66. Defines bucket shapes.")
         right_vbox.addWidget(bucket_group)
         right_vbox.addStretch()
+
+        # --- Final Layout Assembly ---
         layout.addLayout(left_vbox, stretch=1)
         layout.addLayout(right_vbox, stretch=1)
 
