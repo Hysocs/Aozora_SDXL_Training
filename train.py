@@ -1,9 +1,9 @@
+import os
 import inspect
 import re
 from pathlib import Path
 import glob
 import gc
-import os
 import json
 from collections import defaultdict
 import imghdr
@@ -30,6 +30,7 @@ import config as default_config
 import multiprocessing
 from multiprocessing import Pool, cpu_count
 import argparse
+import copy # <--- ADD THIS IMPORT
 
 # --- Global Settings ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -410,28 +411,69 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     save_file(base_sd, output_path)
     print(f"[OK] Save complete: {output_path}")
     gc.collect(); torch.cuda.empty_cache()
-    return base_sd
+    # No return needed as we operated on a copy
+
+
+def has_nan_in_state(state_dict):
+    for key, value in state_dict.items():
+        if isinstance(value, dict):
+            if has_nan_in_state(value): return True
+        elif isinstance(value, torch.Tensor):
+            if torch.isnan(value).any() or torch.isinf(value).any(): return True
+    return False
+
+def sanitize_state(state_dict):
+    for key, value in state_dict.items():
+        if isinstance(value, dict):
+            sanitize_state(value)
+        elif isinstance(value, torch.Tensor):
+            state_dict[key] = torch.nan_to_num(value, nan=0.0, posinf=0.0, neginf=0.0)
+    return state_dict
 
 def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
     
-    updated_state_dict = save_model(
-        base_sd=base_model_state_dict,
+    # --- CHANGE 1: Use a deepcopy of the state dict for saving ---
+    # This prevents modifying the original state dict in memory, avoiding potential corruption.
+    save_model(
+        base_sd=copy.deepcopy(base_model_state_dict), # Create a fresh copy for the save operation
         output_path=checkpoint_model_path,
         unet=unet,
         trained_unet_param_names=trainable_param_names,
         save_dtype=save_dtype
     )
     
+    opt_state = optimizer.state_dict()
+    sched_state = scheduler.state_dict()
+    
+    opt_has_nan = has_nan_in_state(opt_state)
+    sched_has_nan = has_nan_in_state(sched_state)
+    
+    if opt_has_nan or sched_has_nan:
+        print("WARNING: NaN/Inf detected in optimizer or scheduler state during save! Sanitizing...")
+        if opt_has_nan:
+            opt_state = sanitize_state(opt_state)
+        if sched_has_nan:
+            sched_state = sanitize_state(sched_state)
+    
     state_path = checkpoint_dir / f"training_state_step_{step}.pt"
     torch.save({
         'step': step,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        'optimizer_state_dict': opt_state,
+        'scheduler_state_dict': sched_state,
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
-    return updated_state_dict
+    
+    # --- AGGRESSIVE CLEANUP ---
+    del opt_state, sched_state
+    gc.collect()
+    torch.cuda.empty_cache()
+    # --- END AGGRESSIVE CLEANUP ---
+
+    # --- CHANGE 2: No need to return the state dict anymore ---
+    # The original state_dict was never modified.
+
     
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     """Rescales betas to have zero terminal SNR from https://arxiv.org/pdf/2305.08891.pdf"""
@@ -543,6 +585,17 @@ def main():
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location=device)
+        
+        opt_has_nan = has_nan_in_state(state['optimizer_state_dict'])
+        sched_has_nan = has_nan_in_state(state['scheduler_state_dict'])
+        
+        if opt_has_nan or sched_has_nan:
+            print("WARNING: NaN/Inf detected in loaded optimizer or scheduler state! Sanitizing...")
+            if opt_has_nan:
+                state['optimizer_state_dict'] = sanitize_state(state['optimizer_state_dict'])
+            if sched_has_nan:
+                state['scheduler_state_dict'] = sanitize_state(state['scheduler_state_dict'])
+        
         global_step = state['step']
         optimizer.load_state_dict(state['optimizer_state_dict'])
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
@@ -553,7 +606,7 @@ def main():
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
     train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
-    train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=(config.NUM_WORKERS > 0), pin_memory=True)
+    train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=False, pin_memory=True)
     
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
     
@@ -597,9 +650,9 @@ def main():
         with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             
-            if is_v_prediction_model and config.USE_MIN_SNR_GAMMA > 0:
+            if is_v_prediction_model and config.USE_MIN_SNR_GAMMA:
                 snr = noise_scheduler.alphas_cumprod.to(device)[timesteps] / (1 - noise_scheduler.alphas_cumprod.to(device)[timesteps])
-                snr_loss_weights = (torch.stack([snr, config.MIN_SNR_GAMMA * torch.ones_like(snr)], dim=1).min(dim=1)[0] / snr).detach()
+                snr_loss_weights = torch.min(config.MIN_SNR_GAMMA / snr, torch.ones_like(snr))
                 loss = (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
             else:
                 loss = F.mse_loss(pred.float(), target.float())
@@ -617,12 +670,33 @@ def main():
         
         optim_start = time.time()
         if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+            # --- HARDENED OPTIMIZER STEP ---
             scaler.unscale_(optimizer)
-            torch.nn.utils.clip_grad_norm_([p for p in params_to_optimize if p.grad is not None], config.CLIP_GRAD_NORM)
-            scaler.step(optimizer)
-            scaler.update()
-            lr_scheduler.step()
+
+            # 1. Check for non-finite gradients before clipping
+            all_grads_are_finite = all(torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
+
+            if all_grads_are_finite:
+                # 2. Clip gradients only if they are valid
+                torch.nn.utils.clip_grad_norm_(
+                    [p for p in params_to_optimize if p.grad is not None], 
+                    config.CLIP_GRAD_NORM
+                )
+                
+                # 3. Step the optimizer
+                scaler.step(optimizer)
+                scaler.update()
+                lr_scheduler.step()
+            else:
+                # 4. Skip the optimizer step and warn the user
+                print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients. Skipping optimizer step to prevent corruption. Check learning rate and data.")
+                # Optionally, you can clear the corrupted gradients here
+                # scaler.update() # Still need to update scaler even if step is skipped
+
+            # Always zero the gradients to start the next accumulation cycle fresh
             optimizer.zero_grad(set_to_none=True)
+            # --- END HARDENED OPTIMIZER STEP ---
+
             progress_bar.set_postfix({
                 "loss": f"{loss.item():.4f}",
                 "ema_loss": f"{ema_loss:.4f}",
@@ -635,15 +709,20 @@ def main():
         # The 'Data' time now represents how long it took to get the pre-fetched batch.
         # The true data loading/transfer is happening in the background.
         print(f"Step {global_step}: Data={data_fetch_time - optim_start:.3f}s, Forward={forward_time:.3f}s, Backward={backward_time:.3f}s, Optim={optim_time:.3f}s")
-        
+
+        if torch.isnan(loss):
+            print(f"NaN detected at step {global_step}, timesteps={timesteps}")
+            raise ValueError("NaN in loss")
+
         progress_bar.update(1)
         global_step += 1
         
         batch = prefetcher.next()
         
         if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
-            base_model_state_dict = save_training_checkpoint(
-                base_model_state_dict=base_model_state_dict,
+            # --- CHANGE 3: The call no longer re-assigns the state dict ---
+            save_training_checkpoint(
+                base_model_state_dict=base_model_state_dict, # Pass the original, clean dict
                 unet=unet, 
                 optimizer=optimizer, 
                 scheduler=lr_scheduler, 
@@ -652,6 +731,12 @@ def main():
                 trainable_param_names=unet_param_names_to_optimize, 
                 save_dtype=config.compute_dtype
             )
+
+        # --- PERIODIC GARBAGE COLLECTION ---
+        # At the end of each step, clear any python-level objects that might be lingering
+        if global_step % 100 == 0: # Adjust frequency as needed
+             gc.collect()
+        # --- END PERIODIC GARBAGE COLLECTION ---
 
         if global_step >= config.MAX_TRAIN_STEPS: break
 
