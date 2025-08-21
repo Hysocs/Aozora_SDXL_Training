@@ -230,6 +230,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 "norm3",
                 "conv_norm_out"
             ],
+            "USE_PER_CHANNEL_NOISE": True,
             "USE_MIN_SNR_GAMMA": True,
             "MIN_SNR_GAMMA": 5.0,
             "MIN_SNR_VARIANT": "corrected",
@@ -238,7 +239,7 @@ class TrainingGUI(QtWidgets.QWidget):
             "IP_NOISE_GAMMA": 0.1,
             "USE_RESIDUAL_SHIFTING": True,
             "USE_COND_DROPOUT": True,
-            "COND_DROPOUT_PROB": 0.1
+            "COND_DROPOUT_PROB": 0.1,
         }
         rtx3060_90_path = os.path.join(self.config_dir, "rtx3060_90.json")
         if not os.path.exists(rtx3060_90_path):
@@ -427,6 +428,13 @@ class TrainingGUI(QtWidgets.QWidget):
         left_layout = QtWidgets.QVBoxLayout()
         adv_group = QtWidgets.QGroupBox("Advanced (v-prediction)")
         adv_layout = QtWidgets.QVBoxLayout(adv_group)
+        self._create_bool_option(
+        adv_layout,
+        "USE_PER_CHANNEL_NOISE",
+        "Use Per-Channel (Color) Noise",
+        "Generates independent noise for R, G, B channels. Recommended for color-rich training, especially with v-prediction."
+        )
+        adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
         self._create_bool_option(adv_layout, "USE_RESIDUAL_SHIFTING", "Use Residual Shifting Schedulers", "High-Noise Timestep Sampling with Curved Schedules")
         self._create_bool_option(adv_layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR Rescaling", "Rescales noise schedule for better dynamic range in v-pred.")
         adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
@@ -554,10 +562,17 @@ class TrainingGUI(QtWidgets.QWidget):
         if not self.unet_layer_checkboxes: return
         self.current_config["UNET_TRAIN_TARGETS"] = [k for k, cb in self.unet_layer_checkboxes.items() if cb.isChecked()]
     def _update_config_from_widget(self, key, widget):
-        if key not in self.current_config: return
-        if isinstance(widget, QtWidgets.QLineEdit): self.current_config[key] = widget.text().strip()
-        elif isinstance(widget, QtWidgets.QCheckBox): self.current_config[key] = widget.isChecked()
-        elif isinstance(widget, QtWidgets.QComboBox): self.current_config[key] = widget.currentText()
+        """
+        Updates the internal configuration dictionary based on the state of a UI widget.
+        This version will add the key to the dictionary if it doesn't exist.
+        """
+        # The check 'if key not in self.current_config' has been removed.
+        if isinstance(widget, QtWidgets.QLineEdit):
+            self.current_config[key] = widget.text().strip()
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            self.current_config[key] = widget.isChecked()
+        elif isinstance(widget, QtWidgets.QComboBox):
+            self.current_config[key] = widget.currentText()
     def _read_config_from_file(self):
         config = {}
         with open(self.default_path, 'r') as f:

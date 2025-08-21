@@ -72,6 +72,7 @@ class TrainingConfig:
         float_keys = ["UNET_LEARNING_RATE", "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT"]
+        bool_keys = ["USE_PER_CHANNEL_NOISE"]
        
         for key in float_keys:
             if hasattr(self, key):
@@ -88,6 +89,14 @@ class TrainingConfig:
                 val = getattr(self, key)
                 try: setattr(self, key, str(val).lower())
                 except (ValueError, TypeError): setattr(self, key, "corrected")
+        for key in bool_keys:
+            if hasattr(self, key):
+                val = getattr(self, key)
+                # Convert to boolean, ensuring strings like "true" are handled
+                if isinstance(val, str):
+                    setattr(self, key, val.lower() in ['true', '1', 't', 'y', 'yes'])
+                else:
+                    setattr(self, key, bool(val))
 class DataPrefetcher:
     def __init__(self, loader, device, dtype):
         self.loader = iter(loader)
@@ -592,7 +601,17 @@ def main():
        
         latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
        
-        noise = torch.randn_like(latents)
+        if config.USE_PER_CHANNEL_NOISE:
+            # This is the default, multi-color static behavior
+            noise = torch.randn_like(latents)
+        else:
+            # This is the monochromatic (single-color) static behavior
+            # 1. Create noise for a single channel
+            noise_mono = torch.randn_like(latents[:, :1, :, :])
+            # 2. Repeat this noise across all channels
+            noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
+            
+
         timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device)
        
         latents = apply_perturbations(config, latents)
