@@ -172,79 +172,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if not os.path.exists(self.default_path):
             with open(self.default_path, 'w') as f:
                 json.dump(self.default_config, f, indent=4)
-        rtx3060_90_data = {
-            "SINGLE_FILE_CHECKPOINT_PATH": "",
-            "INSTANCE_DATA_DIR": "",
-            "OUTPUT_DIR": "",
-            "FORCE_RECACHE_LATENTS": False,
-            "CACHING_BATCH_SIZE": 4,
-            "BATCH_SIZE": 1,
-            "NUM_WORKERS": 0,
-            "TARGET_PIXEL_AREA": 1048576,
-            "BUCKET_ASPECT_RATIOS": [
-                0.5,
-                0.56,
-                0.66,
-                0.75,
-                1.0,
-                1.25,
-                1.33,
-                1.5,
-                1.77,
-                2.0
-            ],
-            "MAX_TRAIN_STEPS": 250000,
-            "GRADIENT_ACCUMULATION_STEPS": 64,
-            "MIXED_PRECISION": "bfloat16",
-            "SEED": 42,
-            "SAVE_EVERY_N_STEPS": 5000,
-            "RESUME_TRAINING": True,
-            "RESUME_MODEL_PATH": "",
-            "RESUME_STATE_PATH": "",
-            "UNET_LEARNING_RATE": 8e-07,
-            "LR_SCHEDULER_TYPE": "cosine",
-            "LR_WARMUP_PERCENT": 0.1,
-            "CLIP_GRAD_NORM": 1.0,
-            "UNET_TRAIN_TARGETS": [
-                "attn1",
-                "attn2",
-                "mid_block.attentions",
-                "ff",
-                "to_q",
-                "to_k",
-                "to_v",
-                "to_out.0",
-                "proj_in",
-                "proj_out",
-                "time_embedding",
-                "time_emb_proj",
-                "add_embedding",
-                "conv_in",
-                "conv_shortcut",
-                "downsamplers",
-                "upsamplers",
-                "conv_out",
-                "norm",
-                "norm1",
-                "norm2",
-                "norm3",
-                "conv_norm_out"
-            ],
-            "USE_PER_CHANNEL_NOISE": True,
-            "USE_MIN_SNR_GAMMA": True,
-            "MIN_SNR_GAMMA": 5.0,
-            "MIN_SNR_VARIANT": "corrected",
-            "USE_ZERO_TERMINAL_SNR": True,
-            "USE_IP_NOISE_GAMMA": True,
-            "IP_NOISE_GAMMA": 0.1,
-            "USE_RESIDUAL_SHIFTING": True,
-            "USE_COND_DROPOUT": True,
-            "COND_DROPOUT_PROB": 0.1,
-        }
-        rtx3060_90_path = os.path.join(self.config_dir, "rtx3060_90.json")
-        if not os.path.exists(rtx3060_90_path):
-            with open(rtx3060_90_path, 'w') as f:
-                json.dump(rtx3060_90_data, f, indent=4)
     def _load_presets(self):
         self.presets = {}
         for filename in os.listdir(self.config_dir):
@@ -274,17 +201,17 @@ class TrainingGUI(QtWidgets.QWidget):
         self.config_dropdown.addItem("Default")
         if os.path.exists(self.config_path):
             self.config_dropdown.addItem("User Config")
-        display_names = {
-            "rtx3060_90": "RTX 3060 (90%)",
-        }
         for name in sorted(self.presets.keys()):
-            display = display_names.get(name, name.replace("_", " ").title())
+            display = name.replace("_", " ").title()
             self.config_dropdown.addItem(display, name)
         self.config_dropdown.currentIndexChanged.connect(self.load_selected_config)
         corner_hbox.addWidget(self.config_dropdown)
         self.save_button = QtWidgets.QPushButton("Save Config")
         self.save_button.clicked.connect(self.save_config)
         corner_hbox.addWidget(self.save_button)
+        self.save_as_button = QtWidgets.QPushButton("Save As...")
+        self.save_as_button.clicked.connect(self.save_as_config)
+        corner_hbox.addWidget(self.save_as_button)
         self.restore_button = QtWidgets.QPushButton("↺")
         self.restore_button.setToolTip("Restore Defaults")
         self.restore_button.setFixedHeight(32)
@@ -323,6 +250,96 @@ class TrainingGUI(QtWidgets.QWidget):
         else:
             self.current_config = copy.deepcopy(self.presets[selected_key])
         self._apply_config_to_widgets()
+    def _prepare_config_to_save(self):
+        config_to_save = {}
+        with open(self.default_path, 'r') as f:
+            default_map = json.load(f)
+        for key, live_val in self.current_config.items():
+            if live_val is None:
+                continue
+            default_val = default_map.get(key)
+            converted_val = None
+            try:
+                if key == "UNET_TRAIN_TARGETS":
+                    converted_val = live_val
+                elif default_val is not None:
+                    if isinstance(default_val, bool):
+                        converted_val = bool(live_val)
+                    elif isinstance(default_val, int):
+                        converted_val = int(str(live_val)) if str(live_val).strip() else 0
+                    elif isinstance(default_val, float):
+                        converted_val = float(str(live_val)) if str(live_val).strip() else 0.0
+                    elif isinstance(default_val, list):
+                        raw_list_str = str(live_val).strip().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
+                        converted_val = [float(p.strip()) for p in raw_list_str.split(',') if p.strip()]
+                    else:
+                        converted_val = str(live_val)
+                elif isinstance(live_val, list):
+                    converted_val = live_val
+                else:
+                    converted_val = str(live_val)
+                config_to_save[key] = converted_val
+            except (ValueError, TypeError) as e:
+                self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
+        return config_to_save
+    def save_config(self):
+        config_to_save = self._prepare_config_to_save()
+        index = self.config_dropdown.currentIndex()
+        selected_display = self.config_dropdown.currentText()
+        selected_key = self.config_dropdown.itemData(index)
+        save_path = ""
+        is_new_user_config = False
+        if selected_display == "Default":
+            save_path = self.config_path
+            is_new_user_config = True
+        elif selected_display == "User Config":
+            save_path = self.config_path
+        else:
+            save_path = os.path.join(self.config_dir, f"{selected_key}.json")
+        try:
+            with open(save_path, 'w') as f:
+                json.dump(config_to_save, f, indent=4)
+            self.log(f"Successfully saved all settings to {os.path.basename(save_path)}")
+            if selected_key is not None:
+                self.presets[selected_key] = config_to_save
+            if is_new_user_config and "User Config" not in [self.config_dropdown.itemText(i) for i in range(self.config_dropdown.count())]:
+                self.config_dropdown.insertItem(1, "User Config")
+            if is_new_user_config:
+                 self.config_dropdown.setCurrentText("User Config")
+        except Exception as e:
+            self.log(f"CRITICAL ERROR: Could not write to {save_path}. Error: {e}")
+
+            
+    def save_as_config(self):
+        name, ok = QtWidgets.QInputDialog.getText(self, "Save Preset As", "Enter preset name (alphanumeric, underscores):")
+        if ok and name:
+            if not re.match(r'^[a-zA-Z0-9_]+$', name):
+                self.log("Error: Preset name must be alphanumeric with underscores only.")
+                return
+            save_path = os.path.join(self.config_dir, f"{name}.json")
+            if os.path.exists(save_path):
+                reply = QtWidgets.QMessageBox.question(self, "Overwrite?", f"Preset '{name}' exists. Overwrite?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+                if reply != QtWidgets.QMessageBox.StandardButton.Yes:
+                    return
+            config_to_save = self._prepare_config_to_save()
+            try:
+                with open(save_path, 'w') as f:
+                    json.dump(config_to_save, f, indent=4)
+                self.log(f"Successfully saved preset to {os.path.basename(save_path)}")
+
+                # --- FIX STARTS HERE ---
+                # Add the new configuration to the in-memory presets dictionary.
+                self.presets[name] = config_to_save
+                # --- FIX ENDS HERE ---
+
+                existing_index = self.config_dropdown.findData(name)
+                if existing_index == -1:
+                    display = name.replace("_", " ").title()
+                    self.config_dropdown.addItem(display, name)
+                self.config_dropdown.setCurrentIndex(self.config_dropdown.findData(name))
+            except Exception as e:
+                self.log(f"Error saving preset: {e}")
+
     def _on_tab_change(self, index):
         if self.tab_view.widget(index).layout() is not None: return
         tab_widget = self.tab_view.widget(index)
@@ -604,86 +621,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if "RESUME_TRAINING" in self.widgets: self.toggle_resume_widgets()
         if "USE_IP_NOISE_GAMMA" in self.widgets: self.toggle_ip_noise_gamma_widget()
         if "USE_COND_DROPOUT" in self.widgets: self.toggle_cond_dropout_widget()
-    def save_config(self):
-        config_to_save = {}
-        with open(self.default_path, 'r') as f:
-            default_map = json.load(f)
-
-        # --- REVISED LOGIC ---
-        # Iterate over all items in the current UI state to preserve all settings from loaded presets.
-        for key, live_val in self.current_config.items():
-            if live_val is None:
-                self.log(f"Info: No value for '{key}' in UI state. Skipping.")
-                continue
-
-            # Get the default value primarily for type inference
-            default_val = default_map.get(key)
-            converted_val = None
-
-            try:
-                if key == "UNET_TRAIN_TARGETS":
-                    converted_val = live_val
-                elif default_val is not None:
-                    # Use the type of the default value to guide conversion
-                    if isinstance(default_val, bool):
-                        converted_val = bool(live_val)
-                    elif isinstance(default_val, int):
-                        converted_val = int(str(live_val)) if str(live_val).strip() else 0
-                    elif isinstance(default_val, float):
-                        converted_val = float(str(live_val)) if str(live_val).strip() else 0.0
-                    elif isinstance(default_val, list):
-                        raw_list_str = str(live_val).strip().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
-                        converted_val = [float(p.strip()) for p in raw_list_str.split(',') if p.strip()]
-                    else: # Fallback to string
-                        converted_val = str(live_val)
-                elif isinstance(live_val, list): # Handle lists not in default (like UNET_TRAIN_TARGETS)
-                     converted_val = live_val
-                else: # For keys not in default map, convert to string
-                    converted_val = str(live_val)
-                
-                config_to_save[key] = converted_val
-            except (ValueError, TypeError) as e:
-                self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
-
-        index = self.config_dropdown.currentIndex()
-        selected_display = self.config_dropdown.currentText()
-        selected_key = self.config_dropdown.itemData(index)
-
-        save_path = ""
-        is_new_user_config = False
-
-        # Determine the correct file path to save to
-        if selected_display == "Default":
-            # When saving "Default", always create/overwrite "user_config.json"
-            save_path = self.config_path
-            self.log("Saving changes from 'Default' to 'user_config.json'...")
-            is_new_user_config = True
-        elif selected_display == "User Config":
-            # Saving "User Config" overwrites itself
-             save_path = self.config_path
-        else:
-            # Saving a preset overwrites the preset file
-            save_path = os.path.join(self.config_dir, f"{selected_key}.json")
-
-        try:
-            with open(save_path, 'w') as f:
-                json.dump(config_to_save, f, indent=4)
-            self.log(f"Successfully saved all settings to {os.path.basename(save_path)}")
-
-            # Update the in-memory presets dictionary if a preset was saved
-            if selected_key is not None:
-                self.presets[selected_key] = config_to_save
-
-            # If we just created the user config for the first time, add it to the dropdown
-            if is_new_user_config and "User Config" not in [self.config_dropdown.itemText(i) for i in range(self.config_dropdown.count())]:
-                self.config_dropdown.insertItem(1, "User Config")
-            
-            # If we just saved a new user config, make it the active selection
-            if is_new_user_config:
-                 self.config_dropdown.setCurrentText("User Config")
-
-        except Exception as e:
-            self.log(f"CRITICAL ERROR: Could not write to {save_path}. Error: {e}")
     def restore_defaults(self):
         if os.path.exists(self.config_path):
             os.remove(self.config_path)
