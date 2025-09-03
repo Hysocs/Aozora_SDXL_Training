@@ -6,11 +6,14 @@
 
 # --- Paths ---
 SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safetensors"
-INSTANCE_DATA_DIR = "./DatasetV1/"
+INSTANCE_DATASETS = [{"path": "./DatasetV1/", "repeats": 1}]
 OUTPUT_DIR = "./sdxl_finetune_output"
 
 # --- Caching & Data ---
 FORCE_RECACHE_LATENTS = False
+MIRROR_REPEATS = False # If True, duplicates from 'repeats' will be horizontally mirrored
+DARKEN_REPEATS = False  # Increase gamma on dataset repeats to darken them
+GAMMA_VALUE = 2.0  # Fixed gamma for darkening (can make configurable later)
 CACHING_BATCH_SIZE = 3
 BATCH_SIZE = 1 # Recommended to keep at 1 for this script
 NUM_WORKERS = 4 # Set to 0 on Windows if you encounter DataLoader errors

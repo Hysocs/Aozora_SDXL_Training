@@ -1,6 +1,6 @@
-import os
 import inspect
 import re
+import os
 from pathlib import Path
 import glob
 import gc
@@ -31,6 +31,7 @@ import multiprocessing
 from multiprocessing import Pool, cpu_count
 import argparse
 import copy
+import numpy as np
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -61,10 +62,16 @@ class TrainingConfig:
                 print(f"WARNING: Specified config {path} does not exist. Using defaults.")
         else:
             print("INFO: No configuration file specified. Using default settings.")
+            
         float_keys = ["UNET_LEARNING_RATE", "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT"]
-        bool_keys = ["USE_PER_CHANNEL_NOISE"]
+        bool_keys = [
+            "MIRROR_REPEATS", "DARKEN_REPEATS", 
+            "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", "USE_MIN_SNR_GAMMA", 
+            "USE_ZERO_TERMINAL_SNR", "USE_IP_NOISE_GAMMA", "USE_RESIDUAL_SHIFTING", 
+            "USE_COND_DROPOUT"
+        ]
        
         for key in float_keys:
             if hasattr(self, key):
@@ -84,7 +91,6 @@ class TrainingConfig:
         for key in bool_keys:
             if hasattr(self, key):
                 val = getattr(self, key)
-                # Convert to boolean, ensuring strings like "true" are handled
                 if isinstance(val, str):
                     setattr(self, key, val.lower() in ['true', '1', 't', 'y', 'yes'])
                 else:
@@ -151,6 +157,26 @@ def resize_and_crop(image, target_w, target_h):
     image = image.resize((new_w, new_h), Image.LANCZOS)
     left, top = (new_w - target_w) // 2, (new_h - target_h) // 2
     return image.crop((left, top, left + target_w, top + target_h))
+
+def apply_sigmoid_contrast(image, gain=10, cutoff=0.5):
+    """
+    Increases contrast using a Sigmoid (S-Curve) function.
+    - gain (float): The steepness of the curve. Higher values mean more contrast. (e.g., 5-15)
+    - cutoff (float, 0-1): The midpoint of the contrast curve (0.5 is standard mid-gray).
+    """
+    if image.mode != 'RGB':
+        image = image.convert('RGB')
+        
+    arr = np.array(image, dtype=np.float32) / 255.0  # Normalize to 0-1 range
+    
+    # Apply the sigmoid function
+    arr = 1 / (1 + np.exp(gain * (cutoff - arr)))
+    
+    # Scale back to 0-255
+    arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
+    
+    return Image.fromarray(arr)
+
 def validate_image_and_assign_bucket(args):
     ip, bucketer = args
     if "_truncated" in ip.stem: return None
@@ -186,109 +212,316 @@ def validate_image_and_assign_bucket(args):
         return None
 def validate_wrapper(args):
     return validate_image_and_assign_bucket(args)
+
 def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, text_encoder2, vae, device_for_encoding):
-    data_root_path = Path(config.INSTANCE_DATA_DIR)
+    if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
+        config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
    
-    if config.FORCE_RECACHE_LATENTS:
-        print("Force recache enabled. Deleting old cache directories...")
-        for cache_dir in data_root_path.rglob(".precomputed_embeddings_cache"):
-            if cache_dir.is_dir(): shutil.rmtree(cache_dir)
-    print("Scanning for images recursively...")
-    all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in data_root_path.rglob(f"*{ext}")]
-    if not all_image_paths: raise ValueError(f"No images found in {config.INSTANCE_DATA_DIR}")
-    existing_stems = {p.stem for p in data_root_path.rglob(".precomputed_embeddings_cache/*.pt")}
-    images_to_process = [p for p in all_image_paths if p.stem not in existing_stems] if not config.FORCE_RECACHE_LATENTS else all_image_paths
-   
-    if not images_to_process:
-        print("All images are already cached. Nothing to do.")
-        vae.cpu(); text_encoder1.cpu(); text_encoder2.cpu(); gc.collect(); torch.cuda.empty_cache()
-        return
-    print(f"Found {len(images_to_process)} images to cache. Now validating and assigning to buckets...")
     bucketer = AspectRatioBucketing(config.TARGET_PIXEL_AREA, config.BUCKET_ASPECT_RATIOS)
-   
-    with Pool(processes=cpu_count()) as pool:
-        args = [(ip, bucketer) for ip in images_to_process]
-        results = list(tqdm(pool.imap(validate_wrapper, args), total=len(args), desc="Validating and bucketing"))
-   
-    image_metadata = [res for res in results if res]
-    if not image_metadata: raise ValueError("No valid images found after scanning.")
-    print(f"Validation complete. Found {len(image_metadata)} valid images to cache.")
-   
-    grouped_metadata = defaultdict(list)
-    for meta in image_metadata:
-        grouped_metadata[meta["bucket_resolution"]].append(meta)
-   
-    all_batches_to_process = []
-    for bucket_res, metadata_list in grouped_metadata.items():
-        for i in range(0, len(metadata_list), config.CACHING_BATCH_SIZE):
-            all_batches_to_process.append((bucket_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
-    random.shuffle(all_batches_to_process)
-   
     vae.to(device_for_encoding); text_encoder1.to(device_for_encoding); text_encoder2.to(device_for_encoding)
     vae.enable_tiling()
     img_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-    for (target_w, target_h), batch_metadata in tqdm(all_batches_to_process, desc="Caching embeddings in batches"):
-        image_tensors = []
-        captions_batch = [meta['caption'] for meta in batch_metadata]
-        for meta in batch_metadata:
-            try:
-                img = Image.open(meta['ip']).convert('RGB')
-                processed_img = resize_and_crop(img, target_w, target_h)
-                image_tensors.append(img_transform(processed_img))
-            except Exception as e:
-                tqdm.write(f"\n[ERROR] Skipping bad image {meta['ip']}: {e}")
-        if not image_tensors: continue
-           
-        img_tensor_batch = torch.stack(image_tensors).to(device_for_encoding, dtype=vae.dtype)
-       
-        with torch.no_grad():
-            text_inputs1 = tokenizer1(captions_batch, padding="max_length", max_length=tokenizer1.model_max_length, truncation=True, return_tensors="pt")
-            text_inputs2 = tokenizer2(captions_batch, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
-           
-            prompt_embeds_out = text_encoder1(text_inputs1.input_ids.to(device_for_encoding), output_hidden_states=True)
-            pooled_prompt_embeds_out = text_encoder2(text_inputs2.input_ids.to(device_for_encoding), output_hidden_states=True)
-           
-            prompt_embeds_batch = torch.cat([prompt_embeds_out.hidden_states[-2], pooled_prompt_embeds_out.hidden_states[-2]], dim=-1)
-            pooled_prompt_embeds_batch = pooled_prompt_embeds_out.text_embeds
-           
-            latents_batch = vae.encode(img_tensor_batch).latent_dist.mean * vae.config.scaling_factor
-            if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
-                raise ValueError("NaN or Inf detected in latents—bad encoding!")
-        for j, meta in enumerate(batch_metadata):
-            image_path = meta['ip']
-            cache_dir = image_path.parent / ".precomputed_embeddings_cache"
-            cache_dir.mkdir(exist_ok=True)
-           
-            torch.save({
-                "latents_cpu": latents_batch[j].clone().cpu().to(config.compute_dtype),
-                "prompt_embeds_cpu": prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
-                "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
-                "original_size_as_tuple": meta["original_size"],
-                "target_size_as_tuple": (target_h, target_w),
-            }, cache_dir / f"{image_path.stem}.pt")
-           
-        del img_tensor_batch, latents_batch, prompt_embeds_batch, pooled_prompt_embeds_batch
-        gc.collect(); torch.cuda.empty_cache()
-       
+   
+    for dataset in config.INSTANCE_DATASETS:
+        data_root_path = Path(dataset["path"])
+        print(f"Processing dataset: {data_root_path}")
+   
+        print("Scanning for images recursively...")
+        all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in data_root_path.rglob(f"*{ext}")]
+        if not all_image_paths: 
+            print(f"WARNING: No images found in {data_root_path}. Skipping.")
+            continue
+        existing_stems = {p.stem for p in data_root_path.rglob(".precomputed_embeddings_cache/*.pt")}
+        images_to_process = [p for p in all_image_paths if p.stem not in existing_stems]
+   
+        if not images_to_process:
+            print("All images are already cached. Nothing to do.")
+            continue
+        print(f"Found {len(images_to_process)} images to cache. Now validating and assigning to buckets...")
+   
+        with Pool(processes=cpu_count()) as pool:
+            args = [(ip, bucketer) for ip in images_to_process]
+            results = list(tqdm(pool.imap(validate_wrapper, args), total=len(args), desc="Validating and bucketing"))
+   
+        image_metadata = [res for res in results if res]
+        if not image_metadata: 
+            print(f"WARNING: No valid images found in {data_root_path}. Skipping.")
+            continue
+        print(f"Validation complete. Found {len(image_metadata)} valid images to cache.")
+   
+        grouped_metadata = defaultdict(list)
+        for meta in image_metadata:
+            grouped_metadata[meta["bucket_resolution"]].append(meta)
+   
+        all_batches_to_process = []
+        for bucket_res, metadata_list in grouped_metadata.items():
+            for i in range(0, len(metadata_list), config.CACHING_BATCH_SIZE):
+                all_batches_to_process.append((bucket_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
+        random.shuffle(all_batches_to_process)
+   
+        if config.DARKEN_REPEATS:
+            print("DARKEN_REPEATS enabled: Caching high-contrast variants for repeats.")
+        if config.MIRROR_REPEATS:
+            print("MIRROR_REPEATS enabled: Caching horizontally flipped variants for repeats.")
+
+        for (target_w, target_h), batch_metadata in tqdm(all_batches_to_process, desc="Caching embeddings in batches"):
+            captions_batch = [meta['caption'] for meta in batch_metadata]
+            with torch.no_grad():
+                prompt_embeds_batch, pooled_prompt_embeds_batch = compute_chunked_text_embeddings(
+                    captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device_for_encoding,
+                    max_chunk_length=75, max_total_tokens=300  # Adjust as needed;
+                )
+            
+            variants = {}
+            
+            # Original
+            image_tensors = []
+            for meta in batch_metadata:
+                try:
+                    img = Image.open(meta['ip']).convert('RGB')
+                    processed_img = resize_and_crop(img, target_w, target_h)
+                    image_tensors.append(img_transform(processed_img))
+                except Exception as e:
+                    tqdm.write(f"\n[ERROR] Skipping bad image {meta['ip']}: {e}")
+            if image_tensors:
+                img_tensor_batch = torch.stack(image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                with torch.no_grad():
+                    latents_batch = vae.encode(img_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                    if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
+                        raise ValueError("NaN or Inf detected in latents—bad encoding!")
+                variants["original"] = latents_batch
+                del img_tensor_batch
+            
+            # Contrast
+            if config.DARKEN_REPEATS:
+                contrast_image_tensors = []
+                for meta in batch_metadata:
+                    try:
+                        img = Image.open(meta['ip']).convert('RGB')
+                        contrast_img = apply_sigmoid_contrast(img, gain=10)
+                        processed_contrast = resize_and_crop(contrast_img, target_w, target_h)
+                        contrast_image_tensors.append(img_transform(processed_contrast))
+                    except Exception as e:
+                        tqdm.write(f"\n[ERROR] Skipping bad contrast image {meta['ip']}: {e}")
+                if contrast_image_tensors:
+                    contrast_tensor_batch = torch.stack(contrast_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                    with torch.no_grad():
+                        contrast_latents_batch = vae.encode(contrast_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                        if torch.isnan(contrast_latents_batch).any() or torch.isinf(contrast_latents_batch).any():
+                            raise ValueError("NaN or Inf in contrast latents!")
+                    variants["contrast"] = contrast_latents_batch
+                    del contrast_tensor_batch
+            
+            # Flipped
+            if config.MIRROR_REPEATS:
+                flipped_image_tensors = []
+                for meta in batch_metadata:
+                    try:
+                        img = Image.open(meta['ip']).convert('RGB')
+                        flipped_img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                        processed_flipped = resize_and_crop(flipped_img, target_w, target_h)
+                        flipped_image_tensors.append(img_transform(processed_flipped))
+                    except Exception as e:
+                        tqdm.write(f"\n[ERROR] Skipping bad flipped image {meta['ip']}: {e}")
+                if flipped_image_tensors:
+                    flipped_tensor_batch = torch.stack(flipped_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                    with torch.no_grad():
+                        flipped_latents_batch = vae.encode(flipped_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                        if torch.isnan(flipped_latents_batch).any() or torch.isinf(flipped_latents_batch).any():
+                            raise ValueError("NaN or Inf in flipped latents!")
+                    variants["flipped"] = flipped_latents_batch
+                    del flipped_tensor_batch
+            
+            # Flipped Contrast
+            if config.MIRROR_REPEATS and config.DARKEN_REPEATS:
+                fc_image_tensors = []
+                for meta in batch_metadata:
+                    try:
+                        img = Image.open(meta['ip']).convert('RGB')
+                        contrast_img = apply_sigmoid_contrast(img, gain=10)
+                        fc_img = contrast_img.transpose(Image.FLIP_LEFT_RIGHT)
+                        processed_fc = resize_and_crop(fc_img, target_w, target_h)
+                        fc_image_tensors.append(img_transform(processed_fc))
+                    except Exception as e:
+                        tqdm.write(f"\n[ERROR] Skipping bad flipped contrast image {meta['ip']}: {e}")
+                if fc_image_tensors:
+                    fc_tensor_batch = torch.stack(fc_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                    with torch.no_grad():
+                        fc_latents_batch = vae.encode(fc_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                        if torch.isnan(fc_latents_batch).any() or torch.isinf(fc_latents_batch).any():
+                            raise ValueError("NaN or Inf in flipped contrast latents!")
+                    variants["flipped_contrast"] = fc_latents_batch
+                    del fc_tensor_batch
+            
+            for j, meta in enumerate(batch_metadata):
+                image_path = meta['ip']
+                cache_dir = image_path.parent / ".precomputed_embeddings_cache"
+                cache_dir.mkdir(exist_ok=True)
+                save_data = {
+                    "original_size_as_tuple": meta["original_size"],
+                    "target_size_as_tuple": (target_h, target_w),
+                    "prompt_embeds_cpu": prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
+                    "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
+                }
+                for key, latents in variants.items():
+                    save_data[key] = {
+                        "latents_cpu": latents[j].clone().cpu().to(config.compute_dtype)
+                    }
+                torch.save(save_data, cache_dir / f"{image_path.stem}.pt")
+            
+            for latents in variants.values():
+                del latents
+            del prompt_embeds_batch, pooled_prompt_embeds_batch
+            gc.collect(); torch.cuda.empty_cache()
+   
     vae.disable_tiling()
     vae.cpu(); text_encoder1.cpu(); text_encoder2.cpu(); gc.collect(); torch.cuda.empty_cache()
+
+def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device, max_chunk_length=75, max_total_tokens=300):
+    """
+    Compute embeddings for long captions by chunking without truncation.
+    - Splits each caption into ~75-token chunks (word-aware split).
+    - Encodes each chunk separately.
+    - Concatenates hidden states on seq_len dim.
+    - Averages pooled embeds across chunks.
+    - Caps at max_total_tokens to avoid excessive VRAM.
+    """
+    import warnings
+    
+    prompt_embeds_batch = []
+    pooled_prompt_embeds_batch = []
+    
+    model_max_length = tokenizer1.model_max_length
+    max_chunks = max_total_tokens // model_max_length
+    max_seq_len = max_chunks * model_max_length
+    
+    for caption in captions_batch:
+        # Tokenize full caption to check length, suppressing warning
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            full_tokens1 = tokenizer1(caption, return_tensors="pt", add_special_tokens=True).input_ids[0]
+        
+        if len(full_tokens1) <= model_max_length:
+            # Short caption: encode normally
+            inputs1 = tokenizer1(caption, padding="max_length", max_length=model_max_length, truncation=True, return_tensors="pt")
+            inputs2 = tokenizer2(caption, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
+            with torch.no_grad():
+                emb1 = text_encoder1(inputs1.input_ids.to(device), output_hidden_states=True).hidden_states[-2]
+                emb2_out = text_encoder2(inputs2.input_ids.to(device), output_hidden_states=True)
+                emb2 = emb2_out.hidden_states[-2]
+                pooled = emb2_out.text_embeds
+            combined_emb = torch.cat([emb1, emb2], dim=-1)
+            # Pad to max_seq_len with zeros
+            combined_emb = F.pad(combined_emb, (0, 0, 0, max_seq_len - combined_emb.shape[1]), "constant", 0.0)
+            prompt_embeds_batch.append(combined_emb)
+            pooled_prompt_embeds_batch.append(pooled)
+            continue
+        
+        # Long caption: chunk it
+        words = caption.split()  # Word split to preserve meaning (better than char/token split)
+        chunk_size = max_chunk_length
+        chunks = []
+        current_chunk = []
+        current_len = 0
+        for word in words:
+            # Estimate token len (approx; could tokenize incrementally for precision)
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                word_tokens = len(tokenizer1(word, add_special_tokens=False).input_ids)
+            if current_len + word_tokens > chunk_size and current_chunk:
+                chunks.append(' '.join(current_chunk))
+                current_chunk = [word]
+                current_len = word_tokens
+            else:
+                current_chunk.append(word)
+                current_len += word_tokens
+        if current_chunk:
+            chunks.append(' '.join(current_chunk))
+        
+        # Cap chunks to max_total_tokens / 77
+        chunks = chunks[:max_chunks]
+        
+        chunk_embeds = []
+        chunk_pooled = []
+        for chunk in chunks:
+            inputs1 = tokenizer1(chunk, padding="max_length", max_length=model_max_length, truncation=True, return_tensors="pt")
+            inputs2 = tokenizer2(chunk, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
+            with torch.no_grad():
+                emb1 = text_encoder1(inputs1.input_ids.to(device), output_hidden_states=True).hidden_states[-2]
+                emb2_out = text_encoder2(inputs2.input_ids.to(device), output_hidden_states=True)
+                emb2 = emb2_out.hidden_states[-2]
+                pooled = emb2_out.text_embeds
+            combined_emb = torch.cat([emb1, emb2], dim=-1)
+            chunk_embeds.append(combined_emb)
+            chunk_pooled.append(pooled)
+        
+        # Concat on seq_len (dim=1)
+        full_emb = torch.cat(chunk_embeds, dim=1)
+        # Pad to max_seq_len with zeros
+        full_emb = F.pad(full_emb, (0, 0, 0, max_seq_len - full_emb.shape[1]), "constant", 0.0)
+        # FIX IS HERE: Removed .unsqueeze(0)
+        full_pooled = torch.mean(torch.stack(chunk_pooled), dim=0)  # Average pooled
+        
+        prompt_embeds_batch.append(full_emb)
+        pooled_prompt_embeds_batch.append(full_pooled)
+    
+    return torch.cat(prompt_embeds_batch, dim=0), torch.cat(pooled_prompt_embeds_batch, dim=0)
+    
 class ImageTextLatentDataset(Dataset):
-    def __init__(self, data_root):
-        self.data_root = Path(data_root)
-        self.latent_files = sorted(list(self.data_root.rglob(".precomputed_embeddings_cache/*.pt")))
+    def __init__(self, config):
+        if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
+            config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
+        self.latent_files = []
+        should_mirror_repeats = getattr(config, 'MIRROR_REPEATS', False)
+        should_darken_repeats = getattr(config, 'DARKEN_REPEATS', False)
+        for dataset in config.INSTANCE_DATASETS:
+            root = Path(dataset["path"])
+            files = list(root.rglob(".precomputed_embeddings_cache/*.pt"))
+            repeats = dataset.get("repeats", 1)
+            
+            # The first pass is always the original
+            self.latent_files.extend([(f, "original") for f in files])
+            
+            # For subsequent repeats, add the appropriate variant
+            if repeats > 1:
+                for _ in range(repeats - 1):
+                    if should_darken_repeats and should_mirror_repeats:
+                        self.latent_files.extend([(f, "flipped_contrast") for f in files])
+                    elif should_darken_repeats:
+                        self.latent_files.extend([(f, "contrast") for f in files])
+                    elif should_mirror_repeats:
+                        self.latent_files.extend([(f, "flipped") for f in files])
+                    else:
+                        self.latent_files.extend([(f, "original") for f in files])
+
+        self.latent_files = sorted(self.latent_files, key=lambda x: str(x[0]))
         if not self.latent_files:
-            raise ValueError(f"No cached embedding files found in subdirectories of {self.data_root}. Please ensure pre-caching was successful.")
-        print(f"Dataset initialized with {len(self.latent_files)} pre-cached samples from all subdirectories.")
+            raise ValueError("No cached embedding files found in the datasets. Please ensure pre-caching was successful.")
+        print(f"Dataset initialized with {len(self.latent_files)} pre-cached samples (including repeats) from all datasets.")
+
     def __len__(self): return len(self.latent_files)
+
     def __getitem__(self, i):
+        file_path, variant_key = self.latent_files[i]
         try:
-            data = torch.load(self.latent_files[i], map_location="cpu")
-            if torch.isnan(data["latents_cpu"]).any() or torch.isinf(data["latents_cpu"]).any():
+            full_data = torch.load(file_path, map_location="cpu")
+            if variant_key not in full_data:
+                print(f"WARNING: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
+                variant_key = "original"
+            variant_data = full_data[variant_key]
+            if torch.isnan(variant_data["latents_cpu"]).any() or torch.isinf(variant_data["latents_cpu"]).any():
                 raise ValueError("NaN/Inf in latents")
-            return data
+            return {
+                "latents_cpu": variant_data["latents_cpu"],
+                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"],
+                "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"],
+                "original_size_as_tuple": full_data["original_size_as_tuple"],
+                "target_size_as_tuple": full_data["target_size_as_tuple"],
+            }
         except Exception as e:
-            print(f"WARNING: Skipping bad .pt file {self.latent_files[i]}: {e}")
+            print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
             return None
+        
 def custom_collate_fn_latent(batch):
     batch = list(filter(None, batch))
     if not batch: return {}
@@ -473,7 +706,11 @@ def main():
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True); CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    if not Path(config.INSTANCE_DATA_DIR).exists(): raise FileNotFoundError(f"Data dir not found: {config.INSTANCE_DATA_DIR}")
+    if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
+        if not Path(config.INSTANCE_DATA_DIR).exists(): raise FileNotFoundError(f"Data dir not found: {config.INSTANCE_DATA_DIR}")
+    else:
+        for ds in config.INSTANCE_DATASETS:
+            if not Path(ds["path"]).exists(): raise FileNotFoundError(f"Data dir not found: {ds['path']}")
     if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
     config.compute_dtype = torch.bfloat16 if config.MIXED_PRECISION == "bfloat16" else torch.float16
     print(f"Using compute dtype: {config.compute_dtype}, Device: {device}")
@@ -572,7 +809,7 @@ def main():
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
-    train_dataset = ImageTextLatentDataset(config.INSTANCE_DATA_DIR)
+    train_dataset = ImageTextLatentDataset(config)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=False, pin_memory=True)
    
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"

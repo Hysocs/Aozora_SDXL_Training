@@ -1,8 +1,11 @@
 {
     "SINGLE_FILE_CHECKPOINT_PATH": "./Aozora-XL_vPredV1-Final.safetensors",
-    "INSTANCE_DATA_DIR": "./DatasetV1/",
+    "INSTANCE_DATASETS": [],
     "OUTPUT_DIR": "./sdxl_finetune_output",
     "FORCE_RECACHE_LATENTS": false,
+    "MIRROR_REPEATS": false,
+    "DARKEN_REPEATS": false,
+    "GAMMA_VALUE": 2.0,
     "CACHING_BATCH_SIZE": 3,
     "BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
@@ -32,10 +35,10 @@
         "attn1",
         "attn2",
         "ff",
+        "time_embedding",
         "time_emb_proj",
         "conv_in",
-        "conv_out",
-        "time_embedding"
+        "conv_out"
     ],
     "USE_PER_CHANNEL_NOISE": true,
     "USE_MIN_SNR_GAMMA": true,
