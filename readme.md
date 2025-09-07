@@ -4,7 +4,7 @@ A user-friendly graphical interface (GUI) for fine-tuning Stable Diffusion XL (S
 
 The goal of this project is to provide a simple yet powerful way for users to fine-tune SDXL without needing to edit scripts or manage complex command-line arguments. Everything is controlled through the GUI.
 
-- **Please note that the model only works with vpred models supporting the standard format, merged or lora merged models may not train and layer selection is hand crafted for my model**
+- **Please note that the Trainer only works with vpred models supporting the standard format, merged or lora merged models may not train and layer selection is hand crafted for my model**
 
 <img src="https://i.imgur.com/IK57j6r.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/Sv54FgU.png" alt="Gui" width="850"/>
