@@ -27,9 +27,26 @@
     "RESUME_TRAINING": false,
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
-    "UNET_LEARNING_RATE": 8e-07,
-    "LR_SCHEDULER_TYPE": "cosine",
-    "LR_WARMUP_PERCENT": 0.25,
+    "LR_CUSTOM_CURVE": [
+        [
+            0.0,
+            0.0
+        ],
+        [
+            0.05411765,
+            5e-07
+        ],
+        [
+            0.70823529,
+            5e-07
+        ],
+        [
+            1.0,
+            0.0
+        ]
+    ],
+    "LR_GRAPH_MIN": 0.0,
+    "LR_GRAPH_MAX": 1e-06,
     "CLIP_GRAD_NORM": 1.0,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -49,5 +66,8 @@
     "IP_NOISE_GAMMA": 0.01,
     "USE_RESIDUAL_SHIFTING": false,
     "USE_COND_DROPOUT": true,
-    "COND_DROPOUT_PROB": 0.1
+    "COND_DROPOUT_PROB": 0.1,
+    "UNET_LEARNING_RATE": "8e-07",
+    "LR_SCHEDULER_TYPE": "cosine",
+    "LR_WARMUP_PERCENT": "0.25"
 }

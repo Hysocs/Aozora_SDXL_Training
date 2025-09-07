@@ -5,7 +5,7 @@
 # ====================================================================================
 
 # --- Paths ---
-SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safetensors"
+SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safensors"
 INSTANCE_DATASETS = [{"path": "./DatasetV1/", "repeats": 1}]
 OUTPUT_DIR = "./sdxl_finetune_output"
 
@@ -33,13 +33,20 @@ SAVE_EVERY_N_STEPS = 5000
 # --- Resume from Checkpoint (Manual Paths) ---
 RESUME_TRAINING = False
 # These paths are used ONLY if RESUME_TRAINING is True
-RESUME_MODEL_PATH = "" # e.g., "./sdxl_finetune_output/checkpoints/checkpoint_step_5000.safetensors"
+RESUME_MODEL_PATH = "" # e.g., "./sdxl_finetune_output/checkpoints/checkpoint_step_5000.safensors"
 RESUME_STATE_PATH = "" # e.g., "./sdxl_finetune_output/checkpoints/training_state_step_5000.pt"
 
 # --- Learning Rate & Optimizer ---
-UNET_LEARNING_RATE = 8e-7
-LR_SCHEDULER_TYPE = "cosine"
-LR_WARMUP_PERCENT = 0.25 # e.g., 0.1 for 10% of total steps
+# Points are defined as [step_percentage, absolute_learning_rate]
+LR_CUSTOM_CURVE = [
+    [0.0, 0.0],
+    [0.05, 8.0e-7],
+    [0.85, 8.0e-7],
+    [1.0, 1.0e-7]
+]
+# These control the visible Y-axis range of the graph in the GUI
+LR_GRAPH_MIN = 0.0
+LR_GRAPH_MAX = 1.0e-6
 CLIP_GRAD_NORM = 1.0
 
 # --- Layer Training Targets (UNet-Only) ---

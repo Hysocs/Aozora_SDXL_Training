@@ -19,6 +19,7 @@ bitsandbytes==0.46.0
 PyQt6
 xformers
 lpips
+pyqtgraph
 triton-windows
 opencv-python-headless
 lion-pytorch

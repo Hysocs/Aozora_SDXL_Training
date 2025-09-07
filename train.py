@@ -14,6 +14,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader
+from torch.optim.lr_scheduler import _LRScheduler
 from diffusers import StableDiffusionXLPipeline, DDPMScheduler
 from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile
@@ -21,8 +22,6 @@ from torchvision import transforms
 from tqdm.auto import tqdm
 from transformers import (
     Adafactor,
-    get_linear_schedule_with_warmup,
-    get_cosine_schedule_with_warmup,
 )
 import logging
 import warnings
@@ -31,11 +30,68 @@ import multiprocessing
 from multiprocessing import Pool, cpu_count
 import argparse
 import copy
+import signal
 import numpy as np
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
 Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
+
+class CustomCurveScheduler(_LRScheduler):
+    """
+    Custom learning rate scheduler that interpolates linearly between points
+    defined in a custom curve, synced with the global training step.
+    """
+    def __init__(self, optimizer, lr_curve_points, max_steps, last_epoch=-1):
+        if not lr_curve_points or len(lr_curve_points) < 2:
+            raise ValueError("LR_CUSTOM_CURVE must contain at least two points.")
+            
+        # Convert normalized steps (0.0 to 1.0) to absolute steps
+        self.absolute_points = sorted([[p[0] * max_steps, p[1]] for p in lr_curve_points])
+        
+        # Ensure the curve starts at step 0 and ends at max_steps for proper interpolation
+        if self.absolute_points[0][0] > 0:
+            self.absolute_points.insert(0, [0, self.absolute_points[0][1]])
+        if self.absolute_points[-1][0] < max_steps:
+             self.absolute_points.append([max_steps, self.absolute_points[-1][1]])
+
+        # CORRECTED LINE: The 'verbose' argument is deprecated and has been removed.
+        super().__init__(optimizer, last_epoch)
+
+    def get_lr(self):
+        # self.last_epoch is the current global step number (0-indexed)
+        current_step = self.last_epoch
+
+        # Find the two points the current step is between
+        p1 = None
+        p2 = None
+        # Handle the very last step explicitly
+        if current_step >= self.absolute_points[-1][0]:
+            return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
+
+        for i in range(len(self.absolute_points) - 1):
+            if self.absolute_points[i][0] <= current_step < self.absolute_points[i+1][0]:
+                p1 = self.absolute_points[i]
+                p2 = self.absolute_points[i+1]
+                break
+        
+        if p1 is None or p2 is None:
+             # Should not happen with the guards above, but as a fallback
+            return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
+
+        step1, lr1 = p1
+        step2, lr2 = p2
+
+        # Avoid division by zero if points have the same step coordinate
+        if step2 == step1:
+            return [lr1 for _ in self.optimizer.param_groups]
+            
+        # Linear interpolation
+        progress = (current_step - step1) / (step2 - step1)
+        current_lr = lr1 + progress * (lr2 - lr1)
+
+        return [current_lr for _ in self.optimizer.param_groups]
+    
 class TrainingConfig:
     def __init__(self):
         for key, value in default_config.__dict__.items():
@@ -63,7 +119,7 @@ class TrainingConfig:
         else:
             print("INFO: No configuration file specified. Using default settings.")
             
-        float_keys = ["UNET_LEARNING_RATE", "LR_WARMUP_PERCENT", "CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
+        float_keys = ["CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT"]
         bool_keys = [
@@ -378,14 +434,6 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
     vae.cpu(); text_encoder1.cpu(); text_encoder2.cpu(); gc.collect(); torch.cuda.empty_cache()
 
 def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device, max_chunk_length=75, max_total_tokens=300):
-    """
-    Compute embeddings for long captions by chunking without truncation.
-    - Splits each caption into ~75-token chunks (word-aware split).
-    - Encodes each chunk separately.
-    - Concatenates hidden states on seq_len dim.
-    - Averages pooled embeds across chunks.
-    - Caps at max_total_tokens to avoid excessive VRAM.
-    """
     import warnings
     
     prompt_embeds_batch = []
@@ -396,13 +444,11 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
     max_seq_len = max_chunks * model_max_length
     
     for caption in captions_batch:
-        # Tokenize full caption to check length, suppressing warning
         with warnings.catch_warnings():
             warnings.simplefilter("ignore")
             full_tokens1 = tokenizer1(caption, return_tensors="pt", add_special_tokens=True).input_ids[0]
         
         if len(full_tokens1) <= model_max_length:
-            # Short caption: encode normally
             inputs1 = tokenizer1(caption, padding="max_length", max_length=model_max_length, truncation=True, return_tensors="pt")
             inputs2 = tokenizer2(caption, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
             with torch.no_grad():
@@ -411,20 +457,17 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
                 emb2 = emb2_out.hidden_states[-2]
                 pooled = emb2_out.text_embeds
             combined_emb = torch.cat([emb1, emb2], dim=-1)
-            # Pad to max_seq_len with zeros
             combined_emb = F.pad(combined_emb, (0, 0, 0, max_seq_len - combined_emb.shape[1]), "constant", 0.0)
             prompt_embeds_batch.append(combined_emb)
             pooled_prompt_embeds_batch.append(pooled)
             continue
         
-        # Long caption: chunk it
-        words = caption.split()  # Word split to preserve meaning (better than char/token split)
+        words = caption.split()
         chunk_size = max_chunk_length
         chunks = []
         current_chunk = []
         current_len = 0
         for word in words:
-            # Estimate token len (approx; could tokenize incrementally for precision)
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore")
                 word_tokens = len(tokenizer1(word, add_special_tokens=False).input_ids)
@@ -438,7 +481,6 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
         if current_chunk:
             chunks.append(' '.join(current_chunk))
         
-        # Cap chunks to max_total_tokens / 77
         chunks = chunks[:max_chunks]
         
         chunk_embeds = []
@@ -455,15 +497,17 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
             chunk_embeds.append(combined_emb)
             chunk_pooled.append(pooled)
         
-        # Concat on seq_len (dim=1)
         full_emb = torch.cat(chunk_embeds, dim=1)
-        # Pad to max_seq_len with zeros
         full_emb = F.pad(full_emb, (0, 0, 0, max_seq_len - full_emb.shape[1]), "constant", 0.0)
-        # FIX IS HERE: Removed .unsqueeze(0)
-        full_pooled = torch.mean(torch.stack(chunk_pooled), dim=0)  # Average pooled
+        
+        # --- THE FIX ---
+        # The standard approach is to use the pooled embedding from the FIRST chunk only,
+        # as it is assumed to contain the primary subject of the prompt.
+        # Averaging dilutes the conceptual signal.
+        first_chunk_pooled = chunk_pooled[0]
         
         prompt_embeds_batch.append(full_emb)
-        pooled_prompt_embeds_batch.append(full_pooled)
+        pooled_prompt_embeds_batch.append(first_chunk_pooled)
     
     return torch.cat(prompt_embeds_batch, dim=0), torch.cat(pooled_prompt_embeds_batch, dim=0)
     
@@ -775,17 +819,27 @@ def main():
    
     if not params_to_optimize:
         raise ValueError("No parameters were selected for training. Please specify valid UNET_TRAIN_TARGETS.")
-    optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": config.UNET_LEARNING_RATE}]
+        
+    # Find the initial learning rate from the start of the curve (the LR at step 0).
+    initial_lr = config.LR_CUSTOM_CURVE[0][1] if hasattr(config, "LR_CUSTOM_CURVE") and config.LR_CUSTOM_CURVE else 0.0
+    print(f"INFO: Setting initial optimizer LR to {initial_lr:.2e} (will be controlled by scheduler).")
+    optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": initial_lr}]
+
     unet_trainable_params = sum(p.numel() for p in params_to_optimize)
     unet_total_params_count = sum(p.numel() for p in unet.parameters())
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M")
-    print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | LR: {config.UNET_LEARNING_RATE:.2e} | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
+    print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
    
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
-    num_update_steps = math.ceil(config.MAX_TRAIN_STEPS / config.GRADIENT_ACCUMULATION_STEPS)
-    num_warmup_update_steps = math.ceil(num_update_steps * config.LR_WARMUP_PERCENT)
-    lr_scheduler_class = get_linear_schedule_with_warmup if config.LR_SCHEDULER_TYPE == "linear" else get_cosine_schedule_with_warmup
-    lr_scheduler = lr_scheduler_class(optimizer=optimizer, num_warmup_steps=num_warmup_update_steps, num_training_steps=num_update_steps)
+    
+    if not hasattr(config, "LR_CUSTOM_CURVE") or not config.LR_CUSTOM_CURVE:
+        raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'. Please define it in your config file.")
+    print("INFO: Using CustomCurveScheduler for learning rate based on the GUI curve.")
+    lr_scheduler = CustomCurveScheduler(
+        optimizer=optimizer,
+        lr_curve_points=config.LR_CUSTOM_CURVE,
+        max_steps=config.MAX_TRAIN_STEPS
+    )
    
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
@@ -802,6 +856,9 @@ def main():
                 state['scheduler_state_dict'] = sanitize_state(state['scheduler_state_dict'])
        
         global_step = state['step']
+        # Advance the scheduler to the loaded step to ensure LR is correct
+        # The last_epoch in the loaded state should already be correct, but this is a safeguard
+        lr_scheduler.last_epoch = global_step
         optimizer.load_state_dict(state['optimizer_state_dict'])
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
         del state; gc.collect(); torch.cuda.empty_cache()
@@ -821,6 +878,12 @@ def main():
     batch = prefetcher.next()
     ema_loss = None
     ema_decay = 0.99
+    
+    # Correct initial LR if resuming
+    if global_step > 0:
+        for g in optimizer.param_groups:
+            g['lr'] = lr_scheduler.get_last_lr()[0]
+            
     while global_step < config.MAX_TRAIN_STEPS:
         if batch is None:
             prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
@@ -831,33 +894,24 @@ def main():
         latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
        
         if config.USE_PER_CHANNEL_NOISE:
-            # This is the default, multi-color static behavior
             noise = torch.randn_like(latents)
         else:
-            # This is the monochromatic (single-color) static behavior
-            # 1. Create noise for a single channel
             noise_mono = torch.randn_like(latents[:, :1, :, :])
-            # 2. Repeat this noise across all channels
             noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
             
 
         timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device)
-       
         latents = apply_perturbations(config, latents)
-       
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_prediction_model else noise
-       
         original_sizes, target_sizes = batch["original_sizes"], batch["target_sizes"]
         crops_coords_top_left = [(0, 0) for _ in original_sizes]
         add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
-       
         prompt_embeds, pooled_prompt_embeds = apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds)
        
         forward_start = time.time()
         with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
-           
             loss = compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_prediction_model)
             if ema_loss is None:
                 ema_loss = loss.item()
@@ -878,10 +932,8 @@ def main():
                     [p for p in params_to_optimize if p.grad is not None],
                     config.CLIP_GRAD_NORM
                 )
-               
                 scaler.step(optimizer)
                 scaler.update()
-                lr_scheduler.step()
             else:
                 print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients. Skipping optimizer step to prevent corruption. Check learning rate and data.")
             optimizer.zero_grad(set_to_none=True)
@@ -893,11 +945,16 @@ def main():
                 "mem_gb": f"{torch.cuda.memory_reserved() / 1e9:.2f}"
             })
         optim_time = time.time() - optim_start
-        print(f"Step {global_step}: Data={data_fetch_time - optim_start:.3f}s, Forward={forward_time:.3f}s, Backward={backward_time:.3f}s, Optim={optim_time:.3f}s")
+        # print(f"Step {global_step}: Data={data_fetch_time - optim_start:.3f}s, Forward={forward_time:.3f}s, Backward={backward_time:.3f}s, Optim={optim_time:.3f}s")
         if torch.isnan(loss):
             print(f"NaN detected at step {global_step}, timesteps={timesteps}")
             raise ValueError("NaN in loss")
         progress_bar.update(1)
+        
+        # Step the scheduler every global step to keep it synced with the GUI curve.
+        # This should happen after the optimizer step for the current iteration.
+        lr_scheduler.step()
+        
         global_step += 1
        
         batch = prefetcher.next()
