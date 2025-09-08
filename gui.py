@@ -1,4 +1,3 @@
-
 import json
 import os
 import re
@@ -12,6 +11,7 @@ import sys
 from pathlib import Path
 import random
 import shutil
+import math # <-- Required for the new logarithmic calculations
 
 STYLESHEET = """
 QWidget {
@@ -145,6 +145,9 @@ class LRCurveWidget(QtWidgets.QWidget):
     pointsChanged = QtCore.pyqtSignal(list)
     selectionChanged = QtCore.pyqtSignal(int)
 
+    # This is used ONLY when min_lr_bound is 0 to prevent log(0) errors.
+    LOG_FLOOR_DIVISOR = 10000.0
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(250)
@@ -197,23 +200,65 @@ class LRCurveWidget(QtWidgets.QWidget):
     def get_points(self):
         return self._points
 
+    def _get_log_range(self):
+        """Calculates the log range, correctly handling a min_lr_bound of 0."""
+        safe_max_lr = max(self.max_lr_bound, 1e-12)
+        log_max = math.log(safe_max_lr)
+        
+        # Determine the effective minimum for the log calculation
+        if self.min_lr_bound > 0:
+            effective_min_lr = self.min_lr_bound
+        else:
+            # If user wants 0, we need a small internal floor for the math
+            effective_min_lr = safe_max_lr / self.LOG_FLOOR_DIVISOR
+        
+        # Clamp to a very small positive number to be safe
+        effective_min_lr = max(effective_min_lr, 1e-12)
+        log_min = math.log(effective_min_lr)
+        
+        return log_max, log_min
+
     def _to_pixel_coords(self, norm_x, abs_lr):
         graph_width = self.width() - self.padding['left'] - self.padding['right']
         graph_height = self.height() - self.padding['top'] - self.padding['bottom']
+        
         px = self.padding['left'] + norm_x * graph_width
-        y_range = self.max_lr_bound - self.min_lr_bound
-        if y_range == 0: y_range = 1.0
-        normalized_y = (abs_lr - self.min_lr_bound) / y_range
+        
+        # If the value is at or below the defined minimum, pin it to the bottom.
+        if abs_lr <= self.min_lr_bound:
+            py = self.padding['top'] + graph_height
+            return QtCore.QPointF(px, py)
+
+        log_max, log_min = self._get_log_range()
+        log_range = log_max - log_min
+
+        if log_range <= 0:
+            py = self.padding['top'] # Should be at max value
+            return QtCore.QPointF(px, py)
+
+        normalized_y = (math.log(abs_lr) - log_min) / log_range
         py = self.padding['top'] + (1 - normalized_y) * graph_height
         return QtCore.QPointF(px, py)
 
     def _to_data_coords(self, px, py):
         graph_width = self.width() - self.padding['left'] - self.padding['right']
         graph_height = self.height() - self.padding['top'] - self.padding['bottom']
+        
         norm_x = (px - self.padding['left']) / graph_width
-        normalized_y = 1 - ((py - self.padding['top']) / graph_height)
-        y_range = self.max_lr_bound - self.min_lr_bound
-        abs_lr = self.min_lr_bound + (normalized_y * y_range)
+        # Clamp normalized_y to [0, 1] to prevent values outside the bounds
+        clamped_py = max(self.padding['top'], min(py, self.padding['top'] + graph_height))
+        normalized_y = 1 - ((clamped_py - self.padding['top']) / graph_height)
+        
+        log_max, log_min = self._get_log_range()
+        log_range = log_max - log_min
+
+        if log_range <= 0:
+            abs_lr = self.min_lr_bound
+        else:
+            log_val = log_min + (normalized_y * log_range)
+            abs_lr = math.exp(log_val)
+            
+        # The final value must always respect the user-defined bounds.
         clamped_lr = max(self.min_lr_bound, min(self.max_lr_bound, abs_lr))
         return max(0.0, min(1.0, norm_x)), clamped_lr
 
@@ -230,7 +275,7 @@ class LRCurveWidget(QtWidgets.QWidget):
 
     def draw_grid_and_labels(self, painter, rect):
         painter.setPen(self.grid_color)
-        for i in range(5):
+        for i in range(5): # 5 lines for 4 sections
             y = rect.top() + (i / 4.0) * rect.height()
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
             x = rect.left() + (i / 4.0) * rect.width()
@@ -247,18 +292,33 @@ class LRCurveWidget(QtWidgets.QWidget):
         font = self.font(); font.setPointSize(10); painter.setFont(font)
         painter.setPen(self.text_color)
 
-        y_range = self.max_lr_bound - self.min_lr_bound
+        log_max, log_min = self._get_log_range()
+        log_range = log_max - log_min
+        
         for i in range(5):
-            lr_val = self.max_lr_bound - (i / 4.0) * y_range
+            normalized_y = 1.0 - (i / 4.0) # 1.0 for top, 0.0 for bottom
+            
+            # Anchor top and bottom labels to the exact bounds
+            if i == 0:
+                lr_val = self.max_lr_bound
+            elif i == 4:
+                lr_val = self.min_lr_bound
+            else:
+                if log_range > 0:
+                    lr_val = math.exp(log_min + (normalized_y * log_range))
+                else: # Fallback for flat range
+                    lr_val = self.max_lr_bound
+
             label = f"{lr_val:.1e}"
             y = rect.top() + (i / 4.0) * rect.height()
             painter.drawText(QtCore.QRect(0, int(y - 10), self.padding['left'] - 5, 20),
                              QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
+            
             step_val = int(self.max_steps * (i / 4.0))
-            label = str(step_val)
+            label_x = str(step_val)
             x = rect.left() + (i / 4.0) * rect.width()
             painter.drawText(QtCore.QRect(int(x - 50), rect.bottom() + 5, 100, 20),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, label)
+                             QtCore.Qt.AlignmentFlag.AlignCenter, label_x)
         
         small_font = self.font()
         small_font.setPointSize(8)
@@ -332,7 +392,7 @@ class LRCurveWidget(QtWidgets.QWidget):
     def mouseReleaseEvent(self, event):
         if event.button() != QtCore.Qt.MouseButton.LeftButton: return
         self._dragging_point_index = -1
-        self.set_points(self._points)
+        self.set_points(self._points) # Re-sorts and updates visuals
         self.pointsChanged.emit(self._points)
 
     def add_point(self):
@@ -348,7 +408,17 @@ class LRCurveWidget(QtWidgets.QWidget):
         if insert_idx != -1:
             prev_p = self._points[insert_idx - 1]
             next_p = self._points[insert_idx]
-            new_p = [(prev_p[0] + next_p[0]) / 2, (prev_p[1] + next_p[1]) / 2]
+            
+            # When inserting a point, do it in log space to make it visually centered
+            _, log_min = self._get_log_range()
+            # Use max with a small number to avoid log(0) on existing points
+            log_prev = math.log(max(prev_p[1], 1e-12))
+            log_next = math.log(max(next_p[1], 1e-12))
+            
+            # Ensure the interpolated value doesn't go below the graph's floor
+            new_lr = math.exp(max(log_min, (log_prev + log_next) / 2))
+            
+            new_p = [(prev_p[0] + next_p[0]) / 2, new_lr]
             self._points.insert(insert_idx, new_p)
             self.set_points(self._points)
             self.pointsChanged.emit(self._points)
@@ -843,68 +913,151 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_lr_button_states(-1)
 
     def _set_cosine_preset(self):
-        try: max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-        except ValueError: max_lr = 1e-6
-        points = [[0.0, 0.0], [0.05, max_lr], [0.5, max_lr / 2], [1.0, 0.0]]
+        try:
+            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
+            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
+        except (ValueError, KeyError):
+            self.log("ERROR: Min/Max LR must be set to use this preset.")
+            return
+
+        # --- Behavior Definitions ---
+        warmup_portion = 0.05  # Use the first 5% of steps to warm up to max_lr
+        num_curve_points = 10  # Generate 30 points to create a smooth curve
+
+        # --- Point Generation ---
+        points = []
+        # 1. Start at min_lr and add the warmup point
+        points.append([0.0, min_lr])
+        points.append([warmup_portion, max_lr])
+        
+        # 2. Generate the cosine curve points after the warmup
+        # The cosine decay happens in the range from warmup_portion to 1.0
+        decay_duration = 1.0 - warmup_portion
+        for i in range(num_curve_points):
+            # 'progress' goes from 0.0 to 1.0, representing how far along the cosine decay we are
+            progress = i / (num_curve_points - 1)
+            
+            # Calculate the X-axis value (the overall training progress)
+            norm_x = warmup_portion + progress * decay_duration
+            
+            # Calculate the LR using the cosine annealing formula
+            cosine_val = 0.5 * (1 + math.cos(math.pi * progress))
+            lr_val = min_lr + (max_lr - min_lr) * cosine_val
+            
+            points.append([norm_x, lr_val])
+
         self.lr_curve_widget.set_points(points)
         self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Cosine learning rate preset.")
+        self.log("Applied mathematical Cosine preset with warmup.")
 
     def _set_linear_preset(self):
-        try: max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-        except ValueError: max_lr = 1e-6
-        points = [[0.0, 0.0], [0.05, max_lr], [1.0, 0.0]]
+        try:
+            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
+            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
+        except (ValueError, KeyError):
+            self.log("ERROR: Min/Max LR must be set to use this preset.")
+            return
+
+        # A linear schedule is a simple triangle: warmup, then linear decay.
+        warmup_portion = 0.05  # Use 5% of steps for warmup
+
+        points = [
+            [0.0, min_lr],              # Start at min
+            [warmup_portion, max_lr],   # Peak at the end of warmup
+            [1.0, min_lr]               # Linearly decay to min
+        ]
+        
         self.lr_curve_widget.set_points(points)
         self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Linear learning rate preset.")
+        self.log("Applied Linear preset with warmup and decay.")
         
     def _set_constant_preset(self):
-        try: max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-        except ValueError: max_lr = 1e-6
-        points = [[0.0, 0.0], [0.05, max_lr], [0.9, max_lr], [1.0, 0.0]]
+        try:
+            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
+            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
+        except (ValueError, KeyError):
+            self.log("ERROR: Min/Max LR must be set to use this preset.")
+            return
+
+        # Warmup, hold constant at max_lr, then cooldown.
+        warmup_portion = 0.05   # 5% warmup
+        cooldown_portion = 0.10   # 10% cooldown at the end
+        cooldown_start = 1.0 - cooldown_portion
+
+        points = [
+            [0.0, min_lr],                  # Start at min
+            [warmup_portion, max_lr],       # End of warmup
+            [cooldown_start, max_lr],       # Start of cooldown
+            [1.0, min_lr]                   # End at min
+        ]
+        
         self.lr_curve_widget.set_points(points)
         self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Constant learning rate preset.")
+        self.log("Applied Constant preset with warmup and cooldown.")
 
     def _set_step_preset(self):
         try:
             max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
+            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-            total_images = int(self.total_repeats_label.text())
         except (ValueError, KeyError):
-            self.log("ERROR: Max LR, Max Steps, and Dataset must be set to use Step preset.")
+            self.log("ERROR: Min/Max LR and Max Steps must be set to use this preset.")
             return
 
-        if total_images <= 0 or max_steps <= 0:
-            self.log("ERROR: Cannot generate Step preset without images and >0 steps.")
+        if max_steps <= 0:
+            self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
             return
         
-        steps_per_epoch = total_images
-        num_stairs = 4
-        cooldown_epochs = 2
-        start_lr = max_lr / 2.0
-        lr_increment = (max_lr - start_lr) / (num_stairs - 1) if num_stairs > 1 else 0
+        # --- BEHAVIOR DEFINITIONS ---
+        num_stairs = 4                      # The number of distinct learning rate steps
+        stairs_end_portion = 0.5            # Fit all stairs into the first 50% of training
+        cooldown_start_portion = 0.9        # Start the final LR decay at 90% of training
 
+        # --- LOGARITHMIC CALCULATIONS ---
+        # To make steps visually even, we must work in log space.
+        
+        # 1. Define the safe logarithmic range, handling min_lr = 0.
+        # A very small number is used as a floor to prevent math.log(0) errors.
+        safe_min_lr = max(min_lr, 1e-12)
+        log_min = math.log(safe_min_lr)
+        log_max = math.log(max_lr)
+
+        # 2. The first stair will be at the logarithmic midpoint, which is visually halfway.
+        log_start_lr = (log_min + log_max) / 2.0
+        
         points = []
+        steps_per_stair = (max_steps * stairs_end_portion) / num_stairs
+        
+        # --- POINT GENERATION ---
         for i in range(num_stairs):
-            current_lr = start_lr + i * lr_increment
-            start_step = i * steps_per_epoch
-            end_step = (i + 1) * steps_per_epoch
+            # 3. Interpolate evenly in LOG space from our start point to the max.
+            # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
+            interpolation_factor = i / (num_stairs - 1) if num_stairs > 1 else 1.0
             
-            if start_step >= max_steps: break
-
+            # This formula finds the evenly spaced log value for the current stair.
+            current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
+            
+            # 4. Convert the calculated log value back to a real LR value.
+            current_lr = math.exp(current_log_lr)
+            
+            start_step = i * steps_per_stair
+            end_step = (i + 1) * steps_per_stair
+            
+            # Add the two points that define the flat top of the stair
             points.append([start_step / max_steps, current_lr])
             points.append([(end_step - 1) / max_steps, current_lr])
 
-        cooldown_start_step = max_steps - (cooldown_epochs * steps_per_epoch)
-        if cooldown_start_step > (num_stairs * steps_per_epoch):
-             points.append([cooldown_start_step / max_steps, max_lr])
+        # Anchor the end of the stairs and create the flat top before cooldown
+        points.append([stairs_end_portion, max_lr])
+        points.append([cooldown_start_portion, max_lr])
+        
+        # Final decay to the user-defined minimum learning rate
+        points.append([1.0, min_lr])
 
-        points.append([1.0, 0.0])
-
+        # --- UPDATE WIDGET ---
         self.lr_curve_widget.set_points(points)
         self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Step learning rate preset.")
+        self.log(f"Applied mathematical Step preset. Start LR (visual midpoint): {math.exp(log_start_lr):.2e}")
 
     def _populate_advanced_tab(self, parent_widget):
         main_layout = QtWidgets.QHBoxLayout(parent_widget)
