@@ -922,7 +922,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         # --- Behavior Definitions ---
         warmup_portion = 0.05  # Use the first 5% of steps to warm up to max_lr
-        num_curve_points = 10  # Generate 30 points to create a smooth curve
+        num_curve_points = 15  # Generate 30 points to create a smooth curve
 
         # --- Point Generation ---
         points = []
