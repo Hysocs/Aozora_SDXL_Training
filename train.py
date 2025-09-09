@@ -758,10 +758,10 @@ def main():
     if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
     config.compute_dtype = torch.bfloat16 if config.MIXED_PRECISION == "bfloat16" else torch.float16
     print(f"Using compute dtype: {config.compute_dtype}, Device: {device}")
-   
+
     use_scaler = config.compute_dtype == torch.float16
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
-   
+
     print("Loading all components for embedding and latent generation...")
     temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype, use_safetensors=True)
     precompute_and_cache_latents(
@@ -774,7 +774,9 @@ def main():
         device_for_encoding=device,
     )
     del temp_pipe; gc.collect(); torch.cuda.empty_cache()
+
     global_step = 0
+
     model_to_load = config.SINGLE_FILE_CHECKPOINT_PATH
     latest_state_path = None
     if config.RESUME_TRAINING:
@@ -786,7 +788,7 @@ def main():
             model_to_load = str(resume_model_path); latest_state_path = resume_state_path
         else:
             print("[WARNING] Resume training is ON, but one or more paths are invalid. Reverting to base model.")
-   
+
     print(f"\nLoading model for training: {model_to_load}")
     pipeline_temp = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype, use_safetensors=True)
     unet = pipeline_temp.unet
@@ -796,7 +798,7 @@ def main():
     base_model_state_dict = load_file(model_to_load)
     del pipeline_temp.vae, pipeline_temp.tokenizer, pipeline_temp.tokenizer_2, pipeline_temp.text_encoder, pipeline_temp.text_encoder_2, pipeline_temp
     gc.collect(); torch.cuda.empty_cache()
-   
+
     if hasattr(unet, 'enable_xformers_memory_efficient_attention'):
         try:
             unet.enable_xformers_memory_efficient_attention()
@@ -811,16 +813,15 @@ def main():
                 print(f"WARNING: Could not enable any attention optimization. Training will be slower. Error: {e2}")
     unet.to(device).requires_grad_(False)
     if hasattr(unet, 'enable_gradient_checkpointing'): unet.enable_gradient_checkpointing()
-   
+
     print(f"Targeting UNet layers with keywords: {config.UNET_TRAIN_TARGETS}")
     unet_param_names_to_optimize = { name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS) }
     params_to_optimize = [p for n, p in unet.named_parameters() if n in unet_param_names_to_optimize]
     for p in params_to_optimize: p.requires_grad_(True)
-   
+
     if not params_to_optimize:
         raise ValueError("No parameters were selected for training. Please specify valid UNET_TRAIN_TARGETS.")
-        
-    # Find the initial learning rate from the start of the curve (the LR at step 0).
+
     initial_lr = config.LR_CUSTOM_CURVE[0][1] if hasattr(config, "LR_CUSTOM_CURVE") and config.LR_CUSTOM_CURVE else 0.0
     print(f"INFO: Setting initial optimizer LR to {initial_lr:.2e} (will be controlled by scheduler).")
     optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": initial_lr}]
@@ -829,9 +830,9 @@ def main():
     unet_total_params_count = sum(p.numel() for p in unet.parameters())
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M")
     print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
-   
+
     optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
-    
+
     if not hasattr(config, "LR_CUSTOM_CURVE") or not config.LR_CUSTOM_CURVE:
         raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'. Please define it in your config file.")
     print("INFO: Using CustomCurveScheduler for learning rate based on the GUI curve.")
@@ -840,24 +841,22 @@ def main():
         lr_curve_points=config.LR_CUSTOM_CURVE,
         max_steps=config.MAX_TRAIN_STEPS
     )
-   
+
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location=device)
-       
+
         opt_has_nan = has_nan_in_state(state['optimizer_state_dict'])
         sched_has_nan = has_nan_in_state(state['scheduler_state_dict'])
-       
+
         if opt_has_nan or sched_has_nan:
             print("WARNING: NaN/Inf detected in loaded optimizer or scheduler state! Sanitizing...")
             if opt_has_nan:
                 state['optimizer_state_dict'] = sanitize_state(state['optimizer_state_dict'])
             if sched_has_nan:
                 state['scheduler_state_dict'] = sanitize_state(state['scheduler_state_dict'])
-       
+
         global_step = state['step']
-        # Advance the scheduler to the loaded step to ensure LR is correct
-        # The last_epoch in the loaded state should already be correct, but this is a safeguard
         lr_scheduler.last_epoch = global_step
         optimizer.load_state_dict(state['optimizer_state_dict'])
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
@@ -868,18 +867,16 @@ def main():
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
     train_dataset = ImageTextLatentDataset(config)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=False, pin_memory=True)
-   
+
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
-   
+
     unet.train()
     progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
-   
+
     prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
     batch = prefetcher.next()
-    ema_loss = None
-    ema_decay = 0.99
+    loss_accumulator = 0.0
     
-    # Correct initial LR if resuming
     if global_step > 0:
         for g in optimizer.param_groups:
             g['lr'] = lr_scheduler.get_last_lr()[0]
@@ -889,7 +886,6 @@ def main():
             prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
             batch = prefetcher.next()
             if not batch: continue
-        data_fetch_time = time.time()
        
         latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
        
@@ -899,7 +895,6 @@ def main():
             noise_mono = torch.randn_like(latents[:, :1, :, :])
             noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
             
-
         timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device)
         latents = apply_perturbations(config, latents)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
@@ -909,25 +904,42 @@ def main():
         add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
         prompt_embeds, pooled_prompt_embeds = apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds)
        
-        forward_start = time.time()
         with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             loss = compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_prediction_model)
-            if ema_loss is None:
-                ema_loss = loss.item()
-            else:
-                ema_loss = ema_decay * ema_loss + (1 - ema_decay) * loss.item()
-        forward_time = time.time() - forward_start
-       
-        backward_start = time.time()
+
+        if not torch.isfinite(loss):
+            print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf loss. Skipping this micro-batch.")
+            # We still increment the step counters and progress bar to move on
+            global_step += 1
+            progress_bar.update(1)
+            lr_scheduler.step()
+            batch = prefetcher.next()
+            continue
+        
+        loss_accumulator += loss.item()
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        backward_time = time.time() - backward_start
-       
-        optim_start = time.time()
-        if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-            scaler.unscale_(optimizer)
+
+        global_step += 1
+        progress_bar.update(1)
+
+        # --- CONSOLIDATED LOGGING AND OPTIMIZER STEP ---
+        if global_step > 0 and global_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
+            # First, print a detailed log for the completed accumulation cycle
+            avg_loss = loss_accumulator / config.GRADIENT_ACCUMULATION_STEPS
+            current_lr = lr_scheduler.get_last_lr()[0]
+            tqdm.write(
+                f"Step: {global_step} | "
+                f"Avg Loss: {avg_loss:.5f} | "
+                f"LR: {current_lr:.3e} | "
+                f"VRAM: {torch.cuda.memory_reserved() / 1e9:.2f} GB"
+            )
+            loss_accumulator = 0.0  # Reset for the next cycle
+
+            # Then, perform the optimizer step
             all_grads_are_finite = all(torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
             if all_grads_are_finite:
+                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(
                     [p for p in params_to_optimize if p.grad is not None],
                     config.CLIP_GRAD_NORM
@@ -935,28 +947,11 @@ def main():
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients. Skipping optimizer step to prevent corruption. Check learning rate and data.")
+                print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients in accumulation cycle. Skipping optimizer step.")
+            
             optimizer.zero_grad(set_to_none=True)
-            progress_bar.set_postfix({
-                "loss": f"{loss.item():.4f}",
-                "ema_loss": f"{ema_loss:.4f}",
-                "lr": f"{lr_scheduler.get_last_lr()[0]:.2e}",
-                "timesteps_min_max": f"{timesteps.min().item()}-{timesteps.max().item()}",
-                "mem_gb": f"{torch.cuda.memory_reserved() / 1e9:.2f}"
-            })
-        optim_time = time.time() - optim_start
-        # print(f"Step {global_step}: Data={data_fetch_time - optim_start:.3f}s, Forward={forward_time:.3f}s, Backward={backward_time:.3f}s, Optim={optim_time:.3f}s")
-        if torch.isnan(loss):
-            print(f"NaN detected at step {global_step}, timesteps={timesteps}")
-            raise ValueError("NaN in loss")
-        progress_bar.update(1)
-        
-        # Step the scheduler every global step to keep it synced with the GUI curve.
-        # This should happen after the optimizer step for the current iteration.
+
         lr_scheduler.step()
-        
-        global_step += 1
-       
         batch = prefetcher.next()
        
         if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
@@ -973,6 +968,7 @@ def main():
         if global_step % 100 == 0:
              gc.collect()
         if global_step >= config.MAX_TRAIN_STEPS: break
+
     progress_bar.close()
     print("--> Training finished.")
     print("\nSaving final model...")
@@ -987,6 +983,7 @@ def main():
     )
     print(f"--> Final model saved to {output_path}")
     print("\nTRAINING COMPLETE")
+    
 if __name__ == "__main__":
     try:
         multiprocessing.set_start_method('spawn', force=True)

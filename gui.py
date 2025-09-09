@@ -921,34 +921,51 @@ class TrainingGUI(QtWidgets.QWidget):
             return
 
         # --- Behavior Definitions ---
-        warmup_portion = 0.05  # Use the first 5% of steps to warm up to max_lr
-        num_curve_points = 15  # Generate 30 points to create a smooth curve
+        warmup_portion = 0.10
+        num_decay_points = 10  # This is plenty for a smooth base curve
 
         # --- Point Generation ---
         points = []
-        # 1. Start at min_lr and add the warmup point
+
+        # 1. Define the Warmup
         points.append([0.0, min_lr])
         points.append([warmup_portion, max_lr])
-        
-        # 2. Generate the cosine curve points after the warmup
-        # The cosine decay happens in the range from warmup_portion to 1.0
+
+        # 2. Define the main Cosine Decay
         decay_duration = 1.0 - warmup_portion
-        for i in range(num_curve_points):
-            # 'progress' goes from 0.0 to 1.0, representing how far along the cosine decay we are
-            progress = i / (num_curve_points - 1)
-            
-            # Calculate the X-axis value (the overall training progress)
-            norm_x = warmup_portion + progress * decay_duration
-            
-            # Calculate the LR using the cosine annealing formula
-            cosine_val = 0.5 * (1 + math.cos(math.pi * progress))
+        for i in range(num_decay_points + 1):
+            decay_progress = i / num_decay_points
+            norm_x = warmup_portion + decay_progress * decay_duration
+            cosine_val = 0.5 * (1 + math.cos(math.pi * decay_progress))
             lr_val = min_lr + (max_lr - min_lr) * cosine_val
-            
             points.append([norm_x, lr_val])
 
-        self.lr_curve_widget.set_points(points)
-        self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied mathematical Cosine preset with warmup.")
+        # --- REFINEMENT: Add an extra point in the final segment to improve visual spacing ---
+        # Get the last two points we just generated
+        p_last = points[-1]
+        p_before_last = points[-2]
+
+        # Find the x-coordinate halfway between them
+        midpoint_x = (p_before_last[0] + p_last[0]) / 2.0
+
+        # Now, calculate the *correct* learning rate for that new x-coordinate.
+        # We must re-run the cosine formula to ensure the point lies ON the curve,
+        # not just on a straight line between the other two points.
+        midpoint_decay_progress = (midpoint_x - warmup_portion) / decay_duration
+        midpoint_cosine_val = 0.5 * (1 + math.cos(math.pi * midpoint_decay_progress))
+        midpoint_lr_val = min_lr + (max_lr - min_lr) * midpoint_cosine_val
+
+        # Add the new, interpolated point to our list
+        points.append([midpoint_x, midpoint_lr_val])
+        
+        # --- Finalization ---
+        # Use a set to remove any potential duplicate points from floating point inaccuracies,
+        # then sort the final list by the x-coordinate to ensure it's in the correct order.
+        unique_points = sorted(list(set(tuple(p) for p in points)), key=lambda x: x[0])
+        
+        self.lr_curve_widget.set_points(unique_points)
+        self.lr_curve_widget.pointsChanged.emit(unique_points)
+        self.log(f"Applied mathematical Cosine preset with {len(unique_points)} points (final segment refined).")
 
     def _set_linear_preset(self):
         try:
@@ -1007,9 +1024,16 @@ class TrainingGUI(QtWidgets.QWidget):
         if max_steps <= 0:
             self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
             return
+
+        try:
+            total_images = int(self.total_repeats_label.text())
+        except (ValueError, AttributeError):
+            total_images = 0
+
+        steps_per_epoch = total_images if total_images > 0 else 0
         
         # --- BEHAVIOR DEFINITIONS ---
-        num_stairs = 4                      # The number of distinct learning rate steps
+        num_stairs = 5                      # The number of distinct learning rate steps
         stairs_end_portion = 0.5            # Fit all stairs into the first 50% of training
         cooldown_start_portion = 0.9        # Start the final LR decay at 90% of training
 
@@ -1026,26 +1050,74 @@ class TrainingGUI(QtWidgets.QWidget):
         log_start_lr = (log_min + log_max) / 2.0
         
         points = []
-        steps_per_stair = (max_steps * stairs_end_portion) / num_stairs
         
-        # --- POINT GENERATION ---
-        for i in range(num_stairs):
-            # 3. Interpolate evenly in LOG space from our start point to the max.
-            # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
-            interpolation_factor = i / (num_stairs - 1) if num_stairs > 1 else 1.0
+        if steps_per_epoch > 0:
+            stairs_end_steps = int(max_steps * stairs_end_portion)
+            num_epochs_in_stairs = stairs_end_steps // steps_per_epoch
             
-            # This formula finds the evenly spaced log value for the current stair.
-            current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
+            if num_epochs_in_stairs > 0:
+                effective_num_stairs = min(num_stairs, num_epochs_in_stairs)
+                epochs_per_stair = num_epochs_in_stairs / effective_num_stairs
+                current_epoch = 0
+                
+                for i in range(effective_num_stairs):
+                    # Interpolate evenly in LOG space from our start point to the max.
+                    # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
+                    interpolation_factor = i / (effective_num_stairs - 1) if effective_num_stairs > 1 else 1.0
+                    
+                    # This formula finds the evenly spaced log value for the current stair.
+                    current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
+                    
+                    # Convert the calculated log value back to a real LR value.
+                    current_lr = math.exp(current_log_lr)
+                    
+                    # Calculate end epoch for this stair
+                    target_end_epoch = (i + 1) * epochs_per_stair
+                    end_epoch = round(target_end_epoch)
+                    end_epoch = min(end_epoch, num_epochs_in_stairs)
+                    
+                    # Ensure progression
+                    if end_epoch <= current_epoch:
+                        end_epoch = current_epoch + 1
+                        end_epoch = min(end_epoch, num_epochs_in_stairs)
+                    
+                    start_step = current_epoch * steps_per_epoch
+                    end_step = end_epoch * steps_per_epoch
+                    end_step = min(end_step, stairs_end_steps)
+                    
+                    # Add the two points that define the flat top of the stair
+                    points.append([start_step / max_steps, current_lr])
+                    points.append([end_step / max_steps, current_lr])
+                    
+                    current_epoch = end_epoch
+            else:
+                # Fallback even if steps_per_epoch > 0 but no epochs fit in stairs portion
+                pass
+        else:
+            # Fallback to original behavior if no total images
+            pass
+
+        if not points:  # Fallback if no epoch-aligned points generated
+            steps_per_stair = (max_steps * stairs_end_portion) / num_stairs
             
-            # 4. Convert the calculated log value back to a real LR value.
-            current_lr = math.exp(current_log_lr)
-            
-            start_step = i * steps_per_stair
-            end_step = (i + 1) * steps_per_stair
-            
-            # Add the two points that define the flat top of the stair
-            points.append([start_step / max_steps, current_lr])
-            points.append([(end_step - 1) / max_steps, current_lr])
+            # --- POINT GENERATION ---
+            for i in range(num_stairs):
+                # 3. Interpolate evenly in LOG space from our start point to the max.
+                # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
+                interpolation_factor = i / (num_stairs - 1) if num_stairs > 1 else 1.0
+                
+                # This formula finds the evenly spaced log value for the current stair.
+                current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
+                
+                # 4. Convert the calculated log value back to a real LR value.
+                current_lr = math.exp(current_log_lr)
+                
+                start_step = i * steps_per_stair
+                end_step = (i + 1) * steps_per_stair
+                
+                # Add the two points that define the flat top of the stair
+                points.append([start_step / max_steps, current_lr])
+                points.append([end_step / max_steps, current_lr])
 
         # Anchor the end of the stairs and create the flat top before cooldown
         points.append([stairs_end_portion, max_lr])
