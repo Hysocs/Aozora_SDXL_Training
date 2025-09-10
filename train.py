@@ -38,34 +38,24 @@ Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 
 class CustomCurveScheduler(_LRScheduler):
-    """
-    Custom learning rate scheduler that interpolates linearly between points
-    defined in a custom curve, synced with the global training step.
-    """
     def __init__(self, optimizer, lr_curve_points, max_steps, last_epoch=-1):
         if not lr_curve_points or len(lr_curve_points) < 2:
             raise ValueError("LR_CUSTOM_CURVE must contain at least two points.")
             
-        # Convert normalized steps (0.0 to 1.0) to absolute steps
         self.absolute_points = sorted([[p[0] * max_steps, p[1]] for p in lr_curve_points])
         
-        # Ensure the curve starts at step 0 and ends at max_steps for proper interpolation
         if self.absolute_points[0][0] > 0:
             self.absolute_points.insert(0, [0, self.absolute_points[0][1]])
         if self.absolute_points[-1][0] < max_steps:
              self.absolute_points.append([max_steps, self.absolute_points[-1][1]])
 
-        # CORRECTED LINE: The 'verbose' argument is deprecated and has been removed.
         super().__init__(optimizer, last_epoch)
 
     def get_lr(self):
-        # self.last_epoch is the current global step number (0-indexed)
         current_step = self.last_epoch
 
-        # Find the two points the current step is between
         p1 = None
         p2 = None
-        # Handle the very last step explicitly
         if current_step >= self.absolute_points[-1][0]:
             return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
 
@@ -76,17 +66,14 @@ class CustomCurveScheduler(_LRScheduler):
                 break
         
         if p1 is None or p2 is None:
-             # Should not happen with the guards above, but as a fallback
             return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
 
         step1, lr1 = p1
         step2, lr2 = p2
 
-        # Avoid division by zero if points have the same step coordinate
         if step2 == step1:
             return [lr1 for _ in self.optimizer.param_groups]
             
-        # Linear interpolation
         progress = (current_step - step1) / (step2 - step1)
         current_lr = lr1 + progress * (lr2 - lr1)
 
@@ -215,20 +202,13 @@ def resize_and_crop(image, target_w, target_h):
     return image.crop((left, top, left + target_w, top + target_h))
 
 def apply_sigmoid_contrast(image, gain=10, cutoff=0.5):
-    """
-    Increases contrast using a Sigmoid (S-Curve) function.
-    - gain (float): The steepness of the curve. Higher values mean more contrast. (e.g., 5-15)
-    - cutoff (float, 0-1): The midpoint of the contrast curve (0.5 is standard mid-gray).
-    """
     if image.mode != 'RGB':
         image = image.convert('RGB')
         
-    arr = np.array(image, dtype=np.float32) / 255.0  # Normalize to 0-1 range
+    arr = np.array(image, dtype=np.float32) / 255.0
     
-    # Apply the sigmoid function
     arr = 1 / (1 + np.exp(gain * (cutoff - arr)))
     
-    # Scale back to 0-255
     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
     
     return Image.fromarray(arr)
@@ -325,12 +305,11 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
             with torch.no_grad():
                 prompt_embeds_batch, pooled_prompt_embeds_batch = compute_chunked_text_embeddings(
                     captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device_for_encoding,
-                    max_chunk_length=75, max_total_tokens=300  # Adjust as needed;
+                    max_chunk_length=75, max_total_tokens=300
                 )
             
             variants = {}
             
-            # Original
             image_tensors = []
             for meta in batch_metadata:
                 try:
@@ -348,7 +327,6 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                 variants["original"] = latents_batch
                 del img_tensor_batch
             
-            # Contrast
             if config.DARKEN_REPEATS:
                 contrast_image_tensors = []
                 for meta in batch_metadata:
@@ -368,7 +346,6 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                     variants["contrast"] = contrast_latents_batch
                     del contrast_tensor_batch
             
-            # Flipped
             if config.MIRROR_REPEATS:
                 flipped_image_tensors = []
                 for meta in batch_metadata:
@@ -388,7 +365,6 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                     variants["flipped"] = flipped_latents_batch
                     del flipped_tensor_batch
             
-            # Flipped Contrast
             if config.MIRROR_REPEATS and config.DARKEN_REPEATS:
                 fc_image_tensors = []
                 for meta in batch_metadata:
@@ -519,10 +495,8 @@ class ImageTextLatentDataset(Dataset):
             files = list(root.rglob(".precomputed_embeddings_cache/*.pt"))
             repeats = dataset.get("repeats", 1)
             
-            # The first pass is always the original
             self.latent_files.extend([(f, "original") for f in files])
             
-            # For subsequent repeats, add the appropriate variant
             if repeats > 1:
                 for _ in range(repeats - 1):
                     if should_darken_repeats and should_mirror_repeats:
@@ -714,22 +688,16 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     return betas
 
 def sample_timesteps(config, noise_scheduler, batch_size, device, weights=None):
-    """
-    Selects timesteps for training based on the chosen sampling strategy.
-    """
     variant = getattr(config, "NOISE_SCHEDULE_VARIANT", "uniform")
 
     if variant == "residual_shifting":
-        # Hard clamp to the second half of the timesteps
         min_timestep = int(0.5 * noise_scheduler.config.num_train_timesteps)
         return torch.randint(min_timestep, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
     
     elif variant == "logsnr_laplace" and weights is not None:
-        # Importance sampling using pre-calculated LogSNR weights
         return torch.multinomial(weights, num_samples=batch_size, replacement=True).long()
     
-    else: # This covers "uniform" and any other fallback cases
-        # Standard uniform sampling
+    else: 
         return torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
     
 def apply_perturbations(config, latents):
@@ -743,21 +711,30 @@ def apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds):
     return prompt_embeds, pooled_prompt_embeds
 
 def compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_pred):
-    if is_v_pred and config.USE_MIN_SNR_GAMMA:
+    if is_v_pred and hasattr(config, "USE_SNR_GAMMA") and config.USE_SNR_GAMMA:
         snr = noise_scheduler.alphas_cumprod.to(pred.device)[timesteps] / (1 - noise_scheduler.alphas_cumprod.to(pred.device)[timesteps])
         snr = torch.nan_to_num(snr, nan=0.0, posinf=1e8, neginf=0.0).clamp(min=1e-8)
-        gamma_tensor = torch.tensor(config.MIN_SNR_GAMMA, device=snr.device, dtype=snr.dtype)
-        if config.MIN_SNR_VARIANT == "standard":
-            snr_loss_weights = torch.min(gamma_tensor / snr, torch.ones_like(snr))
-        elif config.MIN_SNR_VARIANT == "corrected":
-            snr_loss_weights = torch.min(gamma_tensor, snr) / (snr + 1)
-        elif config.MIN_SNR_VARIANT == "debiased":
-            snr_loss_weights = torch.clamp(1.0 / torch.sqrt(snr), max=1000.0)
-        else:
-            raise ValueError(f"Unknown MIN_SNR_VARIANT: {config.MIN_SNR_VARIANT}. Use 'standard', 'corrected', or 'debiased'.")
-        return (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
-    else:
-        return F.mse_loss(pred.float(), target.float())
+        gamma_tensor = torch.tensor(config.SNR_GAMMA, device=snr.device, dtype=snr.dtype)
+        
+        snr_loss_weights = None
+        
+        if config.SNR_STRATEGY == "Min-SNR":
+            if config.MIN_SNR_VARIANT == "standard":
+                snr_loss_weights = torch.min(gamma_tensor / snr, torch.ones_like(snr))
+            elif config.MIN_SNR_VARIANT == "corrected":
+                snr_loss_weights = torch.min(gamma_tensor, snr) / (snr + 1)
+            elif config.MIN_SNR_VARIANT == "debiased":
+                snr_loss_weights = torch.clamp(1.0 / torch.sqrt(snr), max=1000.0)
+            else:
+                raise ValueError(f"Unknown MIN_SNR_VARIANT: {config.MIN_SNR_VARIANT}. Use 'standard', 'corrected', or 'debiased'.")
+        
+        elif config.SNR_STRATEGY == "Max-SNR":
+            snr_loss_weights = torch.clamp(snr, max=gamma_tensor)
+
+        if snr_loss_weights is not None:
+             return (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
+            
+    return F.mse_loss(pred.float(), target.float())
   
 def main():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -848,7 +825,7 @@ def main():
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M")
     print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
 
-    optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=0.0, scale_parameter=False, relative_step=False)
+    optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=config.WEIGHT_DECAY, scale_parameter=False, relative_step=False)
 
     if not hasattr(config, "LR_CUSTOM_CURVE") or not config.LR_CUSTOM_CURVE:
         raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'. Please define it in your config file.")
@@ -881,32 +858,24 @@ def main():
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
 
-    # ====================================================================================
-    # --- NEW: Pre-calculate timestep weights for LogSNR Importance Sampling ---
-    # ====================================================================================
     timestep_weights = None
     if hasattr(config, "NOISE_SCHEDULE_VARIANT") and config.NOISE_SCHEDULE_VARIANT == "logsnr_laplace":
         print("INFO: Using LogSNR Laplace importance sampling for timesteps.")
         alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
-        # Prevent division by zero or log(0)
         clipped_alphas_cumprod = torch.clamp(alphas_cumprod, 1e-8, 1 - 1e-8)
         log_snr = torch.log(clipped_alphas_cumprod) - torch.log(1 - clipped_alphas_cumprod)
         
-        # Use a Laplace distribution centered at logSNR=0 as the probability weight
         laplace_weights = torch.exp(-torch.abs(log_snr))
         
-        # Normalize weights to form a probability distribution
         timestep_weights = laplace_weights / laplace_weights.sum()
     else:
         print("INFO: Using uniform timestep sampling.")
-    # ====================================================================================
 
     train_dataset = ImageTextLatentDataset(config)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=False, pin_memory=True)
 
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
 
-    # --- MODIFIED: Added timestep_weights to function signature ---
     def train_step(batch, use_scaler, scaler, timestep_weights):
         latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
         if config.USE_PER_CHANNEL_NOISE:
@@ -915,7 +884,6 @@ def main():
             noise_mono = torch.randn_like(latents[:, :1, :, :])
             noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
         
-        # --- MODIFIED: Pass weights to the sampling function ---
         timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device, weights=timestep_weights)
         
         latents = apply_perturbations(config, latents)
@@ -956,7 +924,6 @@ def main():
                 for k, v in batch.items()
             }
 
-            # --- MODIFIED: Pass timestep_weights into the train_step function call ---
             loss_item = train_step(batch, use_scaler, scaler, timestep_weights)
 
             if loss_item is None:
