@@ -500,10 +500,6 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
         full_emb = torch.cat(chunk_embeds, dim=1)
         full_emb = F.pad(full_emb, (0, 0, 0, max_seq_len - full_emb.shape[1]), "constant", 0.0)
         
-        # --- THE FIX ---
-        # The standard approach is to use the pooled embedding from the FIRST chunk only,
-        # as it is assumed to contain the primary subject of the prompt.
-        # Averaging dilutes the conceptual signal.
         first_chunk_pooled = chunk_pooled[0]
         
         prompt_embeds_batch.append(full_emb)
@@ -553,12 +549,21 @@ class ImageTextLatentDataset(Dataset):
                 print(f"WARNING: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
                 variant_key = "original"
             variant_data = full_data[variant_key]
-            if torch.isnan(variant_data["latents_cpu"]).any() or torch.isinf(variant_data["latents_cpu"]).any():
-                raise ValueError("NaN/Inf in latents")
+            latents = variant_data["latents_cpu"]
+            prompt_embeds = full_data["prompt_embeds_cpu"]
+            pooled_embeds = full_data["pooled_prompt_embeds_cpu"]
+
+            if torch.isnan(latents).any() or torch.isinf(latents).any():
+                raise ValueError(f"NaN/Inf in latents for file: {file_path}")
+            if torch.isnan(prompt_embeds).any() or torch.isinf(prompt_embeds).any():
+                raise ValueError(f"NaN/Inf in prompt_embeds for file: {file_path}")
+            if torch.isnan(pooled_embeds).any() or torch.isinf(pooled_embeds).any():
+                raise ValueError(f"NaN/Inf in pooled_embeds for file: {file_path}")
+
             return {
-                "latents_cpu": variant_data["latents_cpu"],
-                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"],
-                "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"],
+                "latents_cpu": latents,
+                "prompt_embeds_cpu": prompt_embeds,
+                "pooled_prompt_embeds_cpu": pooled_embeds,
                 "original_size_as_tuple": full_data["original_size_as_tuple"],
                 "target_size_as_tuple": full_data["target_size_as_tuple"],
             }
@@ -708,13 +713,25 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     betas = 1 - alphas
     return betas
 
-def sample_timesteps(config, noise_scheduler, batch_size, device):
-    if config.USE_RESIDUAL_SHIFTING:
+def sample_timesteps(config, noise_scheduler, batch_size, device, weights=None):
+    """
+    Selects timesteps for training based on the chosen sampling strategy.
+    """
+    variant = getattr(config, "NOISE_SCHEDULE_VARIANT", "uniform")
+
+    if variant == "residual_shifting":
+        # Hard clamp to the second half of the timesteps
         min_timestep = int(0.5 * noise_scheduler.config.num_train_timesteps)
         return torch.randint(min_timestep, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
-    else:
+    
+    elif variant == "logsnr_laplace" and weights is not None:
+        # Importance sampling using pre-calculated LogSNR weights
+        return torch.multinomial(weights, num_samples=batch_size, replacement=True).long()
+    
+    else: # This covers "uniform" and any other fallback cases
+        # Standard uniform sampling
         return torch.randint(0, noise_scheduler.config.num_train_timesteps, (batch_size,), device=device).long()
-
+    
 def apply_perturbations(config, latents):
     if config.USE_IP_NOISE_GAMMA > 0:
         return latents + config.IP_NOISE_GAMMA * torch.randn_like(latents)
@@ -845,57 +862,62 @@ def main():
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location=device)
-
         opt_has_nan = has_nan_in_state(state['optimizer_state_dict'])
         sched_has_nan = has_nan_in_state(state['scheduler_state_dict'])
-
         if opt_has_nan or sched_has_nan:
             print("WARNING: NaN/Inf detected in loaded optimizer or scheduler state! Sanitizing...")
             if opt_has_nan:
                 state['optimizer_state_dict'] = sanitize_state(state['optimizer_state_dict'])
             if sched_has_nan:
                 state['scheduler_state_dict'] = sanitize_state(state['scheduler_state_dict'])
-
         global_step = state['step']
         lr_scheduler.last_epoch = global_step
         optimizer.load_state_dict(state['optimizer_state_dict'])
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
         del state; gc.collect(); torch.cuda.empty_cache()
         print(f"[OK] Resumed training from step {global_step}.")
+    
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
+
+    # ====================================================================================
+    # --- NEW: Pre-calculate timestep weights for LogSNR Importance Sampling ---
+    # ====================================================================================
+    timestep_weights = None
+    if hasattr(config, "NOISE_SCHEDULE_VARIANT") and config.NOISE_SCHEDULE_VARIANT == "logsnr_laplace":
+        print("INFO: Using LogSNR Laplace importance sampling for timesteps.")
+        alphas_cumprod = noise_scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)
+        # Prevent division by zero or log(0)
+        clipped_alphas_cumprod = torch.clamp(alphas_cumprod, 1e-8, 1 - 1e-8)
+        log_snr = torch.log(clipped_alphas_cumprod) - torch.log(1 - clipped_alphas_cumprod)
+        
+        # Use a Laplace distribution centered at logSNR=0 as the probability weight
+        laplace_weights = torch.exp(-torch.abs(log_snr))
+        
+        # Normalize weights to form a probability distribution
+        timestep_weights = laplace_weights / laplace_weights.sum()
+    else:
+        print("INFO: Using uniform timestep sampling.")
+    # ====================================================================================
+
     train_dataset = ImageTextLatentDataset(config)
     train_dataloader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, persistent_workers=False, pin_memory=True)
 
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
 
-    unet.train()
-    progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
-
-    prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
-    batch = prefetcher.next()
-    loss_accumulator = 0.0
-    
-    if global_step > 0:
-        for g in optimizer.param_groups:
-            g['lr'] = lr_scheduler.get_last_lr()[0]
-            
-    while global_step < config.MAX_TRAIN_STEPS:
-        if batch is None:
-            prefetcher = DataPrefetcher(train_dataloader, device, config.compute_dtype)
-            batch = prefetcher.next()
-            if not batch: continue
-       
+    # --- MODIFIED: Added timestep_weights to function signature ---
+    def train_step(batch, use_scaler, scaler, timestep_weights):
         latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
-       
         if config.USE_PER_CHANNEL_NOISE:
             noise = torch.randn_like(latents)
         else:
             noise_mono = torch.randn_like(latents[:, :1, :, :])
             noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
-            
-        timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device)
+        
+        # --- MODIFIED: Pass weights to the sampling function ---
+        timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device, weights=timestep_weights)
+        
         latents = apply_perturbations(config, latents)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_prediction_model else noise
@@ -903,71 +925,91 @@ def main():
         crops_coords_top_left = [(0, 0) for _ in original_sizes]
         add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
         prompt_embeds, pooled_prompt_embeds = apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds)
-       
+        
         with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
             loss = compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_prediction_model)
-
+        
         if not torch.isfinite(loss):
             print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf loss. Skipping this micro-batch.")
-            # We still increment the step counters and progress bar to move on
+            return None
+        
+        scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+        return loss.item()
+
+    unet.train()
+    progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
+    loss_accumulator = 0.0
+    if global_step > 0:
+        for g in optimizer.param_groups:
+            g['lr'] = lr_scheduler.get_last_lr()[0]
+
+    done = False
+    while not done:
+        for batch in train_dataloader:
+            if global_step >= config.MAX_TRAIN_STEPS:
+                done = True
+                break
+
+            batch = {
+                k: v.to(device, dtype=config.compute_dtype if v.is_floating_point() else None, non_blocking=True) if isinstance(v, torch.Tensor) else v
+                for k, v in batch.items()
+            }
+
+            # --- MODIFIED: Pass timestep_weights into the train_step function call ---
+            loss_item = train_step(batch, use_scaler, scaler, timestep_weights)
+
+            if loss_item is None:
+                global_step += 1
+                progress_bar.update(1)
+                lr_scheduler.step()
+                continue
+            
+            loss_accumulator += loss_item
+            
             global_step += 1
             progress_bar.update(1)
-            lr_scheduler.step()
-            batch = prefetcher.next()
-            continue
-        
-        loss_accumulator += loss.item()
-        scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 
-        global_step += 1
-        progress_bar.update(1)
-
-        # --- CONSOLIDATED LOGGING AND OPTIMIZER STEP ---
-        if global_step > 0 and global_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
-            # First, print a detailed log for the completed accumulation cycle
-            avg_loss = loss_accumulator / config.GRADIENT_ACCUMULATION_STEPS
-            current_lr = lr_scheduler.get_last_lr()[0]
-            tqdm.write(
-                f"Step: {global_step} | "
-                f"Avg Loss: {avg_loss:.5f} | "
-                f"LR: {current_lr:.3e} | "
-                f"VRAM: {torch.cuda.memory_reserved() / 1e9:.2f} GB"
-            )
-            loss_accumulator = 0.0  # Reset for the next cycle
-
-            # Then, perform the optimizer step
-            all_grads_are_finite = all(torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
-            if all_grads_are_finite:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(
-                    [p for p in params_to_optimize if p.grad is not None],
-                    config.CLIP_GRAD_NORM
+            if global_step > 0 and global_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                avg_loss = loss_accumulator / config.GRADIENT_ACCUMULATION_STEPS
+                current_lr = lr_scheduler.get_last_lr()[0]
+                tqdm.write(
+                    f"Step: {global_step} | "
+                    f"Avg Loss: {avg_loss:.5f} | "
+                    f"LR: {current_lr:.3e} | "
+                    f"VRAM: {torch.cuda.memory_reserved() / 1e9:.2f} GB"
                 )
-                scaler.step(optimizer)
-                scaler.update()
-            else:
-                print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients in accumulation cycle. Skipping optimizer step.")
-            
-            optimizer.zero_grad(set_to_none=True)
+                loss_accumulator = 0.0
 
-        lr_scheduler.step()
-        batch = prefetcher.next()
-       
-        if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
-            save_training_checkpoint(
-                base_model_state_dict=base_model_state_dict,
-                unet=unet,
-                optimizer=optimizer,
-                scheduler=lr_scheduler,
-                step=global_step,
-                checkpoint_dir=CHECKPOINT_DIR,
-                trainable_param_names=unet_param_names_to_optimize,
-                save_dtype=config.compute_dtype
-            )
-        if global_step % 100 == 0:
-             gc.collect()
-        if global_step >= config.MAX_TRAIN_STEPS: break
+                all_grads_are_finite = all(torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
+                if all_grads_are_finite:
+                    scaler.unscale_(optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        [p for p in params_to_optimize if p.grad is not None],
+                        config.CLIP_GRAD_NORM
+                    )
+                    scaler.step(optimizer)
+                    scaler.update()
+                else:
+                    print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf gradients in accumulation cycle. Skipping optimizer step.")
+                
+                optimizer.zero_grad(set_to_none=True)
+
+            lr_scheduler.step()
+           
+            if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0 and global_step < config.MAX_TRAIN_STEPS:
+                save_training_checkpoint(
+                    base_model_state_dict=base_model_state_dict,
+                    unet=unet,
+                    optimizer=optimizer,
+                    scheduler=lr_scheduler,
+                    step=global_step,
+                    checkpoint_dir=CHECKPOINT_DIR,
+                    trainable_param_names=unet_param_names_to_optimize,
+                    save_dtype=config.compute_dtype
+                )
+            if global_step % 100 == 0:
+                 gc.collect()
 
     progress_bar.close()
     print("--> Training finished.")

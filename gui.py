@@ -515,6 +515,12 @@ class TrainingGUI(QtWidgets.QWidget):
         "MIN_SNR_VARIANT": {"label": "Variant:", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["standard", "corrected", "debiased"]},
         "IP_NOISE_GAMMA": {"label": "Gamma Value:", "tooltip": "Common range is 0.05 to 0.25.", "widget": "QLineEdit"},
         "COND_DROPOUT_PROB": {"label": "Dropout Probability:", "tooltip": "e.g., 0.1 (5-15% common).", "widget": "QLineEdit"},
+        "NOISE_SCHEDULE_VARIANT": {
+            "label": "Timestep Sampling:", 
+            "tooltip": "Changes how timesteps are sampled.\n- uniform: Standard random sampling.\n- logsnr_laplace: Focuses on more informative mid-range noise levels.\n- residual_shifting: Hard clamp to only the second half of timesteps.", 
+            "widget": "QComboBox", 
+            "options": ["uniform", "logsnr_laplace", "residual_shifting"]
+        },
     }
     
     def __init__(self):
@@ -889,10 +895,13 @@ class TrainingGUI(QtWidgets.QWidget):
         constant_btn.clicked.connect(self._set_constant_preset)
         step_btn = QtWidgets.QPushButton("Step")
         step_btn.clicked.connect(self._set_step_preset)
+        cyclical_dip_btn = QtWidgets.QPushButton("Cyclical Dip")
+        cyclical_dip_btn.clicked.connect(self._set_cyclical_dip_preset)
         preset_layout.addWidget(cosine_btn)
         preset_layout.addWidget(linear_btn)
         preset_layout.addWidget(constant_btn)
         preset_layout.addWidget(step_btn)
+        preset_layout.addWidget(cyclical_dip_btn)
         preset_layout.addStretch()
         lr_layout.addLayout(preset_layout)
 
@@ -1014,6 +1023,8 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _set_step_preset(self):
         try:
+            # --- 1. Get User-Defined Boundaries ---
+            # These values are set by the user in the GUI.
             max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
             min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
@@ -1025,141 +1036,200 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
             return
 
-        try:
-            total_images = int(self.total_repeats_label.text())
-        except (ValueError, AttributeError):
-            total_images = 0
+        # --- 2. Define the Preset's Behavior ---
+        # These percentages control the shape of the "backwards" curve.
+        # You can easily tweak these values to change the preset.
+        
+        # At what percentage of training should the warm-up end and the plateau begin?
+        warmup_end_portion = 0.05  # e.g., 5%
+        
+        # At what percentage of training should the high-LR plateau end and the cooldown begin?
+        cooldown_start_portion = 0.60 # e.g., 60%
+        
+        # At what percentage should the cooldown make its sharpest drop?
+        cooldown_mid_portion = 0.65   # e.g., 65%
 
-        steps_per_epoch = total_images if total_images > 0 else 0
-        
-        # --- BEHAVIOR DEFINITIONS ---
-        num_stairs = 5                      # The number of distinct learning rate steps
-        stairs_end_portion = 0.5            # Fit all stairs into the first 50% of training
-        cooldown_start_portion = 0.9        # Start the final LR decay at 90% of training
-
-        # --- LOGARITHMIC CALCULATIONS ---
-        # To make steps visually even, we must work in log space.
-        
-        # 1. Define the safe logarithmic range, handling min_lr = 0.
-        # A very small number is used as a floor to prevent math.log(0) errors.
-        safe_min_lr = max(min_lr, 1e-12)
-        log_min = math.log(safe_min_lr)
-        log_max = math.log(max_lr)
-
-        # 2. The first stair will be at the logarithmic midpoint, which is visually halfway.
-        log_start_lr = (log_min + log_max) / 2.0
-        
-        points = []
-        
-        if steps_per_epoch > 0:
-            stairs_end_steps = int(max_steps * stairs_end_portion)
-            num_epochs_in_stairs = stairs_end_steps // steps_per_epoch
+        # --- 3. Validate Timing ---
+        # Ensure the timings are logical (e.g., warmup ends before cooldown starts).
+        if not (0 < warmup_end_portion < cooldown_start_portion < cooldown_mid_portion < 1.0):
+            self.log("ERROR: Preset timings are illogical. Warmup must end before cooldown starts.")
+            return
             
-            if num_epochs_in_stairs > 0:
-                effective_num_stairs = min(num_stairs, num_epochs_in_stairs)
-                epochs_per_stair = num_epochs_in_stairs / effective_num_stairs
-                current_epoch = 0
-                
-                for i in range(effective_num_stairs):
-                    # Interpolate evenly in LOG space from our start point to the max.
-                    # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
-                    interpolation_factor = i / (effective_num_stairs - 1) if effective_num_stairs > 1 else 1.0
-                    
-                    # This formula finds the evenly spaced log value for the current stair.
-                    current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
-                    
-                    # Convert the calculated log value back to a real LR value.
-                    current_lr = math.exp(current_log_lr)
-                    
-                    # Calculate end epoch for this stair
-                    target_end_epoch = (i + 1) * epochs_per_stair
-                    end_epoch = round(target_end_epoch)
-                    end_epoch = min(end_epoch, num_epochs_in_stairs)
-                    
-                    # Ensure progression
-                    if end_epoch <= current_epoch:
-                        end_epoch = current_epoch + 1
-                        end_epoch = min(end_epoch, num_epochs_in_stairs)
-                    
-                    start_step = current_epoch * steps_per_epoch
-                    end_step = end_epoch * steps_per_epoch
-                    end_step = min(end_step, stairs_end_steps)
-                    
-                    # Add the two points that define the flat top of the stair
-                    points.append([start_step / max_steps, current_lr])
-                    points.append([end_step / max_steps, current_lr])
-                    
-                    current_epoch = end_epoch
-            else:
-                # Fallback even if steps_per_epoch > 0 but no epochs fit in stairs portion
-                pass
-        else:
-            # Fallback to original behavior if no total images
-            pass
-
-        if not points:  # Fallback if no epoch-aligned points generated
-            steps_per_stair = (max_steps * stairs_end_portion) / num_stairs
-            
-            # --- POINT GENERATION ---
-            for i in range(num_stairs):
-                # 3. Interpolate evenly in LOG space from our start point to the max.
-                # The interpolation factor moves from 0 (at stair 0) to 1 (at the last stair).
-                interpolation_factor = i / (num_stairs - 1) if num_stairs > 1 else 1.0
-                
-                # This formula finds the evenly spaced log value for the current stair.
-                current_log_lr = log_start_lr + (log_max - log_start_lr) * interpolation_factor
-                
-                # 4. Convert the calculated log value back to a real LR value.
-                current_lr = math.exp(current_log_lr)
-                
-                start_step = i * steps_per_stair
-                end_step = (i + 1) * steps_per_stair
-                
-                # Add the two points that define the flat top of the stair
-                points.append([start_step / max_steps, current_lr])
-                points.append([end_step / max_steps, current_lr])
-
-        # Anchor the end of the stairs and create the flat top before cooldown
-        points.append([stairs_end_portion, max_lr])
-        points.append([cooldown_start_portion, max_lr])
+        # --- 4. Generate the Curve Points ---
+        # The points are defined as [step_percentage, learning_rate].
         
-        # Final decay to the user-defined minimum learning rate
-        points.append([1.0, min_lr])
+        points = [
+            # Point 1: Start of training (step 0) at a near-zero LR.
+            # We use min_lr as a safe, non-zero starting point.
+            [0.0, min_lr],
+            
+            # Point 2: End of the warm-up phase.
+            # The LR has now ramped up to the user's defined maximum.
+            [warmup_end_portion, max_lr],
+            
+            # Point 3: End of the high-LR plateau.
+            # The LR stays at the maximum value until this point.
+            [cooldown_start_portion, max_lr],
+            
+            # Point 4: The "knee" of the cooldown.
+            # The LR makes a sharp drop to a low value for the refinement phase.
+            # A good intermediate value is often a fraction of the max_lr, e.g., 1/40th.
+            # This prevents the drop from being a completely vertical line.
+            [cooldown_mid_portion, max_lr / 40],
+            
+            # Point 5: End of training.
+            # The LR has fully decayed to the user's defined minimum.
+            [1.0, min_lr]
+        ]
 
-        # --- UPDATE WIDGET ---
+        # --- 5. UPDATE WIDGET ---
+        # Set the points on the graph widget and emit the signal that they have changed.
         self.lr_curve_widget.set_points(points)
         self.lr_curve_widget.pointsChanged.emit(points)
-        self.log(f"Applied mathematical Step preset. Start LR (visual midpoint): {math.exp(log_start_lr):.2e}")
+        self.log(f"Applied 'Plateau Refinement' preset. High-LR phase is from {warmup_end_portion*100:.0f}% to {cooldown_start_portion*100:.0f}%.")
+
+    def _set_cyclical_dip_preset(self):
+        try:
+            # --- 1. Get User-Defined Boundaries (Same as Step Preset) ---
+            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
+            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
+            max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
+        except (ValueError, KeyError):
+            self.log("ERROR: Min/Max LR and Max Steps must be set to use this preset.")
+            return
+
+        if max_steps <= 0:
+            self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
+            return
+
+        # --- 2. Define the Preset's Behavior ---
+        
+        # --- Core Structure (Identical to your Step Preset) ---
+        warmup_end_portion = 0.05
+        cooldown_start_portion = 0.60
+        cooldown_mid_portion = 0.65
+        
+        # --- Dip Configuration ---
+        num_dips = 2
+        # How low should the LR go during a dip? (As a fraction of the max_lr)
+        dip_factor = 0.25
+        # How long should the flat bottom of each dip last? (As a percentage of total training)
+        dip_bottom_duration = 0.035
+        # How long should the transition down/up for each dip take?
+        dip_transition_duration = 0.025
+
+        # --- 3. Validate Timing ---
+        if not (0 < warmup_end_portion < cooldown_start_portion < cooldown_mid_portion < 1.0):
+            self.log("ERROR: Preset timings are illogical.")
+            return
+
+        # --- 4. Generate the Curve Points ---
+        points = []
+        
+        # Point 1 & 2: The Initial Warm-up (Identical to Step Preset)
+        points.append([0.0, min_lr])
+        points.append([warmup_end_portion, max_lr])
+
+        # --- Logic for Injecting WIDER "U" Shaped Dips into the Plateau ---
+        plateau_start = warmup_end_portion
+        plateau_end = cooldown_start_portion
+        plateau_duration = plateau_end - plateau_start
+
+        # Calculate total duration of one full dip cycle and all dips
+        single_dip_total_duration = (dip_transition_duration * 2) + dip_bottom_duration
+        all_dips_total_duration = num_dips * single_dip_total_duration
+
+        # Calculate the duration of the flat, high-LR parts to place between the dips
+        flat_part_duration = (plateau_duration - all_dips_total_duration) / (num_dips + 1)
+        
+        if flat_part_duration < 0:
+            self.log("ERROR: Dips are too long or numerous to fit in the plateau. Reduce num_dips or dip durations.")
+            return
+
+        current_pos = plateau_start
+        dip_lr = max(max_lr * dip_factor, min_lr)
+
+        for _ in range(num_dips):
+            # Add the flat part before the dip
+            current_pos += flat_part_duration
+            points.append([current_pos, max_lr])
+            
+            # Transition Down
+            current_pos += dip_transition_duration
+            points.append([current_pos, dip_lr])
+            
+            # Hold at the bottom
+            current_pos += dip_bottom_duration
+            points.append([current_pos, dip_lr])
+
+            # Transition Up
+            current_pos += dip_transition_duration
+            points.append([current_pos, max_lr])
+
+        # Point 3: End of the high-LR plateau (Identical to Step Preset)
+        points.append([cooldown_start_portion, max_lr])
+        
+        # Point 4: The "knee" of the cooldown (Identical to Step Preset)
+        points.append([cooldown_mid_portion, max_lr / 40])
+        
+        # Point 5: End of training (Identical to Step Preset)
+        points.append([1.0, min_lr])
+
+        # --- 5. UPDATE WIDGET ---
+        self.lr_curve_widget.set_points(points)
+        self.lr_curve_widget.pointsChanged.emit(points)
+        self.log(f"Applied Step Preset with {num_dips} dips.")
 
     def _populate_advanced_tab(self, parent_widget):
         main_layout = QtWidgets.QHBoxLayout(parent_widget)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(20)
         left_layout = QtWidgets.QVBoxLayout()
-        adv_group = QtWidgets.QGroupBox("Advanced (v-prediction)")
+
+        adv_group = QtWidgets.QGroupBox("Advanced Training & Scheduler Options")
         adv_layout = QtWidgets.QVBoxLayout(adv_group)
-        self._create_bool_option(adv_layout, "USE_PER_CHANNEL_NOISE", "Use Per-Channel (Color) Noise", "...")
+
+        self._create_bool_option(adv_layout, "USE_PER_CHANNEL_NOISE", "Use Per-Channel (Color) Noise", "Enables applying noise independently to R, G, and B channels.")
         adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(adv_layout, "USE_RESIDUAL_SHIFTING", "Use Residual Shifting Schedulers", "...")
-        self._create_bool_option(adv_layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR Rescaling", "...")
+
+        scheduler_form_layout = QtWidgets.QFormLayout()
+        scheduler_form_layout.setContentsMargins(0, 10, 0, 10)
+        scheduler_form_layout.setSpacing(15)
+
+        self._create_bool_option(scheduler_form_layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR Rescaling", "Rescales the noise schedule to improve dynamic range.")
+        
+        # This now creates our unified dropdown with all 3 modes
+        label, widget = self._create_widget("NOISE_SCHEDULE_VARIANT")
+        scheduler_form_layout.addRow(label, widget)
+        
+        # The checkbox for USE_RESIDUAL_SHIFTING has been completely removed from here.
+
+        adv_layout.addLayout(scheduler_form_layout)
         adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(adv_layout, "USE_MIN_SNR_GAMMA", "Use Min-SNR Gamma", "...", self.toggle_min_snr_gamma_widget)
+
+        self._create_bool_option(adv_layout, "USE_MIN_SNR_GAMMA", "Use Min-SNR Gamma Weighting", "Reweights the loss to focus on noisier timesteps.", self.toggle_min_snr_gamma_widget)
         self.min_snr_sub_widget = SubOptionWidget()
         for key in ["MIN_SNR_GAMMA", "MIN_SNR_VARIANT"]:
             label, widget = self._create_widget(key); self.min_snr_sub_widget.addRow(label, widget)
         adv_layout.addWidget(self.min_snr_sub_widget)
         adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(adv_layout, "USE_IP_NOISE_GAMMA", "Use Input Perturbation Noise", "...", self.toggle_ip_noise_gamma_widget)
+
+        self._create_bool_option(adv_layout, "USE_IP_NOISE_GAMMA", "Use Input Perturbation Noise", "Adds noise to input latents for regularization.", self.toggle_ip_noise_gamma_widget)
         self.ip_sub_widget = SubOptionWidget()
         label, widget = self._create_widget("IP_NOISE_GAMMA"); self.ip_sub_widget.addRow(label, widget)
         adv_layout.addWidget(self.ip_sub_widget)
         adv_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(adv_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", "...", self.toggle_cond_dropout_widget)
+
+        self._create_bool_option(adv_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", "Improves classifier-free guidance.", self.toggle_cond_dropout_widget)
         self.cond_sub_widget = SubOptionWidget()
         label, widget = self._create_widget("COND_DROPOUT_PROB"); self.cond_sub_widget.addRow(label, widget)
         adv_layout.addWidget(self.cond_sub_widget)
+
         left_layout.addWidget(adv_group)
         left_layout.addStretch()
+
+        # --- Right Side (UNet Layer Targeting) remains exactly the same ---
+        # (The rest of the function for the right panel is unchanged)
         right_layout = QtWidgets.QVBoxLayout()
         layers_group = QtWidgets.QGroupBox("UNet Layer Targeting")
         layers_layout = QtWidgets.QVBoxLayout(layers_group)
