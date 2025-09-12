@@ -158,7 +158,7 @@ def main():
     # --- CONFIGURATION SETTINGS ---
     # =================================================================================
     settings = {
-        "DATASET_DIR": r"C:\Users\Administrator\Pictures\Datasets\by Bitseon",
+        "DATASET_DIR": r"C:\Users\Administrator\Pictures\Datasets\The Fragrant Flower Blooms With Dignity",
         "FACE_MODEL_PATH": r"C:\Users\Administrator\Desktop\Aozora_SDXL_Training\utils\Yolo\face_yolov9c.pt",
         "HAND_MODEL_PATH": r"C:\Users\Administrator\Desktop\Aozora_SDXL_Training\utils\Yolo\hand_yolov9c.pt",
         "CONFIDENCE_THRESHOLD": 0.50,

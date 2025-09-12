@@ -10,10 +10,24 @@ from pathlib import Path
 import random
 import shutil
 import math
-# You will need to create a config.py file or comment this line out
-# For example, create config.py with: MAX_TRAIN_STEPS = 1000
+import ctypes
 import config as default_config
 
+def prevent_sleep(enable=True):
+    """Prevent/resume Windows sleep. Use as a context manager or toggle."""
+    ES_CONTINUOUS = 0x80000000
+    ES_SYSTEM_REQUIRED = 0x00000001  # Prevent sleep
+    ES_DISPLAY_REQUIRED = 0x00000002  # Prevent screen off
+
+    kernel32 = ctypes.windll.kernel32
+    if enable:
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+        print("Sleep prevention enabled.")  # Or emit to your log
+    else:
+        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+        print("Sleep prevention disabled.")
+
+        
 # --- STYLESHEET CONSTANT ---
 STYLESHEET = """
 QWidget {
@@ -537,6 +551,12 @@ class ProcessRunner(QThread):
 
     def run(self):
         try:
+            flags = self.creation_flags
+            if os.name == 'nt':  # Windows-specific
+                flags |= (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.HIGH_PRIORITY_CLASS)
+                # Optional: For even higher (realtime-like), use subprocess.REALTIME_PRIORITY_CLASS
+                # but this requires running your GUI as admin and can be risky.
+
             self.process = subprocess.Popen(
                 [self.executable] + self.args,
                 cwd=self.working_dir,
@@ -545,7 +565,7 @@ class ProcessRunner(QThread):
                 stderr=subprocess.STDOUT,
                 universal_newlines=True,
                 bufsize=1,
-                creationflags=self.creation_flags if os.name == 'nt' else 0
+                creationflags=flags  # Use the modified flags here
             )
             self.logSignal.emit(f"INFO: Started subprocess (PID: {self.process.pid})")
 
@@ -969,7 +989,7 @@ class TrainingGUI(QtWidgets.QWidget):
         left_vbox.addWidget(core_group)
         left_vbox.addStretch()
 
-        optimizer_group = self._create_form_group("Optimizer", ["CLIP_GRAD_NORM", "WEIGHT_DECAY"])
+        optimizer_group = self._create_form_group("Raven Optimizer", ["CLIP_GRAD_NORM", "WEIGHT_DECAY"])
         right_vbox.addWidget(optimizer_group)
         
         lr_group = self._create_lr_scheduler_group()
@@ -1365,6 +1385,8 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner.progressSignal.connect(self.handle_process_output)
         self.process_runner.finishedSignal.connect(self.training_finished)
         self.process_runner.errorSignal.connect(self.log)
+        if os.name == 'nt':
+            prevent_sleep(True)
         self.process_runner.start()
 
         self.log(f"INFO: Starting train.py (abs path: {train_py_path}) with config: {config_path} (working dir: {script_dir})")
@@ -1386,6 +1408,8 @@ class TrainingGUI(QtWidgets.QWidget):
         self.param_info_label.setText("Parameters: (training complete)" if exit_code == 0 else "Parameters: (training failed or stopped)")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        if os.name == 'nt':
+            prevent_sleep(False)
 
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return

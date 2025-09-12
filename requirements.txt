@@ -22,8 +22,9 @@ lpips
 pyqtgraph
 triton-windows
 opencv-python-headless
-lion-pytorch
 Pillow==11.2.1
 tqdm==4.67.1
 numpy==1.26.0
 protobuf==4.25.3 # Pinning to a more compatible version <5.0
+psutil
+pywin32

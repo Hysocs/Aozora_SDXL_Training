@@ -20,9 +20,7 @@ from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile
 from torchvision import transforms
 from tqdm.auto import tqdm
-from transformers import (
-    Adafactor,
-)
+from optimizer.raven import Raven
 import logging
 import warnings
 import config as default_config
@@ -556,13 +554,19 @@ class ImageTextLatentDataset(Dataset):
             # --- MASK LOADING LOGIC ---
             mask_latent = torch.zeros(1, latents.shape[1], latents.shape[2]) # Default: no mask
             focus_factor = dataset_config.get("mask_focus_factor", 1.0)
-
             focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
             
             if dataset_config.get("use_mask", False):
                 mask_path = file_path.parents[1] / "masks" / f"{file_path.stem}_mask.png"
                 if mask_path.exists():
                     with Image.open(mask_path).convert("L") as mask_img:
+                        
+                        # --- FIX STARTS HERE ---
+                        # If the latent variant is flipped, we must also flip the mask.
+                        if 'flipped' in variant_key:
+                            mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
+                        # --- FIX ENDS HERE ---
+                            
                         resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
                         mask_tensor = transforms.ToTensor()(resized_mask)
                         mask_latent = (mask_tensor > 0.1).float()
@@ -890,8 +894,19 @@ def main():
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M")
     print(f"GUI_PARAM_INFO::{unet_trainable_params/1e6:.3f}M / {unet_total_params_count/1e6:.3f}M UNet params | Steps: {config.MAX_TRAIN_STEPS} | Batch: {config.BATCH_SIZE}x{config.GRADIENT_ACCUMULATION_STEPS} (Effective: {config.BATCH_SIZE*config.GRADIENT_ACCUMULATION_STEPS})")
 
-    optimizer = Adafactor(optimizer_grouped_parameters, eps=(1e-30, 1e-3), clip_threshold=1.0, decay_rate=-0.8, weight_decay=config.WEIGHT_DECAY, scale_parameter=False, relative_step=False)
-
+    optimizer = Raven(
+        optimizer_grouped_parameters,
+        eps=(1e-30, 1e-3),
+        clip_threshold=1.0,
+        decay_rate=-0.8,
+        weight_decay=config.WEIGHT_DECAY, 
+        scale_parameter=False,
+        relative_step=False,
+        zero_divisor=1e-8,  # From earlier addition; use 1e-8 for stability
+        center_gradients=True,  # New: Centers grads for reduced noise in UNet updates
+        adaptive_decay=True,  # Phase-adaptive decay (default: True)
+        sign_perturbation=False  # Sign perturbation (default: True)
+    )
     if not hasattr(config, "LR_CUSTOM_CURVE") or not config.LR_CUSTOM_CURVE:
         raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'. Please define it in your config file.")
     print("INFO: Using CustomCurveScheduler for learning rate based on the GUI curve.")

@@ -2,13 +2,14 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": true,
-            "mask_path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon/masks",
-            "mask_focus_factor": 2.0
+            "path": "C:/Users/Administrator/Pictures/Datasets/Toy-Dataset",
+            "repeats": 1,
+            "mirror_repeats": false,
+            "darken_repeats": false,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
         }
     ],
     "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
@@ -29,8 +30,8 @@
         1.77,
         2.0
     ],
-    "MAX_TRAIN_STEPS": 3620,
-    "GRADIENT_ACCUMULATION_STEPS": 32,
+    "MAX_TRAIN_STEPS": 500,
+    "GRADIENT_ACCUMULATION_STEPS": 4,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 42,
     "SAVE_EVERY_N_STEPS": 7000,
