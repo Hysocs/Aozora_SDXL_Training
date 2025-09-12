@@ -1,79 +1,102 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "./Aozora-XL_vPredV1-Final.safetensors",
-    "INSTANCE_DATASETS": [],
-    "OUTPUT_DIR": "./sdxl_finetune_output",
-    "FORCE_RECACHE_LATENTS": false,
-    "MIRROR_REPEATS": false,
-    "DARKEN_REPEATS": false,
-    "GAMMA_VALUE": 2.0,
+    "RESUME_TRAINING": false,
+    "INSTANCE_DATASETS": [
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": true,
+            "mask_path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon/masks",
+            "mask_focus_factor": 2.0
+        }
+    ],
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
+    "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "CACHING_BATCH_SIZE": 3,
     "BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "TARGET_PIXEL_AREA": 1327104,
+    "TARGET_PIXEL_AREA": 1048576,
     "BUCKET_ASPECT_RATIOS": [
-        1.0,
-        1.5,
+        0.5,
+        0.56,
         0.66,
-        1.33,
         0.75,
+        1.0,
+        1.25,
+        1.33,
+        1.5,
         1.77,
-        0.56
+        2.0
     ],
-    "MAX_TRAIN_STEPS": 35000,
-    "GRADIENT_ACCUMULATION_STEPS": 64,
+    "MAX_TRAIN_STEPS": 3620,
+    "GRADIENT_ACCUMULATION_STEPS": 32,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 42,
-    "SAVE_EVERY_N_STEPS": 5000,
-    "RESUME_TRAINING": false,
-    "RESUME_MODEL_PATH": "",
-    "RESUME_STATE_PATH": "",
+    "SAVE_EVERY_N_STEPS": 7000,
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_2000.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_2000.pt",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            0.0
+            1e-09
         ],
         [
-            0.05411765,
-            5e-07
+            0.05,
+            3e-05
         ],
         [
-            0.70823529,
-            5e-07
+            0.6,
+            3e-05
+        ],
+        [
+            0.65,
+            7.5e-07
         ],
         [
             1.0,
-            0.0
+            1e-09
         ]
     ],
-    "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 1e-06,
+    "LR_GRAPH_MIN": 1e-09,
+    "LR_GRAPH_MAX": 3e-05,
     "CLIP_GRAD_NORM": 1.0,
+    "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
         "attn2",
+        "mid_block.attentions",
         "ff",
+        "to_q",
+        "to_k",
+        "to_v",
+        "to_out.0",
+        "proj_in",
+        "proj_out",
         "time_embedding",
         "time_emb_proj",
+        "add_embedding",
         "conv_in",
-        "conv_out"
+        "conv2",
+        "conv_shortcut",
+        "downsamplers",
+        "upsamplers",
+        "conv_out",
+        "norm",
+        "norm1",
+        "norm2",
+        "norm3",
+        "conv_norm_out"
     ],
     "USE_PER_CHANNEL_NOISE": true,
-    "NOISE_SCHEDULE_VARIANT": "uniform",
-    "USE_EMA": true,
-    "EMA_DECAY": 0.995,
+    "NOISE_SCHEDULE_VARIANT": "logsnr_laplace",
     "USE_SNR_GAMMA": true,
     "SNR_STRATEGY": "Max-SNR",
-    "SNR_GAMMA": 20.0,
-    "MIN_SNR_VARIANT": "standard",
+    "SNR_GAMMA": 5.0,
+    "MIN_SNR_VARIANT": "corrected",
     "USE_ZERO_TERMINAL_SNR": true,
     "USE_IP_NOISE_GAMMA": true,
     "IP_NOISE_GAMMA": 0.01,
     "USE_COND_DROPOUT": true,
-    "COND_DROPOUT_PROB": 0.1,
-    "USE_MIN_SNR_GAMMA": true,
-    "MIN_SNR_GAMMA": "20.0",
-    "USE_RESIDUAL_SHIFTING": false,
-    "UNET_LEARNING_RATE": "8e-07",
-    "LR_SCHEDULER_TYPE": "cosine",
-    "LR_WARMUP_PERCENT": "0.25"
+    "COND_DROPOUT_PROB": 0.1
 }

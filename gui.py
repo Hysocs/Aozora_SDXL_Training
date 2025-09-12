@@ -3,16 +3,18 @@ import os
 import re
 from PyQt6 import QtWidgets, QtCore, QtGui
 import subprocess
-import threading
-from PyQt6.QtCore import QThread, pyqtSignal, QTimer
-import config as default_config
+from PyQt6.QtCore import QThread, pyqtSignal
 import copy
 import sys
 from pathlib import Path
 import random
 import shutil
 import math
+# You will need to create a config.py file or comment this line out
+# For example, create config.py with: MAX_TRAIN_STEPS = 1000
+import config as default_config
 
+# --- STYLESHEET CONSTANT ---
 STYLESHEET = """
 QWidget {
     background-color: #2c2a3e;
@@ -122,16 +124,43 @@ QTabBar::tab:!selected:hover { background: #4a4668; }
 QScrollArea { border: none; }
 """
 
+class InfoDialog(QtWidgets.QDialog):
+    def __init__(self, title, text_content, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.setMinimumSize(650, 550)
+        self.setStyleSheet("""
+            QDialog { background-color: #2c2a3e; }
+            QTextEdit {
+                background-color: #1a1926;
+                border: 1px solid #4a4668;
+                color: #e0e0e0;
+                font-size: 14px;
+            }
+            QPushButton { /* Inherits from main stylesheet */ }
+        """)
+
+        layout = QtWidgets.QVBoxLayout(self)
+        text_edit = QtWidgets.QTextEdit()
+        text_edit.setReadOnly(True)
+        text_edit.setHtml(text_content)
+        layout.addWidget(text_edit)
+        button_box = QtWidgets.QDialogButtonBox(QtWidgets.QDialogButtonBox.StandardButton.Ok)
+        button_box.accepted.connect(self.accept)
+        layout.addWidget(button_box)
+
 class SubOptionWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.form_layout = QtWidgets.QFormLayout(self)
-        self.form_layout.setContentsMargins(25, 10, 5, 10)
-        self.form_layout.setSpacing(10)
-        self.form_layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+        self.main_layout = QtWidgets.QHBoxLayout(self)
+        self.main_layout.setContentsMargins(25, 10, 5, 10)
+        self.main_layout.setSpacing(10)
+
         self.line_color = QtGui.QColor("#6a48d7")
-    def addRow(self, label_or_widget, widget=None):
-        self.form_layout.addRow(label_or_widget, widget)
+
+    def get_layout(self):
+        return self.main_layout
+
     def paintEvent(self, event: QtGui.QPaintEvent):
         super().paintEvent(event)
         painter = QtGui.QPainter(self)
@@ -419,6 +448,77 @@ class LRCurveWidget(QtWidgets.QWidget):
             self.set_points(self._points)
             self.pointsChanged.emit(self._points)
 
+    def apply_preset(self, points):
+        """Applies a list of points and emits the change signal."""
+        self.set_points(points)
+        self.pointsChanged.emit(points)
+
+    def set_cosine_preset(self):
+        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
+        warmup_portion = 0.10
+        num_decay_points = 10
+        points = [[0.0, min_lr], [warmup_portion, max_lr]]
+        decay_duration = 1.0 - warmup_portion
+
+        for i in range(num_decay_points + 1):
+            decay_progress = i / num_decay_points
+            norm_x = warmup_portion + decay_progress * decay_duration
+            cosine_val = 0.5 * (1 + math.cos(math.pi * decay_progress))
+            lr_val = min_lr + (max_lr - min_lr) * cosine_val
+            points.append([norm_x, lr_val])
+
+        unique_points = sorted(list(set(tuple(p) for p in points)), key=lambda x: x[0])
+        self.apply_preset(unique_points)
+
+    def set_linear_preset(self):
+        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
+        warmup_portion = 0.05
+        points = [[0.0, min_lr], [warmup_portion, max_lr], [1.0, min_lr]]
+        self.apply_preset(points)
+
+    def set_constant_preset(self):
+        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
+        warmup_portion = 0.05
+        cooldown_start = 1.0 - 0.10
+        points = [[0.0, min_lr], [warmup_portion, max_lr], [cooldown_start, max_lr], [1.0, min_lr]]
+        self.apply_preset(points)
+
+    def set_step_preset(self):
+        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
+        points = [[0.0, min_lr], [0.05, max_lr], [0.60, max_lr], [0.65, max_lr / 40], [1.0, min_lr]]
+        self.apply_preset(points)
+
+    def set_cyclical_dip_preset(self):
+        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
+        warmup_end_portion = 0.05
+        cooldown_start_portion = 0.60
+        num_dips = 2
+        dip_factor = 0.25
+        dip_bottom_duration = 0.035
+        dip_transition_duration = 0.025
+
+        points = [[0.0, min_lr], [warmup_end_portion, max_lr]]
+        plateau_duration = cooldown_start_portion - warmup_end_portion
+        single_dip_total_duration = (dip_transition_duration * 2) + dip_bottom_duration
+        flat_part_duration = (plateau_duration - (num_dips * single_dip_total_duration)) / (num_dips + 1)
+
+        if flat_part_duration < 0: return # Or log an error
+
+        current_pos = warmup_end_portion
+        dip_lr = max(max_lr * dip_factor, min_lr)
+        for _ in range(num_dips):
+            current_pos += flat_part_duration
+            points.append([current_pos, max_lr])
+            current_pos += dip_transition_duration
+            points.append([current_pos, dip_lr])
+            current_pos += dip_bottom_duration
+            points.append([current_pos, dip_lr])
+            current_pos += dip_transition_duration
+            points.append([current_pos, max_lr])
+
+        points.extend([[cooldown_start_portion, max_lr], [0.65, max_lr / 40], [1.0, min_lr]])
+        self.apply_preset(points)
+
 class ProcessRunner(QThread):
     logSignal = pyqtSignal(str)
     paramInfoSignal = pyqtSignal(str)
@@ -451,9 +551,7 @@ class ProcessRunner(QThread):
 
             for line in iter(self.process.stdout.readline, ''):
                 line = line.strip()
-                if not line:
-                    continue
-                if "NOTE: Redirects are currently not supported" in line:
+                if not line or "NOTE: Redirects are currently not supported" in line:
                     continue
 
                 if line.startswith("GUI_PARAM_INFO::"):
@@ -523,16 +621,13 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets = {}
         self.unet_layer_checkboxes = {}
         self.process_runner = None
-        self.tabs_loaded = set()
         self.current_config = {}
         self.last_line_is_progress = False
         self.default_config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
         self.presets = {}
-        self.datasets = []
-
+        
         self._initialize_configs()
         self._setup_ui()
-        self._on_tab_change(0)
 
         if self.config_dropdown.count() > 0:
             self.config_dropdown.setCurrentIndex(0)
@@ -574,13 +669,58 @@ class TrainingGUI(QtWidgets.QWidget):
         title_label.setObjectName("TitleLabel")
         title_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         self.main_layout.addWidget(title_label)
+
+        # --- FIX: Initialize these widgets BEFORE they are used in tab population ---
+        self.param_info_label = QtWidgets.QLabel("Parameters: (awaiting training start)")
+        self.param_info_label.setObjectName("ParamInfoLabel")
+        self.param_info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.param_info_label.setContentsMargins(0, 5, 0, 0)
+
+        self.log_textbox = QtWidgets.QTextEdit()
+        self.log_textbox.setReadOnly(True)
+        self.log_textbox.setMinimumHeight(200)
+        # --- END FIX ---
+
         self.tab_view = QtWidgets.QTabWidget()
-        self.tab_view.currentChanged.connect(self._on_tab_change)
+
+        # --- Create and populate all tabs at startup ---
+
+        # Tab 1: Dataset
+        dataset_content_widget = QtWidgets.QWidget()
+        self._populate_dataset_tab(dataset_content_widget)
+        dataset_scroll = QtWidgets.QScrollArea()
+        dataset_scroll.setWidgetResizable(True)
+        dataset_scroll.setWidget(dataset_content_widget)
+        self.tab_view.addTab(dataset_scroll, "Dataset")
+
+        # Tab 2: Model & Training Parameters
+        model_content_widget = QtWidgets.QWidget()
+        self._populate_data_model_tab(model_content_widget)
+        model_scroll = QtWidgets.QScrollArea()
+        model_scroll.setWidgetResizable(True)
+        model_scroll.setWidget(model_content_widget)
+        self.tab_view.addTab(model_scroll, "Model && Training Parameters")
+
+        # Tab 3: Advanced
+        advanced_content_widget = QtWidgets.QWidget()
+        self._populate_advanced_tab(advanced_content_widget)
+        advanced_scroll = QtWidgets.QScrollArea()
+        advanced_scroll.setWidgetResizable(True)
+        advanced_scroll.setWidget(advanced_content_widget)
+        self.tab_view.addTab(advanced_scroll, "Advanced")
+
+        # Tab 4: Training Console
+        console_tab_widget = QtWidgets.QWidget()
+        console_layout = QtWidgets.QVBoxLayout(console_tab_widget)
+        self._populate_console_tab(console_layout) # Now self.param_info_label exists
+        self.tab_view.addTab(console_tab_widget, "Training Console")
+
         self.main_layout.addWidget(self.tab_view)
-        self.tab_view.addTab(QtWidgets.QWidget(), "Dataset")
-        self.tab_view.addTab(QtWidgets.QWidget(), "Model && Training Parameters")
-        self.tab_view.addTab(QtWidgets.QWidget(), "Advanced")
-        self.tab_view.addTab(QtWidgets.QWidget(), "Training Console")
+
+        self._setup_corner_widget()
+        self._setup_action_buttons()
+
+    def _setup_corner_widget(self):
         corner_hbox = QtWidgets.QHBoxLayout()
         corner_hbox.setContentsMargins(10, 5, 10, 5)
         corner_hbox.setSpacing(10)
@@ -593,27 +733,26 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.config_dropdown.addItem(display, name)
         self.config_dropdown.currentIndexChanged.connect(self.load_selected_config)
         corner_hbox.addWidget(self.config_dropdown)
+        
         self.save_button = QtWidgets.QPushButton("Save Config")
         self.save_button.clicked.connect(self.save_config)
         corner_hbox.addWidget(self.save_button)
+        
         self.save_as_button = QtWidgets.QPushButton("Save As...")
         self.save_as_button.clicked.connect(self.save_as_config)
         corner_hbox.addWidget(self.save_as_button)
+        
         self.restore_button = QtWidgets.QPushButton("↺")
         self.restore_button.setToolTip("Restore Selected Config to Defaults")
         self.restore_button.setFixedHeight(32)
         self.restore_button.clicked.connect(self.restore_defaults)
         corner_hbox.addWidget(self.restore_button)
+        
         corner_widget = QtWidgets.QWidget()
         corner_widget.setLayout(corner_hbox)
         self.tab_view.setCornerWidget(corner_widget, QtCore.Qt.Corner.TopRightCorner)
-        self.param_info_label = QtWidgets.QLabel("Parameters: (awaiting training start)")
-        self.param_info_label.setObjectName("ParamInfoLabel")
-        self.param_info_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        self.param_info_label.setContentsMargins(0, 5, 0, 0)
-        self.log_textbox = QtWidgets.QTextEdit()
-        self.log_textbox.setReadOnly(True)
-        self.log_textbox.setMinimumHeight(200)
+
+    def _setup_action_buttons(self):
         button_layout = QtWidgets.QHBoxLayout()
         button_layout.addStretch()
         self.start_button = QtWidgets.QPushButton("Start Training")
@@ -626,7 +765,7 @@ class TrainingGUI(QtWidgets.QWidget):
         button_layout.addWidget(self.start_button)
         button_layout.addWidget(self.stop_button)
         self.main_layout.addLayout(button_layout)
-
+        
     def load_selected_config(self, index):
         selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
         if selected_key and selected_key in self.presets:
@@ -640,46 +779,74 @@ class TrainingGUI(QtWidgets.QWidget):
         self._apply_config_to_widgets()
 
     def _prepare_config_to_save(self):
+        """
+        Builds a clean configuration dictionary for saving, using default_config as the
+        source of truth for which keys are valid. This prevents saving obsolete keys
+        that may exist in memory from older config files.
+        """
         config_to_save = {}
         default_map = self.default_config
 
+        # --- Handle special cases not in the main loop ---
         if hasattr(self, 'model_load_strategy_combo'):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
             config_to_save["RESUME_TRAINING"] = is_resuming
 
-        for key, live_val in self.current_config.items():
-            if key == "RESUME_TRAINING": continue
-            if live_val is None:
+        if hasattr(self, 'dataset_manager'):
+            config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
+
+        # --- Iterate over the canonical keys from default_config ---
+        # This is the key change: we only iterate over keys that are known to be valid.
+        for key in self.default_config.keys():
+            # Skip keys that are handled specially or are not meant to be saved.
+            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS"]:
                 continue
+
+            # Get the current live value for this valid key from our in-memory config.
+            live_val = self.current_config.get(key)
+            if live_val is None:
+                continue  # Don't save if it's not set for some reason
+
             default_val = default_map.get(key)
+
             try:
+                # Handle special formatting for the learning rate curve
                 if key == "LR_CUSTOM_CURVE":
                     rounded_curve = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
                     config_to_save[key] = rounded_curve
                     continue
 
+                # --- Use robust type conversion based on the default value's type ---
+                converted_val = None
                 if isinstance(live_val, (bool, list)):
                     converted_val = live_val
                 elif default_val is not None:
-                    if isinstance(default_val, bool):
+                    default_type = type(default_val)
+                    if default_type == bool:
                         converted_val = str(live_val).strip().lower() in ('true', '1', 't', 'y', 'yes')
-                    elif isinstance(default_val, int):
+                    elif default_type == int:
                         converted_val = int(str(live_val).strip()) if str(live_val).strip() else 0
-                    elif isinstance(default_val, float):
+                    elif default_type == float:
                         converted_val = float(str(live_val).strip()) if str(live_val).strip() else 0.0
-                    elif isinstance(default_val, list):
+                    elif default_type == list:
+                        # Handle comma-separated strings for list values like BUCKET_ASPECT_RATIOS
                         raw_list_str = str(live_val).strip().replace('[', '').replace(']', '').replace("'", "").replace('"', '')
-                        converted_val = [float(p.strip()) for p in raw_list_str.split(',') if p.strip()]
-                    else:
+                        # Try to convert to float, fallback to string if it fails
+                        cleaned_parts = [p.strip() for p in raw_list_str.split(',') if p.strip()]
+                        try:
+                            converted_val = [float(p) for p in cleaned_parts]
+                        except ValueError:
+                             converted_val = cleaned_parts # Keep as strings if they can't be floats
+                    else: # Default to string
                         converted_val = str(live_val)
-                else:
+                else: # Fallback if no default type info
                     converted_val = str(live_val)
+                
                 config_to_save[key] = converted_val
+            
             except (ValueError, TypeError) as e:
                 self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
-        if hasattr(self, "datasets"):
-            config_to_save["INSTANCE_DATASETS"] = [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-            config_to_save.pop("INSTANCE_DATA_DIR", None)
+
         return config_to_save
 
     def save_config(self):
@@ -728,32 +895,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.config_dropdown.blockSignals(False)
             except Exception as e:
                 self.log(f"Error saving preset: {e}")
-
-    def _on_tab_change(self, index):
-        if self.tab_view.widget(index).layout() is not None: return
-        tab_widget = self.tab_view.widget(index)
-        tab_layout = QtWidgets.QVBoxLayout(tab_widget)
-        tab_layout.setContentsMargins(0,0,0,0)
-        tab_name = self.tab_view.tabText(index)
-
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        content_widget = QtWidgets.QWidget()
-        scroll_area.setWidget(content_widget)
-
-        if tab_name == "Dataset":
-            self._populate_dataset_tab(content_widget)
-            tab_layout.addWidget(scroll_area)
-        elif tab_name == "Model && Training Parameters":
-            self._populate_data_model_tab(content_widget)
-            tab_layout.addWidget(scroll_area)
-        elif tab_name == "Advanced":
-            self._populate_advanced_tab(content_widget)
-            tab_layout.addWidget(scroll_area)
-        elif tab_name == "Training Console":
-            self._populate_console_tab(tab_layout)
-
-        self._apply_config_to_widgets()
 
     def _create_widget(self, key):
         if key not in self.UI_DEFINITIONS: return None, None
@@ -806,34 +947,12 @@ class TrainingGUI(QtWidgets.QWidget):
             "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA", "BUCKET_ASPECT_RATIOS"]
         }
         for title, keys in groups.items():
-            group = QtWidgets.QGroupBox(title)
-            form_layout = QtWidgets.QFormLayout(group)
-            for key in keys:
-                label, widget = self._create_widget(key)
-                form_layout.addRow(label, widget)
-            top_hbox.addWidget(group)
+            top_hbox.addWidget(self._create_form_group(title, keys))
         layout.addLayout(top_hbox)
 
-        add_button = QtWidgets.QPushButton("Add Dataset Folder")
-        add_button.clicked.connect(self.add_dataset_folder)
-        layout.addWidget(add_button)
-        self.dataset_grid = QtWidgets.QGridLayout()
-        layout.addLayout(self.dataset_grid)
-        bottom_hbox = QtWidgets.QHBoxLayout()
-        self._create_bool_option(
-            bottom_hbox, "MIRROR_REPEATS", "Mirror Repeats", "Horizontally mirrors repeated images.", None
-        )
-        self._create_bool_option(bottom_hbox, "DARKEN_REPEATS", "Increase Contrast on Repeats", "Applies a contrast-enhancing S-curve to repeated images.", None)
-        bottom_hbox.addStretch(1)
-        bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:"))
-        self.total_label = QtWidgets.QLabel("0")
-        bottom_hbox.addWidget(self.total_label)
-        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:"))
-        self.total_repeats_label = QtWidgets.QLabel("0")
-        bottom_hbox.addWidget(self.total_repeats_label)
-        bottom_hbox.addStretch()
-        layout.addLayout(bottom_hbox)
-        layout.addStretch()
+        self.dataset_manager = DatasetManagerWidget(self)
+        self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
+        layout.addWidget(self.dataset_manager)
 
     def _populate_data_model_tab(self, parent_widget):
         layout = QtWidgets.QHBoxLayout(parent_widget)
@@ -843,18 +962,49 @@ class TrainingGUI(QtWidgets.QWidget):
         left_vbox = QtWidgets.QVBoxLayout()
         right_vbox = QtWidgets.QVBoxLayout()
 
+        path_group = self._create_path_group()
+        left_vbox.addWidget(path_group)
+
+        core_group = self._create_core_training_group()
+        left_vbox.addWidget(core_group)
+        left_vbox.addStretch()
+
+        optimizer_group = self._create_form_group("Optimizer", ["CLIP_GRAD_NORM", "WEIGHT_DECAY"])
+        right_vbox.addWidget(optimizer_group)
+        
+        lr_group = self._create_lr_scheduler_group()
+        right_vbox.addWidget(lr_group)
+        right_vbox.addStretch()
+
+        layout.addLayout(left_vbox, 1)
+        layout.addLayout(right_vbox, 1)
+
+        self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
+        self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
+        self._update_lr_button_states(-1)
+
+    def _create_form_group(self, title, keys):
+        group = QtWidgets.QGroupBox(title)
+        layout = QtWidgets.QFormLayout(group)
+        for key in keys:
+            label, widget = self._create_widget(key)
+            if label and widget:
+                layout.addRow(label, widget)
+        return group
+
+    def _create_path_group(self):
         path_group = QtWidgets.QGroupBox("File & Directory Paths")
         path_layout = QtWidgets.QFormLayout(path_group)
-
+        
         self.model_load_strategy_combo = QtWidgets.QComboBox()
         self.model_load_strategy_combo.addItems(["Load Base Model", "Resume from Checkpoint"])
         path_layout.addRow("Mode:", self.model_load_strategy_combo)
-
+        
         self.base_model_sub_widget = QtWidgets.QWidget()
-        base_model_layout = QtWidgets.QFormLayout(self.base_model_sub_widget)
-        base_model_layout.setContentsMargins(0,0,0,0)
+        base_layout = QtWidgets.QFormLayout(self.base_model_sub_widget)
+        base_layout.setContentsMargins(0,0,0,0)
         label, widget = self._create_widget("SINGLE_FILE_CHECKPOINT_PATH")
-        base_model_layout.addRow(label, widget)
+        base_layout.addRow(label, widget)
         path_layout.addRow(self.base_model_sub_widget)
 
         self.resume_sub_widget = QtWidgets.QWidget()
@@ -865,63 +1015,30 @@ class TrainingGUI(QtWidgets.QWidget):
         label, widget = self._create_widget("RESUME_STATE_PATH")
         resume_layout.addRow(label, widget)
         path_layout.addRow(self.resume_sub_widget)
-        
-        output_dir_label, output_dir_widget = self._create_widget("OUTPUT_DIR")
-        path_layout.addRow(output_dir_label, output_dir_widget)
+
+        label, widget = self._create_widget("OUTPUT_DIR")
+        path_layout.addRow(label, widget)
         
         self.model_load_strategy_combo.currentIndexChanged.connect(self.toggle_resume_widgets)
-        
-        left_vbox.addWidget(path_group)
+        return path_group
 
+    def _create_core_training_group(self):
         core_group = QtWidgets.QGroupBox("Core Training")
-        core_layout = QtWidgets.QFormLayout(core_group)
-        for key in ["MAX_TRAIN_STEPS", "SAVE_EVERY_N_STEPS", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "SEED"]:
+        layout = QtWidgets.QFormLayout(core_group)
+        core_keys = ["MAX_TRAIN_STEPS", "SAVE_EVERY_N_STEPS", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "SEED"]
+        for key in core_keys:
             label, widget = self._create_widget(key)
-            core_layout.addRow(label, widget)
+            layout.addRow(label, widget)
         
-        # Separator 1
-        separator_widget1 = QtWidgets.QWidget()
-        separator_layout1 = QtWidgets.QVBoxLayout(separator_widget1)
-        separator_layout1.setContentsMargins(0, 8, 0, 8)
-        line1 = QtWidgets.QFrame()
-        line1.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        line1.setFixedHeight(2)
-        line1.setStyleSheet("background-color: #4a4668;")
-        separator_layout1.addWidget(line1)
-        core_layout.addRow(separator_widget1)
-        
-        # Timestep Sampling
+        layout.addRow(self._create_separator())
         label, widget = self._create_widget("NOISE_SCHEDULE_VARIANT")
-        core_layout.addRow(label, widget)
+        layout.addRow(label, widget)
+        layout.addRow(self._create_separator())
 
-        # Separator 2
-        separator_widget2 = QtWidgets.QWidget()
-        separator_layout2 = QtWidgets.QVBoxLayout(separator_widget2)
-        separator_layout2.setContentsMargins(0, 8, 0, 8)
-        line2 = QtWidgets.QFrame()
-        line2.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
-        line2.setFixedHeight(2)
-        line2.setStyleSheet("background-color: #4a4668;")
-        separator_layout2.addWidget(line2)
-        core_layout.addRow(separator_widget2)
+        self._create_bool_option(layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.")
+        return core_group
 
-        # Zero-Terminal SNR
-        self._create_bool_option(core_layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.")
-
-        left_vbox.addWidget(core_group)
-        self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
-        self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
-
-        left_vbox.addStretch()
-
-        optimizer_group = QtWidgets.QGroupBox("Optimizer")
-        optimizer_layout = QtWidgets.QFormLayout(optimizer_group)
-        for key in ["CLIP_GRAD_NORM", "WEIGHT_DECAY"]:
-            label, widget = self._create_widget(key)
-            optimizer_layout.addRow(label, widget)
-
-        right_vbox.addWidget(optimizer_group)
-
+    def _create_lr_scheduler_group(self):
         lr_group = QtWidgets.QGroupBox("Learning Rate Scheduler")
         lr_layout = QtWidgets.QVBoxLayout(lr_group)
 
@@ -940,23 +1057,18 @@ class TrainingGUI(QtWidgets.QWidget):
         lr_layout.addLayout(lr_controls_layout)
 
         preset_layout = QtWidgets.QHBoxLayout()
-        preset_label = QtWidgets.QLabel("<b>Presets:</b>")
-        preset_layout.addWidget(preset_label)
-        cosine_btn = QtWidgets.QPushButton("Cosine")
-        cosine_btn.clicked.connect(self._set_cosine_preset)
-        linear_btn = QtWidgets.QPushButton("Linear")
-        linear_btn.clicked.connect(self._set_linear_preset)
-        constant_btn = QtWidgets.QPushButton("Constant")
-        constant_btn.clicked.connect(self._set_constant_preset)
-        step_btn = QtWidgets.QPushButton("Step")
-        step_btn.clicked.connect(self._set_step_preset)
-        cyclical_dip_btn = QtWidgets.QPushButton("Cyclical Dip")
-        cyclical_dip_btn.clicked.connect(self._set_cyclical_dip_preset)
-        preset_layout.addWidget(cosine_btn)
-        preset_layout.addWidget(linear_btn)
-        preset_layout.addWidget(constant_btn)
-        preset_layout.addWidget(step_btn)
-        preset_layout.addWidget(cyclical_dip_btn)
+        preset_layout.addWidget(QtWidgets.QLabel("<b>Presets:</b>"))
+        presets = {
+            "Cosine": self.lr_curve_widget.set_cosine_preset,
+            "Linear": self.lr_curve_widget.set_linear_preset,
+            "Constant": self.lr_curve_widget.set_constant_preset,
+            "Step": self.lr_curve_widget.set_step_preset,
+            "Cyclical Dip": self.lr_curve_widget.set_cyclical_dip_preset
+        }
+        for name, func in presets.items():
+            btn = QtWidgets.QPushButton(name)
+            btn.clicked.connect(func)
+            preset_layout.addWidget(btn)
         preset_layout.addStretch()
         lr_layout.addLayout(preset_layout)
 
@@ -969,197 +1081,13 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
-
-        right_vbox.addWidget(lr_group)
-        right_vbox.addStretch()
-
-        layout.addLayout(left_vbox, 1); layout.addLayout(right_vbox, 1)
-        self._update_lr_button_states(-1)
-
-    def _set_cosine_preset(self):
-        try:
-            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-        except (ValueError, KeyError):
-            self.log("ERROR: Min/Max LR must be set to use this preset.")
-            return
-
-        warmup_portion = 0.10
-        num_decay_points = 10
-
-        points = []
-
-        points.append([0.0, min_lr])
-        points.append([warmup_portion, max_lr])
-
-        decay_duration = 1.0 - warmup_portion
-        for i in range(num_decay_points + 1):
-            decay_progress = i / num_decay_points
-            norm_x = warmup_portion + decay_progress * decay_duration
-            cosine_val = 0.5 * (1 + math.cos(math.pi * decay_progress))
-            lr_val = min_lr + (max_lr - min_lr) * cosine_val
-            points.append([norm_x, lr_val])
-
-        p_last = points[-1]
-        p_before_last = points[-2]
-
-        midpoint_x = (p_before_last[0] + p_last[0]) / 2.0
-
-        midpoint_decay_progress = (midpoint_x - warmup_portion) / decay_duration
-        midpoint_cosine_val = 0.5 * (1 + math.cos(math.pi * midpoint_decay_progress))
-        midpoint_lr_val = min_lr + (max_lr - min_lr) * midpoint_cosine_val
-
-        points.append([midpoint_x, midpoint_lr_val])
-
-        unique_points = sorted(list(set(tuple(p) for p in points)), key=lambda x: x[0])
-
-        self.lr_curve_widget.set_points(unique_points)
-        self.lr_curve_widget.pointsChanged.emit(unique_points)
-        self.log(f"Applied mathematical Cosine preset with {len(unique_points)} points (final segment refined).")
-
-    def _set_linear_preset(self):
-        try:
-            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-        except (ValueError, KeyError):
-            self.log("ERROR: Min/Max LR must be set to use this preset.")
-            return
-
-        warmup_portion = 0.05
-
-        points = [
-            [0.0, min_lr],
-            [warmup_portion, max_lr],
-            [1.0, min_lr]
-        ]
-
-        self.lr_curve_widget.set_points(points)
-        self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Linear preset with warmup and decay.")
-
-    def _set_constant_preset(self):
-        try:
-            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-        except (ValueError, KeyError):
-            self.log("ERROR: Min/Max LR must be set to use this preset.")
-            return
-
-        warmup_portion = 0.05
-        cooldown_portion = 0.10
-        cooldown_start = 1.0 - cooldown_portion
-
-        points = [
-            [0.0, min_lr],
-            [warmup_portion, max_lr],
-            [cooldown_start, max_lr],
-            [1.0, min_lr]
-        ]
-
-        self.lr_curve_widget.set_points(points)
-        self.lr_curve_widget.pointsChanged.emit(points)
-        self.log("Applied Constant preset with warmup and cooldown.")
-
-    def _set_step_preset(self):
-        try:
-            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-            max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-        except (ValueError, KeyError):
-            self.log("ERROR: Min/Max LR and Max Steps must be set to use this preset.")
-            return
-
-        if max_steps <= 0:
-            self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
-            return
-
-        warmup_end_portion = 0.05
-        cooldown_start_portion = 0.60
-        cooldown_mid_portion = 0.65
-
-        if not (0 < warmup_end_portion < cooldown_start_portion < cooldown_mid_portion < 1.0):
-            self.log("ERROR: Preset timings are illogical. Warmup must end before cooldown starts.")
-            return
-
-        points = [
-            [0.0, min_lr],
-            [warmup_end_portion, max_lr],
-            [cooldown_start_portion, max_lr],
-            [cooldown_mid_portion, max_lr / 40],
-            [1.0, min_lr]
-        ]
-
-        self.lr_curve_widget.set_points(points)
-        self.lr_curve_widget.pointsChanged.emit(points)
-        self.log(f"Applied 'Plateau Refinement' preset. High-LR phase is from {warmup_end_portion*100:.0f}% to {cooldown_start_portion*100:.0f}%.")
-
-    def _set_cyclical_dip_preset(self):
-        try:
-            max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-            min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-            max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-        except (ValueError, KeyError):
-            self.log("ERROR: Min/Max LR and Max Steps must be set to use this preset.")
-            return
-
-        if max_steps <= 0:
-            self.log("ERROR: Cannot generate preset with 0 or fewer steps.")
-            return
-
-        warmup_end_portion = 0.05
-        cooldown_start_portion = 0.60
-        cooldown_mid_portion = 0.65
-
-        num_dips = 2
-        dip_factor = 0.25
-        dip_bottom_duration = 0.035
-        dip_transition_duration = 0.025
-
-        if not (0 < warmup_end_portion < cooldown_start_portion < cooldown_mid_portion < 1.0):
-            self.log("ERROR: Preset timings are illogical.")
-            return
-
-        points = []
-
-        points.append([0.0, min_lr])
-        points.append([warmup_end_portion, max_lr])
-
-        plateau_start = warmup_end_portion
-        plateau_end = cooldown_start_portion
-        plateau_duration = plateau_end - plateau_start
-
-        single_dip_total_duration = (dip_transition_duration * 2) + dip_bottom_duration
-        all_dips_total_duration = num_dips * single_dip_total_duration
-
-        flat_part_duration = (plateau_duration - all_dips_total_duration) / (num_dips + 1)
-
-        if flat_part_duration < 0:
-            self.log("ERROR: Dips are too long or numerous to fit in the plateau. Reduce num_dips or dip durations.")
-            return
-
-        current_pos = plateau_start
-        dip_lr = max(max_lr * dip_factor, min_lr)
-
-        for _ in range(num_dips):
-            current_pos += flat_part_duration
-            points.append([current_pos, max_lr])
-
-            current_pos += dip_transition_duration
-            points.append([current_pos, dip_lr])
-
-            current_pos += dip_bottom_duration
-            points.append([current_pos, dip_lr])
-
-            current_pos += dip_transition_duration
-            points.append([current_pos, max_lr])
-
-        points.append([cooldown_start_portion, max_lr])
-        points.append([cooldown_mid_portion, max_lr / 40])
-        points.append([1.0, min_lr])
-
-        self.lr_curve_widget.set_points(points)
-        self.lr_curve_widget.pointsChanged.emit(points)
-        self.log(f"Applied Step Preset with {num_dips} dips.")
+        return lr_group
+        
+    def _create_separator(self):
+        line = QtWidgets.QFrame()
+        line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        line.setStyleSheet("border: 1px solid #4a4668;")
+        return line
 
     def _populate_advanced_tab(self, parent_widget):
         main_layout = QtWidgets.QHBoxLayout(parent_widget)
@@ -1175,13 +1103,13 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self._create_bool_option(noise_layout, "USE_IP_NOISE_GAMMA", "Use Input Perturbation Noise", "Adds noise to input latents for regularization.", self.toggle_ip_noise_gamma_widget)
         self.ip_sub_widget = SubOptionWidget()
-        label, widget = self._create_widget("IP_NOISE_GAMMA"); self.ip_sub_widget.addRow(label, widget)
+        label, widget = self._create_widget("IP_NOISE_GAMMA"); self.ip_sub_widget.get_layout().addWidget(label); self.ip_sub_widget.get_layout().addWidget(widget)
         noise_layout.addWidget(self.ip_sub_widget)
         noise_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
 
         self._create_bool_option(noise_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", "Improves classifier-free guidance.", self.toggle_cond_dropout_widget)
         self.cond_sub_widget = SubOptionWidget()
-        label, widget = self._create_widget("COND_DROPOUT_PROB"); self.cond_sub_widget.addRow(label, widget)
+        label, widget = self._create_widget("COND_DROPOUT_PROB"); self.cond_sub_widget.get_layout().addWidget(label); self.cond_sub_widget.get_layout().addWidget(widget)
         noise_layout.addWidget(self.cond_sub_widget)
         left_layout.addWidget(noise_group)
 
@@ -1190,16 +1118,19 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self._create_bool_option(loss_layout, "USE_SNR_GAMMA", "Use SNR Gamma Weighting", "Reweights the loss based on Signal-to-Noise Ratio.", self.toggle_snr_gamma_widget)
         self.snr_sub_widget = SubOptionWidget()
+        
+        snr_sub_layout = QtWidgets.QFormLayout()
+        self.snr_sub_widget.get_layout().addLayout(snr_sub_layout)
 
         snr_strategy_label, snr_strategy_widget = self._create_widget("SNR_STRATEGY")
-        self.snr_sub_widget.addRow(snr_strategy_label, snr_strategy_widget)
+        snr_sub_layout.addRow(snr_strategy_label, snr_strategy_widget)
         snr_strategy_widget.currentTextChanged.connect(self.toggle_snr_variant_widget)
 
         gamma_label, gamma_widget = self._create_widget("SNR_GAMMA")
-        self.snr_sub_widget.addRow(gamma_label, gamma_widget)
+        snr_sub_layout.addRow(gamma_label, gamma_widget)
 
         self.min_snr_variant_label, self.min_snr_variant_widget = self._create_widget("MIN_SNR_VARIANT")
-        self.snr_sub_widget.addRow(self.min_snr_variant_label, self.min_snr_variant_widget)
+        snr_sub_layout.addRow(self.min_snr_variant_label, self.min_snr_variant_widget)
 
         loss_layout.addWidget(self.snr_sub_widget)
         left_layout.addWidget(loss_group)
@@ -1260,89 +1191,6 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.addWidget(param_group, stretch=0)
         layout.addWidget(self.log_textbox, stretch=1)
 
-    def add_dataset_folder(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder")
-        if not path: return
-        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-        images = [p for ext in exts for p in Path(path).rglob(f"*{ext}") if "_truncated" not in p.stem]
-        if not images:
-            QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder.")
-            return
-        image_count = len(images)
-        preview_path = random.choice(images)
-        self.datasets.append({
-            "path": path,
-            "image_count": image_count,
-            "preview_path": str(preview_path),
-            "repeats": 1
-        })
-        self.current_config["INSTANCE_DATASETS"] = [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-        self.repopulate_dataset_grid()
-        self.update_dataset_totals()
-
-    def repopulate_dataset_grid(self):
-        for i in reversed(range(self.dataset_grid.count())):
-            widget = self.dataset_grid.itemAt(i).widget()
-            if widget:
-                widget.deleteLater()
-        for idx, ds in enumerate(self.datasets):
-            preview_label = QtWidgets.QLabel()
-            pixmap = QtGui.QPixmap(ds["preview_path"]).scaled(128, 128, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
-            preview_label.setPixmap(pixmap)
-            self.dataset_grid.addWidget(preview_label, idx, 0)
-            path_label = QtWidgets.QLabel(ds["path"])
-            path_label.setWordWrap(True)
-            self.dataset_grid.addWidget(path_label, idx, 1)
-            repeats_spin = QtWidgets.QSpinBox()
-            repeats_spin.setMinimum(1)
-            repeats_spin.setMaximum(10000)
-            repeats_spin.setValue(ds["repeats"])
-            repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
-            self.dataset_grid.addWidget(repeats_spin, idx, 2)
-            remove_btn = QtWidgets.QPushButton("Remove")
-            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
-            self.dataset_grid.addWidget(remove_btn, idx, 3)
-            clear_btn = QtWidgets.QPushButton("Clear Cached Latents")
-            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
-            self.dataset_grid.addWidget(clear_btn, idx, 4)
-
-    def update_repeats(self, idx, val):
-        self.datasets[idx]["repeats"] = val
-        self.current_config["INSTANCE_DATASETS"] = [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-        self.update_dataset_totals()
-
-    def remove_dataset(self, idx):
-        del self.datasets[idx]
-        self.current_config["INSTANCE_DATASETS"] = [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-        self.repopulate_dataset_grid()
-        self.update_dataset_totals()
-
-    def update_dataset_totals(self):
-        total = sum(ds["image_count"] for ds in self.datasets)
-        total_rep = sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
-        self.total_label.setText(str(total))
-        self.total_repeats_label.setText(str(total_rep))
-        self._update_epoch_markers_on_graph()
-
-    def confirm_clear_cache(self, path):
-        reply = QtWidgets.QMessageBox.question(self, "Confirm", "Are you sure you want to delete all cached latents in this dataset? They will be deleted.", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.clear_cached_latents(path)
-
-    def clear_cached_latents(self, path):
-        root = Path(path)
-        deleted = False
-        for cache_dir in list(root.rglob(".precomputed_embeddings_cache")):
-            if cache_dir.is_dir():
-                try:
-                    shutil.rmtree(cache_dir)
-                    self.log(f"Deleted cache directory: {cache_dir}")
-                    deleted = True
-                except Exception as e:
-                    self.log(f"Error deleting {cache_dir}: {e}")
-        if not deleted:
-            self.log("No cached latent directories found to delete.")
-
     def _browse_path(self, entry_widget, file_type):
         path = ""
         current_path = os.path.dirname(entry_widget.text()) if entry_widget.text() else ""
@@ -1365,7 +1213,6 @@ class TrainingGUI(QtWidgets.QWidget):
     def _update_unet_targets_config(self):
         if not self.unet_layer_checkboxes: return
         self.current_config["UNET_TRAIN_TARGETS"] = [k for k, cb in self.unet_layer_checkboxes.items() if cb.isChecked()]
-
 
     def _update_config_from_widget(self, key, widget):
         if isinstance(widget, QtWidgets.QLineEdit):
@@ -1408,24 +1255,13 @@ class TrainingGUI(QtWidgets.QWidget):
             self._update_and_clamp_lr_graph()
 
         for toggle_func in [self.toggle_snr_gamma_widget,
-                            self.toggle_ip_noise_gamma_widget, self.toggle_cond_dropout_widget]:
+                            self.toggle_ip_noise_gamma_widget, 
+                            self.toggle_cond_dropout_widget]:
             toggle_func()
 
-        if hasattr(self, "dataset_grid"):
-            self.datasets = []
+        if hasattr(self, "dataset_manager"):
             datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
-            for d in datasets_config:
-                path = d.get("path")
-                if path and os.path.exists(path):
-                    exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-                    images = [p for ext in exts for p in Path(path).rglob(f"*{ext}") if "_truncated" not in p.stem]
-                    if images:
-                        self.datasets.append({
-                            "path": path, "image_count": len(images),
-                            "preview_path": str(random.choice(images)), "repeats": d.get("repeats", 1)
-                        })
-            self.repopulate_dataset_grid()
-            self.update_dataset_totals()
+            self.dataset_manager.load_datasets_from_config(datasets_config)
 
     def restore_defaults(self):
         index = self.config_dropdown.currentIndex()
@@ -1439,10 +1275,11 @@ class TrainingGUI(QtWidgets.QWidget):
             self.save_config()
             self.load_selected_config(index)
             self.log(f"Restored '{selected_key}.json' to defaults.")
-
+            
     def toggle_all_unet_checkboxes(self, state):
         for cb in self.unet_layer_checkboxes.values(): cb.setChecked(state)
         self._update_unet_targets_config()
+        
     def toggle_snr_gamma_widget(self):
         if hasattr(self, 'snr_sub_widget'):
             is_checked = self.widgets.get("USE_SNR_GAMMA", QtWidgets.QCheckBox()).isChecked()
@@ -1452,6 +1289,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def toggle_ip_noise_gamma_widget(self):
         if hasattr(self, 'ip_sub_widget'): self.ip_sub_widget.setVisible(self.widgets.get("USE_IP_NOISE_GAMMA", QtWidgets.QCheckBox()).isChecked())
+        
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
@@ -1460,11 +1298,10 @@ class TrainingGUI(QtWidgets.QWidget):
             
     def toggle_cond_dropout_widget(self):
         if hasattr(self, 'cond_sub_widget'): self.cond_sub_widget.setVisible(self.widgets.get("USE_COND_DROPOUT", QtWidgets.QCheckBox()).isChecked())
+        
     def toggle_snr_variant_widget(self, text=None):
         if not hasattr(self, 'min_snr_variant_widget'): return
-
         strategy = text if text is not None else self.widgets.get("SNR_STRATEGY", QtWidgets.QComboBox()).currentText()
-
         is_min_snr = (strategy == "Min-SNR")
         self.min_snr_variant_label.setVisible(is_min_snr)
         self.min_snr_variant_widget.setVisible(is_min_snr)
@@ -1565,10 +1402,11 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_epoch_markers_on_graph()
 
     def _update_epoch_markers_on_graph(self):
-        if not hasattr(self, 'lr_curve_widget'):
+        if not hasattr(self, 'lr_curve_widget') or not hasattr(self, 'dataset_manager'):
             return
+            
         try:
-            total_images = int(self.total_repeats_label.text())
+            total_images = self.dataset_manager.get_total_repeats()
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
         except (ValueError, KeyError):
             self.lr_curve_widget.set_epoch_data([])
@@ -1590,6 +1428,407 @@ class TrainingGUI(QtWidgets.QWidget):
             is_removable = selected_index > 0 and selected_index < len(self.lr_curve_widget.get_points()) - 1
             self.remove_point_btn.setEnabled(is_removable)
 
+# --- NEW DATASET MANAGER WIDGET ---
+class DatasetManagerWidget(QtWidgets.QWidget):
+    datasetsChanged = QtCore.pyqtSignal()
+
+    def __init__(self, parent_gui):
+        super().__init__()
+        self.parent_gui = parent_gui
+        self.datasets = []
+        self.dataset_widgets = []
+        self._init_ui()
+
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        add_button = QtWidgets.QPushButton("Add Dataset Folder")
+        add_button.clicked.connect(self.add_dataset_folder)
+        layout.addWidget(add_button)
+
+        self.dataset_vbox = QtWidgets.QVBoxLayout()
+        layout.addLayout(self.dataset_vbox)
+
+        bottom_hbox = QtWidgets.QHBoxLayout()
+        bottom_hbox.addStretch(1)
+        bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:"))
+        self.total_label = QtWidgets.QLabel("0")
+        bottom_hbox.addWidget(self.total_label)
+        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:"))
+        self.total_repeats_label = QtWidgets.QLabel("0")
+        bottom_hbox.addWidget(self.total_repeats_label)
+        bottom_hbox.addStretch()
+        layout.addLayout(bottom_hbox)
+        layout.addStretch()
+        
+    def get_total_repeats(self):
+        return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
+
+    def get_datasets_config(self):
+        return [
+            {
+                "path": ds["path"],
+                "repeats": ds["repeats"],
+                "mirror_repeats": ds["mirror_repeats"],
+                "darken_repeats": ds["darken_repeats"],
+                "use_mask": ds["use_mask"],
+                "mask_path": ds["mask_path"],
+                "mask_focus_factor": ds["mask_focus_factor"],
+                "mask_focus_mode": ds["mask_focus_mode"] # <-- ADD THIS LINE
+            } for ds in self.datasets
+        ]
+        
+    def load_datasets_from_config(self, datasets_config):
+        self.datasets = []
+        for d in datasets_config:
+            path = d.get("path")
+            if path and os.path.exists(path):
+                exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
+                images = [p for ext in exts for p in Path(path).rglob(f"*{ext}") if "_truncated" not in p.stem and "_mask" not in p.stem]
+                if images:
+                    self.datasets.append({
+                        "path": path, "image_count": len(images),
+                        "preview_path": str(random.choice(images)),
+                        "repeats": d.get("repeats", 1),
+                        "mirror_repeats": d.get("mirror_repeats", False),
+                        "darken_repeats": d.get("darken_repeats", False),
+                        "use_mask": d.get("use_mask", False),
+                        "mask_path": d.get("mask_path", ""),
+                        "mask_focus_factor": d.get("mask_focus_factor", 2.0),
+                        # <-- ADD THIS LINE WITH A DEFAULT FOR BACKWARD COMPATIBILITY -->
+                        "mask_focus_mode": d.get("mask_focus_mode", "Proportional (Multiply)")
+                    })
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+
+    def add_dataset_folder(self):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder")
+        if not path: return
+        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
+        images = [p for ext in exts for p in Path(path).rglob(f"*{ext}") if "_truncated" not in p.stem and "_mask" not in p.stem]
+        if not images:
+            QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder (or they were all excluded as masks).")
+            return
+        
+        self.datasets.append({
+            "path": path,
+            "image_count": len(images),
+            "preview_path": str(random.choice(images)),
+            "repeats": 1, "mirror_repeats": False, "darken_repeats": False,
+            "use_mask": False, "mask_path": "", "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)", # <-- ADD THIS LINE
+        })
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+
+    def repopulate_dataset_grid(self):
+        for i in reversed(range(self.dataset_vbox.count())):
+            item = self.dataset_vbox.itemAt(i)
+            if item.widget():
+                item.widget().deleteLater()
+        self.dataset_widgets = []
+
+        for idx, ds in enumerate(self.datasets):
+            main_widget = QtWidgets.QWidget()
+            main_layout = QtWidgets.QHBoxLayout(main_widget)
+            main_layout.setContentsMargins(0, 10, 0, 5)
+
+            preview_label = QtWidgets.QLabel()
+            pixmap = QtGui.QPixmap(ds["preview_path"]).scaled(128, 128, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            preview_label.setPixmap(pixmap)
+            main_layout.addWidget(preview_label)
+
+            path_label = QtWidgets.QLabel(f"<b>Path:</b><br>{ds['path']}")
+            path_label.setWordWrap(True)
+            main_layout.addWidget(path_label, 1)
+
+            repeats_spin = QtWidgets.QSpinBox()
+            repeats_spin.setMinimum(1); repeats_spin.setMaximum(10000)
+            repeats_spin.setValue(ds["repeats"])
+            repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
+            
+            form_layout = QtWidgets.QFormLayout()
+            form_layout.addRow("Repeats:", repeats_spin)
+            main_layout.addLayout(form_layout)
+
+            btn_vbox = QtWidgets.QVBoxLayout()
+            remove_btn = QtWidgets.QPushButton("Remove")
+            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
+            btn_vbox.addWidget(remove_btn)
+            clear_btn = QtWidgets.QPushButton("Clear Cached Latents")
+            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
+            btn_vbox.addWidget(clear_btn)
+            main_layout.addLayout(btn_vbox)
+
+            aug_sub_widget, mask_sub_widget, widget_group = self._create_sub_widgets(idx, ds)
+            self.dataset_widgets.append(widget_group)
+            
+            self.dataset_vbox.addWidget(main_widget)
+            self.dataset_vbox.addWidget(aug_sub_widget)
+            self.dataset_vbox.addWidget(mask_sub_widget)
+
+            self.toggle_mask_controls(idx, ds.get("use_mask", False))
+            if ds.get("use_mask"):
+                self.update_mask_preview(idx)
+
+
+
+# In the DatasetManagerWidget class...
+
+# In the DatasetManagerWidget class...
+
+    def _create_sub_widgets(self, idx, ds):
+        aug_sub_widget = SubOptionWidget()
+        aug_layout = aug_sub_widget.get_layout()
+        aug_layout.setContentsMargins(35, 5, 5, 5)
+        mirror_cb = QtWidgets.QCheckBox("Mirror Repeats")
+        mirror_cb.setToolTip("Horizontally mirrors repeated images for this dataset.")
+        mirror_cb.setChecked(ds.get("mirror_repeats", False))
+        mirror_cb.stateChanged.connect(lambda state, i=idx: self.update_dataset_bool(i, "mirror_repeats", state))
+        darken_cb = QtWidgets.QCheckBox("Increase Contrast on Repeats")
+        darken_cb.setToolTip("Applies a contrast-enhancing S-curve to repeated images.")
+        darken_cb.setChecked(ds.get("darken_repeats", False))
+        darken_cb.stateChanged.connect(lambda state, i=idx: self.update_dataset_bool(i, "darken_repeats", state))
+        aug_layout.addWidget(mirror_cb)
+        aug_layout.addWidget(darken_cb)
+        aug_layout.addStretch()
+
+        mask_sub_widget = SubOptionWidget()
+        mask_layout = mask_sub_widget.get_layout()
+        mask_enable_cb = QtWidgets.QCheckBox("Enable Masked Training")
+        mask_enable_cb.setChecked(ds.get("use_mask", False))
+        
+        help_button = QtWidgets.QPushButton("?")
+        help_button.setFixedSize(22, 22)
+        help_button.setToolTip("Click for an explanation of Masked Training.")
+        
+        # --- FINAL CORRECTED STYLESHEET ---
+        # This version aggressively overrides the global button styles to force the small size.
+        help_button.setStyleSheet("""
+            QPushButton {
+                font-weight: bold;
+                font-size: 14px;
+                color: #e0e0e0;
+                background-color: #4a4668;
+                border: 1px solid #5c5a70;
+                border-radius: 11px; /* half of 22px size */
+                padding: 0px;
+                margin: 0px;
+                /* Force size override */
+                min-height: 20px;
+                max-height: 20px;
+                min-width: 20px;
+                max-width: 20px;
+            }
+            QPushButton:hover {
+                background-color: #6a48d7;
+                color: #ffffff;
+                border: 1px solid #ab97e6;
+            }
+            QPushButton:pressed {
+                background-color: #383552;
+            }
+        """)
+
+        help_text = """
+        <p><b>Masked Training</b> allows you to increase the training focus on specific parts of your images.</p>
+        <p>This is useful for teaching the model specific details, objects, or styles in a concentrated area, while the rest of the image continues to train normally.</p>
+        <hr>
+        <p><b>How it Works:</b></p>
+        <ul>
+            <li>You provide a corresponding 'mask' image for each of your training images.</li>
+
+            <li>The mask is an image that acts as a guide:
+                <ul>
+                    <li style="margin-left:15px;"><b>Black pixels</b> mark the areas that will be trained with normal priority (a focus of 1.0).</li>
+                    <li style="margin-left:15px;"><b>Any non-black pixels</b> (white, red, etc.) mark the areas you want to prioritize.</li>
+                </ul>
+            </li>
+
+            <li>The <b>Focus Factor</b> is a multiplier that determines how much more to prioritize the non-black areas. A factor of 2.0 means these focused areas will have twice the impact on training compared to the black areas.</li>
+
+            <li>Masks must be saved in the specified 'Mask Path' folder and have the same filename as the original image, but with a <b>_mask.png</b> suffix.<br><i>(e.g., for 'my_image.jpg', the mask must be 'my_image_mask.png')</i></li>
+        </ul>
+        <p>A preview of the mask (visualized in red) will be shown on a sample image when a valid mask path is provided.</p>
+        """
+
+        def show_help_dialog():
+            dialog = InfoDialog("What is Masked Training?", help_text, self)
+            dialog.exec()
+
+        help_button.clicked.connect(show_help_dialog)
+        
+        mask_enable_layout = QtWidgets.QHBoxLayout()
+        mask_enable_layout.setContentsMargins(0, 0, 0, 0)
+        mask_enable_layout.addWidget(mask_enable_cb)
+        mask_enable_layout.addWidget(help_button, 0, QtCore.Qt.AlignmentFlag.AlignVCenter) # Keep alignment for centering
+        mask_enable_layout.addStretch()
+        
+        mask_path_edit = QtWidgets.QLineEdit(ds.get("mask_path", ""))
+        mask_path_edit.setPlaceholderText("Path to mask folder...")
+        mask_path_edit.textChanged.connect(lambda text, i=idx: self.update_mask_path(i, text))
+        mask_browse_btn = QtWidgets.QPushButton("Browse...")
+        mask_browse_btn.clicked.connect(lambda _, i=idx: self.browse_for_mask_folder(i))
+        mask_preview_label = QtWidgets.QLabel()
+        mask_preview_label.setFixedSize(128, 128)
+        mask_preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #1a1926;")
+        mask_factor_spinbox = QtWidgets.QDoubleSpinBox()
+        mask_factor_spinbox.setRange(1.0, 100.0); mask_factor_spinbox.setSingleStep(0.1)
+        mask_factor_spinbox.setDecimals(2); mask_factor_spinbox.setValue(ds.get("mask_focus_factor", 2.0))
+        mask_factor_spinbox.valueChanged.connect(lambda v, i=idx: self.update_mask_factor(i, v))
+        mask_mode_combo = QtWidgets.QComboBox()
+        mask_mode_combo.addItems(["Proportional (Multiply)", "Uniform (Add)"])
+        mask_mode_combo.setToolTip("Proportional: loss * factor\nUniform: loss + factor")
+        mask_mode_combo.setCurrentText(ds.get("mask_focus_mode", "Proportional (Multiply)"))
+        mask_mode_combo.currentTextChanged.connect(lambda text, i=idx: self.update_mask_mode(i, text))
+        
+        widget_group = {
+            "mask_path_edit": mask_path_edit, "mask_preview": mask_preview_label,
+            "mask_factor_spin": mask_factor_spinbox,
+            "mask_mode_combo": mask_mode_combo,
+        }
+        
+        
+        mask_enable_cb.stateChanged.connect(lambda state, i=idx: self.toggle_mask_controls(i, state))
+        
+        sub_vbox = QtWidgets.QVBoxLayout()
+        sub_vbox.addLayout(mask_enable_layout)
+        path_hbox = QtWidgets.QHBoxLayout()
+        path_hbox.addWidget(mask_path_edit, 1); path_hbox.addWidget(mask_browse_btn)
+        sub_vbox.addLayout(path_hbox)
+        factor_hbox = QtWidgets.QHBoxLayout()
+        factor_hbox.addWidget(QtWidgets.QLabel("Focus Factor:"))
+        factor_hbox.addWidget(mask_factor_spinbox)
+        factor_hbox.addWidget(QtWidgets.QLabel("Mode:"))
+        factor_hbox.addWidget(mask_mode_combo)
+        factor_hbox.addStretch()
+        sub_vbox.addLayout(factor_hbox)
+        mask_layout.addLayout(sub_vbox, 1)
+        mask_layout.addWidget(mask_preview_label)
+
+        return aug_sub_widget, mask_sub_widget, widget_group
+    
+    def update_repeats(self, idx, val):
+        self.datasets[idx]["repeats"] = val
+        self.update_dataset_totals()
+    def update_mask_path(self, idx, text):
+        self.datasets[idx]["mask_path"] = text
+        self.update_mask_preview(idx)
+    def update_mask_factor(self, idx, val):
+        self.datasets[idx]["mask_focus_factor"] = val
+    def update_mask_mode(self, idx, text):
+        self.datasets[idx]["mask_focus_mode"] = text
+    def update_dataset_bool(self, idx, key, state):
+        self.datasets[idx][key] = bool(state)
+    def remove_dataset(self, idx):
+        del self.datasets[idx]
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+    def update_dataset_totals(self):
+        total = sum(ds["image_count"] for ds in self.datasets)
+        total_rep = self.get_total_repeats()
+        self.total_label.setText(str(total))
+        self.total_repeats_label.setText(str(total_rep))
+        self.datasetsChanged.emit()
+
+    def confirm_clear_cache(self, path):
+        reply = QtWidgets.QMessageBox.question(self, "Confirm", "Delete all cached latents in this dataset?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+            self.clear_cached_latents(path)
+
+    def clear_cached_latents(self, path):
+        root = Path(path)
+        deleted = False
+        for cache_dir in list(root.rglob(".precomputed_embeddings_cache")):
+            if cache_dir.is_dir():
+                try:
+                    shutil.rmtree(cache_dir)
+                    self.parent_gui.log(f"Deleted cache directory: {cache_dir}")
+                    deleted = True
+                except Exception as e:
+                    self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
+        if not deleted:
+            self.parent_gui.log("No cached latent directories found to delete.")
+            
+    def browse_for_mask_folder(self, idx):
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Mask Folder")
+        if path:
+            self.dataset_widgets[idx]["mask_path_edit"].setText(path)
+
+    def update_mask_preview(self, idx):
+        preview_label = self.dataset_widgets[idx]["mask_preview"]
+        ds = self.datasets[idx]
+        preview_label.clear()
+
+        base_img_path = Path(ds.get("preview_path", ""))
+        mask_path_dir = Path(ds.get("mask_path", ""))
+
+        if not base_img_path.exists() or not mask_path_dir.is_dir():
+            return
+            
+        mask_filename = f"{base_img_path.stem}_mask.png"
+        mask_file_path = mask_path_dir / mask_filename
+        
+        if not mask_file_path.exists():
+            return
+            
+        try:
+            base_pixmap = QtGui.QPixmap(str(base_img_path))
+            mask_image = QtGui.QImage(str(mask_file_path))
+
+            if base_pixmap.isNull() or mask_image.isNull(): return
+
+            size = QtCore.QSize(128, 128)
+            combined = QtGui.QPixmap(size)
+            combined.fill(QtCore.Qt.GlobalColor.transparent)
+
+            scaled_base = base_pixmap.scaled(size, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            draw_rect = scaled_base.rect().translated((size.width() - scaled_base.width()) // 2, (size.height() - scaled_base.height()) // 2)
+
+            scaled_mask_image = mask_image.scaled(scaled_base.size(), QtCore.Qt.AspectRatioMode.IgnoreAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+
+            mask_pixmap = QtGui.QPixmap.fromImage(scaled_mask_image)
+            
+            mask_bitmap = mask_pixmap.createMaskFromColor(
+                QtGui.QColor('black'), QtCore.Qt.MaskMode.MaskInColor
+            )
+
+            tint_color = QtGui.QColor(229, 57, 53, 150) # semi-transparent red
+            tinted_overlay = QtGui.QPixmap(scaled_base.size())
+            tinted_overlay.fill(tint_color)
+            tinted_overlay.setMask(mask_bitmap) 
+
+            painter = QtGui.QPainter(combined)
+            painter.drawPixmap(draw_rect, scaled_base)      
+            painter.drawPixmap(draw_rect, tinted_overlay) 
+            painter.end()
+            
+            preview_label.setPixmap(combined)
+        except Exception as e:
+            self.parent_gui.log(f"Error creating mask preview for {mask_file_path}: {e}")
+
+    def toggle_mask_controls(self, idx, state):
+        is_checked = bool(state)
+        self.datasets[idx]["use_mask"] = is_checked
+        
+        widgets = self.dataset_widgets[idx]
+        widgets["mask_path_edit"].setVisible(is_checked)
+        widgets["mask_path_edit"].parent().findChild(QtWidgets.QPushButton).setVisible(is_checked) 
+        widgets["mask_preview"].setVisible(is_checked)
+        widgets["mask_factor_spin"].setVisible(is_checked)
+        widgets["mask_factor_spin"].parent().findChild(QtWidgets.QLabel).setVisible(is_checked)
+        
+        widgets["mask_mode_combo"].setVisible(is_checked)
+        mode_label = widgets["mask_mode_combo"].parent().findChild(QtWidgets.QLabel, "Mode:")
+        if mode_label:
+            mode_label.setVisible(is_checked)
+
+        if is_checked:
+            self.update_mask_preview(idx)
+        else:
+            widgets["mask_preview"].clear()
+            
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)

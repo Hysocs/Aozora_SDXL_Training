@@ -84,7 +84,6 @@ class TrainingConfig:
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
-       
         parser = argparse.ArgumentParser(description="Load a specific training configuration.")
         parser.add_argument("--config", type=str, help="Path to the user configuration JSON file.")
         args = parser.parse_args()
@@ -111,9 +110,9 @@ class TrainingConfig:
         str_keys = ["MIN_SNR_VARIANT"]
         bool_keys = [
             "MIRROR_REPEATS", "DARKEN_REPEATS", 
-            "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", "USE_MIN_SNR_GAMMA", 
+            "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", "USE_SNR_GAMMA",
             "USE_ZERO_TERMINAL_SNR", "USE_IP_NOISE_GAMMA", "USE_RESIDUAL_SHIFTING", 
-            "USE_COND_DROPOUT"
+            "USE_COND_DROPOUT", "USE_MASKED_TRAINING"
         ]
        
         for key in float_keys:
@@ -263,7 +262,9 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         print(f"Processing dataset: {data_root_path}")
    
         print("Scanning for images recursively...")
-        all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in data_root_path.rglob(f"*{ext}")]
+        all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+                   for p in data_root_path.rglob(f"*{ext}") 
+                   if "_mask" not in p.stem]
         if not all_image_paths: 
             print(f"WARNING: No images found in {data_root_path}. Skipping.")
             continue
@@ -295,10 +296,7 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                 all_batches_to_process.append((bucket_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
         random.shuffle(all_batches_to_process)
    
-        if config.DARKEN_REPEATS:
-            print("DARKEN_REPEATS enabled: Caching high-contrast variants for repeats.")
-        if config.MIRROR_REPEATS:
-            print("MIRROR_REPEATS enabled: Caching horizontally flipped variants for repeats.")
+        print("INFO: Caching all variants (original, flipped, contrast, flipped-contrast) for future use.")
 
         for (target_w, target_h), batch_metadata in tqdm(all_batches_to_process, desc="Caching embeddings in batches"):
             captions_batch = [meta['caption'] for meta in batch_metadata]
@@ -310,6 +308,7 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
             
             variants = {}
             
+            # Original
             image_tensors = []
             for meta in batch_metadata:
                 try:
@@ -326,64 +325,64 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                         raise ValueError("NaN or Inf detected in latents—bad encoding!")
                 variants["original"] = latents_batch
                 del img_tensor_batch
+
+            # Contrast
+            contrast_image_tensors = []
+            for meta in batch_metadata:
+                try:
+                    img = Image.open(meta['ip']).convert('RGB')
+                    contrast_img = apply_sigmoid_contrast(img, gain=10)
+                    processed_contrast = resize_and_crop(contrast_img, target_w, target_h)
+                    contrast_image_tensors.append(img_transform(processed_contrast))
+                except Exception as e:
+                    tqdm.write(f"\n[ERROR] Skipping bad contrast image {meta['ip']}: {e}")
+            if contrast_image_tensors:
+                contrast_tensor_batch = torch.stack(contrast_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                with torch.no_grad():
+                    contrast_latents_batch = vae.encode(contrast_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                    if torch.isnan(contrast_latents_batch).any() or torch.isinf(contrast_latents_batch).any():
+                        raise ValueError("NaN or Inf in contrast latents!")
+                variants["contrast"] = contrast_latents_batch
+                del contrast_tensor_batch
+
+            # Flipped
+            flipped_image_tensors = []
+            for meta in batch_metadata:
+                try:
+                    img = Image.open(meta['ip']).convert('RGB')
+                    flipped_img = img.transpose(Image.FLIP_LEFT_RIGHT)
+                    processed_flipped = resize_and_crop(flipped_img, target_w, target_h)
+                    flipped_image_tensors.append(img_transform(processed_flipped))
+                except Exception as e:
+                    tqdm.write(f"\n[ERROR] Skipping bad flipped image {meta['ip']}: {e}")
+            if flipped_image_tensors:
+                flipped_tensor_batch = torch.stack(flipped_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                with torch.no_grad():
+                    flipped_latents_batch = vae.encode(flipped_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                    if torch.isnan(flipped_latents_batch).any() or torch.isinf(flipped_latents_batch).any():
+                        raise ValueError("NaN or Inf in flipped latents!")
+                variants["flipped"] = flipped_latents_batch
+                del flipped_tensor_batch
             
-            if config.DARKEN_REPEATS:
-                contrast_image_tensors = []
-                for meta in batch_metadata:
-                    try:
-                        img = Image.open(meta['ip']).convert('RGB')
-                        contrast_img = apply_sigmoid_contrast(img, gain=10)
-                        processed_contrast = resize_and_crop(contrast_img, target_w, target_h)
-                        contrast_image_tensors.append(img_transform(processed_contrast))
-                    except Exception as e:
-                        tqdm.write(f"\n[ERROR] Skipping bad contrast image {meta['ip']}: {e}")
-                if contrast_image_tensors:
-                    contrast_tensor_batch = torch.stack(contrast_image_tensors).to(device_for_encoding, dtype=vae.dtype)
-                    with torch.no_grad():
-                        contrast_latents_batch = vae.encode(contrast_tensor_batch).latent_dist.mean * vae.config.scaling_factor
-                        if torch.isnan(contrast_latents_batch).any() or torch.isinf(contrast_latents_batch).any():
-                            raise ValueError("NaN or Inf in contrast latents!")
-                    variants["contrast"] = contrast_latents_batch
-                    del contrast_tensor_batch
-            
-            if config.MIRROR_REPEATS:
-                flipped_image_tensors = []
-                for meta in batch_metadata:
-                    try:
-                        img = Image.open(meta['ip']).convert('RGB')
-                        flipped_img = img.transpose(Image.FLIP_LEFT_RIGHT)
-                        processed_flipped = resize_and_crop(flipped_img, target_w, target_h)
-                        flipped_image_tensors.append(img_transform(processed_flipped))
-                    except Exception as e:
-                        tqdm.write(f"\n[ERROR] Skipping bad flipped image {meta['ip']}: {e}")
-                if flipped_image_tensors:
-                    flipped_tensor_batch = torch.stack(flipped_image_tensors).to(device_for_encoding, dtype=vae.dtype)
-                    with torch.no_grad():
-                        flipped_latents_batch = vae.encode(flipped_tensor_batch).latent_dist.mean * vae.config.scaling_factor
-                        if torch.isnan(flipped_latents_batch).any() or torch.isinf(flipped_latents_batch).any():
-                            raise ValueError("NaN or Inf in flipped latents!")
-                    variants["flipped"] = flipped_latents_batch
-                    del flipped_tensor_batch
-            
-            if config.MIRROR_REPEATS and config.DARKEN_REPEATS:
-                fc_image_tensors = []
-                for meta in batch_metadata:
-                    try:
-                        img = Image.open(meta['ip']).convert('RGB')
-                        contrast_img = apply_sigmoid_contrast(img, gain=10)
-                        fc_img = contrast_img.transpose(Image.FLIP_LEFT_RIGHT)
-                        processed_fc = resize_and_crop(fc_img, target_w, target_h)
-                        fc_image_tensors.append(img_transform(processed_fc))
-                    except Exception as e:
-                        tqdm.write(f"\n[ERROR] Skipping bad flipped contrast image {meta['ip']}: {e}")
-                if fc_image_tensors:
-                    fc_tensor_batch = torch.stack(fc_image_tensors).to(device_for_encoding, dtype=vae.dtype)
-                    with torch.no_grad():
-                        fc_latents_batch = vae.encode(fc_tensor_batch).latent_dist.mean * vae.config.scaling_factor
-                        if torch.isnan(fc_latents_batch).any() or torch.isinf(fc_latents_batch).any():
-                            raise ValueError("NaN or Inf in flipped contrast latents!")
-                    variants["flipped_contrast"] = fc_latents_batch
-                    del fc_tensor_batch
+            # Flipped + Contrast
+            fc_image_tensors = []
+            for meta in batch_metadata:
+                try:
+                    img = Image.open(meta['ip']).convert('RGB')
+                    contrast_img = apply_sigmoid_contrast(img, gain=10)
+                    fc_img = contrast_img.transpose(Image.FLIP_LEFT_RIGHT)
+                    processed_fc = resize_and_crop(fc_img, target_w, target_h)
+                    fc_image_tensors.append(img_transform(processed_fc))
+                except Exception as e:
+                    tqdm.write(f"\n[ERROR] Skipping bad flipped contrast image {meta['ip']}: {e}")
+            if fc_image_tensors:
+                fc_tensor_batch = torch.stack(fc_image_tensors).to(device_for_encoding, dtype=vae.dtype)
+                with torch.no_grad():
+                    fc_latents_batch = vae.encode(fc_tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                    if torch.isnan(fc_latents_batch).any() or torch.isinf(fc_latents_batch).any():
+                        raise ValueError("NaN or Inf in flipped contrast latents!")
+                variants["flipped_contrast"] = fc_latents_batch
+                del fc_tensor_batch
             
             for j, meta in enumerate(batch_metadata):
                 image_path = meta['ip']
@@ -396,9 +395,10 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                     "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
                 }
                 for key, latents in variants.items():
-                    save_data[key] = {
-                        "latents_cpu": latents[j].clone().cpu().to(config.compute_dtype)
-                    }
+                    if j < len(latents):
+                        save_data[key] = {
+                            "latents_cpu": latents[j].clone().cpu().to(config.compute_dtype)
+                        }
                 torch.save(save_data, cache_dir / f"{image_path.stem}.pt")
             
             for latents in variants.values():
@@ -485,61 +485,105 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
     
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
+        self.config = config
         if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
             config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
+            
         self.latent_files = []
-        should_mirror_repeats = getattr(config, 'MIRROR_REPEATS', False)
-        should_darken_repeats = getattr(config, 'DARKEN_REPEATS', False)
+        all_unique_files = set()
+        
         for dataset in config.INSTANCE_DATASETS:
             root = Path(dataset["path"])
+            print(f"Loading dataset '{root.name}' with config: {dataset}")
             files = list(root.rglob(".precomputed_embeddings_cache/*.pt"))
+            for f in files:
+                all_unique_files.add(f)
+            
             repeats = dataset.get("repeats", 1)
+            should_mirror = dataset.get("mirror_repeats", False)
+            should_darken = dataset.get("darken_repeats", False)
             
-            self.latent_files.extend([(f, "original") for f in files])
+            # Always add the original image once
+            self.latent_files.extend([(f, "original", dataset) for f in files])
             
+            # Add variants for the remaining repeats
             if repeats > 1:
                 for _ in range(repeats - 1):
-                    if should_darken_repeats and should_mirror_repeats:
-                        self.latent_files.extend([(f, "flipped_contrast") for f in files])
-                    elif should_darken_repeats:
-                        self.latent_files.extend([(f, "contrast") for f in files])
-                    elif should_mirror_repeats:
-                        self.latent_files.extend([(f, "flipped") for f in files])
-                    else:
-                        self.latent_files.extend([(f, "original") for f in files])
+                    variant_key = "original"
+                    if should_darken and should_mirror: variant_key = "flipped_contrast"
+                    elif should_darken: variant_key = "contrast"
+                    elif should_mirror: variant_key = "flipped"
+                    self.latent_files.extend([(f, variant_key, dataset) for f in files])
 
         self.latent_files = sorted(self.latent_files, key=lambda x: str(x[0]))
         if not self.latent_files:
-            raise ValueError("No cached embedding files found in the datasets. Please ensure pre-caching was successful.")
-        print(f"Dataset initialized with {len(self.latent_files)} pre-cached samples (including repeats) from all datasets.")
+            raise ValueError("No cached embedding files found. Please ensure pre-caching was successful.")
+        
+        print(f"Dataset initialized with {len(self.latent_files)} samples (including repeats).")
+
+        # --- SANITY CHECK LOGIC ---
+        # This check is broad and warns if any dataset wants masks but none are found globally.
+        if any(d.get("use_mask", False) for d in config.INSTANCE_DATASETS):
+            print("INFO: Masked training is enabled for at least one dataset. Checking for mask files...")
+            
+            found_masks = 0
+            for file_path in all_unique_files:
+                # The mask path is relative to the image path, not the cache path.
+                # .pt path: .../dataset_folder/.precomputed_embeddings_cache/image.pt
+                # mask path: .../dataset_folder/masks/image_mask.png
+                mask_path = file_path.parents[1] / "masks" / f"{file_path.stem}_mask.png"
+                if mask_path.exists():
+                    found_masks += 1
+            
+            print(f"INFO: Found {found_masks} masks for {len(all_unique_files)} unique cached images.")
+            if found_masks == 0:
+                print("WARNING: No masks were found. Masked training will have no effect. Please check your 'masks' subfolders.")
+        # --- END SANITY CHECK ---
 
     def __len__(self): return len(self.latent_files)
 
     def __getitem__(self, i):
-        file_path, variant_key = self.latent_files[i]
+        file_path, variant_key, dataset_config = self.latent_files[i]
         try:
             full_data = torch.load(file_path, map_location="cpu")
-            if variant_key not in full_data:
-                print(f"WARNING: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
-                variant_key = "original"
+            if variant_key not in full_data or "latents_cpu" not in full_data.get(variant_key, {}):
+                tqdm.write(f"Warning: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
+                variant_key = "original" # Fallback
+            
             variant_data = full_data[variant_key]
             latents = variant_data["latents_cpu"]
-            prompt_embeds = full_data["prompt_embeds_cpu"]
-            pooled_embeds = full_data["pooled_prompt_embeds_cpu"]
 
-            if torch.isnan(latents).any() or torch.isinf(latents).any():
-                raise ValueError(f"NaN/Inf in latents for file: {file_path}")
-            if torch.isnan(prompt_embeds).any() or torch.isinf(prompt_embeds).any():
-                raise ValueError(f"NaN/Inf in prompt_embeds for file: {file_path}")
-            if torch.isnan(pooled_embeds).any() or torch.isinf(pooled_embeds).any():
-                raise ValueError(f"NaN/Inf in pooled_embeds for file: {file_path}")
+            # --- MASK LOADING LOGIC ---
+            mask_latent = torch.zeros(1, latents.shape[1], latents.shape[2]) # Default: no mask
+            focus_factor = dataset_config.get("mask_focus_factor", 1.0)
+
+            focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
+            
+            if dataset_config.get("use_mask", False):
+                mask_path = file_path.parents[1] / "masks" / f"{file_path.stem}_mask.png"
+                if mask_path.exists():
+                    with Image.open(mask_path).convert("L") as mask_img:
+                        resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
+                        mask_tensor = transforms.ToTensor()(resized_mask)
+                        mask_latent = (mask_tensor > 0.1).float()
+
+            # --- END MASK LOADING LOGIC ---
+
+            for key, tensor in [("latents", latents), 
+                                ("prompt_embeds", full_data["prompt_embeds_cpu"]), 
+                                ("pooled_embeds", full_data["pooled_prompt_embeds_cpu"])]:
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    raise ValueError(f"NaN/Inf in {key} for file: {file_path}")
 
             return {
                 "latents_cpu": latents,
-                "prompt_embeds_cpu": prompt_embeds,
-                "pooled_prompt_embeds_cpu": pooled_embeds,
+                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"],
+                "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"],
                 "original_size_as_tuple": full_data["original_size_as_tuple"],
                 "target_size_as_tuple": full_data["target_size_as_tuple"],
+                "mask_latent_cpu": mask_latent,
+                "mask_focus_factor_cpu": focus_factor,
+                "mask_focus_mode_cpu": focus_mode
             }
         except Exception as e:
             print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
@@ -554,6 +598,9 @@ def custom_collate_fn_latent(batch):
         "pooled_prompt_embeds": torch.stack([item["pooled_prompt_embeds_cpu"] for item in batch]),
         "original_sizes": [item["original_size_as_tuple"] for item in batch],
         "target_sizes": [item["target_size_as_tuple"] for item in batch],
+        "masks": torch.stack([item["mask_latent_cpu"] for item in batch]),
+        "mask_focus_factors": torch.tensor([item["mask_focus_factor_cpu"] for item in batch]),
+        "mask_focus_modes": [item["mask_focus_mode_cpu"] for item in batch], # <-- ADD THIS LINE
     }
 def filter_scheduler_config(s,c):return{k:v for k,v in s.items() if k in inspect.signature(c.__init__).parameters}
 def _generate_hf_to_sd_unet_key_mapping(hf_keys):
@@ -710,14 +757,33 @@ def apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds):
         return torch.zeros_like(prompt_embeds), torch.zeros_like(pooled_prompt_embeds)
     return prompt_embeds, pooled_prompt_embeds
 
-def compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_pred):
+def compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_pred, mask=None, mask_focus_factors=None, mask_focus_modes=None):
+    loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+
+    if mask is not None and mask_focus_factors is not None and mask_focus_modes is not None:
+        factors = mask_focus_factors.view(-1, 1, 1, 1).to(mask.device, dtype=loss.dtype)
+        
+        weight_map_mul = torch.where(mask == 1, factors, torch.ones_like(mask))
+        loss_mul = loss * weight_map_mul
+        
+        additive_map = mask * factors
+        loss_add = loss + additive_map
+
+        is_add_mode = torch.tensor(
+            [mode.startswith("Uniform") for mode in mask_focus_modes], 
+            device=loss.device
+        ).view(-1, 1, 1, 1)
+
+        loss = torch.where(is_add_mode, loss_add, loss_mul)
+
+    loss = loss.mean(dim=list(range(1, len(loss.shape))))
+
     if is_v_pred and hasattr(config, "USE_SNR_GAMMA") and config.USE_SNR_GAMMA:
         snr = noise_scheduler.alphas_cumprod.to(pred.device)[timesteps] / (1 - noise_scheduler.alphas_cumprod.to(pred.device)[timesteps])
         snr = torch.nan_to_num(snr, nan=0.0, posinf=1e8, neginf=0.0).clamp(min=1e-8)
         gamma_tensor = torch.tensor(config.SNR_GAMMA, device=snr.device, dtype=snr.dtype)
         
         snr_loss_weights = None
-        
         if config.SNR_STRATEGY == "Min-SNR":
             if config.MIN_SNR_VARIANT == "standard":
                 snr_loss_weights = torch.min(gamma_tensor / snr, torch.ones_like(snr))
@@ -726,15 +792,14 @@ def compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_pred):
             elif config.MIN_SNR_VARIANT == "debiased":
                 snr_loss_weights = torch.clamp(1.0 / torch.sqrt(snr), max=1000.0)
             else:
-                raise ValueError(f"Unknown MIN_SNR_VARIANT: {config.MIN_SNR_VARIANT}. Use 'standard', 'corrected', or 'debiased'.")
-        
+                raise ValueError(f"Unknown MIN_SNR_VARIANT: {config.MIN_SNR_VARIANT}.")
         elif config.SNR_STRATEGY == "Max-SNR":
             snr_loss_weights = torch.clamp(snr, max=gamma_tensor)
 
         if snr_loss_weights is not None:
-             return (F.mse_loss(pred.float(), target.float(), reduction="none").mean([1,2,3]) * snr_loss_weights).mean()
-            
-    return F.mse_loss(pred.float(), target.float())
+            loss = loss * snr_loss_weights
+    
+    return loss.mean()
   
 def main():
     torch.backends.cuda.matmul.allow_tf32 = True
@@ -876,30 +941,38 @@ def main():
 
     is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
 
-    def train_step(batch, use_scaler, scaler, timestep_weights):
-        latents, prompt_embeds, pooled_prompt_embeds = batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"]
+    def train_step(batch, config, use_scaler, scaler, timestep_weights):
+        latents, prompt_embeds, pooled_prompt_embeds, masks, mask_focus_factors, mask_focus_modes = (
+            batch["latents"], batch["prompt_embeds"], batch["pooled_prompt_embeds"], 
+            batch["masks"], batch["mask_focus_factors"], batch["mask_focus_modes"]
+        )
+        
         if config.USE_PER_CHANNEL_NOISE:
             noise = torch.randn_like(latents)
         else:
             noise_mono = torch.randn_like(latents[:, :1, :, :])
             noise = noise_mono.repeat(1, latents.shape[1], 1, 1)
         
-        timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], device, weights=timestep_weights)
+        timesteps = sample_timesteps(config, noise_scheduler, latents.shape[0], latents.device, weights=timestep_weights)
         
         latents = apply_perturbations(config, latents)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        
+        is_v_prediction_model = noise_scheduler.config.prediction_type == "v_prediction"
         target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_prediction_model else noise
+        
         original_sizes, target_sizes = batch["original_sizes"], batch["target_sizes"]
         crops_coords_top_left = [(0, 0) for _ in original_sizes]
-        add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=device, dtype=prompt_embeds.dtype)
+        add_time_ids = torch.tensor([list(s1) + list(c) + list(s2) for s1, c, s2 in zip(original_sizes, crops_coords_top_left, target_sizes)], device=latents.device, dtype=prompt_embeds.dtype)
+        
         prompt_embeds, pooled_prompt_embeds = apply_conditioning_dropout(config, prompt_embeds, pooled_prompt_embeds)
         
-        with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=use_scaler):
+        with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_prompt_embeds, "time_ids": add_time_ids}).sample
-            loss = compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_prediction_model)
+            loss = compute_loss(config, noise_scheduler, pred, target, timesteps, is_v_prediction_model, mask=masks, mask_focus_factors=mask_focus_factors, mask_focus_modes=mask_focus_modes)
         
         if not torch.isfinite(loss):
-            print(f"\n[WARNING] Step {global_step}: Detected NaN/Inf loss. Skipping this micro-batch.")
+            print(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
             return None
         
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
@@ -924,7 +997,7 @@ def main():
                 for k, v in batch.items()
             }
 
-            loss_item = train_step(batch, use_scaler, scaler, timestep_weights)
+            loss_item = train_step(batch, config, use_scaler, scaler, timestep_weights)
 
             if loss_item is None:
                 global_step += 1

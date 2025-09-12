@@ -6,19 +6,37 @@
 
 # --- Paths ---
 SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safensors"
-INSTANCE_DATASETS = [{"path": "./DatasetV1/", "repeats": 1}]
 OUTPUT_DIR = "./sdxl_finetune_output"
 
-# --- Caching & Data ---
-FORCE_RECACHE_LATENTS = False
-MIRROR_REPEATS = False # If True, duplicates from 'repeats' will be horizontally mirrored
-DARKEN_REPEATS = False  # Increase gamma on dataset repeats to darken them
-GAMMA_VALUE = 2.0  # Fixed gamma for darkening (can make configurable later)
+# --- Dataset Configuration ---
+# This is a list of datasets. The GUI manages this list.
+# For each dataset, you can now specify:
+#   - "path": The folder containing your images.
+#   - "repeats": How many times to repeat this dataset per epoch.
+#   - "mirror_repeats": (bool) If True, duplicates from 'repeats' will be horizontally mirrored.
+#   - "darken_repeats": (bool) If True, applies a contrast-enhancing S-curve to repeated images.
+#   - "use_mask": (bool) True to enable masked training for this specific dataset.
+#   - "mask_path": The folder containing corresponding masks if "use_mask" is True.
+#   - "mask_focus_factor": (float) How much to prioritize the masked area (e.g., 2.0 means twice the loss weight).
+INSTANCE_DATASETS = [
+    {
+        "path": "./DatasetV1/",
+        "repeats": 1,
+        "mirror_repeats": False,
+        "darken_repeats": False,
+        "use_mask": False,
+        "mask_path": "",
+        "mask_focus_factor": 2.0,
+        "mask_focus_mode": "Proportional (Multiply)"
+    }
+]
+
+# --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 3
 BATCH_SIZE = 1 # Recommended to keep at 1 for this script
 NUM_WORKERS = 4 # Set to 0 on Windows if you encounter DataLoader errors
 
-# --- NEW: Aspect Ratio Bucketing ---
+# --- Aspect Ratio Bucketing ---
 # The total number of pixels for each bucket (e.g., 1024*1024 = 1,048,576)
 TARGET_PIXEL_AREA = 1327104
 BUCKET_ASPECT_RATIOS = [1.0, 1.5, 0.66, 1.33, 0.75, 1.77, 0.56]
@@ -48,6 +66,7 @@ LR_CUSTOM_CURVE = [
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 CLIP_GRAD_NORM = 1.0
+WEIGHT_DECAY = 0.01
 
 # --- Layer Training Targets (UNet-Only) ---
 # These are the default layers that will be trained. The GUI shows all options.
@@ -65,7 +84,7 @@ UNET_TRAIN_TARGETS = [
 USE_PER_CHANNEL_NOISE = True
 NOISE_SCHEDULE_VARIANT = "uniform" # "uniform", "logsnr_laplace", "residual_shifting"
 USE_SNR_GAMMA = True
-SNR_STRATEGY = "Min-SNR" # NEW: Can be "Min-SNR" or "Max-SNR"
+SNR_STRATEGY = "Min-SNR" # Can be "Min-SNR" or "Max-SNR"
 SNR_GAMMA = 20.0
 MIN_SNR_VARIANT = "standard"  # "standard", "corrected", "debiased"
 USE_ZERO_TERMINAL_SNR = True  # Rescales the noise schedule to force SNR=0 at final timestep for better dynamic range
@@ -73,4 +92,3 @@ USE_IP_NOISE_GAMMA = True  # Adds Gaussian noise to input latents for regulariza
 IP_NOISE_GAMMA = 0.01  # Value for IP noise gamma (common range: 0.05-0.25)
 USE_COND_DROPOUT = True
 COND_DROPOUT_PROB = 0.1  # Common range: 0.05-0.15; higher for diverse datasets
-WEIGHT_DECAY = 0.01
