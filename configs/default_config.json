@@ -2,7 +2,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/Toy-Dataset",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon",
             "repeats": 1,
             "mirror_repeats": false,
             "darken_repeats": false,
@@ -16,8 +16,8 @@
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "CACHING_BATCH_SIZE": 3,
     "BATCH_SIZE": 1,
-    "NUM_WORKERS": 4,
-    "TARGET_PIXEL_AREA": 1048576,
+    "NUM_WORKERS": 0,
+    "TARGET_PIXEL_AREA": 1179648,
     "BUCKET_ASPECT_RATIOS": [
         0.5,
         0.56,
@@ -31,7 +31,7 @@
         2.0
     ],
     "MAX_TRAIN_STEPS": 500,
-    "GRADIENT_ACCUMULATION_STEPS": 4,
+    "GRADIENT_ACCUMULATION_STEPS": 8,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 42,
     "SAVE_EVERY_N_STEPS": 7000,
@@ -43,16 +43,12 @@
             1e-09
         ],
         [
-            0.05,
-            3e-05
+            0.2,
+            1.5e-05
         ],
         [
-            0.6,
-            3e-05
-        ],
-        [
-            0.65,
-            7.5e-07
+            0.85,
+            1.5e-05
         ],
         [
             1.0,
@@ -60,8 +56,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 1e-09,
-    "LR_GRAPH_MAX": 3e-05,
-    "CLIP_GRAD_NORM": 1.0,
+    "LR_GRAPH_MAX": 0.0001,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -90,14 +85,14 @@
         "conv_norm_out"
     ],
     "USE_PER_CHANNEL_NOISE": true,
-    "NOISE_SCHEDULE_VARIANT": "logsnr_laplace",
-    "USE_SNR_GAMMA": true,
-    "SNR_STRATEGY": "Max-SNR",
-    "SNR_GAMMA": 5.0,
-    "MIN_SNR_VARIANT": "corrected",
-    "USE_ZERO_TERMINAL_SNR": true,
-    "USE_IP_NOISE_GAMMA": true,
-    "IP_NOISE_GAMMA": 0.01,
-    "USE_COND_DROPOUT": true,
+    "NOISE_SCHEDULE_VARIANT": "uniform",
+    "USE_SNR_GAMMA": false,
+    "SNR_STRATEGY": "Min-SNR",
+    "SNR_GAMMA": 10.0,
+    "MIN_SNR_VARIANT": "debiased",
+    "USE_ZERO_TERMINAL_SNR": false,
+    "USE_IP_NOISE_GAMMA": false,
+    "IP_NOISE_GAMMA": 0.2,
+    "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.1
 }

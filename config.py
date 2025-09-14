@@ -65,7 +65,6 @@ LR_CUSTOM_CURVE = [
 # These control the visible Y-axis range of the graph in the GUI
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
-CLIP_GRAD_NORM = 1.0
 WEIGHT_DECAY = 0.01
 
 # --- Layer Training Targets (UNet-Only) ---

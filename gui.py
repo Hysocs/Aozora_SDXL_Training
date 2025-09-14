@@ -614,13 +614,12 @@ class TrainingGUI(QtWidgets.QWidget):
         "SEED": {"label": "Seed:", "tooltip": "Ensures reproducible training.", "widget": "QLineEdit"},
         "RESUME_MODEL_PATH": {"label": "Resume Model:", "tooltip": "The .safetensors checkpoint file.", "widget": "Path", "file_type": "file_safetensors"},
         "RESUME_STATE_PATH": {"label": "Resume State:", "tooltip": "The .pt optimizer state file.", "widget": "Path", "file_type": "file_pt"},
-        "CLIP_GRAD_NORM": {"label": "Clip Gradient Norm:", "tooltip": "Helps prevent unstable training. 1.0 is safe.", "widget": "QLineEdit"},
         "WEIGHT_DECAY": {"label": "Optimizer Weight Decay:", "tooltip": "L2 regularization to prevent overfitting. Common range: 0.0 to 0.1.", "widget": "QDoubleSpinBox", "range": [0.0, 0.1], "step": 0.001, "decimals": 3},
         "LR_GRAPH_MIN": {"label": "Graph Min LR:", "tooltip": "The minimum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "SNR_STRATEGY": {"label": "Strategy:", "tooltip": "Min-SNR focuses on noisy steps, Max-SNR focuses on cleaner steps.", "widget": "QComboBox", "options": ["Min-SNR", "Max-SNR"]},
         "SNR_GAMMA": {"label": "Gamma Value:", "tooltip": "For Min-SNR, common range is 5-20. For Max-SNR, this acts as a clamp.", "widget": "QLineEdit"},
-        "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["standard", "corrected", "debiased"]},
+        "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["debiased", "corrected", "standard"]},
         "IP_NOISE_GAMMA": {"label": "Gamma Value:", "tooltip": "Common range is 0.05 to 0.25.", "widget": "QLineEdit"},
         "COND_DROPOUT_PROB": {"label": "Dropout Probability:", "tooltip": "e.g., 0.1 (5-15% common).", "widget": "QLineEdit"},
         "NOISE_SCHEDULE_VARIANT": {
@@ -989,7 +988,7 @@ class TrainingGUI(QtWidgets.QWidget):
         left_vbox.addWidget(core_group)
         left_vbox.addStretch()
 
-        optimizer_group = self._create_form_group("Raven Optimizer", ["CLIP_GRAD_NORM", "WEIGHT_DECAY"])
+        optimizer_group = self._create_form_group("Raven Optimizer", ["WEIGHT_DECAY"])
         right_vbox.addWidget(optimizer_group)
         
         lr_group = self._create_lr_scheduler_group()
