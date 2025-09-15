@@ -1021,7 +1021,7 @@ class TrainingGUI(QtWidgets.QWidget):
         help_text = """
         <p><b>Optimizers</b> are the algorithms used to update the model's weights during training based on the calculated loss.</p>
         <hr>
-        <p><b>Raven(Reusable Accelerated VRAM-Efficient Network Optimizer):</b></p>
+        <p><b>Raven(Reusable Adam Variant for Efficient Networking):</b></p>
         <p><b>CPU Offloading, Higher stability if you have a decent CPU. Requires 20+ GB of RAM:</b></p>
         <ul>
             <li>A custom optimizer that is a variant of AdamW.</li>
