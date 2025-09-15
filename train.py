@@ -31,8 +31,8 @@ import copy
 import signal
 import numpy as np
 from diffusers.models.attention_processor import AttnProcessor2_0
+from transformers.optimization import Adafactor
 
-# --- Suppress Warnings & Configure Environment ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -40,9 +40,6 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-# ========================================================================================
-# BUCKET BATCH SAMPLER & DATA STRUCTURES
-# ========================================================================================
 class BucketBatchSampler(Sampler):
     def __init__(self, dataset, batch_size, shuffle=True, drop_last=False):
         self.batch_size = batch_size
@@ -126,9 +123,6 @@ class CustomCurveScheduler(_LRScheduler):
 
         return [current_lr for _ in self.optimizer.param_groups]
     
-# ========================================================================================
-# CONFIGURATION LOADER
-# ========================================================================================
 class TrainingConfig:
     def __init__(self):
         for key, value in default_config.__dict__.items():
@@ -157,7 +151,7 @@ class TrainingConfig:
             
         float_keys = ["CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
-        str_keys = ["MIN_SNR_VARIANT"]
+        str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE"]
         bool_keys = [
             "MIRROR_REPEATS", "DARKEN_REPEATS", 
             "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", "USE_SNR_GAMMA",
@@ -179,7 +173,7 @@ class TrainingConfig:
             if hasattr(self, key):
                 val = getattr(self, key)
                 try: setattr(self, key, str(val).lower())
-                except (ValueError, TypeError): setattr(self, key, "corrected")
+                except (ValueError, TypeError): setattr(self, key, default_config.__dict__[key])
         for key in bool_keys:
             if hasattr(self, key):
                 val = getattr(self, key)
@@ -187,10 +181,21 @@ class TrainingConfig:
                     setattr(self, key, val.lower() in ['true', '1', 't', 'y', 'yes'])
                 else:
                     setattr(self, key, bool(val))
+        if hasattr(self, 'RAVEN_PARAMS'):
+            for param, val in self.RAVEN_PARAMS.items():
+                if isinstance(val, list):
+                    self.RAVEN_PARAMS[param] = [float(x) for x in val]
+                elif param == 'weight_decay' or param == 'eps':
+                    self.RAVEN_PARAMS[param] = float(val)
+        if hasattr(self, 'ADAFACTOR_PARAMS'):
+            for param, val in self.ADAFACTOR_PARAMS.items():
+                if param == 'eps':
+                    self.ADAFACTOR_PARAMS[param] = [float(x) for x in val]
+                elif param in ['clip_threshold', 'decay_rate', 'weight_decay']:
+                    self.ADAFACTOR_PARAMS[param] = float(val)
+                elif param == 'beta1' and isinstance(val, str) and val.lower() == 'none':
+                    self.ADAFACTOR_PARAMS[param] = None
 
-# ========================================================================================
-# DATA PREPARATION & CACHING
-# ========================================================================================
 class AspectRatioBucketing:
     def __init__(self, target_area, aspect_ratios, stride=64):
         self.target_area = target_area
@@ -337,12 +342,10 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                     img = Image.open(meta['ip']).convert('RGB')
                     contrast_img = apply_sigmoid_contrast(img, gain=10)
                     
-                    # Original and Flipped
                     processed_img = resize_and_crop(img, target_w, target_h)
                     image_tensors_variants["original"].append(img_transform(processed_img))
                     image_tensors_variants["flipped"].append(img_transform(processed_img.transpose(Image.FLIP_LEFT_RIGHT)))
                     
-                    # Contrast and Flipped Contrast
                     processed_contrast = resize_and_crop(contrast_img, target_w, target_h)
                     image_tensors_variants["contrast"].append(img_transform(processed_contrast))
                     image_tensors_variants["flipped_contrast"].append(img_transform(processed_contrast.transpose(Image.FLIP_LEFT_RIGHT)))
@@ -386,20 +389,16 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
     
     for caption in captions_batch:
         with torch.no_grad():
-            # Tokenize with both tokenizers
             text_inputs1 = tokenizer1(caption, padding="max_length", max_length=tokenizer1.model_max_length, truncation=True, return_tensors="pt")
             text_inputs2 = tokenizer2(caption, padding="max_length", max_length=tokenizer2.model_max_length, truncation=True, return_tensors="pt")
             
-            # Get embeddings from CLIP-L
             prompt_embeds_out1 = text_encoder1(text_inputs1.input_ids.to(device), output_hidden_states=True)
-            prompt_embeds1 = prompt_embeds_out1.hidden_states[-2] # Penultimate layer
+            prompt_embeds1 = prompt_embeds_out1.hidden_states[-2]
             
-            # Get embeddings and pooled output from OpenCLIP-ViT/G
             prompt_embeds_out2 = text_encoder2(text_inputs2.input_ids.to(device), output_hidden_states=True)
             prompt_embeds2 = prompt_embeds_out2.hidden_states[-2]
-            pooled_prompt_embeds2 = prompt_embeds_out2[0] # The [CLS] token output
+            pooled_prompt_embeds2 = prompt_embeds_out2[0]
 
-            # Combine embeddings
             prompt_embeds = torch.cat((prompt_embeds1, prompt_embeds2), dim=-1)
         
         prompt_embeds_list.append(prompt_embeds)
@@ -448,9 +447,6 @@ class ImageTextLatentDataset(Dataset):
                 full_data = torch.load(file_path, map_location="cpu")
                 latents = full_data.get("original", {}).get("latents_cpu")
                 if latents is not None:
-                    # --- FIX ---
-                    # The saved latent has shape (Channels, Height, Width).
-                    # Indices are [0, 1, 2]. We need Height and Width for the bucket key.
                     self.bucket_keys.append((latents.shape[1], latents.shape[2]))
                 else:
                     tqdm.write(f"WARNING: 'original' latents not found in {file_path}. Marking as invalid.")
@@ -474,14 +470,11 @@ class ImageTextLatentDataset(Dataset):
             variant_data = full_data[variant_key]
             latents = variant_data["latents_cpu"]
 
-            # --- FIX ---
-            # Correctly initialize the mask with (1, Height, Width)
             mask_latent = torch.ones(1, latents.shape[1], latents.shape[2]) 
             focus_factor = dataset_config.get("mask_focus_factor", 1.0)
             focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
             
             if dataset_config.get("use_mask", False):
-                # Mask path is now stored relative to the dataset root
                 mask_dir = Path(dataset_config["path"]) / "masks" 
                 mask_path = mask_dir / f"{file_path.stem}_mask.png"
                 if mask_path.exists():
@@ -489,9 +482,6 @@ class ImageTextLatentDataset(Dataset):
                         if 'flipped' in variant_key:
                             mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
                         
-                        # --- FIX ---
-                        # PIL's resize takes (Width, Height). Latent shape is (C, H, W).
-                        # So we need (latents.shape[2], latents.shape[1]).
                         resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
                         mask_tensor = transforms.ToTensor()(resized_mask)
                         mask_latent = (mask_tensor > 0.1).float()
@@ -504,7 +494,7 @@ class ImageTextLatentDataset(Dataset):
 
             return {
                 "latents_cpu": latents,
-                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0), # Remove batch dim if present
+                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0),
                 "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"].squeeze(0),
                 "original_size_as_tuple": full_data["original_size_as_tuple"],
                 "target_size_as_tuple": full_data["target_size_as_tuple"],
@@ -530,12 +520,7 @@ def custom_collate_fn_latent(batch):
         "mask_focus_modes": [item["mask_focus_mode_cpu"] for item in batch],
     }
 
-# ========================================================================================
-# REFACTORED FEATURE PLUG-INS
-# ========================================================================================
-
 class TimestepSampler:
-    """Plugin to handle various timestep sampling strategies."""
     def __init__(self, config, noise_scheduler, device):
         self.variant = config.NOISE_SCHEDULE_VARIANT
         self.num_timesteps = noise_scheduler.config.num_train_timesteps
@@ -556,11 +541,10 @@ class TimestepSampler:
             return torch.randint(min_timestep, self.num_timesteps, (batch_size,), device=self.device).long()
         elif self.variant == "logsnr_laplace":
             return torch.multinomial(self.weights, num_samples=batch_size, replacement=True).long()
-        else: # uniform
+        else:
             return torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
 
 class InputPerturbation:
-    """Plugin for applying input perturbation noise (IP Noise Gamma)."""
     def __init__(self, config):
         self.is_enabled = config.USE_IP_NOISE_GAMMA and config.IP_NOISE_GAMMA > 0
         if self.is_enabled:
@@ -579,7 +563,6 @@ class InputPerturbation:
         return latents + self.gamma * noise
 
 class ConditioningDropout:
-    """Plugin for applying text conditioning dropout."""
     def __init__(self, config):
         self.is_enabled = config.USE_COND_DROPOUT
         if self.is_enabled:
@@ -591,17 +574,11 @@ class ConditioningDropout:
             return torch.zeros_like(prompt_embeds), torch.zeros_like(pooled_embeds)
         return prompt_embeds, pooled_embeds
 
-
 class BaseLoss:
-    """Computes the base loss before any weighting.
-    MODIFIED to use Huber Loss for v-prediction stability."""
     def __call__(self, pred, target, is_v_pred):
-        # The delta parameter controls the crossover point between MSE and MAE.
-        # A value of 1.0 is a standard, robust default.
-        return F.huber_loss(pred.float(), target.float(), reduction="none", delta=1.0)
+        return F.huber_loss(pred.float(), target.float(), reduction="none", delta=2.0)
 
 class MaskedLoss:
-    """Plugin to apply weighting for masked training."""
     def __init__(self, config):
         self.is_enabled = any(d.get("use_mask", False) for d in config.INSTANCE_DATASETS)
         if self.is_enabled:
@@ -612,27 +589,21 @@ class MaskedLoss:
             return loss.mean(dim=list(range(1, len(loss.shape))))
 
         factors = factors.view(-1, 1, 1, 1).to(masks.device, dtype=loss.dtype)
-        # Proportional (multiply) logic
         weight_map_mul = torch.where(masks == 1, factors, torch.ones_like(masks))
         loss_mul = loss * weight_map_mul
         
-        # Uniform (add) logic
-        additive_map = (masks - 1) * factors # Non-mask is 0, mask is factor-1
+        additive_map = (masks - 1) * factors
         loss_add = loss + additive_map
 
-        # Select which logic to use per-item in the batch
         is_add_mode = torch.tensor([mode.startswith("Uniform") for mode in modes], device=loss.device).view(-1, 1, 1, 1)
         final_loss = torch.where(is_add_mode, loss_add, loss_mul)
         
         return final_loss.mean(dim=list(range(1, len(final_loss.shape))))
 
 class MinSNRLoss:
-    """Plugin for Min-SNR loss weighting with corrected implementations."""
     def __init__(self, config, noise_scheduler):
         self.is_enabled = config.USE_SNR_GAMMA
         if self.is_enabled:
-            # Gamma is only used for the 'standard' and 'corrected' variants.
-            # The 'debiased' variant is parameter-free.
             self.gamma = config.SNR_GAMMA 
             self.variant = config.MIN_SNR_VARIANT
             self.alphas_cumprod = noise_scheduler.alphas_cumprod.to("cpu")
@@ -643,31 +614,22 @@ class MinSNRLoss:
             return loss.mean(), None
 
         timesteps_cpu = timesteps.cpu()
-        # Calculate SNR and move it to the correct device
         snr = (self.alphas_cumprod[timesteps_cpu] / (1 - self.alphas_cumprod[timesteps_cpu])).to(loss.device)
         snr = torch.clamp(snr, min=1e-8)
         
         if self.variant == "debiased":
-            # This is the proper implementation from the Min-SNR paper for v-prediction.
-            # It rebalances the loss landscape without needing a gamma parameter.
             snr_loss_weights = 1 / (snr + 1)
-
         elif self.variant == "standard":
-            # This is the "capping" method. It reduces loss on high-SNR steps.
             snr_loss_weights = torch.clamp(self.gamma / snr, max=1.0)
-        
         elif self.variant == "corrected":
-            # This is an experimental variant that boosts high-SNR steps. Not recommended.
             snr_loss_weights = (self.gamma * snr) / (snr + 1)
-        
-        else: # Fallback
+        else:
             return loss.mean(), None
             
-        # The final loss is the mean of the element-wise product of the original loss and the weights.
         final_loss = (loss * snr_loss_weights).mean()
         return final_loss, snr_loss_weights
+
 class FeaturePlugins:
-    """Container for all feature plugins."""
     def __init__(self, config, noise_scheduler, device):
         self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
         self.input_perturbation = InputPerturbation(config)
@@ -677,17 +639,13 @@ class FeaturePlugins:
         self.min_snr_loss = MinSNRLoss(config, noise_scheduler)
         self.is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
 
-# ========================================================================================
-# DIAGNOSTICS & LOGGING (Corrected)
-# ========================================================================================
 class TrainingDiagnostics:
-    """A class to accumulate and report training diagnostics."""
     def __init__(self, accumulation_steps):
         self.accumulation_steps = accumulation_steps
         self.losses = deque(maxlen=accumulation_steps)
         self.grad_norms = deque(maxlen=accumulation_steps)
         self.max_grads = deque(maxlen=accumulation_steps)
-        self.timesteps = deque(maxlen=accumulation_steps * 256) # Larger buffer for timesteps
+        self.timesteps = deque(maxlen=accumulation_steps * 256)
 
     def step(self, loss, timesteps):
         if loss is not None:
@@ -697,11 +655,7 @@ class TrainingDiagnostics:
     def report(self, global_step, lr, trainable_params):
         if not self.losses: return
         
-        # --- Gradient Stats ---
         total_norm, max_grad_val = 0.0, 0.0
-        
-        # --- FIX APPLIED HERE ---
-        # Changed p.grad.is_finite() to the correct torch.isfinite(p.grad).all()
         params_with_grad = [p for p in trainable_params if p.grad is not None and torch.isfinite(p.grad).all()]
         
         if params_with_grad:
@@ -713,7 +667,6 @@ class TrainingDiagnostics:
                     max_grad_val = current_max
             total_norm = total_norm ** 0.5
         
-        # --- Formatting and Printing ---
         avg_loss = sum(self.losses) / len(self.losses)
         vram_gb = torch.cuda.memory_reserved() / 1e9
         
@@ -734,9 +687,6 @@ class TrainingDiagnostics:
         self.max_grads.clear()
         self.timesteps.clear()
 
-# ========================================================================================
-# MODEL SAVING & UTILITIES
-# ========================================================================================
 def filter_scheduler_config(s,c):return{k:v for k,v in s.items() if k in inspect.signature(c.__init__).parameters}
 def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     final_map = {}
@@ -771,8 +721,6 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     return final_map
 
 def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
-    """Saves the UNet weights into the base model state_dict and provides a detailed verification report."""
-    
     def get_param_category(key_name):
         if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
         if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
@@ -802,7 +750,6 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     print("\n" + "="*60)
     print(" SAVE MODEL VERIFICATION REPORT")
     print("="*60)
-    total_model_params, total_model_saved = 0, 0
     for category, counts in sorted(param_counters.items()):
         saved, total = counts['saved'], counts['total']
         print(f" - {category:<25}: Found {total:>4} -> Saved {saved:>4}")
@@ -818,7 +765,7 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     save_file(base_sd, output_path)
     print(f"[OK] Save complete: {output_path}")
 
-def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
+def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
     save_model(
@@ -831,6 +778,7 @@ def save_training_checkpoint(base_model_state_dict, unet, optimizer, scheduler, 
     state_path = checkpoint_dir / f"training_state_step_{step}.pt"
     torch.save({
         'step': step,
+        'optimizer_type': config.OPTIMIZER_TYPE,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': scheduler.state_dict(),
     }, state_path)
@@ -910,27 +858,50 @@ def main():
     for p in params_to_optimize: p.requires_grad_(True)
 
     if not params_to_optimize: raise ValueError("No parameters were selected for training.")
-
-    initial_lr = config.LR_CUSTOM_CURVE[0][1] if config.LR_CUSTOM_CURVE else 3e-5
-    print(f"INFO: Setting initial optimizer LR to {initial_lr:.2e}.")
-    optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": initial_lr}]
     
+    if not config.LR_CUSTOM_CURVE:
+        raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'.")
+
+    initial_lr = config.LR_CUSTOM_CURVE[0][1]
+    print(f"INFO: Setting initial optimizer LR to {initial_lr:.2e}.")
+
+    optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": initial_lr}]
+
     unet_trainable_params = sum(p.numel() for p in params_to_optimize)
     print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M")
-    
 
-    print("INFO: Using Raven optimizer (AdamW with CPU Offloading).")
-    optimizer = Raven(
-        params=params_to_optimize,
-        lr=initial_lr,             # Let the scheduler handle this
-        betas=(0.9, 0.999),        # Standard AdamW values
-        weight_decay=0.01,         # A good starting point for SDXL
-        eps=1e-8
-    )
-    if not config.LR_CUSTOM_CURVE: raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'.")
-    
+    optimizer_type = config.OPTIMIZER_TYPE
+    print(f"INFO: Using {optimizer_type} optimizer.")
+
+    # Normalize optimizer_type to match expected case
+    optimizer_type = optimizer_type.capitalize()  # Convert to "Raven" or "Adafactor"
+
+    if optimizer_type == "Raven":
+        raven_params = config.RAVEN_PARAMS
+        optimizer = Raven(
+            params=optimizer_grouped_parameters,
+            betas=tuple(raven_params["betas"]),
+            weight_decay=raven_params["weight_decay"],
+            eps=raven_params["eps"]
+        )
+    elif optimizer_type == "Adafactor":
+        adafactor_params = config.ADAFACTOR_PARAMS
+        optimizer = Adafactor(
+            params=optimizer_grouped_parameters,
+            lr=None,
+            eps=tuple(adafactor_params["eps"]),
+            clip_threshold=adafactor_params["clip_threshold"],
+            decay_rate=adafactor_params["decay_rate"],
+            beta1=adafactor_params["beta1"],
+            weight_decay=adafactor_params["weight_decay"],
+            scale_parameter=adafactor_params["scale_parameter"],
+            relative_step=adafactor_params["relative_step"],
+            warmup_init=adafactor_params["warmup_init"]
+        )
+    else:
+        raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
+
     print(f"INFO: Scheduler will run for {config.MAX_TRAIN_STEPS} training steps.")
-
     lr_scheduler = CustomCurveScheduler(
         optimizer=optimizer,
         lr_curve_points=config.LR_CUSTOM_CURVE,
@@ -941,7 +912,12 @@ def main():
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location=device)
         global_step = state['step']
-        optimizer.load_state_dict(state['optimizer_state_dict'])
+        state_optimizer_type = state.get('optimizer_type', 'Raven')
+        if state_optimizer_type == optimizer_type:
+            optimizer.load_state_dict(state['optimizer_state_dict'])
+            print(f"[OK] Loaded {optimizer_type} optimizer state.")
+        else:
+            print(f"[WARNING] Optimizer type mismatch (checkpoint: {state_optimizer_type}, current: {optimizer_type}). Skipping optimizer state loading.")
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
         del state; gc.collect()
         print(f"[OK] Resumed training from step {global_step}.")
@@ -986,9 +962,6 @@ def main():
             return None, timesteps
         
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        if diagnostics.losses and sum(diagnostics.losses)/len(diagnostics.losses) > 0.8:  # Catch early spikes
-            for p in params_to_optimize:
-                p.grad.data.mul_(0.5)
         return loss.item(), timesteps
 
     unet.train()
@@ -1009,24 +982,25 @@ def main():
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(params_to_optimize, 1.0)
-                diagnostics.report(global_step + 1, optimizer.param_groups[0]['lr'], params_to_optimize)
+                
+                current_lr = optimizer.param_groups[0]['lr']
+                diagnostics.report(global_step + 1, current_lr, params_to_optimize)
                 
                 has_invalid_grads = any(not torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
                 if has_invalid_grads:
                     tqdm.write(f"\n[WARNING] Step {global_step + 1}: Detected NaN/Inf gradients. Skipping optimizer step.")
+                    optimizer.zero_grad(set_to_none=True)
                 else:
                     scaler.step(optimizer)
                     scaler.update()
-
-                optimizer.zero_grad(set_to_none=True)
+                    lr_scheduler.step()
+                    optimizer.zero_grad(set_to_none=True)
             
-            lr_scheduler.step()
-
             global_step += 1
             progress_bar.update(1)
            
             if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0:
-                save_training_checkpoint(base_model_state_dict, unet, optimizer, lr_scheduler, global_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype)
+                save_training_checkpoint(config, base_model_state_dict, unet, optimizer, lr_scheduler, global_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype)
     
     progress_bar.close()
     print("--> Training finished.")

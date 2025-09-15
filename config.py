@@ -91,3 +91,21 @@ USE_IP_NOISE_GAMMA = True  # Adds Gaussian noise to input latents for regulariza
 IP_NOISE_GAMMA = 0.01  # Value for IP noise gamma (common range: 0.05-0.25)
 USE_COND_DROPOUT = True
 COND_DROPOUT_PROB = 0.1  # Common range: 0.05-0.15; higher for diverse datasets
+
+# --- Optimizer Configuration ---
+OPTIMIZER_TYPE = "Raven"  # Options: "Raven", "Adafactor"
+RAVEN_PARAMS = {
+    "betas": [0.9, 0.999],  # Momentum parameters for Raven
+    "eps": 1e-8,  # Numerical stability term
+    "weight_decay": 0.01  # L2 regularization
+}
+ADAFACTOR_PARAMS = {
+    "eps": [1e-30, 1e-3],  # Stabilization for scale and parameters
+    "clip_threshold": 1.0,  # Gradient clipping threshold
+    "decay_rate": -0.8,  # Second-moment decay rate
+    "beta1": None,  # First-moment estimation (None to disable)
+    "weight_decay": 0.01,  # L2 regularization
+    "scale_parameter": True,  # Enable parameter scaling
+    "relative_step": False,  # Disable relative step sizing
+    "warmup_init": False  # Disable warmup
+}
