@@ -721,6 +721,8 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     return final_map
 
 def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
+    """Saves the UNet weights into the base model state_dict and provides a detailed verification report."""
+    
     def get_param_category(key_name):
         if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
         if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
@@ -750,6 +752,7 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     print("\n" + "="*60)
     print(" SAVE MODEL VERIFICATION REPORT")
     print("="*60)
+    total_model_params, total_model_saved = 0, 0
     for category, counts in sorted(param_counters.items()):
         saved, total = counts['saved'], counts['total']
         print(f" - {category:<25}: Found {total:>4} -> Saved {saved:>4}")

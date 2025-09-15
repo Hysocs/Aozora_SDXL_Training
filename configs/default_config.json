@@ -17,7 +17,7 @@
         1.77,
         2.0
     ],
-    "MAX_TRAIN_STEPS": 3620,
+    "MAX_TRAIN_STEPS": 5000,
     "GRADIENT_ACCUMULATION_STEPS": 16,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 42,
@@ -82,6 +82,36 @@
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by Anmo_too",
+            "repeats": 3,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by Hews",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/The Fragrant Flower Blooms With Dignity",
             "repeats": 5,
             "mirror_repeats": true,
             "darken_repeats": true,
