@@ -158,11 +158,11 @@ def main():
     # --- CONFIGURATION SETTINGS ---
     # =================================================================================
     settings = {
-        "DATASET_DIR": r"C:\Users\Administrator\Pictures\Datasets\The Fragrant Flower Blooms With Dignity",
+        "DATASET_DIR": r"C:\Users\Administrator\Pictures\Datasets\by Bigrbear",
         "FACE_MODEL_PATH": r"C:\Users\Administrator\Desktop\Aozora_SDXL_Training\utils\Yolo\face_yolov9c.pt",
         "HAND_MODEL_PATH": r"C:\Users\Administrator\Desktop\Aozora_SDXL_Training\utils\Yolo\hand_yolov9c.pt",
-        "CONFIDENCE_THRESHOLD": 0.50,
-        "IMAGE_SIZE": 1280,
+        "CONFIDENCE_THRESHOLD": 0.60,
+        "IMAGE_SIZE": 1024,
         "BOX_PADDING": 20,
         "RUN_MODE": "preview"
     }

@@ -617,6 +617,12 @@ class TrainingGUI(QtWidgets.QWidget):
             "widget": "QComboBox",
             "options": ["uniform", "logsnr_laplace", "residual_shifting"]
         },
+        "MEMORY_EFFICIENT_ATTENTION": {
+            "label": "Attention Backend:",
+            "tooltip": "Select the attention mechanism to use.\n- xformers: Can be faster and use less VRAM, if installed.\n- sdpa: Scaled Dot Product Attention (PyTorch 2.0 default).",
+            "widget": "QComboBox",
+            "options": ["xformers", "sdpa"]
+        },
     }
     def __init__(self):
         super().__init__()
@@ -1146,7 +1152,18 @@ class TrainingGUI(QtWidgets.QWidget):
         main_layout = QtWidgets.QHBoxLayout(parent_widget)
         main_layout.setContentsMargins(15, 15, 15, 15)
         main_layout.setSpacing(20)
+        
         left_layout = QtWidgets.QVBoxLayout()
+
+        # --- START: Modified Section ---
+        # A new group box for the attention mechanism dropdown.
+        attention_group = QtWidgets.QGroupBox("Memory Efficient Attention")
+        attention_layout = QtWidgets.QFormLayout(attention_group)
+        label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
+        attention_layout.addRow(label, widget)
+        left_layout.addWidget(attention_group)
+        # --- END: Modified Section ---
+
         noise_group = QtWidgets.QGroupBox("Noise & Regularization")
         noise_layout = QtWidgets.QVBoxLayout(noise_group)
         self._create_bool_option(noise_layout, "USE_PER_CHANNEL_NOISE", "Use Per-Channel (Color) Noise", "Enables applying noise independently to R, G, and B channels.")
@@ -1161,6 +1178,7 @@ class TrainingGUI(QtWidgets.QWidget):
         label, widget = self._create_widget("COND_DROPOUT_PROB"); self.cond_sub_widget.get_layout().addWidget(label); self.cond_sub_widget.get_layout().addWidget(widget)
         noise_layout.addWidget(self.cond_sub_widget)
         left_layout.addWidget(noise_group)
+        
         loss_group = QtWidgets.QGroupBox("Loss Weighting")
         loss_layout = QtWidgets.QVBoxLayout(loss_group)
         self._create_bool_option(loss_layout, "USE_SNR_GAMMA", "Use SNR Gamma Weighting", "Reweights the loss based on Signal-to-Noise Ratio.", self.toggle_snr_gamma_widget)
@@ -1177,6 +1195,7 @@ class TrainingGUI(QtWidgets.QWidget):
         loss_layout.addWidget(self.snr_sub_widget)
         left_layout.addWidget(loss_group)
         left_layout.addStretch()
+        
         right_layout = QtWidgets.QVBoxLayout()
         layers_group = QtWidgets.QGroupBox("UNet Layer Targeting")
         layers_layout = QtWidgets.QVBoxLayout(layers_group)
@@ -1218,6 +1237,7 @@ class TrainingGUI(QtWidgets.QWidget):
         scroll_area.setWidget(scroll_content)
         right_layout.addWidget(layers_group)
         right_layout.addStretch()
+        
         main_layout.addLayout(left_layout, stretch=1)
         main_layout.addLayout(right_layout, stretch=1)
     def _populate_console_tab(self, layout):

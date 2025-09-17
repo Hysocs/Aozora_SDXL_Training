@@ -80,6 +80,7 @@ UNET_TRAIN_TARGETS = [
 ]
 
 # --- Advanced ---
+MEMORY_EFFICIENT_ATTENTION = "xformers"  # Options: "xformers", "sdpa"
 USE_PER_CHANNEL_NOISE = True
 NOISE_SCHEDULE_VARIANT = "uniform" # "uniform", "logsnr_laplace", "residual_shifting"
 USE_SNR_GAMMA = True

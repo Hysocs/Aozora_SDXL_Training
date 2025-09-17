@@ -17,13 +17,13 @@
         1.77,
         2.0
     ],
-    "MAX_TRAIN_STEPS": 5000,
+    "MAX_TRAIN_STEPS": 21720,
     "GRADIENT_ACCUMULATION_STEPS": 16,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 42,
-    "SAVE_EVERY_N_STEPS": 7000,
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_2000.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_2000.pt",
+    "SAVE_EVERY_N_STEPS": 5000,
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_15000.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_15000.pt",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
@@ -67,6 +67,7 @@
         "norm3",
         "conv_norm_out"
     ],
+    "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_PER_CHANNEL_NOISE": true,
     "NOISE_SCHEDULE_VARIANT": "uniform",
     "USE_SNR_GAMMA": false,
@@ -78,43 +79,13 @@
     "IP_NOISE_GAMMA": 0.2,
     "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.05,
-    "RESUME_TRAINING": false,
+    "RESUME_TRAINING": true,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Bitseon",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
             "path": "C:/Users/Administrator/Pictures/Datasets/by Anmo_too",
-            "repeats": 3,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Hews",
             "repeats": 2,
             "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/The Fragrant Flower Blooms With Dignity",
-            "repeats": 5,
-            "mirror_repeats": true,
-            "darken_repeats": true,
+            "darken_repeats": false,
             "use_mask": false,
             "mask_path": "",
             "mask_focus_factor": 2.0,

@@ -6,7 +6,6 @@ import glob
 import gc
 import json
 from collections import defaultdict, deque
-import imghdr
 import random
 import time
 import shutil
@@ -733,19 +732,27 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
 
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     print("\nUpdating weights for UNet...")
+    
+    # Directly get the trained weights from the UNet on the GPU
     model_sd_on_device = unet.state_dict()
    
-    for hf_key in list(trained_unet_param_names):
+    # Create a new state dictionary for saving to avoid modifying the original in-memory one.
+    # This is still far more memory-efficient than deepcopying the entire base model.
+    sd_to_save = copy.deepcopy(base_sd)
+
+    for hf_key in trained_unet_param_names:
         category = get_param_category(hf_key)
         param_counters[category]['total'] += 1
 
         mapped_part = unet_key_map.get(hf_key)
         if mapped_part:
             sd_key = 'model.diffusion_model.' + mapped_part
-            if sd_key in base_sd:
-                base_sd[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
+            if sd_key in sd_to_save:
+                # Move the tensor to CPU and convert dtype before assigning
+                sd_to_save[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
                 param_counters[category]['saved'] += 1
     
+    # It's crucial to clean up the GPU-side state dict after use
     del model_sd_on_device
     gc.collect()
 
@@ -765,19 +772,29 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     print("="*60)
     
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    save_file(base_sd, output_path)
+    # Save the newly created state dictionary
+    save_file(sd_to_save, output_path)
     print(f"[OK] Save complete: {output_path}")
+    
+    # Clean up the copied state dict
+    del sd_to_save
+    gc.collect()
+
 
 def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
+    
+    # Pass the original base_model_state_dict directly without deepcopying here.
+    # The deepcopy is now handled inside save_model more efficiently.
     save_model(
-        base_sd=copy.deepcopy(base_model_state_dict),
+        base_sd=base_model_state_dict,
         output_path=checkpoint_model_path,
         unet=unet,
         trained_unet_param_names=trainable_param_names,
         save_dtype=save_dtype
     )
+    
     state_path = checkpoint_dir / f"training_state_step_{step}.pt"
     torch.save({
         'step': step,
@@ -844,13 +861,23 @@ def main():
     base_model_state_dict = load_file(model_to_load)
     del pipeline_temp; gc.collect(); torch.cuda.empty_cache()
 
-    if hasattr(unet, 'enable_xformers_memory_efficient_attention'):
-        try:
-            unet.enable_xformers_memory_efficient_attention()
-            print("INFO: xFormers enabled.")
-        except Exception:
+    if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
+        if hasattr(unet, 'enable_xformers_memory_efficient_attention'):
+            try:
+                unet.enable_xformers_memory_efficient_attention()
+                print("INFO: xFormers memory-efficient attention enabled.")
+            except Exception as e:
+                print(f"WARNING: Could not enable xformers, falling back to SDPA. Error: {e}")
+                unet.set_attn_processor(AttnProcessor2_0())
+        else:
+            print("WARNING: xformers not available on this version of diffusers. Falling back to SDPA.")
             unet.set_attn_processor(AttnProcessor2_0())
-            print("INFO: xFormers not available. Using PyTorch 2.0's SDPA.")
+    elif config.MEMORY_EFFICIENT_ATTENTION == "sdpa":
+        unet.set_attn_processor(AttnProcessor2_0())
+        print("INFO: PyTorch 2.0's Scaled Dot Product Attention (SDPA) enabled.")
+    else:
+        print(f"WARNING: Unknown attention mechanism '{config.MEMORY_EFFICIENT_ATTENTION}'. Defaulting to SDPA.")
+        unet.set_attn_processor(AttnProcessor2_0())
     
     unet.to(device).requires_grad_(False)
     unet.enable_gradient_checkpointing()
@@ -913,7 +940,8 @@ def main():
 
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
-        state = torch.load(latest_state_path, map_location=device)
+        # After (Correct and Memory-Efficient)
+        state = torch.load(latest_state_path, map_location="cpu")
         global_step = state['step']
         state_optimizer_type = state.get('optimizer_type', 'Raven')
         if state_optimizer_type == optimizer_type:

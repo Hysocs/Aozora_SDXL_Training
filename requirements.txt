@@ -1,30 +1,35 @@
 # ==========================================================
 #      Core Deep Learning & SDXL Training Libraries
 # ==========================================================
-# NOTE: Versions pinned to a known stable stack from your working environment.
-# PyTorch and its ecosystem are installed separately in install.bat.
+# NOTE: PyTorch and Flash Attention are installed separately in install.bat.
 
-# Core Hugging Face / Diffusers ecosystem (updated versions)
-diffusers==0.33.1
-transformers==4.46.3
-accelerate==0.29.3 # This version is generally fine and stable
-safetensors==0.5.3
+# Core Hugging Face / Diffusers ecosystem (Latest compatible versions will be installed)
+diffusers
+transformers
+accelerate
+safetensors
 
 # 8-bit optimizer and memory optimization libraries
-bitsandbytes==0.46.0
+bitsandbytes
+
+# Xformers - Installed with the same index as PyTorch for compatibility
+xformers --index-url https://download.pytorch.org/whl/cu128
 
 # ==========================================================
 #              GUI and Helper Libraries
 # ==========================================================
 PyQt6
-xformers
 lpips
 pyqtgraph
 triton-windows
 opencv-python-headless
-Pillow==11.2.1
-tqdm==4.67.1
-numpy==1.26.0
+Pillow
+tqdm
+numpy
 protobuf==4.25.3 # Pinning to a more compatible version <5.0
 psutil
 pywin32
+scipy
+pandas
+matplotlib
+xformers

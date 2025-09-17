@@ -1,4 +1,3 @@
-
 CLS
 SETLOCAL ENABLEDELAYEDEXPANSION
 
@@ -21,13 +20,14 @@ SET "COLOR_WHITE=!ESC![97m"
 
 :: --- ( STEP 1: CONFIGURE YOUR PATHS AND URLS HERE ) ---
 SET VENV_DIR=portable_Venv
-SET PYTHON_EXE=py -3.10
+SET PYTHON_EXE=py -3.11
 SET VENV_PATH=.\!VENV_DIR!\Scripts
 SET WHEELS_DIR=.\!VENV_DIR!\Wheels
 
 
-SET FLASH_ATTN_URL="https://github.com/kingbri1/flash-attention/releases/download/v2.7.4.post1/flash_attn-2.7.4.post1+cu128torch2.7.0cxx11abiFALSE-cp310-cp310-win_amd64.whl"
-SET FLASH_ATTN_FILENAME=flash_attn-2.7.4.post1+cu128torch2.7.0cxx11abiFALSE-cp310-cp310-win_amd64.whl
+:: [UPDATED] Flash Attention URL for PyTorch 2.8.0 and Python 3.11
+SET FLASH_ATTN_URL="https://github.com/kingbri1/flash-attention/releases/download/v2.8.2/flash_attn-2.8.2+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl"
+SET FLASH_ATTN_FILENAME=flash_attn-2.8.3+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl
 SET FLASH_ATTN_WHL_PATH=!WHEELS_DIR!\!FLASH_ATTN_FILENAME!
 
 :: --- ( END OF CONFIGURATION ) ---
@@ -79,6 +79,7 @@ IF NOT EXIST "requirements.txt" (
 where %PYTHON_EXE% >nul 2>nul
 IF ERRORLEVEL 1 (
     ECHO !COLOR_RED![ERROR] Python command '%PYTHON_EXE%' not found.!COLOR_RESET!
+    ECHO !COLOR_RED!Please ensure you have Python 3.11 installed and available in your PATH.!COLOR_RESET!
     GOTO:FATAL_ERROR
 )
 IF NOT EXIST "!VENV_PATH!\activate.bat" (
@@ -101,6 +102,13 @@ ECHO !COLOR_WHITE![INFO] Upgrading pip...!COLOR_RESET!
 python -m pip install --upgrade pip
 ECHO.
 
+:: [UPDATED] Install the correct PyTorch stack FIRST. This is crucial.
+:: We are using the CUDA 12.8 builds as they are a stable standard.
+ECHO !COLOR_WHITE![INFO] Installing PyTorch, Torchvision, and Torchaudio... This is the most important step!!COLOR_RESET!
+python -m pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+IF ERRORLEVEL 1 (ECHO !COLOR_RED![ERROR] Failed to install PyTorch.!COLOR_RESET! & GOTO:FATAL_ERROR)
+ECHO !COLOR_GREEN![SUCCESS] PyTorch stack installed.!COLOR_RESET! & ECHO.
+
 :: Check/download Flash Attention if selected
 IF "!INSTALL_MODE!"=="FLASH" (
     IF NOT EXIST "!FLASH_ATTN_WHL_PATH!" (
@@ -122,17 +130,9 @@ IF "!INSTALL_MODE!"=="FLASH" (
 )
 
 ECHO !COLOR_WHITE![INFO] Installing remaining dependencies from requirements.txt...!COLOR_RESET!
-python -m pip install -r requirements.txt
+python -m pip install -r requirements.txt --upgrade
 IF ERRORLEVEL 1 (ECHO !COLOR_RED![ERROR] Failed to install from requirements.txt.!COLOR_RESET! & GOTO:FATAL_ERROR)
 ECHO !COLOR_GREEN![SUCCESS] All other dependencies installed.!COLOR_RESET! & ECHO.
-
-:: [MODIFIED] Install the correct PyTorch stack FIRST. This is crucial.
-:: We are using the CUDA 12.1 builds as they are a stable standard.
-ECHO !COLOR_WHITE![INFO] Installing PyTorch, Torchvision, and Torchaudio... This is the most important step!!COLOR_RESET!
-python -m pip install torch==2.7.1 torchvision==0.22.1 torchaudio==2.7.1 --index-url https://download.pytorch.org/whl/cu128
-IF ERRORLEVEL 1 (ECHO !COLOR_RED![ERROR] Failed to install PyTorch.!COLOR_RESET! & GOTO:FATAL_ERROR)
-ECHO !COLOR_GREEN![SUCCESS] PyTorch stack installed.!COLOR_RESET! & ECHO.
-
 
 ECHO.
 ECHO !COLOR_GREEN!============================================================!COLOR_RESET!
