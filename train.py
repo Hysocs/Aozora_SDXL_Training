@@ -38,47 +38,75 @@ Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+def set_seed(seed):
+    """Sets the seed for all relevant random number generators."""
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed) # for multi-GPU
+    print(f"INFO: Set random seed to {seed}")
 
 class BucketBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size, shuffle=True, drop_last=False):
+    def __init__(self, dataset, batch_size, seed, shuffle=True, drop_last=False):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.drop_last = drop_last
-        self.buckets = defaultdict(list)
+        self.seed = seed
+        self.dataset = dataset
         
-        for i, key in enumerate(dataset.bucket_keys):
-            if key is not None:
-                self.buckets[key].append(i)
-        
-        self.buckets_list = [b for b in self.buckets.values() if len(b) > 0]
-        tqdm.write(f"INFO: Created {len(self.buckets_list)} buckets for training with sizes: {[len(b) for b in self.buckets_list]}")
+        # 1. Create a flat list of all indices, respecting repeats from the dataset config.
+        # This is our master list for one "scientific epoch".
+        self.epoch_indices = []
+        for i, (_, _, dataset_config) in enumerate(self.dataset.latent_files):
+            # The dataset already pre-expanded the files with repeats, so we just add the index.
+            self.epoch_indices.append(i)
+
+        tqdm.write(f"INFO: BucketBatchSampler initialized with {len(self.epoch_indices)} total samples for one epoch.")
 
     def __iter__(self):
+        # 2. Shuffle the master list of indices for the current epoch using the seed.
+        if self.shuffle:
+            # Use a local Random instance to not interfere with global state.
+            g = torch.Generator()
+            g.manual_seed(self.seed)
+            shuffled_indices = torch.randperm(len(self.epoch_indices), generator=g).tolist()
+        else:
+            shuffled_indices = list(range(len(self.epoch_indices)))
+
+        # 3. Group the shuffled indices into buckets.
+        buckets = defaultdict(list)
+        for i in shuffled_indices:
+            bucket_key = self.dataset.bucket_keys[i]
+            if bucket_key is not None:
+                buckets[bucket_key].append(i)
+        
+        # 4. Create batches from each bucket.
         all_batches = []
-        for bucket_indices in self.buckets_list:
-            if self.shuffle:
-                random.shuffle(bucket_indices)
-            
+        for bucket_indices in buckets.values():
             for i in range(0, len(bucket_indices), self.batch_size):
                 batch = bucket_indices[i:i + self.batch_size]
                 if not self.drop_last or len(batch) == self.batch_size:
                     all_batches.append(batch)
         
-        if self.shuffle:
-            random.shuffle(all_batches)
+        # 5. IMPORTANT: We do NOT shuffle the batches. The order is determined by the initial shuffle.
+        # To add some variability between epochs without losing predictability, we sort batches by size.
+        # This keeps similarly-sized batches together, which can be slightly more efficient.
+        all_batches.sort(key=len, reverse=True)
             
         for batch in all_batches:
             yield batch
+            
+        # Increment the seed for the next epoch to get a new, but still predictable, shuffle order.
+        self.seed += 1
 
     def __len__(self):
-        total = 0
-        for bucket in self.buckets_list:
-            n = len(bucket)
-            if self.drop_last:
-                total += n // self.batch_size
-            else:
-                total += (n + self.batch_size - 1) // self.batch_size
-        return total
+        # The total number of batches is based on the total number of samples.
+        if self.drop_last:
+            return len(self.epoch_indices) // self.batch_size
+        else:
+            return (len(self.epoch_indices) + self.batch_size - 1) // self.batch_size
 
 class CustomCurveScheduler(_LRScheduler):
     def __init__(self, optimizer, lr_curve_points, max_steps, last_epoch=-1):
@@ -432,41 +460,58 @@ class ImageTextLatentDataset(Dataset):
             config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
             
         self.latent_files = []
-        all_unique_files = set()
         
-        for dataset in config.INSTANCE_DATASETS:
-            root = Path(dataset["path"])
-            print(f"Loading dataset '{root.name}' with config: {dataset}")
-            files = list(root.rglob(".precomputed_embeddings_cache/*.pt"))
-            for f in files:
-                all_unique_files.add(f)
+        for dataset_config in config.INSTANCE_DATASETS:
+            root = Path(dataset_config["path"])
+            print(f"Loading dataset '{root.name}' with config: {dataset_config}")
             
-            repeats = dataset.get("repeats", 1)
-            should_mirror = dataset.get("mirror_repeats", False)
-            should_darken = dataset.get("darken_repeats", False)
-            
-            self.latent_files.extend([(f, "original", dataset) for f in files])
-            
-            if repeats > 1:
-                for _ in range(repeats - 1):
-                    variant_key = "original"
-                    if should_darken and should_mirror: variant_key = "flipped_contrast"
-                    elif should_darken: variant_key = "contrast"
-                    elif should_mirror: variant_key = "flipped"
-                    self.latent_files.extend([(f, variant_key, dataset) for f in files])
+            cache_dir = root / ".precomputed_embeddings_cache"
+            if not cache_dir.exists():
+                print(f"WARNING: Cache directory not found for {root}. Skipping this dataset.")
+                continue
 
-        self.latent_files = sorted(self.latent_files, key=lambda x: str(x[0]))
+            files_in_dataset = sorted(list(cache_dir.glob("*.pt")))
+            if not files_in_dataset:
+                print(f"WARNING: No cached .pt files found in {cache_dir}. Skipping this dataset.")
+                continue
+
+            repeats = int(dataset_config.get("repeats", 1))
+            should_mirror = dataset_config.get("mirror_repeats", False)
+            should_darken = dataset_config.get("darken_repeats", False)
+            
+            # Create a list of variants to cycle through for the repeats
+            variants_to_use = ["original"]
+            if repeats > 1:
+                # Build the list of variants based on config
+                other_variants = []
+                if should_mirror: other_variants.append("flipped")
+                if should_darken: other_variants.append("contrast")
+                if should_mirror and should_darken: other_variants.append("flipped_contrast")
+                
+                # Cycle through the available variants for the remaining repeats
+                if other_variants:
+                    for i in range(repeats - 1):
+                        variants_to_use.append(other_variants[i % len(other_variants)])
+
+            # Extend the main list with all files and their assigned variants
+            for f in files_in_dataset:
+                for i in range(repeats):
+                    variant_key = variants_to_use[i % len(variants_to_use)]
+                    self.latent_files.append((f, variant_key, dataset_config))
+
         if not self.latent_files:
-            raise ValueError("No cached embedding files found. Please ensure pre-caching was successful.")
+            raise ValueError("No cached embedding files found across all datasets. Please ensure pre-caching was successful.")
         
+        # Pre-caching bucket keys remains the same
         tqdm.write("INFO: Pre-caching bucket shapes for all latent files...")
         self.bucket_keys = []
         for file_path, _, _ in tqdm(self.latent_files, desc="Caching bucket keys"):
             try:
                 full_data = torch.load(file_path, map_location="cpu")
+                # Always use the 'original' latent shape for consistent bucketing regardless of variant
                 latents = full_data.get("original", {}).get("latents_cpu")
                 if latents is not None:
-                    self.bucket_keys.append((latents.shape[1], latents.shape[2]))
+                    self.bucket_keys.append(latents.shape[-2:]) # (height, width)
                 else:
                     tqdm.write(f"WARNING: 'original' latents not found in {file_path}. Marking as invalid.")
                     self.bucket_keys.append(None)
@@ -474,7 +519,7 @@ class ImageTextLatentDataset(Dataset):
                 tqdm.write(f"WARNING: Could not load bucket key for {file_path}: {e}")
                 self.bucket_keys.append(None)
         
-        print(f"Dataset initialized with {len(self.latent_files)} samples (including repeats).")
+        print(f"Dataset initialized with {len(self.latent_files)} total samples for one scientific epoch.")
 
     def __len__(self): return len(self.latent_files)
 
@@ -846,6 +891,9 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
   
 def main():
     config = TrainingConfig()
+    # Set seeds for reproducibility
+    if config.SEED is not None:
+        set_seed(config.SEED)
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -963,7 +1011,7 @@ def main():
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
 
     train_dataset = ImageTextLatentDataset(config)
-    sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
+    sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, seed=config.SEED, shuffle=True, drop_last=False)
     train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
     
     # train_step function remains unchanged
