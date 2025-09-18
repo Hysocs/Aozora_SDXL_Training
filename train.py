@@ -549,10 +549,10 @@ class TimestepSampler:
             alphas_cumprod = noise_scheduler.alphas_cumprod.to(device, dtype=torch.float32)
             clipped_alphas = torch.clamp(alphas_cumprod, min=1e-8, max=1 - 1e-8)
             log_snr = torch.log(clipped_alphas) - torch.log(1 - clipped_alphas)
-            scale = 0.3
+            scale = 1.0  # Changed from 0.3
             self.weights = torch.exp(-torch.abs(log_snr) / scale)
             self.weights /= self.weights.sum()
-            print("INFO: Initialized LogSNR Laplace timestep sampler.")
+            print("INFO: Initialized LogSNR Laplace timestep sampler with scale=1.0.")
 
     def __call__(self, batch_size):
         if self.variant == "residual_shifting":
@@ -949,6 +949,15 @@ def main():
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
+        # Update scheduler internals for consistency
+        noise_scheduler.register_to_config(betas=noise_scheduler.betas)
+        noise_scheduler._beta_schedule = noise_scheduler.betas  # For lazy updates
+        noise_scheduler.alphas = 1.0 - noise_scheduler.betas
+        noise_scheduler.alphas_cumprod = torch.cumprod(noise_scheduler.alphas, dim=0)
+        noise_scheduler.sqrt_alphas_cumprod = torch.sqrt(noise_scheduler.alphas_cumprod)
+        noise_scheduler.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
+        noise_scheduler.log_one_minus_alphas_cumprod = torch.log(noise_scheduler.sqrt_one_minus_alphas_cumprod.pow(2))
+        noise_scheduler.one_minus_alphas_cumprod = 1 - noise_scheduler.alphas_cumprod  # For velocity, etc.
 
     plugins = FeaturePlugins(config, noise_scheduler, device)
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
@@ -959,7 +968,6 @@ def main():
     
     # train_step function remains unchanged
     def train_step(batch):
-        # ... (no changes needed here)
         latents = batch["latents"]
         noise = torch.randn_like(latents) if config.USE_PER_CHANNEL_NOISE else torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
         timesteps = plugins.timestep_sampler(latents.shape[0])
@@ -1045,10 +1053,36 @@ def main():
     progress_bar.close()
     final_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
     print(f"--> Training finished at batch step: {global_step}, optimizer step: {final_optimizer_step}")
+
+    # --- NEWLY MODIFIED SECTION WITH DESCRIPTIVE FILENAMES ---
+    # Define the base name for the final save, incorporating both step counts.
+    file_basename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_steps{global_step}_updates{final_optimizer_step}"
+
+    # Save the final optimizer and scheduler state. Its name will now match the model's.
+    final_state_path = OUTPUT_DIR / f"{file_basename}_state.pt"
+    print(f"\n[INFO] Saving final optimizer and scheduler state to: {final_state_path}")
+    torch.save({
+        'step': final_optimizer_step,
+        'optimizer_type': config.OPTIMIZER_TYPE,
+        'optimizer_state_dict': optimizer.state_dict(),
+        'scheduler_state_dict': lr_scheduler.state_dict(),
+    }, final_state_path)
+    print(f"[OK] Final state saved.")
+
+    # Release memory to prevent OOM on the final model save.
+    print("[INFO] Releasing optimizer and scheduler memory before final model save...")
+    del optimizer
+    del lr_scheduler
+    gc.collect()
+    torch.cuda.empty_cache()
+    print("[OK] Optimizer and scheduler memory released.")
+
+    # Save the final model weights with the new descriptive name.
+    final_model_path = OUTPUT_DIR / f"{file_basename}.safetensors"
     
-    final_model_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_step_{final_optimizer_step}.safetensors"
     save_model(base_model_state_dict, final_model_path, unet, unet_param_names_to_optimize, config.compute_dtype)
     print("\nTRAINING COMPLETE")
+
 
 if __name__ == "__main__":
     try:
