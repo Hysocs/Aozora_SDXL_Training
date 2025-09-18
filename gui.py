@@ -816,6 +816,17 @@ class TrainingGUI(QtWidgets.QWidget):
         except ValueError:
             raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
         raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
+        
+        # Add V2 params
+        raven_params["use_lookahead"] = self.widgets['RAVEN_use_lookahead'].isChecked()
+        raven_params["la_steps"] = self.widgets['RAVEN_la_steps'].value()
+        raven_params["la_alpha"] = self.widgets['RAVEN_la_alpha'].value()
+        raven_params["use_adaptive_dampening"] = self.widgets['RAVEN_use_adaptive_dampening'].isChecked()
+        raven_params["ad_dampening_factor"] = self.widgets['RAVEN_ad_dampening_factor'].value()
+        raven_params["ad_sigma_threshold"] = self.widgets['RAVEN_ad_sigma_threshold'].value()
+        raven_params["ad_history_window"] = self.widgets['RAVEN_ad_history_window'].value()
+        raven_params["ad_percentile_threshold"] = self.widgets['RAVEN_ad_percentile_threshold'].value()
+
         config_to_save["RAVEN_PARAMS"] = raven_params
 
         adafactor_params = {}
@@ -999,9 +1010,11 @@ class TrainingGUI(QtWidgets.QWidget):
         return core_group
 
     def _create_optimizer_group(self):
+        """Creates the entire 'Optimizer' group box with widgets for Raven (V1+V2) and Adafactor."""
         optimizer_group = QtWidgets.QGroupBox("Optimizer")
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
         
+        # --- Optimizer Type Selector ---
         selector_layout = QtWidgets.QHBoxLayout()
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
         
@@ -1027,22 +1040,21 @@ class TrainingGUI(QtWidgets.QWidget):
         help_text = """
         <p><b>Optimizers</b> are the algorithms used to update the model's weights during training based on the calculated loss.</p>
         <hr>
-        <p><b>Raven(Reusable Adam Variant for Efficient Networking):</b></p>
-        <p><b>CPU Offloading, Higher stability if you have a decent CPU. Requires 20+ GB of RAM:</b></p>
+        <p><b>Raven (Reusable Adam Variant for Efficient Networking):</b></p>
+        <p><b>CPU Offloading, Higher stability if you have a decent CPU. Requires 20+ GB of RAM.</b></p>
         <ul>
-            <li>A custom optimizer that is a variant of AdamW.</li>
-            <li>Generally provides a good balance of performance and stability. It is often faster to converge than Adafactor.</li>
-            <li><b>Betas:</b> Control the running averages of the gradient (beta1) and its square (beta2). Default values are usually fine.</li>
-            <li><b>Eps (Epsilon):</b> A small number to prevent division by zero, adding numerical stability.</li>
-            <li><b>Weight Decay:</b> A regularization technique to prevent overfitting by penalizing large weights.</li>
+            <li>A custom optimizer that is a variant of AdamW. Generally provides a good balance of performance and stability.</li>
+            <li><b>Betas:</b> Control the running averages of the gradient (beta1) and its square (beta2).</li>
+            <li><b>Lookahead:</b> A mechanism that explores with 'fast' weights but updates a more stable set of 'slow' weights, often leading to better generalization.</li>
+            <li><b>Adaptive Dampening:</b> Automatically reduces the learning rate for a single step when a gradient spike is detected, preventing instability without needing to lower the overall LR.</li>
         </ul>
         <hr>
-        <p><b>Adafactor(No CPU Offloading, Requires slightly more VRAM. Lower Stability!):</b></p>
+        <p><b>Adafactor:</b></p>
+        <p><b>No CPU Offloading, Requires slightly more VRAM. Lower Stability.</b></p>
         <ul>
             <li>Designed to be memory-efficient, which can be useful for very large models or systems with limited VRAM.</li>
-            <li>It adapts the learning rate for each parameter individually and uses less memory by not storing the full momentum for every weight.</li>
-            <li>Can sometimes be slower to converge than Adam-based optimizers, but is moderately stable.</li>
-            <li><b>Relative Step Sizing:</b> A key feature of Adafactor that scales updates based on the magnitude of the parameters themselves. It's recommended to keep this enabled (and `scale_parameter` enabled) and to set the `Learning Rate` in the scheduler to `None` or a small constant like 1.0, letting Adafactor manage the step size.</li>
+            <li>It adapts the learning rate for each parameter individually. Can sometimes be slower to converge than Adam-based optimizers.</li>
+            <li><b>Relative Step Sizing:</b> A key feature of Adafactor that scales updates based on the magnitude of the parameters. Recommended to keep enabled and to set the `Learning Rate` in the scheduler to a small constant like 1.0.</li>
         </ul>
         """
         def show_help_dialog():
@@ -1052,8 +1064,11 @@ class TrainingGUI(QtWidgets.QWidget):
         selector_layout.addWidget(help_button)
         main_layout.addLayout(selector_layout)
 
+        # --- Raven Settings Group (with V2 features) ---
         self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
         raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
+        
+        # V1 Params
         self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox()
@@ -1061,8 +1076,53 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
         raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
         raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
+        
+        separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668; margin-top: 10px; margin-bottom: 5px;")
+        raven_layout.addRow(separator)
+        
+        # V2 Lookahead Params
+        self.widgets['RAVEN_use_lookahead'] = QtWidgets.QCheckBox("Use Lookahead")
+        raven_layout.addRow(self.widgets['RAVEN_use_lookahead'])
+        
+        self.lookahead_sub_widget = SubOptionWidget()
+        # CORRECTED PART: Create the QFormLayout without a parent
+        lookahead_form_layout = QtWidgets.QFormLayout()
+        lookahead_form_layout.setContentsMargins(0, 0, 0, 0)
+        self.widgets['RAVEN_la_steps'] = QtWidgets.QSpinBox(); self.widgets['RAVEN_la_steps'].setRange(1, 100)
+        self.widgets['RAVEN_la_alpha'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_la_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_la_alpha'].setSingleStep(0.05); self.widgets['RAVEN_la_alpha'].setDecimals(3)
+        lookahead_form_layout.addRow("Lookahead Steps (k):", self.widgets['RAVEN_la_steps'])
+        lookahead_form_layout.addRow("Alpha:", self.widgets['RAVEN_la_alpha'])
+        # Add the new layout to the SubOptionWidget's existing layout
+        self.lookahead_sub_widget.get_layout().addLayout(lookahead_form_layout)
+        raven_layout.addRow(self.lookahead_sub_widget)
+
+        # V2 Adaptive Dampening Params
+        self.widgets['RAVEN_use_adaptive_dampening'] = QtWidgets.QCheckBox("Use Adaptive Dampening")
+        raven_layout.addRow(self.widgets['RAVEN_use_adaptive_dampening'])
+        
+        self.dampening_sub_widget = SubOptionWidget()
+        # CORRECTED PART: Create the QFormLayout without a parent
+        dampening_form_layout = QtWidgets.QFormLayout()
+        dampening_form_layout.setContentsMargins(0, 0, 0, 0)
+        self.widgets['RAVEN_ad_dampening_factor'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_dampening_factor'].setRange(0.0, 1.0); self.widgets['RAVEN_ad_dampening_factor'].setSingleStep(0.01); self.widgets['RAVEN_ad_dampening_factor'].setDecimals(3)
+        self.widgets['RAVEN_ad_sigma_threshold'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_sigma_threshold'].setRange(0.1, 10.0); self.widgets['RAVEN_ad_sigma_threshold'].setSingleStep(0.1); self.widgets['RAVEN_ad_sigma_threshold'].setDecimals(2)
+        self.widgets['RAVEN_ad_history_window'] = QtWidgets.QSpinBox(); self.widgets['RAVEN_ad_history_window'].setRange(20, 1000)
+        self.widgets['RAVEN_ad_percentile_threshold'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_percentile_threshold'].setRange(0.0, 100.0); self.widgets['RAVEN_ad_percentile_threshold'].setSingleStep(1.0); self.widgets['RAVEN_ad_percentile_threshold'].setDecimals(2)
+        dampening_form_layout.addRow("Dampening Factor:", self.widgets['RAVEN_ad_dampening_factor'])
+        dampening_form_layout.addRow("Sigma Threshold:", self.widgets['RAVEN_ad_sigma_threshold'])
+        dampening_form_layout.addRow("History Window:", self.widgets['RAVEN_ad_history_window'])
+        dampening_form_layout.addRow("Percentile Threshold:", self.widgets['RAVEN_ad_percentile_threshold'])
+        # Add the new layout to the SubOptionWidget's existing layout
+        self.dampening_sub_widget.get_layout().addLayout(dampening_form_layout)
+        raven_layout.addRow(self.dampening_sub_widget)
+
         main_layout.addWidget(self.raven_settings_group)
         
+        # Connect signals to slots for sub-widget visibility
+        self.widgets['RAVEN_use_lookahead'].stateChanged.connect(lambda state: self.lookahead_sub_widget.setVisible(bool(state)))
+        self.widgets['RAVEN_use_adaptive_dampening'].stateChanged.connect(lambda state: self.dampening_sub_widget.setVisible(bool(state)))
+
+        # --- Adafactor Settings Group ---
         self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
         adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
         self.widgets['ADAFACTOR_eps'] = QtWidgets.QLineEdit()
@@ -1072,8 +1132,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets['ADAFACTOR_decay_rate'].setRange(-1.0, 0.0); self.widgets['ADAFACTOR_decay_rate'].setSingleStep(0.01); self.widgets['ADAFACTOR_decay_rate'].setDecimals(3)
         
         beta1_widget = QtWidgets.QWidget()
-        beta1_layout = QtWidgets.QHBoxLayout(beta1_widget)
-        beta1_layout.setContentsMargins(0,0,0,0)
+        beta1_layout = QtWidgets.QHBoxLayout(beta1_widget); beta1_layout.setContentsMargins(0,0,0,0)
         self.widgets['ADAFACTOR_beta1_enabled'] = QtWidgets.QCheckBox("Enable")
         self.widgets['ADAFACTOR_beta1_value'] = QtWidgets.QDoubleSpinBox()
         self.widgets['ADAFACTOR_beta1_value'].setRange(0.0, 1.0); self.widgets['ADAFACTOR_beta1_value'].setSingleStep(0.01); self.widgets['ADAFACTOR_beta1_value'].setDecimals(3)
@@ -1097,7 +1156,6 @@ class TrainingGUI(QtWidgets.QWidget):
         main_layout.addWidget(self.adafactor_settings_group)
         
         return optimizer_group
-
     def _toggle_optimizer_widgets(self):
         selected_optimizer = self.widgets["OPTIMIZER_TYPE"].currentText()
         is_raven = (selected_optimizer == "Raven")
@@ -1293,61 +1351,98 @@ class TrainingGUI(QtWidgets.QWidget):
         elif isinstance(widget, LRCurveWidget):
             self.current_config[key] = widget.get_points()
     def _apply_config_to_widgets(self):
+        """
+        Applies the current_config to all UI widgets, blocking signals to prevent loops.
+        This version is robust and falls back to default_config for any missing keys.
+        """
         for widget in self.widgets.values():
             widget.blockSignals(True)
         try:
+            # --- Apply UNet Targets ---
             if self.unet_layer_checkboxes:
                 unet_targets = self.current_config.get("UNET_TRAIN_TARGETS", [])
                 for key, checkbox in self.unet_layer_checkboxes.items():
                     checkbox.setChecked(key in unet_targets)
+            
+            # --- Set Resume/Base Model Mode ---
             if hasattr(self, 'model_load_strategy_combo'):
                 is_resuming = self.current_config.get("RESUME_TRAINING", False)
                 self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
                 self.toggle_resume_widgets()
             
+            # --- Apply General Widget Values ---
             for key, widget in self.widgets.items():
                 if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
                     continue
-                if key in self.current_config:
-                    value = self.current_config.get(key)
-                    if value is None: continue
-                    if isinstance(widget, QtWidgets.QLineEdit): widget.setText(", ".join(map(str, value)) if isinstance(value, list) else str(value))
-                    elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
-                    elif isinstance(widget, QtWidgets.QDoubleSpinBox): widget.setValue(float(value))
+                
+                value = self.current_config.get(key)
+                if value is None: continue
 
+                if isinstance(widget, QtWidgets.QLineEdit):
+                    widget.setText(", ".join(map(str, value)) if isinstance(value, list) else str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, QtWidgets.QComboBox):
+                    widget.setCurrentText(str(value))
+                elif isinstance(widget, QtWidgets.QDoubleSpinBox):
+                    widget.setValue(float(value))
+
+            # --- Apply Optimizer Settings with Safe Fallbacks ---
             optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
             self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type)
             
-            raven_params = self.current_config.get("RAVEN_PARAMS", default_config.RAVEN_PARAMS)
-            self.widgets["RAVEN_betas"].setText(', '.join(map(str, raven_params.get("betas", [0.9, 0.999]))))
-            self.widgets["RAVEN_eps"].setText(str(raven_params.get("eps", 1e-8)))
-            self.widgets["RAVEN_weight_decay"].setValue(raven_params.get("weight_decay", 0.01))
+            # Consolidate user and default raven params
+            user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
+            full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
 
-            adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", default_config.ADAFACTOR_PARAMS)
-            self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, adafactor_params.get("eps", [1e-30, 1e-3]))))
-            self.widgets["ADAFACTOR_clip_threshold"].setValue(adafactor_params.get("clip_threshold", 1.0))
-            self.widgets["ADAFACTOR_decay_rate"].setValue(adafactor_params.get("decay_rate", -0.8))
-            beta1_val = adafactor_params.get("beta1", None)
+            self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
+            self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
+            self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
+            self.widgets['RAVEN_use_lookahead'].setChecked(full_raven_params["use_lookahead"])
+            self.widgets['RAVEN_la_steps'].setValue(full_raven_params["la_steps"])
+            self.widgets['RAVEN_la_alpha'].setValue(full_raven_params["la_alpha"])
+            self.widgets['RAVEN_use_adaptive_dampening'].setChecked(full_raven_params["use_adaptive_dampening"])
+            self.widgets['RAVEN_ad_dampening_factor'].setValue(full_raven_params["ad_dampening_factor"])
+            self.widgets['RAVEN_ad_sigma_threshold'].setValue(full_raven_params["ad_sigma_threshold"])
+            self.widgets['RAVEN_ad_history_window'].setValue(full_raven_params["ad_history_window"])
+            self.widgets['RAVEN_ad_percentile_threshold'].setValue(full_raven_params["ad_percentile_threshold"])
+            
+            # Consolidate user and default adafactor params
+            user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
+            full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
+
+            self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
+            self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
+            self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
+            beta1_val = full_adafactor_params.get("beta1", None)
             beta1_enabled = beta1_val is not None
             self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
             self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
             self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
-            self.widgets["ADAFACTOR_weight_decay"].setValue(adafactor_params.get("weight_decay", 0.01))
-            self.widgets["ADAFACTOR_scale_parameter"].setChecked(adafactor_params.get("scale_parameter", True))
-            self.widgets["ADAFACTOR_relative_step"].setChecked(adafactor_params.get("relative_step", False))
-            self.widgets["ADAFACTOR_warmup_init"].setChecked(adafactor_params.get("warmup_init", False))
+            self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
+            self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
+            self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
+            self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
             
+            # --- Update Dynamic UI Elements ---
             if hasattr(self, 'lr_curve_widget'):
                 self._update_and_clamp_lr_graph()
             
-            for toggle_func in [self.toggle_snr_gamma_widget, self.toggle_ip_noise_gamma_widget,
-                                self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets]:
+            for toggle_func in [
+                self.toggle_snr_gamma_widget, self.toggle_ip_noise_gamma_widget,
+                self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets
+            ]:
                 toggle_func()
+            
+            # Manually set visibility for new sub-widgets after all values are loaded
+            self.lookahead_sub_widget.setVisible(self.widgets['RAVEN_use_lookahead'].isChecked())
+            self.dampening_sub_widget.setVisible(self.widgets['RAVEN_use_adaptive_dampening'].isChecked())
 
+            # --- Load Datasets ---
             if hasattr(self, "dataset_manager"):
                 datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
                 self.dataset_manager.load_datasets_from_config(datasets_config)
+
         finally:
             for widget in self.widgets.values():
                 widget.blockSignals(False)

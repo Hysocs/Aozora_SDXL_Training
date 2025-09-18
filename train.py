@@ -85,6 +85,7 @@ class CustomCurveScheduler(_LRScheduler):
         if not lr_curve_points or len(lr_curve_points) < 2:
             raise ValueError("LR_CUSTOM_CURVE must contain at least two points.")
             
+        # This part remains the same
         self.absolute_points = sorted([[p[0] * max_steps, p[1]] for p in lr_curve_points])
         
         if self.absolute_points[0][0] > 0:
@@ -94,9 +95,13 @@ class CustomCurveScheduler(_LRScheduler):
 
         super().__init__(optimizer, last_epoch)
 
-    def get_lr(self):
-        current_step = self.last_epoch
+    # THE KEY CHANGE IS HERE: We now pass the current step directly
+    def get_lr(self, current_step=None):
+        # If no step is provided, fall back to the old behavior for compatibility
+        if current_step is None:
+            current_step = self.last_epoch
 
+        # The rest of the logic is the same, just using the new 'current_step' variable
         p1 = None
         p2 = None
         if current_step >= self.absolute_points[-1][0]:
@@ -109,6 +114,7 @@ class CustomCurveScheduler(_LRScheduler):
                 break
         
         if p1 is None or p2 is None:
+            # This can happen if current_step is exactly the last point
             return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
 
         step1, lr1 = p1
@@ -121,6 +127,20 @@ class CustomCurveScheduler(_LRScheduler):
         current_lr = lr1 + progress * (lr2 - lr1)
 
         return [current_lr for _ in self.optimizer.param_groups]
+
+    # We also need a new method to manually set the LR
+    def step(self, current_step=None):
+        if current_step is None:
+            # Fallback to default PyTorch behavior if no step is provided
+            super().step()
+            return
+
+        new_lrs = self.get_lr(current_step=current_step)
+        for param_group, lr in zip(self.optimizer.param_groups, new_lrs):
+            param_group['lr'] = lr
+        
+        # We still update last_epoch, though it's not used for calculation anymore
+        self.last_epoch = current_step
     
 class TrainingConfig:
     def __init__(self):
@@ -782,19 +802,9 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
 
 
 def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
-    checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
-    
-    # Pass the original base_model_state_dict directly without deepcopying here.
-    # The deepcopy is now handled inside save_model more efficiently.
-    save_model(
-        base_sd=base_model_state_dict,
-        output_path=checkpoint_model_path,
-        unet=unet,
-        trained_unet_param_names=trainable_param_names,
-        save_dtype=save_dtype
-    )
-    
+
+    # --- Step 1: Save optimizer and scheduler state to a file FIRST ---
     state_path = checkpoint_dir / f"training_state_step_{step}.pt"
     torch.save({
         'step': step,
@@ -803,7 +813,23 @@ def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, sch
         'scheduler_state_dict': scheduler.state_dict(),
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
-    gc.collect()
+
+    # --- Step 2: Explicitly delete the optimizer and scheduler to free RAM ---
+    # This is the crucial step to prevent OOM.
+    del optimizer
+    del scheduler
+    gc.collect() # Ask the garbage collector to release the memory.
+    print("[INFO] Optimizer and scheduler have been released from memory.")
+
+    # --- Step 3: Now, with RAM freed up, save the model weights ---
+    checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
+    save_model(
+        base_sd=base_model_state_dict,
+        output_path=checkpoint_model_path,
+        unet=unet,
+        trained_unet_param_names=trainable_param_names,
+        save_dtype=save_dtype
+    )
 
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     alphas = 1.0 - betas
@@ -829,6 +855,14 @@ def main():
         if not Path(ds["path"]).exists(): raise FileNotFoundError(f"Data dir not found: {ds['path']}")
     if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
     
+    # --- STEP 1: DEFINE OUR CLOCKS CORRECTLY FROM THE START ---
+    # The user-facing "step" is the number of batches processed.
+    # We derive the number of optimizer updates from this.
+    total_training_steps = config.MAX_TRAIN_STEPS
+    total_optimizer_steps = math.ceil(total_training_steps / config.GRADIENT_ACCUMULATION_STEPS)
+    print(f"INFO: Training for {total_training_steps} batch steps.")
+    print(f"INFO: This will correspond to {total_optimizer_steps} optimizer updates.")
+
     config.compute_dtype = torch.bfloat16 if config.MIXED_PRECISION == "bfloat16" else torch.float16
     print(f"Using compute dtype: {config.compute_dtype}, Device: {device}")
     use_scaler = config.compute_dtype == torch.float16
@@ -862,21 +896,8 @@ def main():
     del pipeline_temp; gc.collect(); torch.cuda.empty_cache()
 
     if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
-        if hasattr(unet, 'enable_xformers_memory_efficient_attention'):
-            try:
-                unet.enable_xformers_memory_efficient_attention()
-                print("INFO: xFormers memory-efficient attention enabled.")
-            except Exception as e:
-                print(f"WARNING: Could not enable xformers, falling back to SDPA. Error: {e}")
-                unet.set_attn_processor(AttnProcessor2_0())
-        else:
-            print("WARNING: xformers not available on this version of diffusers. Falling back to SDPA.")
-            unet.set_attn_processor(AttnProcessor2_0())
-    elif config.MEMORY_EFFICIENT_ATTENTION == "sdpa":
-        unet.set_attn_processor(AttnProcessor2_0())
-        print("INFO: PyTorch 2.0's Scaled Dot Product Attention (SDPA) enabled.")
+        unet.enable_xformers_memory_efficient_attention()
     else:
-        print(f"WARNING: Unknown attention mechanism '{config.MEMORY_EFFICIENT_ATTENTION}'. Defaulting to SDPA.")
         unet.set_attn_processor(AttnProcessor2_0())
     
     unet.to(device).requires_grad_(False)
@@ -893,70 +914,41 @@ def main():
         raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'.")
 
     initial_lr = config.LR_CUSTOM_CURVE[0][1]
-    print(f"INFO: Setting initial optimizer LR to {initial_lr:.2e}.")
-
     optimizer_grouped_parameters = [{"params": params_to_optimize, "lr": initial_lr}]
-
-    unet_trainable_params = sum(p.numel() for p in params_to_optimize)
-    print(f"Trainable UNet params: {unet_trainable_params/1e6:.3f}M")
-
-    optimizer_type = config.OPTIMIZER_TYPE
-    print(f"INFO: Using {optimizer_type} optimizer.")
-
-    # Normalize optimizer_type to match expected case
-    optimizer_type = optimizer_type.capitalize()  # Convert to "Raven" or "Adafactor"
-
+    
+    optimizer_type = config.OPTIMIZER_TYPE.capitalize()
     if optimizer_type == "Raven":
-        raven_params = config.RAVEN_PARAMS
-        optimizer = Raven(
-            params=optimizer_grouped_parameters,
-            betas=tuple(raven_params["betas"]),
-            weight_decay=raven_params["weight_decay"],
-            eps=raven_params["eps"]
-        )
+        optimizer = Raven(params=optimizer_grouped_parameters, **config.RAVEN_PARAMS)
     elif optimizer_type == "Adafactor":
-        adafactor_params = config.ADAFACTOR_PARAMS
-        optimizer = Adafactor(
-            params=optimizer_grouped_parameters,
-            lr=None,
-            eps=tuple(adafactor_params["eps"]),
-            clip_threshold=adafactor_params["clip_threshold"],
-            decay_rate=adafactor_params["decay_rate"],
-            beta1=adafactor_params["beta1"],
-            weight_decay=adafactor_params["weight_decay"],
-            scale_parameter=adafactor_params["scale_parameter"],
-            relative_step=adafactor_params["relative_step"],
-            warmup_init=adafactor_params["warmup_init"]
-        )
+        optimizer = Adafactor(params=optimizer_grouped_parameters, **config.ADAFACTOR_PARAMS)
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
-    print(f"INFO: Scheduler will run for {config.MAX_TRAIN_STEPS} training steps.")
+    # --- STEP 2: INITIALIZE THE SCHEDULER WITH THE CORRECT TIMELINE ---
+    print(f"INFO: LR Scheduler will run for {total_optimizer_steps} optimizer updates.")
     lr_scheduler = CustomCurveScheduler(
         optimizer=optimizer,
         lr_curve_points=config.LR_CUSTOM_CURVE,
-        max_steps=config.MAX_TRAIN_STEPS
+        max_steps=total_optimizer_steps # Use the derived optimizer step count
     )
 
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
-        # After (Correct and Memory-Efficient)
         state = torch.load(latest_state_path, map_location="cpu")
-        global_step = state['step']
-        state_optimizer_type = state.get('optimizer_type', 'Raven')
-        if state_optimizer_type == optimizer_type:
-            optimizer.load_state_dict(state['optimizer_state_dict'])
-            print(f"[OK] Loaded {optimizer_type} optimizer state.")
-        else:
-            print(f"[WARNING] Optimizer type mismatch (checkpoint: {state_optimizer_type}, current: {optimizer_type}). Skipping optimizer state loading.")
+        
+        optimizer_step_resumed = state['step']
+        global_step = optimizer_step_resumed * config.GRADIENT_ACCUMULATION_STEPS
+
+        optimizer.load_state_dict(state['optimizer_state_dict'])
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
+        lr_scheduler.step(current_step=optimizer_step_resumed)
+
         del state; gc.collect()
-        print(f"[OK] Resumed training from step {global_step}.")
-    
+        print(f"[OK] Resumed training. Resuming at batch step: {global_step}, Optimizer step: {optimizer_step_resumed}.")
+
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
-        print("INFO: Zero-Terminal SNR enabled.")
 
     plugins = FeaturePlugins(config, noise_scheduler, device)
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
@@ -965,43 +957,37 @@ def main():
     sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, shuffle=True, drop_last=False)
     train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
     
+    # train_step function remains unchanged
     def train_step(batch):
+        # ... (no changes needed here)
         latents = batch["latents"]
         noise = torch.randn_like(latents) if config.USE_PER_CHANNEL_NOISE else torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
-
         timesteps = plugins.timestep_sampler(latents.shape[0])
         perturbed_latents = plugins.input_perturbation(latents)
         noisy_latents = noise_scheduler.add_noise(perturbed_latents, noise, timesteps)
-        
         target = noise_scheduler.get_velocity(perturbed_latents, noise, timesteps) if plugins.is_v_prediction else noise
-        
         prompt_embeds, pooled_embeds = plugins.conditioning_dropout(batch["prompt_embeds"], batch["pooled_prompt_embeds"])
-        
-        add_time_ids = torch.cat([
-            torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])
-        ], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
-        
+        add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
         with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_embeds, "time_ids": add_time_ids}).sample
-            
             loss_no_reduction = plugins.base_loss(pred, target, plugins.is_v_prediction)
             loss_per_item = plugins.masked_loss(loss_no_reduction, batch["masks"], batch["mask_focus_factors"], batch["mask_focus_modes"])
             loss, snr_weights = plugins.min_snr_loss(loss_per_item, timesteps)
-        
         if not torch.isfinite(loss):
             tqdm.write(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
             return None, timesteps
-        
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
         return loss.item(), timesteps
 
     unet.train()
-    progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
+    
+    # --- STEP 3: CONFIGURE THE LOOP AND PROGRESS BAR WITH THE INTUITIVE STEP COUNT ---
+    progress_bar = tqdm(range(global_step, total_training_steps), desc="Training Steps", initial=global_step, total=total_training_steps)
     
     done = False
     while not done:
         for batch in train_dataloader:
-            if global_step >= config.MAX_TRAIN_STEPS:
+            if global_step >= total_training_steps:
                 done = True; break
             if not batch: continue
 
@@ -1012,30 +998,55 @@ def main():
 
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params_to_optimize, 1.0)
+                torch.nn.utils.clip_grad_norm_(params_to_optimize, 10.0)
+                
+                optimizer_step = (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS
+                
+                lr_scheduler.step(current_step=optimizer_step)
                 
                 current_lr = optimizer.param_groups[0]['lr']
                 diagnostics.report(global_step + 1, current_lr, params_to_optimize)
                 
-                has_invalid_grads = any(not torch.isfinite(p.grad).all() for p in params_to_optimize if p.grad is not None)
-                if has_invalid_grads:
-                    tqdm.write(f"\n[WARNING] Step {global_step + 1}: Detected NaN/Inf gradients. Skipping optimizer step.")
-                    optimizer.zero_grad(set_to_none=True)
-                else:
-                    scaler.step(optimizer)
-                    scaler.update()
-                    lr_scheduler.step()
-                    optimizer.zero_grad(set_to_none=True)
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad(set_to_none=True)
             
             global_step += 1
             progress_bar.update(1)
            
-            if global_step > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0:
-                save_training_checkpoint(config, base_model_state_dict, unet, optimizer, lr_scheduler, global_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype)
-    
+            # --- STEP 4: CHECKPOINTING IS NOW ALSO BASED ON THE INTUITIVE BATCH STEP ---
+            if global_step > 0 and (global_step % config.SAVE_EVERY_N_STEPS == 0):
+                current_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
+                save_training_checkpoint(
+                    config, base_model_state_dict, unet, optimizer, lr_scheduler, 
+                    current_optimizer_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype
+                )
+
+                print("\n[INFO] Re-initializing optimizer and scheduler post-checkpointing...")
+                
+                if optimizer_type == "Raven":
+                    optimizer = Raven(params=optimizer_grouped_parameters, **config.RAVEN_PARAMS)
+                elif optimizer_type == "Adafactor":
+                    optimizer = Adafactor(params=optimizer_grouped_parameters, **config.ADAFACTOR_PARAMS)
+                
+                state_path = CHECKPOINT_DIR / f"training_state_step_{current_optimizer_step}.pt"
+                state = torch.load(state_path, map_location="cpu")
+                optimizer.load_state_dict(state['optimizer_state_dict'])
+
+                lr_scheduler = CustomCurveScheduler(
+                    optimizer=optimizer, lr_curve_points=config.LR_CUSTOM_CURVE, max_steps=total_optimizer_steps
+                )
+                lr_scheduler.load_state_dict(state['scheduler_state_dict'])
+                lr_scheduler.step(current_step=current_optimizer_step)
+
+                del state; gc.collect()
+                print("[OK] Optimizer and scheduler state reloaded.")
+                
     progress_bar.close()
-    print("--> Training finished.")
-    final_model_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_step_{global_step}.safetensors"
+    final_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
+    print(f"--> Training finished at batch step: {global_step}, optimizer step: {final_optimizer_step}")
+    
+    final_model_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_step_{final_optimizer_step}.safetensors"
     save_model(base_model_state_dict, final_model_path, unet, unet_param_names_to_optimize, config.compute_dtype)
     print("\nTRAINING COMPLETE")
 

@@ -96,9 +96,18 @@ COND_DROPOUT_PROB = 0.1  # Common range: 0.05-0.15; higher for diverse datasets
 # --- Optimizer Configuration ---
 OPTIMIZER_TYPE = "Raven"  # Options: "Raven", "Adafactor"
 RAVEN_PARAMS = {
-    "betas": [0.9, 0.999],  # Momentum parameters for Raven
-    "eps": 1e-8,  # Numerical stability term
-    "weight_decay": 0.01  # L2 regularization
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    # --- V2 Features ---
+    "use_lookahead": True,
+    "la_steps": 6,
+    "la_alpha": 0.5,
+    "use_adaptive_dampening": True,
+    "ad_dampening_factor": 0.15,
+    "ad_sigma_threshold": 3.0,
+    "ad_history_window": 100,
+    "ad_percentile_threshold": 95.0
 }
 ADAFACTOR_PARAMS = {
     "eps": [1e-30, 1e-3],  # Stabilization for scale and parameters

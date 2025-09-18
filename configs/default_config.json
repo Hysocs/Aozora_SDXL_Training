@@ -17,11 +17,11 @@
         1.77,
         2.0
     ],
-    "MAX_TRAIN_STEPS": 21720,
+    "MAX_TRAIN_STEPS": 1000,
     "GRADIENT_ACCUMULATION_STEPS": 16,
     "MIXED_PRECISION": "bfloat16",
-    "SEED": 42,
-    "SAVE_EVERY_N_STEPS": 5000,
+    "SEED": 69,
+    "SAVE_EVERY_N_STEPS": 15000,
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_15000.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_15000.pt",
     "LR_CUSTOM_CURVE": [
@@ -30,8 +30,44 @@
             3.5e-06
         ],
         [
-            0.07058824,
-            2.5e-05
+            0.1,
+            3.5e-05
+        ],
+        [
+            0.19,
+            3.42291e-05
+        ],
+        [
+            0.28,
+            3.1992e-05
+        ],
+        [
+            0.37,
+            2.85076e-05
+        ],
+        [
+            0.46,
+            2.4117e-05
+        ],
+        [
+            0.55,
+            1.925e-05
+        ],
+        [
+            0.64,
+            1.4383e-05
+        ],
+        [
+            0.73,
+            9.9924e-06
+        ],
+        [
+            0.82,
+            6.508e-06
+        ],
+        [
+            0.91,
+            4.2709e-06
         ],
         [
             1.0,
@@ -39,7 +75,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 3.5e-06,
-    "LR_GRAPH_MAX": 2.5e-05,
+    "LR_GRAPH_MAX": 3.5e-05,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -69,7 +105,7 @@
     ],
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_PER_CHANNEL_NOISE": true,
-    "NOISE_SCHEDULE_VARIANT": "uniform",
+    "NOISE_SCHEDULE_VARIANT": "logsnr_laplace",
     "USE_SNR_GAMMA": false,
     "SNR_STRATEGY": "Min-SNR",
     "SNR_GAMMA": 5.0,
@@ -79,12 +115,12 @@
     "IP_NOISE_GAMMA": 0.2,
     "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.05,
-    "RESUME_TRAINING": true,
+    "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Anmo_too",
-            "repeats": 2,
-            "mirror_repeats": true,
+            "path": "C:/Users/Administrator/Pictures/Datasets/RealLifeNude",
+            "repeats": 1,
+            "mirror_repeats": false,
             "darken_repeats": false,
             "use_mask": false,
             "mask_path": "",
@@ -99,7 +135,15 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.1
+        "weight_decay": 0.1,
+        "use_lookahead": true,
+        "la_steps": 4,
+        "la_alpha": 0.1,
+        "use_adaptive_dampening": true,
+        "ad_dampening_factor": 0.15,
+        "ad_sigma_threshold": 3.0,
+        "ad_history_window": 100,
+        "ad_percentile_threshold": 95.0
     },
     "ADAFACTOR_PARAMS": {
         "eps": [
