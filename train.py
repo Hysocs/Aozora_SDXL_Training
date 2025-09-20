@@ -31,6 +31,7 @@ import signal
 import numpy as np
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers.optimization import Adafactor
+from torch.optim import AdamW
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
@@ -56,53 +57,57 @@ class BucketBatchSampler(Sampler):
         self.seed = seed
         self.dataset = dataset
         
-        # 1. Create a flat list of all indices, respecting repeats from the dataset config.
-        # This is our master list for one "scientific epoch".
         self.epoch_indices = []
         for i, (_, _, dataset_config) in enumerate(self.dataset.latent_files):
-            # The dataset already pre-expanded the files with repeats, so we just add the index.
             self.epoch_indices.append(i)
 
         tqdm.write(f"INFO: BucketBatchSampler initialized with {len(self.epoch_indices)} total samples for one epoch.")
 
     def __iter__(self):
-        # 2. Shuffle the master list of indices for the current epoch using the seed.
+        # Use a local generator for all randomization to ensure reproducibility.
+        g = torch.Generator()
+        g.manual_seed(self.seed)
+
+        # 1. Shuffle the master list of indices for the current epoch.
         if self.shuffle:
-            # Use a local Random instance to not interfere with global state.
-            g = torch.Generator()
-            g.manual_seed(self.seed)
             shuffled_indices = torch.randperm(len(self.epoch_indices), generator=g).tolist()
         else:
             shuffled_indices = list(range(len(self.epoch_indices)))
 
-        # 3. Group the shuffled indices into buckets.
+        # 2. Group the shuffled indices into buckets.
         buckets = defaultdict(list)
         for i in shuffled_indices:
             bucket_key = self.dataset.bucket_keys[i]
             if bucket_key is not None:
                 buckets[bucket_key].append(i)
         
-        # 4. Create batches from each bucket.
+        # 3. Create batches from each bucket.
         all_batches = []
-        for bucket_indices in buckets.values():
+        # We iterate through the buckets in a fixed (sorted) order to ensure consistency
+        # before the final shuffle.
+        for bucket_key in sorted(buckets.keys()):
+            bucket_indices = buckets[bucket_key]
             for i in range(0, len(bucket_indices), self.batch_size):
                 batch = bucket_indices[i:i + self.batch_size]
                 if not self.drop_last or len(batch) == self.batch_size:
                     all_batches.append(batch)
         
-        # 5. IMPORTANT: We do NOT shuffle the batches. The order is determined by the initial shuffle.
-        # To add some variability between epochs without losing predictability, we sort batches by size.
-        # This keeps similarly-sized batches together, which can be slightly more efficient.
-        all_batches.sort(key=len, reverse=True)
+        # 4. --- THIS IS THE CRITICAL CHANGE ---
+        # Instead of sorting the batches, we now shuffle them.
+        # This ensures that batches from different aspect ratio buckets (and thus, different artists)
+        # are mixed together, providing a much more stable training signal.
+        if self.shuffle:
+            # Shuffle the list of batches using our seeded generator.
+            perm = torch.randperm(len(all_batches), generator=g).tolist()
+            all_batches = [all_batches[i] for i in perm]
             
         for batch in all_batches:
             yield batch
             
-        # Increment the seed for the next epoch to get a new, but still predictable, shuffle order.
+        # Increment the seed for the next epoch to get a new, predictable shuffle order.
         self.seed += 1
 
     def __len__(self):
-        # The total number of batches is based on the total number of samples.
         if self.drop_last:
             return len(self.epoch_indices) // self.batch_size
         else:
@@ -196,7 +201,7 @@ class TrainingConfig:
         else:
             print("INFO: No configuration file specified. Using default settings.")
             
-        float_keys = ["CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB"]
+        float_keys = ["CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB","SNR_GAMMA"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE"]
         bool_keys = [
@@ -265,17 +270,43 @@ class AspectRatioBucketing:
         return best_bucket
 
 def resize_and_crop(image, target_w, target_h):
+    """
+    High-quality resize and crop that uses progressive downscaling for large images
+    to prevent aliasing and moiré artifacts.
+    """
     img_w, img_h = image.size
     img_aspect = img_w / img_h
     target_aspect = target_w / target_h
+
+    # Determine the initial resize dimensions to preserve aspect ratio
     if img_aspect > target_aspect:
         new_h = target_h
         new_w = int(new_h * img_aspect)
     else:
         new_w = target_w
         new_h = int(new_w / img_aspect)
-   
-    image = image.resize((new_w, new_h), Image.LANCZOS)
+
+    # --- Progressive Downscaling Logic ---
+    # While the image is more than twice the size of the target, we do a series
+    # of 50% downscales using the fast and artifact-free BOX filter.
+    while img_w > new_w * 2 and img_h > new_h * 2:
+        # Calculate the intermediate size (halving the dimensions)
+        intermediate_w, intermediate_h = img_w // 2, img_h // 2
+        
+        # If the intermediate size is still larger than the target, resize.
+        if intermediate_w > new_w and intermediate_h > new_h:
+            image = image.resize((intermediate_w, intermediate_h), Image.Resampling.BOX)
+            img_w, img_h = image.size # Update current dimensions
+        else:
+            # Avoids overshooting the target
+            break
+
+    # --- Final High-Quality Resize ---
+    # Now that the image is a reasonable size, we do the final resize
+    # with a high-quality bicubic filter to get a sharp result.
+    image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
+
+    # --- Center Crop ---
     left, top = (new_w - target_w) // 2, (new_h - target_h) // 2
     return image.crop((left, top, left + target_w, top + target_h))
 
@@ -459,59 +490,65 @@ class ImageTextLatentDataset(Dataset):
         if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
             config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
             
-        self.latent_files = []
+        # --- START OF MODIFIED SECTION ---
         
+        # 1. Load all file paths and their variants into per-dataset lists first.
+        all_dataset_files = []
         for dataset_config in config.INSTANCE_DATASETS:
             root = Path(dataset_config["path"])
             print(f"Loading dataset '{root.name}' with config: {dataset_config}")
             
             cache_dir = root / ".precomputed_embeddings_cache"
-            if not cache_dir.exists():
-                print(f"WARNING: Cache directory not found for {root}. Skipping this dataset.")
-                continue
-
-            files_in_dataset = sorted(list(cache_dir.glob("*.pt")))
-            if not files_in_dataset:
+            if not cache_dir.exists() or not any(cache_dir.glob("*.pt")):
                 print(f"WARNING: No cached .pt files found in {cache_dir}. Skipping this dataset.")
                 continue
 
+            files_in_dataset = sorted(list(cache_dir.glob("*.pt")))
+            
             repeats = int(dataset_config.get("repeats", 1))
             should_mirror = dataset_config.get("mirror_repeats", False)
             should_darken = dataset_config.get("darken_repeats", False)
             
-            # Create a list of variants to cycle through for the repeats
             variants_to_use = ["original"]
             if repeats > 1:
-                # Build the list of variants based on config
                 other_variants = []
                 if should_mirror: other_variants.append("flipped")
                 if should_darken: other_variants.append("contrast")
                 if should_mirror and should_darken: other_variants.append("flipped_contrast")
-                
-                # Cycle through the available variants for the remaining repeats
                 if other_variants:
                     for i in range(repeats - 1):
                         variants_to_use.append(other_variants[i % len(other_variants)])
 
-            # Extend the main list with all files and their assigned variants
+            current_dataset_entries = []
             for f in files_in_dataset:
                 for i in range(repeats):
                     variant_key = variants_to_use[i % len(variants_to_use)]
-                    self.latent_files.append((f, variant_key, dataset_config))
+                    current_dataset_entries.append((f, variant_key, dataset_config))
+            
+            all_dataset_files.append(current_dataset_entries)
+
+        # 2. Interleave the datasets in a round-robin fashion.
+        self.latent_files = []
+        max_len = max(len(d) for d in all_dataset_files)
+        for i in range(max_len):
+            for dataset_list in all_dataset_files:
+                if i < len(dataset_list):
+                    self.latent_files.append(dataset_list[i])
+
+        # --- END OF MODIFIED SECTION ---
 
         if not self.latent_files:
             raise ValueError("No cached embedding files found across all datasets. Please ensure pre-caching was successful.")
         
-        # Pre-caching bucket keys remains the same
+        # The rest of the __init__ method (pre-caching bucket keys) remains the same.
         tqdm.write("INFO: Pre-caching bucket shapes for all latent files...")
         self.bucket_keys = []
         for file_path, _, _ in tqdm(self.latent_files, desc="Caching bucket keys"):
             try:
                 full_data = torch.load(file_path, map_location="cpu")
-                # Always use the 'original' latent shape for consistent bucketing regardless of variant
                 latents = full_data.get("original", {}).get("latents_cpu")
                 if latents is not None:
-                    self.bucket_keys.append(latents.shape[-2:]) # (height, width)
+                    self.bucket_keys.append(latents.shape[-2:])
                 else:
                     tqdm.write(f"WARNING: 'original' latents not found in {file_path}. Marking as invalid.")
                     self.bucket_keys.append(None)
@@ -519,7 +556,7 @@ class ImageTextLatentDataset(Dataset):
                 tqdm.write(f"WARNING: Could not load bucket key for {file_path}: {e}")
                 self.bucket_keys.append(None)
         
-        print(f"Dataset initialized with {len(self.latent_files)} total samples for one scientific epoch.")
+        print(f"Dataset initialized with {len(self.latent_files)} total samples for one scientific epoch after interleaving.")
 
     def __len__(self): return len(self.latent_files)
 
@@ -564,7 +601,8 @@ class ImageTextLatentDataset(Dataset):
                 "target_size_as_tuple": full_data["target_size_as_tuple"],
                 "mask_latent_cpu": mask_latent,
                 "mask_focus_factor_cpu": focus_factor,
-                "mask_focus_mode_cpu": focus_mode
+                "mask_focus_mode_cpu": focus_mode,
+                "file_path_str": str(file_path.name) # We only need the filename
             }
         except Exception as e:
             print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
@@ -582,31 +620,88 @@ def custom_collate_fn_latent(batch):
         "masks": torch.stack([item["mask_latent_cpu"] for item in batch]),
         "mask_focus_factors": torch.tensor([item["mask_focus_factor_cpu"] for item in batch]),
         "mask_focus_modes": [item["mask_focus_mode_cpu"] for item in batch],
+        "file_paths": [item["file_path_str"] for item in batch]
     }
 
 class TimestepSampler:
     def __init__(self, config, noise_scheduler, device):
-        self.variant = config.NOISE_SCHEDULE_VARIANT
-        self.num_timesteps = noise_scheduler.config.num_train_timesteps
+        self.config = config
         self.device = device
+        self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+        self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_") # e.g., "static_adaptive"
         
-        if self.variant == "logsnr_laplace":
-            alphas_cumprod = noise_scheduler.alphas_cumprod.to(device, dtype=torch.float32)
-            clipped_alphas = torch.clamp(alphas_cumprod, min=1e-8, max=1 - 1e-8)
-            log_snr = torch.log(clipped_alphas) - torch.log(1 - clipped_alphas)
-            scale = 1.0  # Changed from 0.3
-            self.weights = torch.exp(-torch.abs(log_snr) / scale)
-            self.weights /= self.weights.sum()
-            print("INFO: Initialized LogSNR Laplace timestep sampler with scale=1.0.")
+        try:
+            min_val_str, max_val_str = config.TIMESTEP_CURRICULUM_START_RANGE.split(',')
+            self.initial_min = int(min_val_str.strip())
+            self.initial_max = int(max_val_str.strip())
+        except (ValueError, AttributeError):
+            print("WARNING: Could not parse TIMESTEP_CURRICULUM_START_RANGE. Using full range [0, 999].")
+            self.initial_min = 0
+            self.initial_max = self.num_train_timesteps - 1
+        
+        self.initial_min = max(0, self.initial_min)
+        self.initial_max = min(self.num_train_timesteps - 1, self.initial_max)
 
-    def __call__(self, batch_size):
-        if self.variant == "residual_shifting":
-            min_timestep = int(0.5 * self.num_timesteps)
-            return torch.randint(min_timestep, self.num_timesteps, (batch_size,), device=self.device).long()
-        elif self.variant == "logsnr_laplace":
-            return torch.multinomial(self.weights, num_samples=batch_size, replacement=True).long()
+        if self.mode == "static_adaptive":
+            self._init_static_adaptive_mode()
+        elif self.mode == "dynamic_balancing":
+            self._init_dynamic_mode()
+        else: # Fixed mode
+            print(f"INFO: Initialized Fixed Timestep Sampling with range: [{self.initial_min}, {self.initial_max}]")
+
+    def _init_static_adaptive_mode(self):
+        self.curriculum_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.TIMESTEP_CURRICULUM_END_PERCENT / 100.0))
+        print("INFO: Initialized Static Adaptive Timestep Curriculum.")
+        print(f"      - Start Range: [{self.initial_min}, {self.initial_max}]")
+        print(f"      - Will expand to full range over {self.curriculum_duration_steps} steps.")
+
+    def _init_dynamic_mode(self):
+        self.probe_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.DYNAMIC_CHALLENGE_PROBE_PERCENT / 100.0))
+        try:
+            min_gn_str, max_gn_str = self.config.DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE.split(',')
+            self.target_grad_norm_min = float(min_gn_str.strip())
+            self.target_grad_norm_max = float(max_gn_str.strip())
+        except (ValueError, AttributeError):
+            print("WARNING: Could not parse DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE. Using defaults [0.25, 0.9].")
+            self.target_grad_norm_min = 0.25
+            self.target_grad_norm_max = 0.90
+        
+        self.current_min_ts = self.initial_min
+        self.current_max_ts = self.initial_max
+        self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.005)) 
+
+        print("INFO: Initialized Dynamic Challenge Balancing.")
+        print(f"      - Probe Phase: {self.probe_duration_steps} steps")
+        print(f"      - Target Grad Norm Range: [{self.target_grad_norm_min}, {self.target_grad_norm_max}]")
+
+    def update_range(self, grad_norm, current_step):
+        if self.mode != "dynamic_balancing": return
+
+        if current_step <= self.probe_duration_steps:
+            if grad_norm < self.target_grad_norm_max:
+                self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
+            if grad_norm > self.target_grad_norm_min:
+                self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
         else:
-            return torch.randint(0, self.num_timesteps, (batch_size,), device=self.device).long()
+            if grad_norm > self.target_grad_norm_max:
+                self.current_max_ts = max(self.current_min_ts, self.current_max_ts - self.adjustment_step_size)
+            elif grad_norm < self.target_grad_norm_min:
+                self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
+                self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
+
+    def __call__(self, batch_size, current_step):
+        if self.mode == "static_adaptive":
+            duration = self.curriculum_duration_steps
+            progress = min(1.0, current_step / duration) if duration > 0 else 1.0
+            min_ts = int(round(self.initial_min * (1.0 - progress)))
+            max_ts = int(round(self.initial_max + (self.num_train_timesteps - 1 - self.initial_max) * progress))
+        elif self.mode == "dynamic_balancing":
+            min_ts, max_ts = self.current_min_ts, self.current_max_ts
+        else: # fixed mode
+            min_ts, max_ts = self.initial_min, self.initial_max
+
+        if max_ts < min_ts: max_ts = min_ts
+        return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device).long()
 
 class InputPerturbation:
     def __init__(self, config):
@@ -682,7 +777,7 @@ class MinSNRLoss:
         snr = torch.clamp(snr, min=1e-8)
         
         if self.variant == "debiased":
-            snr_loss_weights = 1 / (snr + 1)
+            snr_loss_weights = 1 / (snr + self.gamma)
         elif self.variant == "standard":
             snr_loss_weights = torch.clamp(self.gamma / snr, max=1.0)
         elif self.variant == "corrected":
@@ -695,7 +790,7 @@ class MinSNRLoss:
 
 class FeaturePlugins:
     def __init__(self, config, noise_scheduler, device):
-        self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
+        self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)  
         self.input_perturbation = InputPerturbation(config)
         self.conditioning_dropout = ConditioningDropout(config)
         self.base_loss = BaseLoss()
@@ -710,6 +805,7 @@ class TrainingDiagnostics:
         self.grad_norms = deque(maxlen=accumulation_steps)
         self.max_grads = deque(maxlen=accumulation_steps)
         self.timesteps = deque(maxlen=accumulation_steps * 256)
+        self.last_grad_norm = 0.75 # Start with a healthy default
 
     def step(self, loss, timesteps):
         if loss is not None:
@@ -730,6 +826,8 @@ class TrainingDiagnostics:
                 if current_max > max_grad_val:
                     max_grad_val = current_max
             total_norm = total_norm ** 0.5
+        
+        self.last_grad_norm = total_norm # <-- STORE THE LATEST GRAD NORM
         
         avg_loss = sum(self.losses) / len(self.losses)
         vram_gb = torch.cuda.memory_reserved() / 1e9
@@ -901,11 +999,14 @@ def main():
     
     for ds in config.INSTANCE_DATASETS:
         if not Path(ds["path"]).exists(): raise FileNotFoundError(f"Data dir not found: {ds['path']}")
-    if not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists(): raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
+    if not config.SINGLE_FILE_CHECKPOINT_PATH or not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists():
+        # Handle case where base model path might be missing in some configs
+        if config.RESUME_TRAINING and config.RESUME_MODEL_PATH and Path(config.RESUME_MODEL_PATH).exists():
+             pass # Will be handled by resume logic
+        else:
+            raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
+
     
-    # --- STEP 1: DEFINE OUR CLOCKS CORRECTLY FROM THE START ---
-    # The user-facing "step" is the number of batches processed.
-    # We derive the number of optimizer updates from this.
     total_training_steps = config.MAX_TRAIN_STEPS
     total_optimizer_steps = math.ceil(total_training_steps / config.GRADIENT_ACCUMULATION_STEPS)
     print(f"INFO: Training for {total_training_steps} batch steps.")
@@ -918,6 +1019,10 @@ def main():
 
     print("Loading all components for embedding and latent generation...")
     temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype, use_safetensors=True)
+    if hasattr(temp_pipe, "vae"):
+        print("INFO: Enabling VAE slicing and tiling for memory efficiency during caching.")
+        temp_pipe.vae.enable_slicing()
+        temp_pipe.vae.enable_tiling()
     precompute_and_cache_latents(config=config, tokenizer1=temp_pipe.tokenizer, tokenizer2=temp_pipe.tokenizer_2, text_encoder1=temp_pipe.text_encoder, text_encoder2=temp_pipe.text_encoder_2, vae=temp_pipe.vae, device_for_encoding=device)
     del temp_pipe; gc.collect(); torch.cuda.empty_cache()
 
@@ -951,10 +1056,16 @@ def main():
     unet.to(device).requires_grad_(False)
     unet.enable_gradient_checkpointing()
 
-    print(f"Targeting UNet layers with keywords: {config.UNET_TRAIN_TARGETS}")
-    unet_param_names_to_optimize = { name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS) }
-    params_to_optimize = [p for n, p in unet.named_parameters() if n in unet_param_names_to_optimize]
+    # Calculate and display trainable parameters
+    total_params = sum(p.numel() for p in unet.parameters())
+    trainable_params_names = {name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS)}
+    params_to_optimize = [p for n, p in unet.named_parameters() if n in trainable_params_names]
+    trainable_params_count = sum(p.numel() for p in params_to_optimize)
     for p in params_to_optimize: p.requires_grad_(True)
+    
+    print(f"Targeting UNet layers with keywords: {config.UNET_TRAIN_TARGETS}")
+    param_info_str = f"{trainable_params_count/1e6:.2f}M / {total_params/1e6:.2f}M ({trainable_params_count/total_params*100:.2f}%)"
+    print(f"GUI_PARAM_INFO::{param_info_str}") # Special string for GUI
 
     if not params_to_optimize: raise ValueError("No parameters were selected for training.")
     
@@ -969,15 +1080,16 @@ def main():
         optimizer = Raven(params=optimizer_grouped_parameters, **config.RAVEN_PARAMS)
     elif optimizer_type == "Adafactor":
         optimizer = Adafactor(params=optimizer_grouped_parameters, **config.ADAFACTOR_PARAMS)
+    elif optimizer_type == "AdamW":
+        optimizer = AdamW(params=optimizer_grouped_parameters)
     else:
         raise ValueError(f"Unsupported optimizer type: {optimizer_type}")
 
-    # --- STEP 2: INITIALIZE THE SCHEDULER WITH THE CORRECT TIMELINE ---
     print(f"INFO: LR Scheduler will run for {total_optimizer_steps} optimizer updates.")
     lr_scheduler = CustomCurveScheduler(
         optimizer=optimizer,
         lr_curve_points=config.LR_CUSTOM_CURVE,
-        max_steps=total_optimizer_steps # Use the derived optimizer step count
+        max_steps=total_optimizer_steps
     )
 
     if latest_state_path:
@@ -997,15 +1109,112 @@ def main():
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
     if config.USE_ZERO_TERMINAL_SNR:
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
-        # Update scheduler internals for consistency
         noise_scheduler.register_to_config(betas=noise_scheduler.betas)
-        noise_scheduler._beta_schedule = noise_scheduler.betas  # For lazy updates
-        noise_scheduler.alphas = 1.0 - noise_scheduler.betas
-        noise_scheduler.alphas_cumprod = torch.cumprod(noise_scheduler.alphas, dim=0)
-        noise_scheduler.sqrt_alphas_cumprod = torch.sqrt(noise_scheduler.alphas_cumprod)
-        noise_scheduler.sqrt_one_minus_alphas_cumprod = torch.sqrt(1 - noise_scheduler.alphas_cumprod)
-        noise_scheduler.log_one_minus_alphas_cumprod = torch.log(noise_scheduler.sqrt_one_minus_alphas_cumprod.pow(2))
-        noise_scheduler.one_minus_alphas_cumprod = 1 - noise_scheduler.alphas_cumprod  # For velocity, etc.
+
+    class TimestepSampler:
+        def __init__(self, config, noise_scheduler, device):
+            self.config = config
+            self.device = device
+            self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+            self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_") # e.g., "static_adaptive"
+            
+            try:
+                min_val_str, max_val_str = config.TIMESTEP_CURRICULUM_START_RANGE.split(',')
+                self.initial_min = int(min_val_str.strip())
+                self.initial_max = int(max_val_str.strip())
+            except (ValueError, AttributeError):
+                print("WARNING: Could not parse TIMESTEP_CURRICULUM_START_RANGE. Using full range [0, 999].")
+                self.initial_min = 0
+                self.initial_max = self.num_train_timesteps - 1
+            
+            self.initial_min = max(0, self.initial_min)
+            self.initial_max = min(self.num_train_timesteps - 1, self.initial_max)
+
+            if self.mode == "static_adaptive":
+                self._init_static_adaptive_mode()
+            elif self.mode == "dynamic_balancing":
+                self._init_dynamic_mode()
+            else: # Fixed mode
+                print(f"INFO: Initialized Fixed Timestep Sampling with range: [{self.initial_min}, {self.initial_max}]")
+
+        def _init_static_adaptive_mode(self):
+            self.curriculum_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.TIMESTEP_CURRICULUM_END_PERCENT / 100.0))
+            print("INFO: Initialized Static Adaptive Timestep Curriculum.")
+            print(f"      - Start Range: [{self.initial_min}, {self.initial_max}]")
+            print(f"      - Will expand to full range over {self.curriculum_duration_steps} steps.")
+
+        def _init_dynamic_mode(self):
+            self.probe_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.DYNAMIC_CHALLENGE_PROBE_PERCENT / 100.0))
+            try:
+                min_gn_str, max_gn_str = self.config.DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE.split(',')
+                self.target_grad_norm_min = float(min_gn_str.strip())
+                self.target_grad_norm_max = float(max_gn_str.strip())
+            except (ValueError, AttributeError):
+                print("WARNING: Could not parse DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE. Using defaults [0.25, 0.9].")
+                self.target_grad_norm_min = 0.25
+                self.target_grad_norm_max = 0.90
+            
+            self.current_min_ts = self.initial_min
+            self.current_max_ts = self.initial_max
+            self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.005)) 
+
+            print("INFO: Initialized Dynamic Challenge Balancing.")
+            print(f"      - Probe Phase: {self.probe_duration_steps} steps with oscillating boundary expansion.")
+            print(f"      - Target Grad Norm Range: [{self.target_grad_norm_min}, {self.target_grad_norm_max}]")
+
+        def update_range(self, grad_norm, current_step):
+            if self.mode != "dynamic_balancing": return
+
+            # --- PROBE PHASE ---
+            # During the initial probe phase, we aggressively oscillate between expanding the
+            # upper and lower boundaries to find the effective training range as fast as possible.
+            if current_step <= self.probe_duration_steps:
+                # On even steps, we test the upper boundary (harder timesteps).
+                if current_step % 2 == 0:
+                    # If the gradient norm is not yet challenging enough, push the max timestep higher.
+                    if grad_norm < self.target_grad_norm_max:
+                        self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
+                # On odd steps, we test the lower boundary (easier timesteps).
+                else:
+                    # If the gradient norm is not yet easy enough, pull the min timestep lower.
+                    if grad_norm > self.target_grad_norm_min:
+                        self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
+            
+            # --- BALANCING PHASE ---
+            # After the probe phase, we fine-tune the range to keep the grad norm within the target zone.
+            else:
+                if grad_norm > self.target_grad_norm_max:
+                    # Task is too hard, make it easier by reducing the max timestep.
+                    self.current_max_ts = max(self.current_min_ts, self.current_max_ts - self.adjustment_step_size)
+                elif grad_norm < self.target_grad_norm_min:
+                    # Task is too easy, make it harder by expanding the range in both directions.
+                    self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
+                    self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
+
+        def __call__(self, batch_size, current_step):
+            if self.mode == "static_adaptive":
+                duration = self.curriculum_duration_steps
+                progress = min(1.0, current_step / duration) if duration > 0 else 1.0
+                min_ts = int(round(self.initial_min * (1.0 - progress)))
+                max_ts = int(round(self.initial_max + (self.num_train_timesteps - 1 - self.initial_max) * progress))
+            elif self.mode == "dynamic_balancing":
+                min_ts, max_ts = self.current_min_ts, self.current_max_ts
+            else: # fixed mode
+                min_ts, max_ts = self.initial_min, self.initial_max
+
+            if max_ts < min_ts: max_ts = min_ts
+            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device).long()
+
+    # --- UPDATED FEATURE PLUGINS ---
+    class FeaturePlugins:
+        def __init__(self, config, noise_scheduler, device):
+            self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
+            self.input_perturbation = InputPerturbation(config)
+            self.conditioning_dropout = ConditioningDropout(config)
+            self.base_loss = BaseLoss()
+            self.masked_loss = MaskedLoss(config)
+            self.min_snr_loss = MinSNRLoss(config, noise_scheduler)
+            self.is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
 
     plugins = FeaturePlugins(config, noise_scheduler, device)
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
@@ -1014,30 +1223,32 @@ def main():
     sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, seed=config.SEED, shuffle=True, drop_last=False)
     train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
     
-    # train_step function remains unchanged
-    def train_step(batch):
+    # --- UPDATED TRAIN STEP FUNCTION ---
+    def train_step(batch, current_step):
         latents = batch["latents"]
         noise = torch.randn_like(latents) if config.USE_PER_CHANNEL_NOISE else torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
-        timesteps = plugins.timestep_sampler(latents.shape[0])
+        timesteps = plugins.timestep_sampler(latents.shape[0], current_step=current_step)
         perturbed_latents = plugins.input_perturbation(latents)
         noisy_latents = noise_scheduler.add_noise(perturbed_latents, noise, timesteps)
         target = noise_scheduler.get_velocity(perturbed_latents, noise, timesteps) if plugins.is_v_prediction else noise
         prompt_embeds, pooled_embeds = plugins.conditioning_dropout(batch["prompt_embeds"], batch["pooled_prompt_embeds"])
         add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
+        
         with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_embeds, "time_ids": add_time_ids}).sample
             loss_no_reduction = plugins.base_loss(pred, target, plugins.is_v_prediction)
             loss_per_item = plugins.masked_loss(loss_no_reduction, batch["masks"], batch["mask_focus_factors"], batch["mask_focus_modes"])
             loss, snr_weights = plugins.min_snr_loss(loss_per_item, timesteps)
+        
         if not torch.isfinite(loss):
             tqdm.write(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
             return None, timesteps
+        
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
         return loss.item(), timesteps
 
     unet.train()
     
-    # --- STEP 3: CONFIGURE THE LOOP AND PROGRESS BAR WITH THE INTUITIVE STEP COUNT ---
     progress_bar = tqdm(range(global_step, total_training_steps), desc="Training Steps", initial=global_step, total=total_training_steps)
     
     done = False
@@ -1047,14 +1258,19 @@ def main():
                 done = True; break
             if not batch: continue
 
+            if global_step > 1:
+                 tqdm.write(f"Step {global_step}: Processing file: {batch['file_paths'][0]}")
+
             batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            loss_item, timesteps = train_step(batch)
+            # --- UPDATED CALL TO TRAIN_STEP ---
+            loss_item, timesteps = train_step(batch, current_step=global_step)
             diagnostics.step(loss_item, timesteps)
 
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(params_to_optimize, 10.0)
+                if config.CLIP_GRAD_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
                 
                 optimizer_step = (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS
                 
@@ -1062,7 +1278,9 @@ def main():
                 
                 current_lr = optimizer.param_groups[0]['lr']
                 diagnostics.report(global_step + 1, current_lr, params_to_optimize)
-                
+
+                plugins.timestep_sampler.update_range(diagnostics.last_grad_norm, global_step)
+
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
@@ -1070,12 +1288,11 @@ def main():
             global_step += 1
             progress_bar.update(1)
            
-            # --- STEP 4: CHECKPOINTING IS NOW ALSO BASED ON THE INTUITIVE BATCH STEP ---
             if global_step > 0 and (global_step % config.SAVE_EVERY_N_STEPS == 0):
                 current_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
                 save_training_checkpoint(
                     config, base_model_state_dict, unet, optimizer, lr_scheduler, 
-                    current_optimizer_step, CHECKPOINT_DIR, unet_param_names_to_optimize, config.compute_dtype
+                    current_optimizer_step, CHECKPOINT_DIR, trainable_params_names, config.compute_dtype
                 )
 
                 print("\n[INFO] Re-initializing optimizer and scheduler post-checkpointing...")
@@ -1084,7 +1301,9 @@ def main():
                     optimizer = Raven(params=optimizer_grouped_parameters, **config.RAVEN_PARAMS)
                 elif optimizer_type == "Adafactor":
                     optimizer = Adafactor(params=optimizer_grouped_parameters, **config.ADAFACTOR_PARAMS)
-                
+                elif optimizer_type == "AdamW":
+                    optimizer = AdamW(params=optimizer_grouped_parameters)
+
                 state_path = CHECKPOINT_DIR / f"training_state_step_{current_optimizer_step}.pt"
                 state = torch.load(state_path, map_location="cpu")
                 optimizer.load_state_dict(state['optimizer_state_dict'])
@@ -1102,11 +1321,8 @@ def main():
     final_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
     print(f"--> Training finished at batch step: {global_step}, optimizer step: {final_optimizer_step}")
 
-    # --- NEWLY MODIFIED SECTION WITH DESCRIPTIVE FILENAMES ---
-    # Define the base name for the final save, incorporating both step counts.
     file_basename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_steps{global_step}_updates{final_optimizer_step}"
 
-    # Save the final optimizer and scheduler state. Its name will now match the model's.
     final_state_path = OUTPUT_DIR / f"{file_basename}_state.pt"
     print(f"\n[INFO] Saving final optimizer and scheduler state to: {final_state_path}")
     torch.save({
@@ -1117,7 +1333,6 @@ def main():
     }, final_state_path)
     print(f"[OK] Final state saved.")
 
-    # Release memory to prevent OOM on the final model save.
     print("[INFO] Releasing optimizer and scheduler memory before final model save...")
     del optimizer
     del lr_scheduler
@@ -1125,10 +1340,9 @@ def main():
     torch.cuda.empty_cache()
     print("[OK] Optimizer and scheduler memory released.")
 
-    # Save the final model weights with the new descriptive name.
     final_model_path = OUTPUT_DIR / f"{file_basename}.safetensors"
     
-    save_model(base_model_state_dict, final_model_path, unet, unet_param_names_to_optimize, config.compute_dtype)
+    save_model(base_model_state_dict, final_model_path, unet, trainable_params_names, config.compute_dtype)
     print("\nTRAINING COMPLETE")
 
 

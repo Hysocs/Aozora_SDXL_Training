@@ -106,7 +106,7 @@ QPushButton:disabled { color: #5c5a70; border-color: #5c5a70; background-color: 
 #StartButton:hover { background-color: #7e5be0; border-color: #7e5be0; }
 #StopButton { background-color: #e53935; border-color: #e53935; color: #ffffff; }
 #StopButton:hover { background-color: #f44336; border-color: #f44336; }
-#PlotButton {
+#PlotButton, #ExportDataButton, #ClearButton {
     background-color: #4a4668;
     border: 2px solid #ab97e6;
     color: #ab97e6;
@@ -117,37 +117,14 @@ QPushButton:disabled { color: #5c5a70; border-color: #5c5a70; background-color: 
     font-weight: bold;
     font-size: 12px;
 }
-#PlotButton:hover {
+#PlotButton:hover, #ExportDataButton:hover, #ClearButton:hover {
     background-color: #6a48d7;
     color: #ffffff;
 }
-#PlotButton:pressed {
+#PlotButton:pressed, #ExportDataButton:pressed, #ClearButton:pressed {
     background-color: #383552;
 }
-#PlotButton:disabled {
-    color: #5c5a70;
-    border-color: #5c5a70;
-    background-color: transparent;
-}
-#ExportDataButton {
-    background-color: #4a4668;
-    border: 2px solid #ab97e6;
-    color: #ab97e6;
-    padding: 5px 10px;
-    min-height: 24px;
-    max-height: 24px;
-    border-radius: 4px;
-    font-weight: bold;
-    font-size: 12px;
-}
-#ExportDataButton:hover {
-    background-color: #6a48d7;
-    color: #ffffff;
-}
-#ExportDataButton:pressed {
-    background-color: #383552;
-}
-#ExportDataButton:disabled {
+#PlotButton:disabled, #ExportDataButton:disabled, #ClearButton:disabled {
     color: #5c5a70;
     border-color: #5c5a70;
     background-color: transparent;
@@ -611,12 +588,18 @@ class TrainingGUI(QtWidgets.QWidget):
         "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["debiased", "corrected", "standard"]},
         "IP_NOISE_GAMMA": {"label": "Gamma Value:", "tooltip": "Common range is 0.05 to 0.25.", "widget": "QLineEdit"},
         "COND_DROPOUT_PROB": {"label": "Dropout Probability:", "tooltip": "e.g., 0.1 (5-15% common).", "widget": "QLineEdit"},
-        "NOISE_SCHEDULE_VARIANT": {
-            "label": "Timestep Sampling:",
-            "tooltip": "Changes how timesteps are sampled.\n- uniform: Standard random sampling.\n- logsnr_laplace: Focuses on more informative mid-range noise levels.\n- residual_shifting: Hard clamp to only the second half of timesteps.",
+        "TIMESTEP_CURRICULUM_MODE": {
+            "label": "Curriculum Mode:",
+            "tooltip": "Select the timestep sampling strategy.\n- Fixed: Use the exact range below for the entire run.\n- Static Adaptive: Linearly expand the range over a set % of the run.\n- Dynamic Balancing: Automatically adjust the range to keep Grad Norm in a target zone.",
             "widget": "QComboBox",
-            "options": ["uniform", "logsnr_laplace", "residual_shifting"]
+            "options": ["Fixed", "Static Adaptive", "Dynamic Balancing"]
         },
+
+        "TIMESTEP_CURRICULUM_START_RANGE": {"label": "Timestep Range (Start/Fixed):", "tooltip": "The timestep range to sample from, e.g., '200, 800'.\nIf Adaptive Curriculum is off, this range is used for the entire run.\nIf on, this is the starting range that will expand.", "widget": "QLineEdit"},
+        "TIMESTEP_CURRICULUM_END_PERCENT": {"label": "Expand until X% of run:", "tooltip": "The percentage of the total training steps over which the\ntimestep range will expand to its maximum (0-999).", "widget": "QLineEdit"},
+        "DYNAMIC_CHALLENGE_PROBE_PERCENT": {"label": "Probe % of Run:", "tooltip": "The percentage of training steps (e.g., 5% = first 5% of max steps) over which the model will 'probe' its performance for dynamic adjustment. This is where the model will be evaluated for its current grad norm.", "widget": "QLineEdit"},
+        "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": {"label": "Target Grad Norm Range:", "tooltip": "The desired range for the gradient norm, e.g., '0.25, 0.90'. The curriculum will adjust timesteps to keep the grad norm within this range.", "widget": "QLineEdit"},
+
         "MEMORY_EFFICIENT_ATTENTION": {
             "label": "Attention Backend:",
             "tooltip": "Select the attention mechanism to use.\n- xformers: Can be faster and use less VRAM, if installed.\n- sdpa: Scaled Dot Product Attention (PyTorch 2.0 default).",
@@ -817,16 +800,9 @@ class TrainingGUI(QtWidgets.QWidget):
             raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
         raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
         
-        # Add V2 params
-        raven_params["use_lookahead"] = self.widgets['RAVEN_use_lookahead'].isChecked()
-        raven_params["la_steps"] = self.widgets['RAVEN_la_steps'].value()
-        raven_params["la_alpha"] = self.widgets['RAVEN_la_alpha'].value()
-        raven_params["use_adaptive_dampening"] = self.widgets['RAVEN_use_adaptive_dampening'].isChecked()
-        raven_params["ad_dampening_factor"] = self.widgets['RAVEN_ad_dampening_factor'].value()
-        raven_params["ad_sigma_threshold"] = self.widgets['RAVEN_ad_sigma_threshold'].value()
-        raven_params["ad_history_window"] = self.widgets['RAVEN_ad_history_window'].value()
-        raven_params["ad_percentile_threshold"] = self.widgets['RAVEN_ad_percentile_threshold'].value()
-
+        raven_params["use_grad_centralization"] = self.widgets['RAVEN_use_grad_centralization'].isChecked()
+        raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
+        
         config_to_save["RAVEN_PARAMS"] = raven_params
 
         adafactor_params = {}
@@ -948,21 +924,32 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.setContentsMargins(15, 5, 15, 15)
         left_vbox = QtWidgets.QVBoxLayout()
         right_vbox = QtWidgets.QVBoxLayout()
+
         path_group = self._create_path_group()
         left_vbox.addWidget(path_group)
+
         core_group = self._create_core_training_group()
         left_vbox.addWidget(core_group)
-        left_vbox.addStretch()
+
         optimizer_group = self._create_optimizer_group()
-        right_vbox.addWidget(optimizer_group)
+        left_vbox.addWidget(optimizer_group)
+        left_vbox.addStretch()
+
         lr_group = self._create_lr_scheduler_group()
         right_vbox.addWidget(lr_group)
+
+        ts_noise_group = self._create_timestep_noise_group()
+        right_vbox.addWidget(ts_noise_group)
+
         right_vbox.addStretch()
+
         layout.addLayout(left_vbox, 1)
         layout.addLayout(right_vbox, 1)
+
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
         self._update_lr_button_states(-1)
+
     def _create_form_group(self, title, keys):
         group = QtWidgets.QGroupBox(title)
         layout = QtWidgets.QFormLayout(group)
@@ -1002,15 +989,10 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in core_keys:
             label, widget = self._create_widget(key)
             layout.addRow(label, widget)
-        layout.addRow(self._create_separator())
-        label, widget = self._create_widget("NOISE_SCHEDULE_VARIANT")
-        layout.addRow(label, widget)
-        layout.addRow(self._create_separator())
-        self._create_bool_option(layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.")
         return core_group
 
     def _create_optimizer_group(self):
-        """Creates the entire 'Optimizer' group box with widgets for Raven (V1+V2) and Adafactor."""
+        """Creates the entire 'Optimizer' group box with widgets for Raven (V1+V2+V3) and Adafactor."""
         optimizer_group = QtWidgets.QGroupBox("Optimizer")
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
         
@@ -1045,8 +1027,7 @@ class TrainingGUI(QtWidgets.QWidget):
         <ul>
             <li>A custom optimizer that is a variant of AdamW. Generally provides a good balance of performance and stability.</li>
             <li><b>Betas:</b> Control the running averages of the gradient (beta1) and its square (beta2).</li>
-            <li><b>Lookahead:</b> A mechanism that explores with 'fast' weights but updates a more stable set of 'slow' weights, often leading to better generalization.</li>
-            <li><b>Adaptive Dampening:</b> Automatically reduces the learning rate for a single step when a gradient spike is detected, preventing instability without needing to lower the overall LR.</li>
+            <li><b>Gradient Centralization (GC):</b> Acts as a form of regularization by normalizing gradients, which can improve generalization and stabilize training.</li>
         </ul>
         <hr>
         <p><b>Adafactor:</b></p>
@@ -1064,7 +1045,7 @@ class TrainingGUI(QtWidgets.QWidget):
         selector_layout.addWidget(help_button)
         main_layout.addLayout(selector_layout)
 
-        # --- Raven Settings Group (with V2 features) ---
+        # --- Raven Settings Group (with V2 and V3 features) ---
         self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
         raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
         
@@ -1077,51 +1058,52 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
         raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
         
-        separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668; margin-top: 10px; margin-bottom: 5px;")
-        raven_layout.addRow(separator)
+        # Separator for V2
+        separator1 = QtWidgets.QFrame(); separator1.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator1.setStyleSheet("border: 1px solid #4a4668; margin-top: 10px; margin-bottom: 5px;")
+        raven_layout.addRow(separator1)
         
-        # V2 Lookahead Params
-        self.widgets['RAVEN_use_lookahead'] = QtWidgets.QCheckBox("Use Lookahead")
-        raven_layout.addRow(self.widgets['RAVEN_use_lookahead'])
-        
-        self.lookahead_sub_widget = SubOptionWidget()
-        # CORRECTED PART: Create the QFormLayout without a parent
-        lookahead_form_layout = QtWidgets.QFormLayout()
-        lookahead_form_layout.setContentsMargins(0, 0, 0, 0)
-        self.widgets['RAVEN_la_steps'] = QtWidgets.QSpinBox(); self.widgets['RAVEN_la_steps'].setRange(1, 100)
-        self.widgets['RAVEN_la_alpha'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_la_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_la_alpha'].setSingleStep(0.05); self.widgets['RAVEN_la_alpha'].setDecimals(3)
-        lookahead_form_layout.addRow("Lookahead Steps (k):", self.widgets['RAVEN_la_steps'])
-        lookahead_form_layout.addRow("Alpha:", self.widgets['RAVEN_la_alpha'])
-        # Add the new layout to the SubOptionWidget's existing layout
-        self.lookahead_sub_widget.get_layout().addLayout(lookahead_form_layout)
-        raven_layout.addRow(self.lookahead_sub_widget)
 
-        # V2 Adaptive Dampening Params
-        self.widgets['RAVEN_use_adaptive_dampening'] = QtWidgets.QCheckBox("Use Adaptive Dampening")
-        raven_layout.addRow(self.widgets['RAVEN_use_adaptive_dampening'])
-        
-        self.dampening_sub_widget = SubOptionWidget()
-        # CORRECTED PART: Create the QFormLayout without a parent
-        dampening_form_layout = QtWidgets.QFormLayout()
-        dampening_form_layout.setContentsMargins(0, 0, 0, 0)
-        self.widgets['RAVEN_ad_dampening_factor'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_dampening_factor'].setRange(0.0, 1.0); self.widgets['RAVEN_ad_dampening_factor'].setSingleStep(0.01); self.widgets['RAVEN_ad_dampening_factor'].setDecimals(3)
-        self.widgets['RAVEN_ad_sigma_threshold'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_sigma_threshold'].setRange(0.1, 10.0); self.widgets['RAVEN_ad_sigma_threshold'].setSingleStep(0.1); self.widgets['RAVEN_ad_sigma_threshold'].setDecimals(2)
-        self.widgets['RAVEN_ad_history_window'] = QtWidgets.QSpinBox(); self.widgets['RAVEN_ad_history_window'].setRange(20, 1000)
-        self.widgets['RAVEN_ad_percentile_threshold'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_ad_percentile_threshold'].setRange(0.0, 100.0); self.widgets['RAVEN_ad_percentile_threshold'].setSingleStep(1.0); self.widgets['RAVEN_ad_percentile_threshold'].setDecimals(2)
-        dampening_form_layout.addRow("Dampening Factor:", self.widgets['RAVEN_ad_dampening_factor'])
-        dampening_form_layout.addRow("Sigma Threshold:", self.widgets['RAVEN_ad_sigma_threshold'])
-        dampening_form_layout.addRow("History Window:", self.widgets['RAVEN_ad_history_window'])
-        dampening_form_layout.addRow("Percentile Threshold:", self.widgets['RAVEN_ad_percentile_threshold'])
-        # Add the new layout to the SubOptionWidget's existing layout
-        self.dampening_sub_widget.get_layout().addLayout(dampening_form_layout)
-        raven_layout.addRow(self.dampening_sub_widget)
+        # Separator for V3
+        separator2 = QtWidgets.QFrame(); separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator2.setStyleSheet("border: 1px solid #4a4668; margin-top: 10px; margin-bottom: 5px;")
+        raven_layout.addRow(separator2)
 
+        gc_widget_container = QtWidgets.QWidget()
+        gc_hbox = QtWidgets.QHBoxLayout(gc_widget_container)
+        gc_hbox.setContentsMargins(0,0,0,0)
+        gc_hbox.setSpacing(10)
+        
+        self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Use Gradient Centralization (GC)")
+        gc_hbox.addWidget(self.widgets['RAVEN_use_grad_centralization'])
+
+        gc_help_button = QtWidgets.QPushButton("!")
+        gc_help_button.setFixedSize(22, 22)
+        gc_help_button.setToolTip("WARNING: Click for important information about this setting.")
+        gc_help_button.setStyleSheet("""
+            QPushButton {
+                font-weight: bold; font-size: 16px; color: #1a1926;
+                background-color: #ffdd57; border: 1px solid #ffcc00;
+                border-radius: 11px; padding: 0px; margin: 0px;
+                min-height: 20px; max-height: 20px; min-width: 20px; max-width: 20px;
+            }
+            QPushButton:hover { background-color: #ffee99; border: 1px solid #ffdd57; }
+            QPushButton:pressed { background-color: #e6c547; }
+        """)
+        gc_help_button.clicked.connect(self.show_gc_help_dialog)
+        gc_hbox.addWidget(gc_help_button)
+        gc_hbox.addStretch()
+        raven_layout.addRow(gc_widget_container)
+
+        self.gc_sub_widget = SubOptionWidget()
+        gc_form_layout = QtWidgets.QFormLayout()
+        gc_form_layout.setContentsMargins(0, 0, 0, 0)
+        self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.05); self.widgets['RAVEN_gc_alpha'].setDecimals(3)
+        gc_form_layout.addRow("GC Alpha (Strength):", self.widgets['RAVEN_gc_alpha'])
+        self.gc_sub_widget.get_layout().addLayout(gc_form_layout)
+        raven_layout.addRow(self.gc_sub_widget)
+        
         main_layout.addWidget(self.raven_settings_group)
+    
         
-        # Connect signals to slots for sub-widget visibility
-        self.widgets['RAVEN_use_lookahead'].stateChanged.connect(lambda state: self.lookahead_sub_widget.setVisible(bool(state)))
-        self.widgets['RAVEN_use_adaptive_dampening'].stateChanged.connect(lambda state: self.dampening_sub_widget.setVisible(bool(state)))
-
         # --- Adafactor Settings Group ---
         self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
         adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
@@ -1201,6 +1183,56 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return lr_group
+
+    def _create_timestep_noise_group(self):
+        group = QtWidgets.QGroupBox("Timestep & Noise Schedule")
+        layout = QtWidgets.QVBoxLayout(group)
+        
+        # --- Timestep Curriculum Settings ---
+        form_layout = QtWidgets.QFormLayout()
+        
+        # Create the dropdown for mode selection
+        label, widget = self._create_widget("TIMESTEP_CURRICULUM_MODE")
+        form_layout.addRow(label, widget)
+        widget.currentTextChanged.connect(self.toggle_curriculum_sub_widgets)
+
+        label, widget = self._create_widget("TIMESTEP_CURRICULUM_START_RANGE")
+        form_layout.addRow(label, widget)
+        layout.addLayout(form_layout)
+
+        # --- Sub-widget for Static Adaptive Mode ---
+        self.ts_curriculum_sub_widget = SubOptionWidget()
+        # Create a layout for the sub-widget's contents first
+        ts_sub_layout = QtWidgets.QFormLayout()
+        ts_sub_layout.setContentsMargins(0,0,0,0)
+        label, widget = self._create_widget("TIMESTEP_CURRICULUM_END_PERCENT")
+        ts_sub_layout.addRow(label, widget)
+        # Add this new layout to the sub-widget's main layout
+        self.ts_curriculum_sub_widget.get_layout().addLayout(ts_sub_layout)
+        layout.addWidget(self.ts_curriculum_sub_widget)
+        
+        # --- Sub-widget for Dynamic Balancing Mode ---
+        self.dynamic_balancing_sub_widget = SubOptionWidget()
+        # Create a layout for the sub-widget's contents first
+        dynamic_form = QtWidgets.QFormLayout()
+        dynamic_form.setContentsMargins(0, 0, 0, 0)
+        
+        label, widget = self._create_widget("DYNAMIC_CHALLENGE_PROBE_PERCENT")
+        dynamic_form.addRow(label, widget)
+        
+        label, widget = self._create_widget("DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE")
+        dynamic_form.addRow(label, widget)
+
+        # Add this new layout to the sub-widget's main layout
+        self.dynamic_balancing_sub_widget.get_layout().addLayout(dynamic_form)
+        layout.addWidget(self.dynamic_balancing_sub_widget)
+
+        # --- Other Noise Settings ---
+        layout.addWidget(self._create_separator())
+        self._create_bool_option(layout, "USE_ZERO_TERMINAL_SNR", "Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.")
+        
+        return group
+
     def _create_separator(self):
         line = QtWidgets.QFrame()
         line.setFrameShape(QtWidgets.QFrame.Shape.HLine)
@@ -1213,14 +1245,11 @@ class TrainingGUI(QtWidgets.QWidget):
         
         left_layout = QtWidgets.QVBoxLayout()
 
-        # --- START: Modified Section ---
-        # A new group box for the attention mechanism dropdown.
         attention_group = QtWidgets.QGroupBox("Memory Efficient Attention")
         attention_layout = QtWidgets.QFormLayout(attention_group)
         label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
         attention_layout.addRow(label, widget)
         left_layout.addWidget(attention_group)
-        # --- END: Modified Section ---
 
         noise_group = QtWidgets.QGroupBox("Noise & Regularization")
         noise_layout = QtWidgets.QVBoxLayout(noise_group)
@@ -1313,6 +1342,12 @@ class TrainingGUI(QtWidgets.QWidget):
         plot_button.setObjectName("PlotButton")
         plot_button.clicked.connect(self.plot_loss_from_console)
         button_layout.addWidget(plot_button)
+        
+        clear_button = QtWidgets.QPushButton("Clear Console")
+        clear_button.setObjectName("ClearButton")
+        clear_button.clicked.connect(self.clear_console_log)
+        button_layout.addWidget(clear_button)
+
         export_data_button = QtWidgets.QPushButton("Export Data")
         export_data_button.setObjectName("ExportDataButton")
         export_data_button.clicked.connect(self.show_data_window)
@@ -1322,10 +1357,15 @@ class TrainingGUI(QtWidgets.QWidget):
     def _browse_path(self, entry_widget, file_type):
         path = ""
         current_path = os.path.dirname(entry_widget.text()) if entry_widget.text() else ""
-        if file_type == "folder": path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", current_path)
-        elif file_type == "file_safetensors": path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", current_path, "Safetensors Files (*.safetensors)")
-        elif file_type == "file_pt": path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)")
-        if path: entry_widget.setText(path.replace('\\', '/'))
+        options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
+        if file_type == "folder":
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", current_path, options=options)
+        elif file_type == "file_safetensors":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", current_path, "Safetensors Files (*.safetensors)", options=options)
+        elif file_type == "file_pt":
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)", options=options)
+        if path:
+            entry_widget.setText(path.replace('\\', '/'))
     def _create_bool_option(self, layout, key, label, tooltip_text, command=None):
         checkbox = QtWidgets.QCheckBox(label)
         checkbox.setToolTip(tooltip_text)
@@ -1372,7 +1412,7 @@ class TrainingGUI(QtWidgets.QWidget):
             
             # --- Apply General Widget Values ---
             for key, widget in self.widgets.items():
-                if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
+                if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "TIMESTEP_CURRICULUM_MODE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
                     continue
                 
                 value = self.current_config.get(key)
@@ -1391,23 +1431,15 @@ class TrainingGUI(QtWidgets.QWidget):
             optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
             self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type)
             
-            # Consolidate user and default raven params
             user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
             full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
 
             self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
             self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
             self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
-            self.widgets['RAVEN_use_lookahead'].setChecked(full_raven_params["use_lookahead"])
-            self.widgets['RAVEN_la_steps'].setValue(full_raven_params["la_steps"])
-            self.widgets['RAVEN_la_alpha'].setValue(full_raven_params["la_alpha"])
-            self.widgets['RAVEN_use_adaptive_dampening'].setChecked(full_raven_params["use_adaptive_dampening"])
-            self.widgets['RAVEN_ad_dampening_factor'].setValue(full_raven_params["ad_dampening_factor"])
-            self.widgets['RAVEN_ad_sigma_threshold'].setValue(full_raven_params["ad_sigma_threshold"])
-            self.widgets['RAVEN_ad_history_window'].setValue(full_raven_params["ad_history_window"])
-            self.widgets['RAVEN_ad_percentile_threshold'].setValue(full_raven_params["ad_percentile_threshold"])
+            self.widgets['RAVEN_use_grad_centralization'].setChecked(full_raven_params["use_grad_centralization"])
+            self.widgets['RAVEN_gc_alpha'].setValue(full_raven_params["gc_alpha"])
             
-            # Consolidate user and default adafactor params
             user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
             full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
 
@@ -1428,16 +1460,27 @@ class TrainingGUI(QtWidgets.QWidget):
             if hasattr(self, 'lr_curve_widget'):
                 self._update_and_clamp_lr_graph()
             
+            # --- Set the curriculum mode from config ---
+            # This logic correctly sets the dropdown based on the old boolean flags
+            # if they exist, or the new mode string if it exists, ensuring backward compatibility.
+            if self.current_config.get("USE_DYNAMIC_CHALLENGE_BALANCING", False):
+                mode = "Dynamic Balancing"
+            elif self.current_config.get("USE_TIMESTEP_CURRICULUM", False):
+                mode = "Static Adaptive"
+            else:
+                mode = self.current_config.get("TIMESTEP_CURRICULUM_MODE", "Fixed")
+            
+            if "TIMESTEP_CURRICULUM_MODE" in self.widgets:
+                self.widgets["TIMESTEP_CURRICULUM_MODE"].setCurrentText(mode)
+
+            # --- Call all toggle functions to ensure UI state is correct ---
             for toggle_func in [
                 self.toggle_snr_gamma_widget, self.toggle_ip_noise_gamma_widget,
-                self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets
+                self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets,
+                self.toggle_curriculum_sub_widgets
             ]:
                 toggle_func()
             
-            # Manually set visibility for new sub-widgets after all values are loaded
-            self.lookahead_sub_widget.setVisible(self.widgets['RAVEN_use_lookahead'].isChecked())
-            self.dampening_sub_widget.setVisible(self.widgets['RAVEN_use_adaptive_dampening'].isChecked())
-
             # --- Load Datasets ---
             if hasattr(self, "dataset_manager"):
                 datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
@@ -1459,6 +1502,9 @@ class TrainingGUI(QtWidgets.QWidget):
             self.save_config()
             self.load_selected_config(index)
             self.log(f"Restored '{selected_key}.json' to defaults.")
+    def clear_console_log(self):
+        self.log_textbox.clear()
+        self.log("Console cleared.")
     def toggle_all_unet_checkboxes(self, state):
         for cb in self.unet_layer_checkboxes.values(): cb.setChecked(state)
         self._update_unet_targets_config()
@@ -1477,6 +1523,21 @@ class TrainingGUI(QtWidgets.QWidget):
             self.base_model_sub_widget.setVisible(not is_resuming)
     def toggle_cond_dropout_widget(self):
         if hasattr(self, 'cond_sub_widget'): self.cond_sub_widget.setVisible(self.widgets.get("USE_COND_DROPOUT", QtWidgets.QCheckBox()).isChecked())
+    def toggle_curriculum_sub_widgets(self):
+        if not all(hasattr(self, w) for w in ['ts_curriculum_sub_widget', 'dynamic_balancing_sub_widget']):
+            return
+            
+        mode_widget = self.widgets.get("TIMESTEP_CURRICULUM_MODE")
+        if not mode_widget:
+            return
+            
+        selected_mode = mode_widget.currentText()
+        
+        is_static = (selected_mode == "Static Adaptive")
+        is_dynamic = (selected_mode == "Dynamic Balancing")
+        
+        self.ts_curriculum_sub_widget.setVisible(is_static)
+        self.dynamic_balancing_sub_widget.setVisible(is_dynamic)
     def toggle_snr_variant_widget(self, text=None):
         if not hasattr(self, 'min_snr_variant_widget'): return
         strategy = text if text is not None else self.widgets.get("SNR_STRATEGY", QtWidgets.QComboBox()).currentText()
@@ -1502,6 +1563,31 @@ class TrainingGUI(QtWidgets.QWidget):
         if text:
             self.append_log(text, replace=is_progress and self.last_line_is_progress)
             self.last_line_is_progress = is_progress
+            
+    def show_gc_help_dialog(self):
+        help_text = """
+        <h2><font color="#ffdd57">Gradient Centralization (GC) - Advanced Opt-In</font></h2>
+        <p>Gradient Centralization is an optimization technique that normalizes the gradients of a model's weights, which can help stabilize training and improve generalization.</p>
+        <hr>
+        <h3>How It Works</h3>
+        <p>For each layer in the UNet, GC computes the mean of its gradients and subtracts this mean from each individual gradient. This "centers" the gradients around zero. The goal is to make the optimization process smoother and prevent the model from getting stuck in sharp areas of the loss landscape. It acts as a powerful regularizer.</p>
+        <p>This implementation is based on the paper: <b>"Gradient Centralization: A New Optimization Technique for Deep Neural Networks"</b> by Yong et al. (2020).</p>
+        <hr>
+        <h2><font color="#e53935"><u>CRITICAL WARNING: MODEL-ALTERING BEHAVIOR</u></font></h2>
+        <p>Enabling Gradient Centralization is <b>not</b> just a small tweak. It is a fundamental change to the training process that directly alters the gradient information used to update <u>every single trainable weight</u> in the UNet.</p>
+        
+        <h3>Impact on Your Model:</h3>
+        <ul>
+            <li><b>Drastic Internal Changes:</b> Because GC modifies the core update step for all weights, the resulting model will be architecturally different from one trained without it. The internal values and learned features will be completely different.</li>
+            <li><b>Incompatible for Resuming/Merging:</b> You <u>CANNOT</u> resume training from a checkpoint that was saved without GC if you enable it, and vice-versa. The optimizer states and weight distributions will be incompatible. Merging a GC-trained model with a non-GC-trained model will likely produce poor or broken results.</li>
+            <li><b>Changes Model "Feel":</b> Models trained with GC may have a different aesthetic. They can sometimes appear "softer," have different color responses, or be less prone to high-frequency noise and artifacts. This is a direct result of constraining the gradients during training.</li>
+        </ul>
+        
+        <p><b>Recommendation:</b> Only enable this feature if you are starting a <u>brand new training session from scratch</u> and are experimenting with different training techniques. Do not enable it mid-way through a training run.</p>
+        """
+        dialog = InfoDialog("Gradient Centralization (GC) Warning", help_text, self)
+        dialog.exec()
+
     def start_training(self):
         self.save_config()
         self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
@@ -1661,7 +1747,8 @@ class TrainingGUI(QtWidgets.QWidget):
             self,
             "Save CSV File",
             "",
-            "CSV Files (*.csv);;All Files (*.*)"
+            "CSV Files (*.csv);;All Files (*.*)",
+            options=QtWidgets.QFileDialog.Option.DontUseNativeDialog
         )
         if file_path:
             try:
@@ -1757,7 +1844,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.repopulate_dataset_grid()
         self.update_dataset_totals()
     def add_dataset_folder(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", "", options=QtWidgets.QFileDialog.Option.DontUseNativeDialog)
         if not path: return
         exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
         images = [p for ext in exts for p in Path(path).rglob(f"*{ext}") if "_truncated" not in p.stem and "_mask" not in p.stem]
@@ -1965,7 +2052,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         if not deleted:
             self.parent_gui.log("No cached latent directories found to delete.")
     def browse_for_mask_folder(self, idx):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Mask Folder")
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Mask Folder", "", options=QtWidgets.QFileDialog.Option.DontUseNativeDialog)
         if path:
             self.dataset_widgets[idx]["mask_path_edit"].setText(path)
     def update_mask_preview(self, idx):

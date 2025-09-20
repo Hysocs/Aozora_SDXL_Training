@@ -9,15 +9,6 @@ SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safensors"
 OUTPUT_DIR = "./sdxl_finetune_output"
 
 # --- Dataset Configuration ---
-# This is a list of datasets. The GUI manages this list.
-# For each dataset, you can now specify:
-#   - "path": The folder containing your images.
-#   - "repeats": How many times to repeat this dataset per epoch.
-#   - "mirror_repeats": (bool) If True, duplicates from 'repeats' will be horizontally mirrored.
-#   - "darken_repeats": (bool) If True, applies a contrast-enhancing S-curve to repeated images.
-#   - "use_mask": (bool) True to enable masked training for this specific dataset.
-#   - "mask_path": The folder containing corresponding masks if "use_mask" is True.
-#   - "mask_focus_factor": (float) How much to prioritize the masked area (e.g., 2.0 means twice the loss weight).
 INSTANCE_DATASETS = [
     {
         "path": "./DatasetV1/",
@@ -33,42 +24,38 @@ INSTANCE_DATASETS = [
 
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 3
-BATCH_SIZE = 1 # Recommended to keep at 1 for this script
-NUM_WORKERS = 4 # Set to 0 on Windows if you encounter DataLoader errors
+BATCH_SIZE = 1
+NUM_WORKERS = 4
 
 # --- Aspect Ratio Bucketing ---
-# The total number of pixels for each bucket (e.g., 1024*1024 = 1,048,576)
 TARGET_PIXEL_AREA = 1327104
 BUCKET_ASPECT_RATIOS = [1.0, 1.5, 0.66, 1.33, 0.75, 1.77, 0.56]
 
 # --- Training Parameters ---
 MAX_TRAIN_STEPS = 35000
 GRADIENT_ACCUMULATION_STEPS = 64
-MIXED_PRECISION = "bfloat16" # Use "fp16" for older GPUs (e.g., 20-series)
+CLIP_GRAD_NORM = 1.25
+MIXED_PRECISION = "bfloat16"
 SEED = 42
 SAVE_EVERY_N_STEPS = 5000
 
 # --- Resume from Checkpoint (Manual Paths) ---
 RESUME_TRAINING = False
-# These paths are used ONLY if RESUME_TRAINING is True
-RESUME_MODEL_PATH = "" # e.g., "./sdxl_finetune_output/checkpoints/checkpoint_step_5000.safensors"
-RESUME_STATE_PATH = "" # e.g., "./sdxl_finetune_output/checkpoints/training_state_step_5000.pt"
+RESUME_MODEL_PATH = ""
+RESUME_STATE_PATH = ""
 
 # --- Learning Rate & Optimizer ---
-# Points are defined as [step_percentage, absolute_learning_rate]
 LR_CUSTOM_CURVE = [
     [0.0, 0.0],
     [0.05, 8.0e-7],
     [0.85, 8.0e-7],
     [1.0, 1.0e-7]
 ]
-# These control the visible Y-axis range of the graph in the GUI
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 WEIGHT_DECAY = 0.01
 
 # --- Layer Training Targets (UNet-Only) ---
-# These are the default layers that will be trained. The GUI shows all options.
 UNET_TRAIN_TARGETS = [
     "attn1",
     "attn2",
@@ -79,43 +66,48 @@ UNET_TRAIN_TARGETS = [
     "time_embedding",
 ]
 
+# TIMESTEP CURRICULUM
+# Defines the strategy for sampling timesteps during training.
+# "Fixed": Samples from the exact TIMESTEP_CURRICULUM_START_RANGE for the entire run.
+# "Static Adaptive": Starts with START_RANGE and linearly expands to [0, 999] over END_PERCENT of training.
+# "Dynamic Balancing": Self-tunes the range in real-time to keep Grad Norm within a target zone.
+TIMESTEP_CURRICULUM_MODE = "Fixed"  # Options: "Fixed", "Static Adaptive", "Dynamic Balancing"
+TIMESTEP_CURRICULUM_START_RANGE = "0, 999"
+TIMESTEP_CURRICULUM_END_PERCENT = 80
+
+# DYNAMIC CHALLENGE BALANCING (Sub-settings for the "Dynamic Balancing" mode)
+DYNAMIC_CHALLENGE_PROBE_PERCENT = 5
+DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE = "0.25, 0.90"
+
 # --- Advanced ---
-MEMORY_EFFICIENT_ATTENTION = "xformers"  # Options: "xformers", "sdpa"
+MEMORY_EFFICIENT_ATTENTION = "xformers"
 USE_PER_CHANNEL_NOISE = True
-NOISE_SCHEDULE_VARIANT = "uniform" # "uniform", "logsnr_laplace", "residual_shifting"
 USE_SNR_GAMMA = True
-SNR_STRATEGY = "Min-SNR" # Can be "Min-SNR" or "Max-SNR"
+SNR_STRATEGY = "Min-SNR"
 SNR_GAMMA = 20.0
-MIN_SNR_VARIANT = "standard"  # "standard", "corrected", "debiased"
-USE_ZERO_TERMINAL_SNR = True  # Rescales the noise schedule to force SNR=0 at final timestep for better dynamic range
-USE_IP_NOISE_GAMMA = True  # Adds Gaussian noise to input latents for regularization
-IP_NOISE_GAMMA = 0.01  # Value for IP noise gamma (common range: 0.05-0.25)
+MIN_SNR_VARIANT = "standard"
+USE_ZERO_TERMINAL_SNR = True
+USE_IP_NOISE_GAMMA = True
+IP_NOISE_GAMMA = 0.01
 USE_COND_DROPOUT = True
-COND_DROPOUT_PROB = 0.1  # Common range: 0.05-0.15; higher for diverse datasets
+COND_DROPOUT_PROB = 0.1
 
 # --- Optimizer Configuration ---
-OPTIMIZER_TYPE = "Raven"  # Options: "Raven", "Adafactor"
+OPTIMIZER_TYPE = "Raven"
 RAVEN_PARAMS = {
     "betas": [0.9, 0.999],
     "eps": 1e-8,
     "weight_decay": 0.01,
-    # --- V2 Features ---
-    "use_lookahead": True,
-    "la_steps": 6,
-    "la_alpha": 0.5,
-    "use_adaptive_dampening": True,
-    "ad_dampening_factor": 0.15,
-    "ad_sigma_threshold": 3.0,
-    "ad_history_window": 100,
-    "ad_percentile_threshold": 95.0
+    "use_grad_centralization": False,
+    "gc_alpha": 1.0,
 }
 ADAFACTOR_PARAMS = {
-    "eps": [1e-30, 1e-3],  # Stabilization for scale and parameters
-    "clip_threshold": 1.0,  # Gradient clipping threshold
-    "decay_rate": -0.8,  # Second-moment decay rate
-    "beta1": None,  # First-moment estimation (None to disable)
-    "weight_decay": 0.01,  # L2 regularization
-    "scale_parameter": True,  # Enable parameter scaling
-    "relative_step": False,  # Disable relative step sizing
-    "warmup_init": False  # Disable warmup
+    "eps": [1e-30, 1e-3],
+    "clip_threshold": 1.0,
+    "decay_rate": -0.8,
+    "beta1": None,
+    "weight_decay": 0.01,
+    "scale_parameter": True,
+    "relative_step": False,
+    "warmup_init": False
 }

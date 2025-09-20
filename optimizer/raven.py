@@ -1,65 +1,44 @@
 import torch
 from torch.optim import Optimizer
-from collections import deque
-import numpy as np
 import math
 
 class Raven(Optimizer):
     """
-    The Definitive VRAM-Safe and Accelerated AdamW Optimizer.
-
-    This version uses a single, pre-allocated, reusable GPU buffer for AdamW states,
-    offloading them to the CPU to save VRAM.
-
-    V2 Features:
-    - Integrated Lookahead mechanism for proactive stabilization.
-    - Integrated Adaptive Dampening mechanism with a dual-condition trigger
-      to prevent reactive spikes without choking the optimizer during fine-tuning.
+    An ultra-efficient, VRAM-safe AdamW Optimizer with an optional, low-VRAM
+    adaptive LR mode. It removes all non-essential features for maximum stability.
     """
     def __init__(
         self,
         params,
+        lr: float = 1e-4,
         betas: tuple[float, float] = (0.9, 0.999),
         weight_decay: float = 0.01,
         eps: float = 1e-8,
-        # --- Lookahead Parameters ---
-        use_lookahead: bool = False,
-        la_steps: int = 6,
-        la_alpha: float = 0.5,
-        # --- Adaptive Dampening Parameters ---
-        use_adaptive_dampening: bool = False,
-        ad_dampening_factor: float = 0.1,
-        ad_sigma_threshold: float = 3.0,
-        ad_percentile_threshold: float = 95.0, # The fix for the "choking" issue
-        ad_history_window: int = 100,
+        use_grad_centralization: bool = False,
+        gc_alpha: float = 1.0,
+        use_adaptive_lr: bool = False,
+        adaptive_beta: float = 0.99,
+        adaptive_increase_factor: float = 1.01,
+        adaptive_decrease_factor: float = 0.97,
     ):
-        # --- Validation ---
-        if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0:
-            raise ValueError(f"Betas must be in [0, 1), got {betas}")
-        if not 0.0 <= weight_decay:
-            raise ValueError(f"Invalid weight_decay value: {weight_decay}")
-        if use_lookahead:
-            if not 0.0 <= la_alpha < 1.0: raise ValueError(f"Lookahead alpha must be in [0, 1)")
-            if not la_steps >= 1: raise ValueError(f"Lookahead steps must be >= 1")
-        if use_adaptive_dampening:
-            if not 0.0 < ad_dampening_factor <= 1.0: raise ValueError(f"Dampening factor must be in (0, 1]")
-            if not ad_sigma_threshold > 0: raise ValueError(f"Sigma threshold must be > 0")
-            if not 0.0 < ad_percentile_threshold < 100.0: raise ValueError(f"Percentile threshold must be in (0, 100)")
-            if not ad_history_window > 20: raise ValueError(f"History window must be > 20 for stable stats")
+        if not 0.0 <= lr: raise ValueError(f"Invalid learning rate: {lr}")
+        if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0: raise ValueError(f"Betas must be in [0, 1), got {betas}")
+        if not 0.0 <= weight_decay: raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        if use_grad_centralization and not 0.0 <= gc_alpha <= 1.0: raise ValueError(f"gc_alpha must be in [0, 1], got {gc_alpha}")
 
         defaults = dict(
-            betas=betas, weight_decay=weight_decay, eps=eps,
-            use_lookahead=use_lookahead, la_steps=la_steps, la_alpha=la_alpha,
-            use_adaptive_dampening=use_adaptive_dampening, ad_dampening_factor=ad_dampening_factor,
-            ad_sigma_threshold=ad_sigma_threshold, ad_percentile_threshold=ad_percentile_threshold,
+            lr=lr, betas=betas, weight_decay=weight_decay, eps=eps,
+            use_grad_centralization=use_grad_centralization, gc_alpha=gc_alpha,
+            use_adaptive_lr=use_adaptive_lr, adaptive_beta=adaptive_beta,
+            adaptive_increase_factor=adaptive_increase_factor, adaptive_decrease_factor=adaptive_decrease_factor,
         )
         super(Raven, self).__init__(params, defaults)
 
-        # --- Adaptive Dampening State ---
-        if use_adaptive_dampening:
-            self.grad_norm_history = deque(maxlen=ad_history_window)
+        for group in self.param_groups:
+            if group['use_adaptive_lr']:
+                group['adaptive_lr'] = group['lr']
+                group['smoothed_global_dot_prod'] = 0.0
 
-        # --- VRAM-Saving Kernel ---
         max_param_size = 0
         self.param_device = None
         for group in self.param_groups:
@@ -70,9 +49,10 @@ class Raven(Optimizer):
         if max_param_size > 0:
             self.reusable_exp_avg_gpu = torch.zeros(max_param_size, device=self.param_device, dtype=torch.float32)
             self.reusable_exp_avg_sq_gpu = torch.zeros(max_param_size, device=self.param_device, dtype=torch.float32)
+            # --- FIX: Re-introduce the third buffer. This is necessary for the feature to work. ---
+            self.reusable_prev_update_gpu = torch.zeros(max_param_size, device=self.param_device, dtype=torch.float32) if any(g['use_adaptive_lr'] for g in self.param_groups) else None
         else:
-            self.reusable_exp_avg_gpu = None
-            self.reusable_exp_avg_sq_gpu = None
+            self.reusable_exp_avg_gpu, self.reusable_exp_avg_sq_gpu, self.reusable_prev_update_gpu = None, None, None
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -81,63 +61,33 @@ class Raven(Optimizer):
             with torch.enable_grad():
                 loss = closure()
 
-        # --- Adaptive Dampening Calculation (runs once per step) ---
-        lr_dampening_factor = 1.0
-        if self.defaults.get('use_adaptive_dampening'):
-            params_with_grad = [p for group in self.param_groups for p in group['params'] if p.grad is not None]
-            if params_with_grad:
-                total_norm = torch.norm(torch.stack([torch.norm(p.grad.detach(), 2).cpu() for p in params_with_grad]), 2).item()
-                
-                # Check for outliers only if we have enough history for stable statistics
-                if len(self.grad_norm_history) >= self.grad_norm_history.maxlen:
-                    # Condition 1: Is the spike statistically significant (relative check)?
-                    mean_norm = np.mean(self.grad_norm_history)
-                    std_norm = np.std(self.grad_norm_history)
-                    statistical_threshold = mean_norm + self.defaults['ad_sigma_threshold'] * std_norm
-                    is_stat_significant = total_norm > statistical_threshold
-                    
-                    # Condition 2: Is the spike absolutely large (minimum threshold check)?
-                    # This prevents the system from choking on small gradients.
-                    absolute_threshold = np.percentile(self.grad_norm_history, self.defaults['ad_percentile_threshold'])
-                    is_absolutely_large = total_norm > absolute_threshold
-
-                    if is_stat_significant and is_absolutely_large:
-                        lr_dampening_factor = self.defaults['ad_dampening_factor']
-                        print(f"\n[RAVEN EYE] Grad norm spike detected! Norm: {total_norm:.2f} > (Stat Thresh: {statistical_threshold:.2f} AND Abs Thresh: {absolute_threshold:.2f}). Dampening LR.")
-
-                self.grad_norm_history.append(total_norm)
-
-        # --- Main Parameter Loop ---
         for group in self.param_groups:
-            effective_lr = group['lr'] * lr_dampening_factor
+            effective_lr = group.get('adaptive_lr', group['lr']) if group['use_adaptive_lr'] else group['lr']
+            global_dot_product_sum = 0.0
 
             for p in group["params"]:
                 if p.grad is None: continue
                 grad = p.grad.float()
-                if grad.is_sparse:
-                    raise RuntimeError("Raven does not support sparse gradients.")
+                if grad.is_sparse: raise RuntimeError("Raven does not support sparse gradients.")
+                if group['use_grad_centralization'] and grad.dim() > 1:
+                    grad.sub_(grad.mean(dim=tuple(range(grad.dim() - 1)), keepdim=True), alpha=group['gc_alpha'])
 
                 state = self.state[p]
+                num_param_elements = p.numel()
 
                 if len(state) == 0:
                     state["step"] = 0
                     state["exp_avg_cpu"] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.bfloat16)
                     state["exp_avg_sq_cpu"] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.float32)
-                    if group['use_lookahead']:
-                        state['slow_param_cpu'] = torch.empty_like(p, device='cpu').copy_(p.data)
-                        state['la_step_counter'] = 0
+                    if group['use_adaptive_lr']:
+                        state['prev_update_cpu'] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.bfloat16)
 
                 state["step"] += 1
                 
-                if group["weight_decay"] != 0:
-                    p.mul_(1.0 - effective_lr * group["weight_decay"])
-
-                # --- Core AdamW Update ---
                 exp_avg_cpu = state["exp_avg_cpu"]
                 exp_avg_sq_cpu = state["exp_avg_sq_cpu"]
                 beta1, beta2 = group["betas"]
                 
-                num_param_elements = p.numel()
                 exp_avg_gpu_view = self.reusable_exp_avg_gpu[:num_param_elements].view_as(p)
                 exp_avg_sq_gpu_view = self.reusable_exp_avg_sq_gpu[:num_param_elements].view_as(p)
 
@@ -151,23 +101,40 @@ class Raven(Optimizer):
                 bias_correction2 = 1.0 - beta2 ** state["step"]
                 
                 denom = (exp_avg_sq_gpu_view.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
-                step_size = effective_lr / bias_correction1
+                current_update_direction = exp_avg_gpu_view / denom
+
+                if group['use_adaptive_lr'] and state['step'] > 1:
+                    # --- FIX: Use the pre-allocated buffer to move prev_update to the GPU ---
+                    prev_update_gpu_view = self.reusable_prev_update_gpu[:num_param_elements].view_as(p)
+                    prev_update_gpu_view.copy_(state['prev_update_cpu'], non_blocking=True)
+                    
+                    # Now the dot product is a fast, same-device operation
+                    dot_product = torch.dot(current_update_direction.view(-1), prev_update_gpu_view.view(-1))
+                    global_dot_product_sum += dot_product
+
+                # Save the current update direction for the next step's calculation
+                if group['use_adaptive_lr']:
+                    state['prev_update_cpu'].copy_(current_update_direction, non_blocking=True)
                 
+                if group["weight_decay"] != 0:
+                    p.mul_(1.0 - effective_lr * group["weight_decay"])
+                
+                step_size = effective_lr / bias_correction1
                 p.addcdiv_(exp_avg_gpu_view, denom, value=-step_size)
                 
                 exp_avg_cpu.copy_(exp_avg_gpu_view, non_blocking=True)
                 exp_avg_sq_cpu.copy_(exp_avg_sq_gpu_view, non_blocking=True)
 
-                # --- Lookahead Update ---
-                if group['use_lookahead']:
-                    state['la_step_counter'] += 1
-                    if state['la_step_counter'] >= group['la_steps']:
-                        slow_p_cpu = state['slow_param_cpu']
-                        fast_p_cpu = p.data.cpu()
-                        slow_p_cpu.add_(fast_p_cpu - slow_p_cpu, alpha=group['la_alpha'])
-                        p.data.copy_(slow_p_cpu)
-                        state['la_step_counter'] = 0
+            if group['use_adaptive_lr']:
+                scheduler_lr_ceiling = group['lr']
+                group['smoothed_global_dot_prod'] = group['adaptive_beta'] * group['smoothed_global_dot_prod'] + (1 - group['adaptive_beta']) * global_dot_product_sum
+                
+                if group['smoothed_global_dot_prod'] > 0:
+                    group['adaptive_lr'] *= group['adaptive_increase_factor']
+                else:
+                    group['adaptive_lr'] *= group['adaptive_decrease_factor']
+                
+                group['adaptive_lr'] = min(group['adaptive_lr'], scheduler_lr_ceiling)
 
-        if torch.cuda.is_available():
-            torch.cuda.synchronize()
+        if torch.cuda.is_available(): torch.cuda.synchronize()
         return loss

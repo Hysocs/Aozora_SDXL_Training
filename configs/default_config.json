@@ -6,76 +6,36 @@
     "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
     "BUCKET_ASPECT_RATIOS": [
-        0.5,
         0.56,
-        0.66,
         0.75,
         1.0,
-        1.25,
         1.33,
-        1.5,
-        1.77,
-        2.0
+        1.77
     ],
     "MAX_TRAIN_STEPS": 2000,
-    "GRADIENT_ACCUMULATION_STEPS": 16,
+    "GRADIENT_ACCUMULATION_STEPS": 4,
+    "CLIP_GRAD_NORM": 1.25,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 69,
-    "SAVE_EVERY_N_STEPS": 15000,
+    "SAVE_EVERY_N_STEPS": 5000,
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_15000.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_15000.pt",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            3.5e-06
+            4.5e-06
         ],
         [
-            0.1,
-            8.5e-05
-        ],
-        [
-            0.19,
-            8.30056e-05
-        ],
-        [
-            0.28,
-            7.72174e-05
-        ],
-        [
-            0.37,
-            6.82022e-05
-        ],
-        [
-            0.46,
-            5.68424e-05
-        ],
-        [
-            0.55,
-            4.425e-05
-        ],
-        [
-            0.64,
-            3.16576e-05
-        ],
-        [
-            0.73,
-            2.02978e-05
-        ],
-        [
-            0.82,
-            1.12826e-05
-        ],
-        [
-            0.91,
-            5.4944e-06
+            0.05,
+            4.5e-05
         ],
         [
             1.0,
-            3.5e-06
+            4.5e-06
         ]
     ],
-    "LR_GRAPH_MIN": 3.5e-06,
-    "LR_GRAPH_MAX": 8.5e-05,
+    "LR_GRAPH_MIN": 4.5e-06,
+    "LR_GRAPH_MAX": 4.5e-05,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -103,27 +63,31 @@
         "norm3",
         "conv_norm_out"
     ],
+    "TIMESTEP_CURRICULUM_MODE": "Fixed",
+    "TIMESTEP_CURRICULUM_START_RANGE": "0, 999",
+    "TIMESTEP_CURRICULUM_END_PERCENT": 80,
+    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 5,
+    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.31, 0.91",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_PER_CHANNEL_NOISE": true,
-    "NOISE_SCHEDULE_VARIANT": "logsnr_laplace",
     "USE_SNR_GAMMA": false,
     "SNR_STRATEGY": "Min-SNR",
-    "SNR_GAMMA": 5.0,
+    "SNR_GAMMA": 2.5,
     "MIN_SNR_VARIANT": "debiased",
-    "USE_ZERO_TERMINAL_SNR": true,
+    "USE_ZERO_TERMINAL_SNR": false,
     "USE_IP_NOISE_GAMMA": false,
-    "IP_NOISE_GAMMA": 0.2,
+    "IP_NOISE_GAMMA": 0.01,
     "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.05,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by otokakoto",
+            "path": "C:/Users/Administrator/Pictures/Datasets/Tester",
             "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": true,
-            "mask_path": "C:/Users/Administrator/Pictures/Datasets/by otokakoto/masks",
+            "mirror_repeats": false,
+            "darken_repeats": false,
+            "use_mask": false,
+            "mask_path": "",
             "mask_focus_factor": 2.0,
             "mask_focus_mode": "Proportional (Multiply)"
         }
@@ -136,14 +100,8 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.1,
-        "use_lookahead": true,
-        "la_steps": 4,
-        "la_alpha": 0.1,
-        "use_adaptive_dampening": true,
-        "ad_dampening_factor": 0.15,
-        "ad_sigma_threshold": 3.0,
-        "ad_history_window": 100,
-        "ad_percentile_threshold": 95.0
+        "use_grad_centralization": false,
+        "gc_alpha": 0.25
     },
     "ADAFACTOR_PARAMS": {
         "eps": [
