@@ -573,7 +573,6 @@ class TrainingGUI(QtWidgets.QWidget):
         "CACHING_BATCH_SIZE": {"label": "Caching Batch Size", "tooltip": "Adjust based on VRAM (e.g., 2-4).", "widget": "QLineEdit"},
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QLineEdit"},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
-        "BUCKET_ASPECT_RATIOS": {"label": "Aspect Ratios (comma-sep)", "tooltip": "e.g., 1.0, 1.5, 0.66. Defines bucket shapes.", "widget": "QLineEdit"},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
         "SAVE_EVERY_N_STEPS": {"label": "Save Every N Steps:", "tooltip": "How often to save a checkpoint.", "widget": "QLineEdit"},
         "GRADIENT_ACCUMULATION_STEPS": {"label": "Gradient Accumulation:", "tooltip": "Simulates a larger batch size.", "widget": "QLineEdit"},
@@ -910,7 +909,7 @@ class TrainingGUI(QtWidgets.QWidget):
         top_hbox.setSpacing(20)
         groups = {
             "Batching & DataLoaders": ["CACHING_BATCH_SIZE", "NUM_WORKERS"],
-            "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA", "BUCKET_ASPECT_RATIOS"]
+            "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA"]
         }
         for title, keys in groups.items():
             top_hbox.addWidget(self._create_form_group(title, keys))
@@ -1073,6 +1072,9 @@ class TrainingGUI(QtWidgets.QWidget):
         gc_hbox.setSpacing(10)
         
         self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Use Gradient Centralization (GC)")
+        self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(
+            lambda state: self.gc_sub_widget.setVisible(bool(state))
+        )
         gc_hbox.addWidget(self.widgets['RAVEN_use_grad_centralization'])
 
         gc_help_button = QtWidgets.QPushButton("!")

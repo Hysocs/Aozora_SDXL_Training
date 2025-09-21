@@ -5,37 +5,30 @@
     "BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
-    "BUCKET_ASPECT_RATIOS": [
-        0.56,
-        0.75,
-        1.0,
-        1.33,
-        1.77
-    ],
     "MAX_TRAIN_STEPS": 2000,
-    "GRADIENT_ACCUMULATION_STEPS": 4,
+    "GRADIENT_ACCUMULATION_STEPS": 8,
     "CLIP_GRAD_NORM": 1.25,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 69,
-    "SAVE_EVERY_N_STEPS": 5000,
+    "SAVE_EVERY_N_STEPS": 15000,
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_15000.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_15000.pt",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            4.5e-06
+            5e-06
         ],
         [
             0.05,
-            4.5e-05
+            5e-05
         ],
         [
             1.0,
-            4.5e-06
+            5e-06
         ]
     ],
-    "LR_GRAPH_MIN": 4.5e-06,
-    "LR_GRAPH_MAX": 4.5e-05,
+    "LR_GRAPH_MIN": 5e-06,
+    "LR_GRAPH_MAX": 5e-05,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -63,18 +56,18 @@
         "norm3",
         "conv_norm_out"
     ],
-    "TIMESTEP_CURRICULUM_MODE": "Fixed",
+    "TIMESTEP_CURRICULUM_MODE": "Dynamic Balancing",
     "TIMESTEP_CURRICULUM_START_RANGE": "0, 999",
     "TIMESTEP_CURRICULUM_END_PERCENT": 80,
-    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 5,
-    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.31, 0.91",
+    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 10,
+    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.51, 0.91",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_PER_CHANNEL_NOISE": true,
     "USE_SNR_GAMMA": false,
     "SNR_STRATEGY": "Min-SNR",
     "SNR_GAMMA": 2.5,
     "MIN_SNR_VARIANT": "debiased",
-    "USE_ZERO_TERMINAL_SNR": false,
+    "USE_ZERO_TERMINAL_SNR": true,
     "USE_IP_NOISE_GAMMA": false,
     "IP_NOISE_GAMMA": 0.01,
     "USE_COND_DROPOUT": false,
@@ -82,10 +75,10 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/Tester",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by nanika_iru",
             "repeats": 2,
-            "mirror_repeats": false,
-            "darken_repeats": false,
+            "mirror_repeats": true,
+            "darken_repeats": true,
             "use_mask": false,
             "mask_path": "",
             "mask_focus_factor": 2.0,
@@ -99,9 +92,9 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.1,
+        "weight_decay": 0.01,
         "use_grad_centralization": false,
-        "gc_alpha": 0.25
+        "gc_alpha": 1.0
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

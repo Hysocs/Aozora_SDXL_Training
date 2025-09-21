@@ -29,8 +29,6 @@ NUM_WORKERS = 4
 
 # --- Aspect Ratio Bucketing ---
 TARGET_PIXEL_AREA = 1327104
-BUCKET_ASPECT_RATIOS = [1.0, 1.5, 0.66, 1.33, 0.75, 1.77, 0.56]
-
 # --- Training Parameters ---
 MAX_TRAIN_STEPS = 35000
 GRADIENT_ACCUMULATION_STEPS = 64

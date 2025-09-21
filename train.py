@@ -40,13 +40,12 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 def set_seed(seed):
-    """Sets the seed for all relevant random number generators."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
     if torch.cuda.is_available():
         torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed) # for multi-GPU
+        torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
 class BucketBatchSampler(Sampler):
@@ -64,27 +63,21 @@ class BucketBatchSampler(Sampler):
         tqdm.write(f"INFO: BucketBatchSampler initialized with {len(self.epoch_indices)} total samples for one epoch.")
 
     def __iter__(self):
-        # Use a local generator for all randomization to ensure reproducibility.
         g = torch.Generator()
         g.manual_seed(self.seed)
 
-        # 1. Shuffle the master list of indices for the current epoch.
         if self.shuffle:
             shuffled_indices = torch.randperm(len(self.epoch_indices), generator=g).tolist()
         else:
             shuffled_indices = list(range(len(self.epoch_indices)))
 
-        # 2. Group the shuffled indices into buckets.
         buckets = defaultdict(list)
         for i in shuffled_indices:
             bucket_key = self.dataset.bucket_keys[i]
             if bucket_key is not None:
                 buckets[bucket_key].append(i)
         
-        # 3. Create batches from each bucket.
         all_batches = []
-        # We iterate through the buckets in a fixed (sorted) order to ensure consistency
-        # before the final shuffle.
         for bucket_key in sorted(buckets.keys()):
             bucket_indices = buckets[bucket_key]
             for i in range(0, len(bucket_indices), self.batch_size):
@@ -92,19 +85,13 @@ class BucketBatchSampler(Sampler):
                 if not self.drop_last or len(batch) == self.batch_size:
                     all_batches.append(batch)
         
-        # 4. --- THIS IS THE CRITICAL CHANGE ---
-        # Instead of sorting the batches, we now shuffle them.
-        # This ensures that batches from different aspect ratio buckets (and thus, different artists)
-        # are mixed together, providing a much more stable training signal.
         if self.shuffle:
-            # Shuffle the list of batches using our seeded generator.
             perm = torch.randperm(len(all_batches), generator=g).tolist()
             all_batches = [all_batches[i] for i in perm]
             
         for batch in all_batches:
             yield batch
             
-        # Increment the seed for the next epoch to get a new, predictable shuffle order.
         self.seed += 1
 
     def __len__(self):
@@ -118,7 +105,6 @@ class CustomCurveScheduler(_LRScheduler):
         if not lr_curve_points or len(lr_curve_points) < 2:
             raise ValueError("LR_CUSTOM_CURVE must contain at least two points.")
             
-        # This part remains the same
         self.absolute_points = sorted([[p[0] * max_steps, p[1]] for p in lr_curve_points])
         
         if self.absolute_points[0][0] > 0:
@@ -128,13 +114,10 @@ class CustomCurveScheduler(_LRScheduler):
 
         super().__init__(optimizer, last_epoch)
 
-    # THE KEY CHANGE IS HERE: We now pass the current step directly
     def get_lr(self, current_step=None):
-        # If no step is provided, fall back to the old behavior for compatibility
         if current_step is None:
             current_step = self.last_epoch
 
-        # The rest of the logic is the same, just using the new 'current_step' variable
         p1 = None
         p2 = None
         if current_step >= self.absolute_points[-1][0]:
@@ -147,7 +130,6 @@ class CustomCurveScheduler(_LRScheduler):
                 break
         
         if p1 is None or p2 is None:
-            # This can happen if current_step is exactly the last point
             return [self.absolute_points[-1][1] for _ in self.optimizer.param_groups]
 
         step1, lr1 = p1
@@ -161,10 +143,8 @@ class CustomCurveScheduler(_LRScheduler):
 
         return [current_lr for _ in self.optimizer.param_groups]
 
-    # We also need a new method to manually set the LR
     def step(self, current_step=None):
         if current_step is None:
-            # Fallback to default PyTorch behavior if no step is provided
             super().step()
             return
 
@@ -172,7 +152,6 @@ class CustomCurveScheduler(_LRScheduler):
         for param_group, lr in zip(self.optimizer.param_groups, new_lrs):
             param_group['lr'] = lr
         
-        # We still update last_epoch, though it's not used for calculation anymore
         self.last_epoch = current_step
     
 class TrainingConfig:
@@ -180,10 +159,12 @@ class TrainingConfig:
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
+
         parser = argparse.ArgumentParser(description="Load a specific training configuration.")
         parser.add_argument("--config", type=str, help="Path to the user configuration JSON file.")
         args = parser.parse_args()
         user_config_path = args.config
+        
         if user_config_path:
             path = Path(user_config_path)
             if path.exists():
@@ -192,8 +173,7 @@ class TrainingConfig:
                     with open(path, 'r') as f:
                         user_config = json.load(f)
                     for key, value in user_config.items():
-                        if hasattr(self, key):
-                            setattr(self, key, value)
+                        setattr(self, key, value)
                 except (json.JSONDecodeError, TypeError) as e:
                     print(f"ERROR: Could not read or parse {path}: {e}. Using default settings.")
             else:
@@ -205,10 +185,9 @@ class TrainingConfig:
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE"]
         bool_keys = [
-            "MIRROR_REPEATS", "DARKEN_REPEATS", 
-            "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", "USE_SNR_GAMMA",
-            "USE_ZERO_TERMINAL_SNR", "USE_IP_NOISE_GAMMA", "USE_RESIDUAL_SHIFTING", 
-            "USE_COND_DROPOUT", "USE_MASKED_TRAINING"
+            "MIRROR_REPEATS", "DARKEN_REPEATS", "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", 
+            "USE_SNR_GAMMA", "USE_ZERO_TERMINAL_SNR", "USE_IP_NOISE_GAMMA", 
+            "USE_RESIDUAL_SHIFTING", "USE_COND_DROPOUT", "USE_MASKED_TRAINING"
         ]
        
         for key in float_keys:
@@ -233,82 +212,95 @@ class TrainingConfig:
                     setattr(self, key, val.lower() in ['true', '1', 't', 'y', 'yes'])
                 else:
                     setattr(self, key, bool(val))
+        
         if hasattr(self, 'RAVEN_PARAMS'):
-            for param, val in self.RAVEN_PARAMS.items():
-                if isinstance(val, list):
-                    self.RAVEN_PARAMS[param] = [float(x) for x in val]
-                elif param == 'weight_decay' or param == 'eps':
-                    self.RAVEN_PARAMS[param] = float(val)
-        if hasattr(self, 'ADAFACTOR_PARAMS'):
-            for param, val in self.ADAFACTOR_PARAMS.items():
-                if param == 'eps':
-                    self.ADAFACTOR_PARAMS[param] = [float(x) for x in val]
-                elif param in ['clip_threshold', 'decay_rate', 'weight_decay']:
-                    self.ADAFACTOR_PARAMS[param] = float(val)
-                elif param == 'beta1' and isinstance(val, str) and val.lower() == 'none':
-                    self.ADAFACTOR_PARAMS[param] = None
+            if not isinstance(self.RAVEN_PARAMS, dict):
+                print("WARNING: RAVEN_PARAMS from config is not a dictionary. Using defaults.")
+                self.RAVEN_PARAMS = default_config.RAVEN_PARAMS
 
-class AspectRatioBucketing:
-    def __init__(self, target_area, aspect_ratios, stride=64):
+            raven_types = {
+                "betas": list, "eps": float, "weight_decay": float,
+                "use_grad_centralization": bool, "gc_alpha": float,
+            }
+
+            for param, expected_type in raven_types.items():
+                val = self.RAVEN_PARAMS.get(param)
+                try:
+                    if expected_type == bool:
+                        self.RAVEN_PARAMS[param] = str(val).lower() in ['true', '1'] if isinstance(val, (str, int)) else bool(val)
+                    elif expected_type == float:
+                        self.RAVEN_PARAMS[param] = float(val)
+                    elif expected_type == list and isinstance(val, list):
+                        self.RAVEN_PARAMS[param] = [float(x) for x in val]
+                except (ValueError, TypeError):
+                    default_val = default_config.RAVEN_PARAMS.get(param)
+                    print(f"WARNING: Could not convert RAVEN_PARAMS['{param}']. Using default: {default_val}")
+                    self.RAVEN_PARAMS[param] = default_val
+
+        if hasattr(self, 'ADAFACTOR_PARAMS'):
+            if not isinstance(self.ADAFACTOR_PARAMS, dict):
+                print("WARNING: ADAFACTOR_PARAMS from config is not a dictionary. Using defaults.")
+                self.ADAFACTOR_PARAMS = default_config.ADAFACTOR_PARAMS
+
+            ada_types = {
+                "eps": list, "clip_threshold": float, "decay_rate": float,
+                "beta1": 'optional_float', "weight_decay": float, "scale_parameter": bool,
+                "relative_step": bool, "warmup_init": bool
+            }
+
+            for param, expected_type in ada_types.items():
+                val = self.ADAFACTOR_PARAMS.get(param)
+                try:
+                    if expected_type == 'optional_float':
+                        if val is None or (isinstance(val, str) and val.lower() == 'none'):
+                            self.ADAFACTOR_PARAMS[param] = None
+                        else:
+                            self.ADAFACTOR_PARAMS[param] = float(val)
+                    elif expected_type == bool:
+                        self.ADAFACTOR_PARAMS[param] = str(val).lower() in ['true', '1'] if isinstance(val, (str, int)) else bool(val)
+                    elif expected_type == float:
+                        self.ADAFACTOR_PARAMS[param] = float(val)
+                    elif expected_type == list and isinstance(val, list):
+                        self.ADAFACTOR_PARAMS[param] = [float(x) for x in val]
+                except (ValueError, TypeError):
+                    default_val = default_config.ADAFACTOR_PARAMS.get(param)
+                    print(f"WARNING: Could not convert ADAFACTOR_PARAMS['{param}']. Using default: {default_val}")
+                    self.ADAFACTOR_PARAMS[param] = default_val
+
+class ResolutionCalculator:
+    def __init__(self, target_area, stride=64):
         self.target_area = target_area
         self.stride = stride
-        self.bucket_resolutions = self._generate_bucket_resolutions(aspect_ratios)
-        print(f"INFO: Initialized {len(self.bucket_resolutions)} aspect ratio buckets for a target area of ~{target_area/1e6:.2f}M pixels.")
-        for i, res in enumerate(self.bucket_resolutions): print(f" - Bucket {i}: {res} (AR: {res[0]/res[1]:.2f})")
-    def _generate_bucket_resolutions(self, aspect_ratios):
-        resolutions = set()
-        for aspect_ratio in aspect_ratios:
+        print(f"INFO: Initialized ResolutionCalculator for a target area of ~{target_area/1e6:.2f}M pixels.")
+
+    def calculate_resolution(self, width, height):
+        original_area = width * height
+        if original_area > self.target_area:
+            aspect_ratio = width / height
             h = math.sqrt(self.target_area / aspect_ratio)
             w = h * aspect_ratio
-            h = int(h // self.stride) * self.stride
             w = int(w // self.stride) * self.stride
-            if h > 0 and w > 0: resolutions.add((w, h))
-        return sorted(list(resolutions), key=lambda x: x[0] * x[1], reverse=True)
-    def assign_to_bucket(self, width, height):
-        aspect_ratio = width / height
-        best_bucket = min(self.bucket_resolutions, key=lambda b: abs(b[0]/b[1] - aspect_ratio))
-        return best_bucket
-
-def resize_and_crop(image, target_w, target_h):
-    """
-    High-quality resize and crop that uses progressive downscaling for large images
-    to prevent aliasing and moiré artifacts.
-    """
-    img_w, img_h = image.size
-    img_aspect = img_w / img_h
-    target_aspect = target_w / target_h
-
-    # Determine the initial resize dimensions to preserve aspect ratio
-    if img_aspect > target_aspect:
-        new_h = target_h
-        new_w = int(new_h * img_aspect)
-    else:
-        new_w = target_w
-        new_h = int(new_w / img_aspect)
-
-    # --- Progressive Downscaling Logic ---
-    # While the image is more than twice the size of the target, we do a series
-    # of 50% downscales using the fast and artifact-free BOX filter.
-    while img_w > new_w * 2 and img_h > new_h * 2:
-        # Calculate the intermediate size (halving the dimensions)
-        intermediate_w, intermediate_h = img_w // 2, img_h // 2
-        
-        # If the intermediate size is still larger than the target, resize.
-        if intermediate_w > new_w and intermediate_h > new_h:
-            image = image.resize((intermediate_w, intermediate_h), Image.Resampling.BOX)
-            img_w, img_h = image.size # Update current dimensions
+            h = int(h // self.stride) * self.stride
         else:
-            # Avoids overshooting the target
+            w = int(width // self.stride) * self.stride
+            h = int(height // self.stride) * self.stride
+        
+        if w == 0: w = self.stride
+        if h == 0: h = self.stride
+        return (w, h)
+
+def resize_to_fit(image, target_w, target_h):
+    img_w, img_h = image.size
+    
+    while img_w > target_w * 2 and img_h > target_h * 2:
+        intermediate_w, intermediate_h = img_w // 2, img_h // 2
+        if intermediate_w > target_w and intermediate_h > target_h:
+            image = image.resize((intermediate_w, intermediate_h), Image.Resampling.BOX)
+            img_w, img_h = image.size
+        else:
             break
 
-    # --- Final High-Quality Resize ---
-    # Now that the image is a reasonable size, we do the final resize
-    # with a high-quality bicubic filter to get a sharp result.
-    image = image.resize((new_w, new_h), Image.Resampling.BICUBIC)
-
-    # --- Center Crop ---
-    left, top = (new_w - target_w) // 2, (new_h - target_h) // 2
-    return image.crop((left, top, left + target_w, top + target_h))
+    return image.resize((target_w, target_h), Image.Resampling.BICUBIC)
 
 def apply_sigmoid_contrast(image, gain=10, cutoff=0.5):
     if image.mode != 'RGB':
@@ -319,26 +311,32 @@ def apply_sigmoid_contrast(image, gain=10, cutoff=0.5):
     arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
     return Image.fromarray(arr)
 
-def validate_image_and_assign_bucket(args):
-    ip, bucketer = args
+def validate_and_assign_resolution(args):
+    ip, calculator = args
     if "_truncated" in ip.stem: return None
     try:
         with Image.open(ip) as img:
             img.verify()
         with Image.open(ip) as img:
             img.load()
+            if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                background = Image.new("RGB", img.size, (128, 128, 128))
+                background.paste(img, (0, 0), img.split()[-1])
+                img = background
+            else:
+                img = img.convert("RGB")
             w, h = img.size
         cp = ip.with_suffix('.txt')
         caption = ip.stem.replace('_', ' ')
         if cp.exists():
             with open(cp, 'r', encoding='utf-8') as f: caption = f.read().strip()
        
-        bucket_resolution = bucketer.assign_to_bucket(w, h)
+        target_resolution = calculator.calculate_resolution(w, h)
        
         return {
             "ip": ip,
             "caption": caption,
-            "bucket_resolution": bucket_resolution,
+            "target_resolution": target_resolution,
             "original_size": (w, h)
         }
     except Exception as e:
@@ -354,13 +352,13 @@ def validate_image_and_assign_bucket(args):
         return None
 
 def validate_wrapper(args):
-    return validate_image_and_assign_bucket(args)
+    return validate_and_assign_resolution(args)
 
 def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, text_encoder2, vae, device_for_encoding):
     if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
         config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
    
-    bucketer = AspectRatioBucketing(config.TARGET_PIXEL_AREA, config.BUCKET_ASPECT_RATIOS)
+    calculator = ResolutionCalculator(config.TARGET_PIXEL_AREA)
     vae.to(device_for_encoding); text_encoder1.to(device_for_encoding); text_encoder2.to(device_for_encoding)
     vae.enable_tiling()
     img_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
@@ -381,11 +379,11 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         if not images_to_process:
             print("All images are already cached. Nothing to do.")
             continue
-        print(f"Found {len(images_to_process)} images to cache. Now validating and assigning to buckets...")
+        print(f"Found {len(images_to_process)} images to cache. Now validating and assigning resolutions...")
    
         with Pool(processes=cpu_count()) as pool:
-            args = [(ip, bucketer) for ip in images_to_process]
-            results = list(tqdm(pool.imap(validate_wrapper, args), total=len(args), desc="Validating and bucketing"))
+            args = [(ip, calculator) for ip in images_to_process]
+            results = list(tqdm(pool.imap(validate_wrapper, args), total=len(args), desc="Validating"))
    
         image_metadata = [res for res in results if res]
         if not image_metadata: 
@@ -395,12 +393,12 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
    
         grouped_metadata = defaultdict(list)
         for meta in image_metadata:
-            grouped_metadata[meta["bucket_resolution"]].append(meta)
+            grouped_metadata[meta["target_resolution"]].append(meta)
    
         all_batches_to_process = []
-        for bucket_res, metadata_list in grouped_metadata.items():
+        for target_res, metadata_list in grouped_metadata.items():
             for i in range(0, len(metadata_list), config.CACHING_BATCH_SIZE):
-                all_batches_to_process.append((bucket_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
+                all_batches_to_process.append((target_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
         random.shuffle(all_batches_to_process)
    
         print("INFO: Caching all variants (original, flipped, contrast, flipped-contrast) for future use.")
@@ -417,14 +415,21 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
             
             for meta in batch_metadata:
                 try:
-                    img = Image.open(meta['ip']).convert('RGB')
+                    with Image.open(meta['ip']) as img:
+                        if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
+                            background = Image.new("RGB", img.size, (128, 128, 128))
+                            background.paste(img, (0, 0), img.split()[-1])
+                            img = background
+                        else:
+                            img = img.convert("RGB")
+
                     contrast_img = apply_sigmoid_contrast(img, gain=10)
                     
-                    processed_img = resize_and_crop(img, target_w, target_h)
+                    processed_img = resize_to_fit(img, target_w, target_h)
                     image_tensors_variants["original"].append(img_transform(processed_img))
                     image_tensors_variants["flipped"].append(img_transform(processed_img.transpose(Image.FLIP_LEFT_RIGHT)))
                     
-                    processed_contrast = resize_and_crop(contrast_img, target_w, target_h)
+                    processed_contrast = resize_to_fit(contrast_img, target_w, target_h)
                     image_tensors_variants["contrast"].append(img_transform(processed_contrast))
                     image_tensors_variants["flipped_contrast"].append(img_transform(processed_contrast.transpose(Image.FLIP_LEFT_RIGHT)))
 
@@ -445,7 +450,7 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                 cache_dir.mkdir(exist_ok=True)
                 save_data = {
                     "original_size_as_tuple": meta["original_size"],
-                    "target_size_as_tuple": (target_h, target_w),
+                    "target_size_as_tuple": (target_w, target_h),
                     "prompt_embeds_cpu": prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
                     "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
                 }
@@ -490,9 +495,6 @@ class ImageTextLatentDataset(Dataset):
         if not hasattr(config, "INSTANCE_DATASETS") or not config.INSTANCE_DATASETS:
             config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
             
-        # --- START OF MODIFIED SECTION ---
-        
-        # 1. Load all file paths and their variants into per-dataset lists first.
         all_dataset_files = []
         for dataset_config in config.INSTANCE_DATASETS:
             root = Path(dataset_config["path"])
@@ -527,7 +529,6 @@ class ImageTextLatentDataset(Dataset):
             
             all_dataset_files.append(current_dataset_entries)
 
-        # 2. Interleave the datasets in a round-robin fashion.
         self.latent_files = []
         max_len = max(len(d) for d in all_dataset_files)
         for i in range(max_len):
@@ -535,22 +536,19 @@ class ImageTextLatentDataset(Dataset):
                 if i < len(dataset_list):
                     self.latent_files.append(dataset_list[i])
 
-        # --- END OF MODIFIED SECTION ---
-
         if not self.latent_files:
             raise ValueError("No cached embedding files found across all datasets. Please ensure pre-caching was successful.")
         
-        # The rest of the __init__ method (pre-caching bucket keys) remains the same.
-        tqdm.write("INFO: Pre-caching bucket shapes for all latent files...")
+        tqdm.write("INFO: Pre-caching bucket keys for all latent files...")
         self.bucket_keys = []
         for file_path, _, _ in tqdm(self.latent_files, desc="Caching bucket keys"):
             try:
                 full_data = torch.load(file_path, map_location="cpu")
-                latents = full_data.get("original", {}).get("latents_cpu")
-                if latents is not None:
-                    self.bucket_keys.append(latents.shape[-2:])
+                target_size = full_data.get("target_size_as_tuple")
+                if target_size is not None:
+                    self.bucket_keys.append(tuple(target_size))
                 else:
-                    tqdm.write(f"WARNING: 'original' latents not found in {file_path}. Marking as invalid.")
+                    tqdm.write(f"WARNING: 'target_size_as_tuple' not found in {file_path}. Marking as invalid.")
                     self.bucket_keys.append(None)
             except Exception as e:
                 tqdm.write(f"WARNING: Could not load bucket key for {file_path}: {e}")
@@ -602,7 +600,7 @@ class ImageTextLatentDataset(Dataset):
                 "mask_latent_cpu": mask_latent,
                 "mask_focus_factor_cpu": focus_factor,
                 "mask_focus_mode_cpu": focus_mode,
-                "file_path_str": str(file_path.name) # We only need the filename
+                "file_path_str": str(file_path.name)
             }
         except Exception as e:
             print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
@@ -628,7 +626,7 @@ class TimestepSampler:
         self.config = config
         self.device = device
         self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
-        self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_") # e.g., "static_adaptive"
+        self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_")
         
         try:
             min_val_str, max_val_str = config.TIMESTEP_CURRICULUM_START_RANGE.split(',')
@@ -646,7 +644,7 @@ class TimestepSampler:
             self._init_static_adaptive_mode()
         elif self.mode == "dynamic_balancing":
             self._init_dynamic_mode()
-        else: # Fixed mode
+        else:
             print(f"INFO: Initialized Fixed Timestep Sampling with range: [{self.initial_min}, {self.initial_max}]")
 
     def _init_static_adaptive_mode(self):
@@ -697,7 +695,7 @@ class TimestepSampler:
             max_ts = int(round(self.initial_max + (self.num_train_timesteps - 1 - self.initial_max) * progress))
         elif self.mode == "dynamic_balancing":
             min_ts, max_ts = self.current_min_ts, self.current_max_ts
-        else: # fixed mode
+        else:
             min_ts, max_ts = self.initial_min, self.initial_max
 
         if max_ts < min_ts: max_ts = min_ts
@@ -805,7 +803,7 @@ class TrainingDiagnostics:
         self.grad_norms = deque(maxlen=accumulation_steps)
         self.max_grads = deque(maxlen=accumulation_steps)
         self.timesteps = deque(maxlen=accumulation_steps * 256)
-        self.last_grad_norm = 0.75 # Start with a healthy default
+        self.last_grad_norm = 0.75
 
     def step(self, loss, timesteps):
         if loss is not None:
@@ -827,7 +825,7 @@ class TrainingDiagnostics:
                     max_grad_val = current_max
             total_norm = total_norm ** 0.5
         
-        self.last_grad_norm = total_norm # <-- STORE THE LATEST GRAD NORM
+        self.last_grad_norm = total_norm
         
         avg_loss = sum(self.losses) / len(self.losses)
         vram_gb = torch.cuda.memory_reserved() / 1e9
@@ -883,8 +881,6 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     return final_map
 
 def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
-    """Saves the UNet weights into the base model state_dict and provides a detailed verification report."""
-    
     def get_param_category(key_name):
         if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
         if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
@@ -896,11 +892,8 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     print("\nUpdating weights for UNet...")
     
-    # Directly get the trained weights from the UNet on the GPU
     model_sd_on_device = unet.state_dict()
    
-    # Create a new state dictionary for saving to avoid modifying the original in-memory one.
-    # This is still far more memory-efficient than deepcopying the entire base model.
     sd_to_save = copy.deepcopy(base_sd)
 
     for hf_key in trained_unet_param_names:
@@ -911,11 +904,9 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
         if mapped_part:
             sd_key = 'model.diffusion_model.' + mapped_part
             if sd_key in sd_to_save:
-                # Move the tensor to CPU and convert dtype before assigning
                 sd_to_save[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
                 param_counters[category]['saved'] += 1
     
-    # It's crucial to clean up the GPU-side state dict after use
     del model_sd_on_device
     gc.collect()
 
@@ -935,11 +926,9 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
     print("="*60)
     
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    # Save the newly created state dictionary
     save_file(sd_to_save, output_path)
     print(f"[OK] Save complete: {output_path}")
     
-    # Clean up the copied state dict
     del sd_to_save
     gc.collect()
 
@@ -947,7 +936,6 @@ def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype)
 def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
     print(f"\nSAVING CHECKPOINT AT STEP {step}")
 
-    # --- Step 1: Save optimizer and scheduler state to a file FIRST ---
     state_path = checkpoint_dir / f"training_state_step_{step}.pt"
     torch.save({
         'step': step,
@@ -957,14 +945,11 @@ def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, sch
     }, state_path)
     print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
 
-    # --- Step 2: Explicitly delete the optimizer and scheduler to free RAM ---
-    # This is the crucial step to prevent OOM.
     del optimizer
     del scheduler
-    gc.collect() # Ask the garbage collector to release the memory.
+    gc.collect()
     print("[INFO] Optimizer and scheduler have been released from memory.")
 
-    # --- Step 3: Now, with RAM freed up, save the model weights ---
     checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
     save_model(
         base_sd=base_model_state_dict,
@@ -989,7 +974,6 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
   
 def main():
     config = TrainingConfig()
-    # Set seeds for reproducibility
     if config.SEED is not None:
         set_seed(config.SEED)
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -1000,9 +984,8 @@ def main():
     for ds in config.INSTANCE_DATASETS:
         if not Path(ds["path"]).exists(): raise FileNotFoundError(f"Data dir not found: {ds['path']}")
     if not config.SINGLE_FILE_CHECKPOINT_PATH or not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists():
-        # Handle case where base model path might be missing in some configs
         if config.RESUME_TRAINING and config.RESUME_MODEL_PATH and Path(config.RESUME_MODEL_PATH).exists():
-             pass # Will be handled by resume logic
+             pass
         else:
             raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
 
@@ -1056,7 +1039,6 @@ def main():
     unet.to(device).requires_grad_(False)
     unet.enable_gradient_checkpointing()
 
-    # Calculate and display trainable parameters
     total_params = sum(p.numel() for p in unet.parameters())
     trainable_params_names = {name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS)}
     params_to_optimize = [p for n, p in unet.named_parameters() if n in trainable_params_names]
@@ -1065,7 +1047,7 @@ def main():
     
     print(f"Targeting UNet layers with keywords: {config.UNET_TRAIN_TARGETS}")
     param_info_str = f"{trainable_params_count/1e6:.2f}M / {total_params/1e6:.2f}M ({trainable_params_count/total_params*100:.2f}%)"
-    print(f"GUI_PARAM_INFO::{param_info_str}") # Special string for GUI
+    print(f"GUI_PARAM_INFO::{param_info_str}")
 
     if not params_to_optimize: raise ValueError("No parameters were selected for training.")
     
@@ -1116,7 +1098,7 @@ def main():
             self.config = config
             self.device = device
             self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
-            self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_") # e.g., "static_adaptive"
+            self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_")
             
             try:
                 min_val_str, max_val_str = config.TIMESTEP_CURRICULUM_START_RANGE.split(',')
@@ -1134,7 +1116,7 @@ def main():
                 self._init_static_adaptive_mode()
             elif self.mode == "dynamic_balancing":
                 self._init_dynamic_mode()
-            else: # Fixed mode
+            else:
                 print(f"INFO: Initialized Fixed Timestep Sampling with range: [{self.initial_min}, {self.initial_max}]")
 
         def _init_static_adaptive_mode(self):
@@ -1155,7 +1137,7 @@ def main():
                 self.target_grad_norm_max = 0.90
             
             self.current_min_ts = self.initial_min
-            self.current_max_ts = self.initial_max
+            self.current_max_ts = self.initial_max 
             self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.005)) 
 
             print("INFO: Initialized Dynamic Challenge Balancing.")
@@ -1165,29 +1147,18 @@ def main():
         def update_range(self, grad_norm, current_step):
             if self.mode != "dynamic_balancing": return
 
-            # --- PROBE PHASE ---
-            # During the initial probe phase, we aggressively oscillate between expanding the
-            # upper and lower boundaries to find the effective training range as fast as possible.
             if current_step <= self.probe_duration_steps:
-                # On even steps, we test the upper boundary (harder timesteps).
                 if current_step % 2 == 0:
-                    # If the gradient norm is not yet challenging enough, push the max timestep higher.
                     if grad_norm < self.target_grad_norm_max:
                         self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
-                # On odd steps, we test the lower boundary (easier timesteps).
                 else:
-                    # If the gradient norm is not yet easy enough, pull the min timestep lower.
                     if grad_norm > self.target_grad_norm_min:
                         self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
             
-            # --- BALANCING PHASE ---
-            # After the probe phase, we fine-tune the range to keep the grad norm within the target zone.
             else:
                 if grad_norm > self.target_grad_norm_max:
-                    # Task is too hard, make it easier by reducing the max timestep.
                     self.current_max_ts = max(self.current_min_ts, self.current_max_ts - self.adjustment_step_size)
                 elif grad_norm < self.target_grad_norm_min:
-                    # Task is too easy, make it harder by expanding the range in both directions.
                     self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
                     self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
 
@@ -1199,13 +1170,12 @@ def main():
                 max_ts = int(round(self.initial_max + (self.num_train_timesteps - 1 - self.initial_max) * progress))
             elif self.mode == "dynamic_balancing":
                 min_ts, max_ts = self.current_min_ts, self.current_max_ts
-            else: # fixed mode
+            else:
                 min_ts, max_ts = self.initial_min, self.initial_max
 
             if max_ts < min_ts: max_ts = min_ts
             return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device).long()
 
-    # --- UPDATED FEATURE PLUGINS ---
     class FeaturePlugins:
         def __init__(self, config, noise_scheduler, device):
             self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
@@ -1223,7 +1193,6 @@ def main():
     sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, seed=config.SEED, shuffle=True, drop_last=False)
     train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
     
-    # --- UPDATED TRAIN STEP FUNCTION ---
     def train_step(batch, current_step):
         latents = batch["latents"]
         noise = torch.randn_like(latents) if config.USE_PER_CHANNEL_NOISE else torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
@@ -1263,7 +1232,6 @@ def main():
 
             batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            # --- UPDATED CALL TO TRAIN_STEP ---
             loss_item, timesteps = train_step(batch, current_step=global_step)
             diagnostics.step(loss_item, timesteps)
 
