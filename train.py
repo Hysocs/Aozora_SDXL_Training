@@ -33,6 +33,7 @@ from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers.optimization import Adafactor
 from torch.optim import AdamW
 
+
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -185,8 +186,8 @@ class TrainingConfig:
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
         str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE"]
         bool_keys = [
-            "MIRROR_REPEATS", "DARKEN_REPEATS", "RESUME_TRAINING", "USE_PER_CHANNEL_NOISE", 
-            "USE_SNR_GAMMA", "USE_ZERO_TERMINAL_SNR", "USE_IP_NOISE_GAMMA", 
+            "MIRROR_REPEATS", "DARKEN_REPEATS", "RESUME_TRAINING", 
+            "USE_SNR_GAMMA", "USE_ZERO_TERMINAL_SNR", 
             "USE_RESIDUAL_SHIFTING", "USE_COND_DROPOUT", "USE_MASKED_TRAINING"
         ]
        
@@ -320,7 +321,7 @@ def validate_and_assign_resolution(args):
         with Image.open(ip) as img:
             img.load()
             if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                background = Image.new("RGB", img.size, (128, 128, 128))
+                background = Image.new("RGB", img.size, (205, 205, 205))
                 background.paste(img, (0, 0), img.split()[-1])
                 img = background
             else:
@@ -362,7 +363,7 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
     vae.to(device_for_encoding); text_encoder1.to(device_for_encoding); text_encoder2.to(device_for_encoding)
     vae.enable_tiling()
     img_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-   
+
     for dataset in config.INSTANCE_DATASETS:
         data_root_path = Path(dataset["path"])
         print(f"Processing dataset: {data_root_path}")
@@ -416,14 +417,16 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
             for meta in batch_metadata:
                 try:
                     with Image.open(meta['ip']) as img:
+                        img = img.convert("RGB")
+
                         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                            background = Image.new("RGB", img.size, (128, 128, 128))
+                            background = Image.new("RGB", img.size, (255, 255, 255)) 
                             background.paste(img, (0, 0), img.split()[-1])
                             img = background
                         else:
                             img = img.convert("RGB")
 
-                    contrast_img = apply_sigmoid_contrast(img, gain=10)
+                    contrast_img = apply_sigmoid_contrast(img, gain=10) 
                     
                     processed_img = resize_to_fit(img, target_w, target_h)
                     image_tensors_variants["original"].append(img_transform(processed_img))
@@ -440,7 +443,13 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                 for key, tensors in image_tensors_variants.items():
                     if tensors:
                         tensor_batch = torch.stack(tensors).to(device_for_encoding, dtype=vae.dtype)
+                        
                         latents_batch = vae.encode(tensor_batch).latent_dist.mean * vae.config.scaling_factor
+                        
+                        if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
+                            tqdm.write(f"\n[WARNING] NaN/Inf detected post-noising in batch '{key}'. Sanitizing.")
+                            latents_batch = torch.nan_to_num(latents_batch, nan=0.0, posinf=0.0, neginf=0.0)
+
                         variants[key] = latents_batch
                         del tensor_batch
             
@@ -701,23 +710,6 @@ class TimestepSampler:
         if max_ts < min_ts: max_ts = min_ts
         return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device).long()
 
-class InputPerturbation:
-    def __init__(self, config):
-        self.is_enabled = config.USE_IP_NOISE_GAMMA and config.IP_NOISE_GAMMA > 0
-        if self.is_enabled:
-            self.gamma = config.IP_NOISE_GAMMA
-            self.use_per_channel = config.USE_PER_CHANNEL_NOISE
-            print(f"INFO: Input Perturbation enabled with gamma={self.gamma}, per-channel={self.use_per_channel}.")
-
-    def __call__(self, latents):
-        if not self.is_enabled:
-            return latents
-        
-        if self.use_per_channel:
-            noise = torch.randn_like(latents)
-        else:
-            noise = torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
-        return latents + self.gamma * noise
 
 class ConditioningDropout:
     def __init__(self, config):
@@ -789,7 +781,6 @@ class MinSNRLoss:
 class FeaturePlugins:
     def __init__(self, config, noise_scheduler, device):
         self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)  
-        self.input_perturbation = InputPerturbation(config)
         self.conditioning_dropout = ConditioningDropout(config)
         self.base_loss = BaseLoss()
         self.masked_loss = MaskedLoss(config)
@@ -1179,7 +1170,6 @@ def main():
     class FeaturePlugins:
         def __init__(self, config, noise_scheduler, device):
             self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
-            self.input_perturbation = InputPerturbation(config)
             self.conditioning_dropout = ConditioningDropout(config)
             self.base_loss = BaseLoss()
             self.masked_loss = MaskedLoss(config)
@@ -1195,17 +1185,36 @@ def main():
     
     def train_step(batch, current_step):
         latents = batch["latents"]
-        noise = torch.randn_like(latents) if config.USE_PER_CHANNEL_NOISE else torch.randn_like(latents[:, :1, :, :]).repeat(1, latents.shape[1], 1, 1)
+
+        # --- REPLACEMENT: OFFSET NOISE IMPLEMENTATION ---
+        noise = torch.randn_like(latents)
+        noise_offset_strength = 0.1
+        offset_noise = torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
+        noise = noise + noise_offset_strength * offset_noise
+        # --- END OF REPLACEMENT ---
+
         timesteps = plugins.timestep_sampler(latents.shape[0], current_step=current_step)
-        perturbed_latents = plugins.input_perturbation(latents)
-        noisy_latents = noise_scheduler.add_noise(perturbed_latents, noise, timesteps)
-        target = noise_scheduler.get_velocity(perturbed_latents, noise, timesteps) if plugins.is_v_prediction else noise
+        
+        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+        target = noise_scheduler.get_velocity(latents, noise, timesteps) if plugins.is_v_prediction else noise
+        
+        # --- FIX: Changed batch["pooled_embeds"] to the correct key batch["pooled_prompt_embeds"] ---
         prompt_embeds, pooled_embeds = plugins.conditioning_dropout(batch["prompt_embeds"], batch["pooled_prompt_embeds"])
+        
         add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
         
         with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
-            pred = unet(noisy_latents, timesteps, prompt_embeds, added_cond_kwargs={"text_embeds": pooled_embeds, "time_ids": add_time_ids}).sample
-            loss_no_reduction = plugins.base_loss(pred, target, plugins.is_v_prediction)
+            pred = unet(
+                noisy_latents.to(config.compute_dtype),
+                timesteps,
+                prompt_embeds.to(config.compute_dtype),
+                added_cond_kwargs={
+                    "text_embeds": pooled_embeds.to(config.compute_dtype),
+                    "time_ids": add_time_ids.to(config.compute_dtype)
+                }
+            ).sample
+            
+            loss_no_reduction = plugins.base_loss(pred.float(), target.float(), plugins.is_v_prediction)
             loss_per_item = plugins.masked_loss(loss_no_reduction, batch["masks"], batch["mask_focus_factors"], batch["mask_focus_modes"])
             loss, snr_weights = plugins.min_snr_loss(loss_per_item, timesteps)
         

@@ -585,7 +585,6 @@ class TrainingGUI(QtWidgets.QWidget):
         "SNR_STRATEGY": {"label": "Strategy:", "tooltip": "Min-SNR focuses on noisy steps, Max-SNR focuses on cleaner steps.", "widget": "QComboBox", "options": ["Min-SNR", "Max-SNR"]},
         "SNR_GAMMA": {"label": "Gamma Value:", "tooltip": "For Min-SNR, common range is 5-20. For Max-SNR, this acts as a clamp.", "widget": "QLineEdit"},
         "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["debiased", "corrected", "standard"]},
-        "IP_NOISE_GAMMA": {"label": "Gamma Value:", "tooltip": "Common range is 0.05 to 0.25.", "widget": "QLineEdit"},
         "COND_DROPOUT_PROB": {"label": "Dropout Probability:", "tooltip": "e.g., 0.1 (5-15% common).", "widget": "QLineEdit"},
         "TIMESTEP_CURRICULUM_MODE": {
             "label": "Curriculum Mode:",
@@ -1255,9 +1254,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         noise_group = QtWidgets.QGroupBox("Noise & Regularization")
         noise_layout = QtWidgets.QVBoxLayout(noise_group)
-        self._create_bool_option(noise_layout, "USE_PER_CHANNEL_NOISE", "Use Per-Channel (Color) Noise", "Enables applying noise independently to R, G, and B channels.")
-        noise_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(noise_layout, "USE_IP_NOISE_GAMMA", "Use Input Perturbation Noise", "Adds noise to input latents for regularization.", self.toggle_ip_noise_gamma_widget)
+
         self.ip_sub_widget = SubOptionWidget()
         label, widget = self._create_widget("IP_NOISE_GAMMA"); self.ip_sub_widget.get_layout().addWidget(label); self.ip_sub_widget.get_layout().addWidget(widget)
         noise_layout.addWidget(self.ip_sub_widget)
@@ -1477,7 +1474,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
             # --- Call all toggle functions to ensure UI state is correct ---
             for toggle_func in [
-                self.toggle_snr_gamma_widget, self.toggle_ip_noise_gamma_widget,
+                self.toggle_snr_gamma_widget,
                 self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets,
                 self.toggle_curriculum_sub_widgets
             ]:
@@ -1516,8 +1513,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.snr_sub_widget.setVisible(is_checked)
             if is_checked:
                 self.toggle_snr_variant_widget()
-    def toggle_ip_noise_gamma_widget(self):
-        if hasattr(self, 'ip_sub_widget'): self.ip_sub_widget.setVisible(self.widgets.get("USE_IP_NOISE_GAMMA", QtWidgets.QCheckBox()).isChecked())
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
@@ -1761,26 +1756,54 @@ class TrainingGUI(QtWidgets.QWidget):
     def plot_loss_from_console(self):
         console_text = self.log_textbox.toPlainText()
         df = extract_data(console_text)
-        if df.empty:
-            QtWidgets.QMessageBox.warning(self, "No Data", "Could not find any valid training step entries in the console output.")
+        if df.empty or "Loss" not in df.columns or "GradNorm" not in df.columns:
+            QtWidgets.QMessageBox.warning(self, "No Data", "Could not find any valid Loss or Grad Norm entries in the console output.")
             return
+
+        # Prepare data
         x = df["Step"]
-        y = df["Loss"]
-        if len(y) > 10:
-            sigma = min(3, max(1, len(y) / 20))
-            y_smooth = gaussian_filter1d(y, sigma=sigma)
-        else:
-            y_smooth = y
-        plt.figure(figsize=(10, 6))
-        plt.plot(x, y, marker="o", linestyle="-", label="Raw Loss", alpha=0.5, markersize=3)
-        if len(y) > 10:
-            plt.plot(x, y_smooth, "g-", linewidth=3, label=f"Smoothed Trend (σ={sigma:.1f})")
-        plt.xlabel("Step")
-        plt.ylabel("Loss")
-        plt.title("Training Loss Over Steps with Smoothed Trend")
-        plt.grid(True, alpha=0.3)
-        plt.legend()
-        plt.tight_layout()
+        y_loss = df["Loss"]
+        y_grad = df["GradNorm"]
+
+        # Create figure and primary axis for Loss
+        fig, ax1 = plt.subplots(figsize=(12, 7))
+
+        # --- Plot Loss on the left Y-axis (ax1) ---
+        color_loss = 'tab:blue'
+        ax1.set_xlabel("Step")
+        ax1.set_ylabel("Loss", color=color_loss)
+        ax1.plot(x, y_loss, marker='o', linestyle=':', color=color_loss, label="Raw Loss", alpha=0.4, markersize=3)
+        ax1.tick_params(axis='y', labelcolor=color_loss)
+
+        # Smooth Loss if enough data points exist
+        if len(y_loss) > 10:
+            sigma_loss = min(5, max(1, len(y_loss) / 20))
+            y_loss_smooth = gaussian_filter1d(y_loss, sigma=sigma_loss)
+            ax1.plot(x, y_loss_smooth, color=color_loss, linewidth=2.5, label=f"Smoothed Loss (σ={sigma_loss:.1f})")
+
+        # Create a secondary axis for Grad Norm that shares the same x-axis
+        ax2 = ax1.twinx()
+        color_grad = 'tab:red'
+        ax2.set_ylabel("Grad Norm", color=color_grad)
+        ax2.plot(x, y_grad, marker='x', linestyle=':', color=color_grad, label="Raw Grad Norm", alpha=0.4, markersize=3)
+        ax2.tick_params(axis='y', labelcolor=color_grad)
+
+        # Smooth Grad Norm if enough data points exist
+        if len(y_grad) > 10:
+            sigma_grad = min(5, max(1, len(y_grad) / 20))
+            y_grad_smooth = gaussian_filter1d(y_grad, sigma=sigma_grad)
+            ax2.plot(x, y_grad_smooth, color=color_grad, linewidth=2.5, label=f"Smoothed Grad Norm (σ={sigma_grad:.1f})")
+
+        # --- Final Touches ---
+        plt.title("Training Loss and Gradient Norm Over Steps")
+        ax1.grid(True, axis='x', alpha=0.3) # Only show vertical grid lines
+        
+        # Combine legends from both axes into one box
+        lines, labels = ax1.get_legend_handles_labels()
+        lines2, labels2 = ax2.get_legend_handles_labels()
+        ax2.legend(lines + lines2, labels + labels2, loc='upper right')
+
+        fig.tight_layout()
         plt.show()
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()

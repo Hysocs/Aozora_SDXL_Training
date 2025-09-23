@@ -5,8 +5,8 @@
     "BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
-    "MAX_TRAIN_STEPS": 2000,
-    "GRADIENT_ACCUMULATION_STEPS": 8,
+    "MAX_TRAIN_STEPS": 4500,
+    "GRADIENT_ACCUMULATION_STEPS": 16,
     "CLIP_GRAD_NORM": 1.25,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 69,
@@ -16,19 +16,59 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            5e-06
+            3e-06
         ],
         [
-            0.05,
-            5e-05
+            0.1,
+            3e-05
+        ],
+        [
+            0.1,
+            3e-05
+        ],
+        [
+            0.19,
+            2.93393e-05
+        ],
+        [
+            0.28,
+            2.74217e-05
+        ],
+        [
+            0.37,
+            2.44351e-05
+        ],
+        [
+            0.46,
+            2.06717e-05
+        ],
+        [
+            0.55,
+            1.65e-05
+        ],
+        [
+            0.64,
+            1.23283e-05
+        ],
+        [
+            0.73,
+            8.5649e-06
+        ],
+        [
+            0.82,
+            5.5783e-06
+        ],
+        [
+            0.91,
+            3.6607e-06
         ],
         [
             1.0,
-            5e-06
+            3e-06
         ]
     ],
-    "LR_GRAPH_MIN": 5e-06,
-    "LR_GRAPH_MAX": 5e-05,
+    "LR_GRAPH_MIN": 3e-06,
+    "LR_GRAPH_MAX": 3e-05,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -57,18 +97,17 @@
         "conv_norm_out"
     ],
     "TIMESTEP_CURRICULUM_MODE": "Dynamic Balancing",
-    "TIMESTEP_CURRICULUM_START_RANGE": "0, 999",
+    "TIMESTEP_CURRICULUM_START_RANGE": "200, 800",
     "TIMESTEP_CURRICULUM_END_PERCENT": 80,
-    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 10,
-    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.51, 0.91",
+    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 8,
+    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.19, 0.89",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_PER_CHANNEL_NOISE": true,
-    "USE_SNR_GAMMA": false,
+    "USE_SNR_GAMMA": true,
     "SNR_STRATEGY": "Min-SNR",
     "SNR_GAMMA": 2.5,
     "MIN_SNR_VARIANT": "debiased",
     "USE_ZERO_TERMINAL_SNR": true,
-    "USE_IP_NOISE_GAMMA": false,
+    "USE_IP_NOISE_GAMMA": true,
     "IP_NOISE_GAMMA": 0.01,
     "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.05,
@@ -76,6 +115,46 @@
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures/Datasets/by nanika_iru",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by madao",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by Didac",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by raiden",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by sAviOr",
             "repeats": 2,
             "mirror_repeats": true,
             "darken_repeats": true,
@@ -93,8 +172,8 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "use_grad_centralization": false,
-        "gc_alpha": 1.0
+        "use_grad_centralization": true,
+        "gc_alpha": 0.4999999999999996
     },
     "ADAFACTOR_PARAMS": {
         "eps": [
