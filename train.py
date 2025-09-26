@@ -390,6 +390,23 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         if not image_metadata: 
             print(f"WARNING: No valid images found in {data_root_path}. Skipping.")
             continue
+        
+        # --- MODIFICATION START: Save metadata to a JSON file ---
+        print("INFO: Saving resolution metadata to metadata.json...")
+        resolution_metadata = {
+            meta['ip'].stem: meta['target_resolution']
+            for meta in image_metadata
+        }
+        metadata_path = data_root_path / "metadata.json"
+        try:
+            with open(metadata_path, 'w', encoding='utf-8') as f:
+                # Convert Path objects to strings for JSON serialization if necessary
+                json.dump(resolution_metadata, f, indent=4)
+            print(f"[OK] Saved metadata for {len(resolution_metadata)} images to {metadata_path}")
+        except Exception as e:
+            print(f"[ERROR] Could not save metadata.json: {e}")
+        # --- MODIFICATION END ---
+
         print(f"Validation complete. Found {len(image_metadata)} valid images to cache.")
    
         grouped_metadata = defaultdict(list)
@@ -548,20 +565,34 @@ class ImageTextLatentDataset(Dataset):
         if not self.latent_files:
             raise ValueError("No cached embedding files found across all datasets. Please ensure pre-caching was successful.")
         
-        tqdm.write("INFO: Pre-caching bucket keys for all latent files...")
+        # --- MODIFICATION START: Efficiently load bucket keys from metadata.json ---
+        tqdm.write("INFO: Pre-loading bucket keys from metadata.json files...")
         self.bucket_keys = []
-        for file_path, _, _ in tqdm(self.latent_files, desc="Caching bucket keys"):
-            try:
-                full_data = torch.load(file_path, map_location="cpu")
-                target_size = full_data.get("target_size_as_tuple")
-                if target_size is not None:
-                    self.bucket_keys.append(tuple(target_size))
-                else:
-                    tqdm.write(f"WARNING: 'target_size_as_tuple' not found in {file_path}. Marking as invalid.")
-                    self.bucket_keys.append(None)
-            except Exception as e:
-                tqdm.write(f"WARNING: Could not load bucket key for {file_path}: {e}")
+        all_metadata = {}
+
+        # Load all metadata from all specified datasets into one dictionary
+        for dataset_config in config.INSTANCE_DATASETS:
+            root = Path(dataset_config["path"])
+            metadata_path = root / "metadata.json"
+            if metadata_path.exists():
+                try:
+                    with open(metadata_path, 'r', encoding='utf-8') as f:
+                        all_metadata.update(json.load(f))
+                except (json.JSONDecodeError, TypeError) as e:
+                    tqdm.write(f"WARNING: Could not load or parse {metadata_path}: {e}")
+            else:
+                tqdm.write(f"WARNING: metadata.json not found for dataset {root}. Bucket info will be missing for its images.")
+
+        # Assign bucket keys by looking up the file stem in the loaded metadata
+        for file_path, _, _ in tqdm(self.latent_files, desc="Assigning bucket keys"):
+            bucket_key = all_metadata.get(file_path.stem)
+            if bucket_key:
+                # JSON loads lists, convert back to tuple for dictionary key usage
+                self.bucket_keys.append(tuple(bucket_key))
+            else:
+                tqdm.write(f"WARNING: No metadata found for {file_path.stem}. Marking as invalid for bucketing.")
                 self.bucket_keys.append(None)
+        # --- MODIFICATION END ---
         
         print(f"Dataset initialized with {len(self.latent_files)} total samples for one scientific epoch after interleaving.")
 

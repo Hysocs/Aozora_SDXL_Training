@@ -1256,8 +1256,6 @@ class TrainingGUI(QtWidgets.QWidget):
         noise_layout = QtWidgets.QVBoxLayout(noise_group)
 
         self.ip_sub_widget = SubOptionWidget()
-        label, widget = self._create_widget("IP_NOISE_GAMMA"); self.ip_sub_widget.get_layout().addWidget(label); self.ip_sub_widget.get_layout().addWidget(widget)
-        noise_layout.addWidget(self.ip_sub_widget)
         noise_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
         self._create_bool_option(noise_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", "Improves classifier-free guidance.", self.toggle_cond_dropout_widget)
         self.cond_sub_widget = SubOptionWidget()
