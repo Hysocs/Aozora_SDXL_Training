@@ -966,54 +966,47 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     return final_map
 
 def save_model(sd_to_save, output_path):  # REFACTOR: Simplified, now called from queue
-    def get_param_category(key_name):
-        if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
-        if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
-        if 'attn2' in key_name or 'cross_attn' in key_name: return "Cross-Attention (attn2)"
-        return "Other"
-
-    # REFACTOR: param_counters and report moved here if needed, but simplified for efficiency
     Path(output_path).parent.mkdir(parents=True, exist_ok=True)
     save_file(sd_to_save, output_path)
     del sd_to_save  # Clean up after save
 
-# REFACTOR: Queue the save instead of sync
-def queue_training_checkpoint(save_queue, config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
-    print(f"\nQUEUING CHECKPOINT SAVE AT STEP {step}")
 
-    state_path = checkpoint_dir / f"training_state_step_{step}.pt"
-    state = {
-        'step': step,
-        'optimizer_type': config.OPTIMIZER_TYPE,
-        'optimizer_state_dict': optimizer.get_state_for_save(),  # REFACTOR: Use new method for 100% state
-        'scheduler_state_dict': scheduler.state_dict(),
-    }
-    save_queue.put({'type': 'state', 'path': state_path, 'data': state})
+# This new helper function generates and prints the report for saved layers.
+def generate_and_log_save_report(trainable_param_names, unet_key_map, sd_to_save):
+    """
+    Analyzes the state dict to be saved and prints a report on which
+    trained layers were successfully included.
+    """
+    def get_param_category(hf_key_name):
+        if 'ff.net' in hf_key_name or 'mlp.fc' in hf_key_name: return "Feed-Forward (ff)"
+        if 'attn1' in hf_key_name or 'self_attn' in hf_key_name: return "Self-Attention (attn1)"
+        if 'attn2' in hf_key_name or 'cross_attn' in hf_key_name: return "Cross-Attention (attn2)"
+        return "Other"
 
-    checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
-    sd_to_save = base_model_state_dict.copy()  # REFACTOR: Shallow copy for efficiency (tensors are immutable refs)
-
-    unet_sd = unet.state_dict()
-    unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
+    param_counters = defaultdict(int)
+    saved_keys_count = 0
 
     for hf_key in trainable_param_names:
         mapped_part = unet_key_map.get(hf_key)
         if mapped_part:
             sd_key = 'model.diffusion_model.' + mapped_part
             if sd_key in sd_to_save:
-                sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=save_dtype, non_blocking=True)  # REFACTOR: Non-blocking copy
+                category = get_param_category(hf_key)
+                param_counters[category] += 1
+                saved_keys_count += 1
 
-    torch.cuda.synchronize()
-    del unet_sd  # Drop ref to GPU state_dict
-    gc.collect()
-    torch.cuda.empty_cache()  # Force free unused allocations
+    tqdm.write("\n---[ MODEL SAVE REPORT ]---")
+    tqdm.write(f"  Targeted {len(trainable_param_names)} UNet layers for training.")
+    for category, count in sorted(param_counters.items()):
+        tqdm.write(f"  - Saved {count:<4} tensors in category: {category}")
 
-    save_queue.put({'type': 'model', 'path': checkpoint_model_path, 'data': sd_to_save})
+    if saved_keys_count == len(trainable_param_names):
+        tqdm.write(f"[OK] Successfully saved all {saved_keys_count} targeted layers.")
+    else:
+        tqdm.write(f"[WARNING] Mismatch: Targeted {len(trainable_param_names)} layers but saved {saved_keys_count}.")
+    tqdm.write("---------------------------\n")
 
-    gc.collect()
-    torch.cuda.empty_cache()
 
-    print(f"[INFO] Checkpoint queued for background save. Continuing training...")
 
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     alphas = 1.0 - betas
@@ -1363,6 +1356,10 @@ def main():
                         sd_key = 'model.diffusion_model.' + mapped_part
                         if sd_key in sd_to_save:
                             sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+                
+
+                generate_and_log_save_report(trainable_params_names, unet_key_map, sd_to_save)
+                
                 torch.cuda.synchronize()
                 del unet_sd
                 gc.collect()
@@ -1399,6 +1396,12 @@ def main():
             sd_key = 'model.diffusion_model.' + mapped_part
             if sd_key in final_sd_to_save:
                 final_sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+    
+
+    print("\nGenerating final model save report...")
+    generate_and_log_save_report(trainable_params_names, unet_key_map, final_sd_to_save)
+
+    
     torch.cuda.synchronize()
     del unet_sd
     gc.collect()
@@ -1425,6 +1428,11 @@ def main():
                 sd_key = 'model.diffusion_model.' + mapped_part
                 if sd_key in ema_sd_to_save:
                     ema_sd_to_save[sd_key] = unet_sd_ema[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+
+
+        print("\nGenerating final EMA model save report...")
+        generate_and_log_save_report(trainable_params_names, unet_key_map, ema_sd_to_save)
+
         
         torch.cuda.synchronize()
         del unet_sd_ema
