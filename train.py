@@ -60,7 +60,8 @@ class BucketBatchSampler(Sampler):
         self.dataset = dataset
         
         self.epoch_indices = []
-        for i, (_, _, dataset_config) in enumerate(self.dataset.latent_files):
+        # FIXED: Only 2 values now (file_path, dataset_config) instead of 3
+        for i, (_, dataset_config) in enumerate(self.dataset.latent_files):
             self.epoch_indices.append(i)
 
         tqdm.write(f"INFO: BucketBatchSampler initialized with {len(self.epoch_indices)} total samples for one epoch.")
@@ -305,14 +306,6 @@ def resize_to_fit(image, target_w, target_h):
 
     return image.resize((target_w, target_h), Image.Resampling.BICUBIC)
 
-def apply_sigmoid_contrast(image, gain=10, cutoff=0.5):
-    if image.mode != 'RGB':
-        image = image.convert('RGB')
-        
-    arr = np.array(image, dtype=np.float32) / 255.0
-    arr = 1 / (1 + np.exp(gain * (cutoff - arr)))
-    arr = np.clip(arr * 255, 0, 255).astype(np.uint8)
-    return Image.fromarray(arr)
 
 def validate_and_assign_resolution(args):
     ip, calculator = args
@@ -323,7 +316,7 @@ def validate_and_assign_resolution(args):
         with Image.open(ip) as img:
             img.load()
             if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                background = Image.new("RGB", img.size, (205, 205, 205))
+                background = Image.new("RGB", img.size, (255, 255, 255))  # Consistent white
                 background.paste(img, (0, 0), img.split()[-1])
                 img = background
             else:
@@ -362,8 +355,13 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         config.INSTANCE_DATASETS = [{"path": config.INSTANCE_DATA_DIR, "repeats": 1}]
    
     calculator = ResolutionCalculator(config.TARGET_PIXEL_AREA)
-    vae.to(device_for_encoding); text_encoder1.to(device_for_encoding); text_encoder2.to(device_for_encoding)
+    
+    # Move to device but keep in float32 for text encoders
+    vae.to(device_for_encoding, dtype=torch.float32)
+    text_encoder1.to(device_for_encoding, dtype=torch.float32)
+    text_encoder2.to(device_for_encoding, dtype=torch.float32)
     vae.enable_tiling()
+    
     img_transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
     for dataset in config.INSTANCE_DATASETS:
@@ -371,17 +369,19 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         print(f"Processing dataset: {data_root_path}")
    
         all_image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
-                   for p in data_root_path.rglob(f"*{ext}") 
-                   if "_mask" not in p.stem]
+                   for p in data_root_path.rglob(f"*{ext}")]
+        
         if not all_image_paths: 
             print(f"WARNING: No images found in {data_root_path}. Skipping.")
             continue
+            
         existing_stems = {p.stem for p in data_root_path.rglob(".precomputed_embeddings_cache/*.pt")}
         images_to_process = [p for p in all_image_paths if p.stem not in existing_stems]
    
         if not images_to_process:
             print("All images are already cached. Nothing to do.")
             continue
+            
         print(f"Found {len(images_to_process)} images to cache. Now validating and assigning resolutions...")
    
         with Pool(processes=cpu_count()) as pool:
@@ -393,7 +393,7 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
             print(f"WARNING: No valid images found in {data_root_path}. Skipping.")
             continue
         
-        # --- MODIFICATION START: Save metadata to a JSON file ---
+        # Save metadata to JSON
         print("INFO: Saving resolution metadata to metadata.json...")
         resolution_metadata = {
             meta['ip'].stem: meta['target_resolution']
@@ -402,12 +402,10 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
         metadata_path = data_root_path / "metadata.json"
         try:
             with open(metadata_path, 'w', encoding='utf-8') as f:
-                # Convert Path objects to strings for JSON serialization if necessary
                 json.dump(resolution_metadata, f, indent=4)
             print(f"[OK] Saved metadata for {len(resolution_metadata)} images to {metadata_path}")
         except Exception as e:
             print(f"[ERROR] Could not save metadata.json: {e}")
-        # --- MODIFICATION END ---
 
         print(f"Validation complete. Found {len(image_metadata)} valid images to cache.")
    
@@ -421,78 +419,73 @@ def precompute_and_cache_latents(config, tokenizer1, tokenizer2, text_encoder1, 
                 all_batches_to_process.append((target_res, metadata_list[i:i + config.CACHING_BATCH_SIZE]))
         random.shuffle(all_batches_to_process)
    
-        print("INFO: Caching all variants (original, flipped, contrast, flipped-contrast) for future use.")
+        print("INFO: Caching embeddings (simplified - no variants).")
 
         for (target_w, target_h), batch_metadata in tqdm(all_batches_to_process, desc="Caching embeddings in batches"):
             captions_batch = [meta['caption'] for meta in batch_metadata]
+            
             with torch.no_grad():
+                # Compute in float32
                 prompt_embeds_batch, pooled_prompt_embeds_batch = compute_chunked_text_embeddings(
                     captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device_for_encoding
                 )
             
-            variants = {}
-            image_tensors_variants = { "original": [], "contrast": [], "flipped": [], "flipped_contrast": [] }
+            image_tensors = []
             
             for meta in batch_metadata:
                 try:
                     with Image.open(meta['ip']) as img:
-                        img = img.convert("RGB")
-
                         if img.mode in ("RGBA", "LA") or (img.mode == "P" and "transparency" in img.info):
-                            background = Image.new("RGB", img.size, (255, 255, 255)) 
+                            background = Image.new("RGB", img.size, (255, 255, 255))  # Consistent white
                             background.paste(img, (0, 0), img.split()[-1])
                             img = background
                         else:
                             img = img.convert("RGB")
 
-                    contrast_img = apply_sigmoid_contrast(img, gain=10) 
-                    
                     processed_img = resize_to_fit(img, target_w, target_h)
-                    image_tensors_variants["original"].append(img_transform(processed_img))
-                    image_tensors_variants["flipped"].append(img_transform(processed_img.transpose(Image.FLIP_LEFT_RIGHT)))
-                    
-                    processed_contrast = resize_to_fit(contrast_img, target_w, target_h)
-                    image_tensors_variants["contrast"].append(img_transform(processed_contrast))
-                    image_tensors_variants["flipped_contrast"].append(img_transform(processed_contrast.transpose(Image.FLIP_LEFT_RIGHT)))
+                    image_tensors.append(img_transform(processed_img))
 
                 except Exception as e:
-                    tqdm.write(f"\n[ERROR] Skipping bad image during variant creation {meta['ip']}: {e}")
+                    tqdm.write(f"\n[ERROR] Skipping bad image {meta['ip']}: {e}")
 
-            with torch.no_grad():
-                for key, tensors in image_tensors_variants.items():
-                    if tensors:
-                        tensor_batch = torch.stack(tensors).to(device_for_encoding, dtype=vae.dtype)
-                        
-                        latents_batch = vae.encode(tensor_batch).latent_dist.mean * vae.config.scaling_factor
-                        
-                        if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
-                            tqdm.write(f"\n[WARNING] NaN/Inf detected post-noising in batch '{key}'. Sanitizing.")
-                            latents_batch = torch.nan_to_num(latents_batch, nan=0.0, posinf=0.0, neginf=0.0)
-
-                        variants[key] = latents_batch
-                        del tensor_batch
+            if image_tensors:
+                with torch.no_grad():
+                    tensor_batch = torch.stack(image_tensors).to(device_for_encoding, dtype=torch.float32)
+                    
+                    # VAE encode with sample() instead of mean
+                    latents_batch = vae.encode(tensor_batch).latent_dist.sample() * vae.config.scaling_factor
+                    
+                    if torch.isnan(latents_batch).any() or torch.isinf(latents_batch).any():
+                        tqdm.write(f"\n[ERROR] NaN/Inf detected in latents! This indicates a serious problem.")
+                        continue  # Skip this batch instead of sanitizing
+                    
+                    del tensor_batch
             
-            for j, meta in enumerate(batch_metadata):
-                image_path = meta['ip']
-                cache_dir = image_path.parent / ".precomputed_embeddings_cache"
-                cache_dir.mkdir(exist_ok=True)
-                save_data = {
-                    "original_size_as_tuple": meta["original_size"],
-                    "target_size_as_tuple": (target_w, target_h),
-                    "prompt_embeds_cpu": prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
-                    "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(config.compute_dtype),
-                }
-                for key, latents in variants.items():
-                    if j < len(latents):
-                        save_data[key] = { "latents_cpu": latents[j].clone().cpu().to(config.compute_dtype) }
-                torch.save(save_data, cache_dir / f"{image_path.stem}.pt")
+                for j, meta in enumerate(batch_metadata):
+                    image_path = meta['ip']
+                    cache_dir = image_path.parent / ".precomputed_embeddings_cache"
+                    cache_dir.mkdir(exist_ok=True)
+                    
+                    save_data = {
+                        "original_size_as_tuple": meta["original_size"],
+                        "target_size_as_tuple": (target_w, target_h),
+                        # Save in float32 for precision
+                        "prompt_embeds_cpu": prompt_embeds_batch[j].clone().cpu().to(torch.float32),
+                        "pooled_prompt_embeds_cpu": pooled_prompt_embeds_batch[j].clone().cpu().to(torch.float32),
+                        "latents_cpu": latents_batch[j].clone().cpu().to(config.compute_dtype),  # Can keep fp16/bf16
+                    }
+                    torch.save(save_data, cache_dir / f"{image_path.stem}.pt")
             
-            del prompt_embeds_batch, pooled_prompt_embeds_batch
-            for latents in variants.values(): del latents
-            gc.collect(); torch.cuda.empty_cache()
+                del prompt_embeds_batch, pooled_prompt_embeds_batch, latents_batch
+                gc.collect()
+                torch.cuda.empty_cache()
    
     vae.disable_tiling()
-    vae.cpu(); text_encoder1.cpu(); text_encoder2.cpu(); gc.collect(); torch.cuda.empty_cache()
+    vae.cpu()
+    text_encoder1.cpu()
+    text_encoder2.cpu()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text_encoder1, text_encoder2, device):
     prompt_embeds_list = []
@@ -508,7 +501,9 @@ def compute_chunked_text_embeddings(captions_batch, tokenizer1, tokenizer2, text
             
             prompt_embeds_out2 = text_encoder2(text_inputs2.input_ids.to(device), output_hidden_states=True)
             prompt_embeds2 = prompt_embeds_out2.hidden_states[-2]
-            pooled_prompt_embeds2 = prompt_embeds_out2[0]
+            
+            # FIXED: Use text_embeds for CLIPTextModelWithProjection (SDXL's text_encoder_2)
+            pooled_prompt_embeds2 = prompt_embeds_out2.text_embeds
 
             prompt_embeds = torch.cat((prompt_embeds1, prompt_embeds2), dim=-1)
         
@@ -536,24 +531,11 @@ class ImageTextLatentDataset(Dataset):
             files_in_dataset = sorted(list(cache_dir.glob("*.pt")))
             
             repeats = int(dataset_config.get("repeats", 1))
-            should_mirror = dataset_config.get("mirror_repeats", False)
-            should_darken = dataset_config.get("darken_repeats", False)
             
-            variants_to_use = ["original"]
-            if repeats > 1:
-                other_variants = []
-                if should_mirror: other_variants.append("flipped")
-                if should_darken: other_variants.append("contrast")
-                if should_mirror and should_darken: other_variants.append("flipped_contrast")
-                if other_variants:
-                    for i in range(repeats - 1):
-                        variants_to_use.append(other_variants[i % len(other_variants)])
-
             current_dataset_entries = []
             for f in files_in_dataset:
                 for i in range(repeats):
-                    variant_key = variants_to_use[i % len(variants_to_use)]
-                    current_dataset_entries.append((f, variant_key, dataset_config))
+                    current_dataset_entries.append((f, dataset_config))
             
             all_dataset_files.append(current_dataset_entries)
 
@@ -565,14 +547,12 @@ class ImageTextLatentDataset(Dataset):
                     self.latent_files.append(dataset_list[i])
 
         if not self.latent_files:
-            raise ValueError("No cached embedding files found across all datasets. Please ensure pre-caching was successful.")
+            raise ValueError("No cached embedding files found. Please ensure pre-caching was successful.")
         
-        # --- MODIFICATION START: Efficiently load bucket keys from metadata.json ---
         tqdm.write("INFO: Pre-loading bucket keys from metadata.json files...")
         self.bucket_keys = []
         all_metadata = {}
 
-        # Load all metadata from all specified datasets into one dictionary
         for dataset_config in config.INSTANCE_DATASETS:
             root = Path(dataset_config["path"])
             metadata_path = root / "metadata.json"
@@ -583,72 +563,45 @@ class ImageTextLatentDataset(Dataset):
                 except (json.JSONDecodeError, TypeError) as e:
                     tqdm.write(f"WARNING: Could not load or parse {metadata_path}: {e}")
             else:
-                tqdm.write(f"WARNING: metadata.json not found for dataset {root}. Bucket info will be missing for its images.")
+                tqdm.write(f"WARNING: metadata.json not found for dataset {root}.")
 
-        # Assign bucket keys by looking up the file stem in the loaded metadata
-        for file_path, _, _ in tqdm(self.latent_files, desc="Assigning bucket keys"):
+        for file_path, _ in tqdm(self.latent_files, desc="Assigning bucket keys"):
             bucket_key = all_metadata.get(file_path.stem)
             if bucket_key:
-                # JSON loads lists, convert back to tuple for dictionary key usage
                 self.bucket_keys.append(tuple(bucket_key))
             else:
-                tqdm.write(f"WARNING: No metadata found for {file_path.stem}. Marking as invalid for bucketing.")
+                tqdm.write(f"WARNING: No metadata found for {file_path.stem}.")
                 self.bucket_keys.append(None)
-        # --- MODIFICATION END ---
         
-        print(f"Dataset initialized with {len(self.latent_files)} total samples for one scientific epoch after interleaving.")
+        print(f"Dataset initialized with {len(self.latent_files)} total samples.")
 
-    def __len__(self): return len(self.latent_files)
+    def __len__(self):
+        return len(self.latent_files)
 
     def __getitem__(self, i):
-            file_path, variant_key, dataset_config = self.latent_files[i]
-            try:
-                full_data = torch.load(file_path, map_location="cpu")
-                if variant_key not in full_data or "latents_cpu" not in full_data.get(variant_key, {}):
-                    tqdm.write(f"Warning: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
-                    variant_key = "original"
-                
-                variant_data = full_data[variant_key]
-                latents = variant_data["latents_cpu"]
+        file_path, dataset_config = self.latent_files[i]
+        try:
+            full_data = torch.load(file_path, map_location="cpu")
+            
+            latents = full_data["latents_cpu"]
+            
+            for key, tensor in [("latents", latents), 
+                                ("prompt_embeds", full_data["prompt_embeds_cpu"]), 
+                                ("pooled_embeds", full_data["pooled_prompt_embeds_cpu"])]:
+                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                    raise ValueError(f"NaN/Inf in {key} for file: {file_path}")
 
-                mask_latent = torch.ones(1, latents.shape[1], latents.shape[2]) 
-                focus_factor = dataset_config.get("mask_focus_factor", 1.0)
-                focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
-                
-                if dataset_config.get("use_mask", False):
-                    mask_dir = Path(dataset_config["path"]) / "masks" 
-                    mask_path = mask_dir / f"{file_path.stem}_mask.png"
-                    if mask_path.exists():
-                        with Image.open(mask_path).convert("L") as mask_img:
-                            if 'flipped' in variant_key:
-                                mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
-                            
-                            resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
-                            mask_tensor = transforms.ToTensor()(resized_mask)
-                            mask_latent = (mask_tensor > 0.1).float()
-
-                for key, tensor in [("latents", latents), 
-                                    ("prompt_embeds", full_data["prompt_embeds_cpu"]), 
-                                    ("pooled_embeds", full_data["pooled_prompt_embeds_cpu"])]:
-                    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                        raise ValueError(f"NaN/Inf in {key} for file: {file_path}")
-
-                return {
-                    "latents_cpu": latents,
-                    "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0),
-                    # === FIX IS HERE ===
-                    "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"].squeeze(0),
-                    # ===================
-                    "original_size_as_tuple": full_data["original_size_as_tuple"],
-                    "target_size_as_tuple": full_data["target_size_as_tuple"],
-                    "mask_latent_cpu": mask_latent,
-                    "mask_focus_factor_cpu": focus_factor,
-                    "mask_focus_mode_cpu": focus_mode,
-                    "file_path_str": str(file_path.name)
-                }
-            except Exception as e:
-                print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
-                return None
+            return {
+                "latents_cpu": latents,
+                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0),
+                "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"].squeeze(0),
+                "original_size_as_tuple": full_data["original_size_as_tuple"],
+                "target_size_as_tuple": full_data["target_size_as_tuple"],
+                "file_path_str": str(file_path.name)
+            }
+        except Exception as e:
+            print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
+            return None
         
 def custom_collate_fn_latent(batch):
     batch = list(filter(None, batch))
@@ -659,9 +612,6 @@ def custom_collate_fn_latent(batch):
         "pooled_prompt_embeds": torch.stack([item["pooled_prompt_embeds_cpu"] for item in batch]),
         "original_sizes": [item["original_size_as_tuple"] for item in batch],
         "target_sizes": [item["target_size_as_tuple"] for item in batch],
-        "masks": torch.stack([item["mask_latent_cpu"] for item in batch]),
-        "mask_focus_factors": torch.tensor([item["mask_focus_factor_cpu"] for item in batch]),
-        "mask_focus_modes": [item["mask_focus_mode_cpu"] for item in batch],
         "file_paths": [item["file_path_str"] for item in batch]
     }
 
@@ -795,7 +745,6 @@ class ConditioningDropout:
 
 class BaseLoss:
     def __call__(self, pred, target, is_v_pred):
-        #return F.huber_loss(pred.float(), target.float(), reduction="none", delta=2.0)
         return F.mse_loss(pred.float(), target.float(), reduction="none")
 
 class MaskedLoss:
@@ -875,9 +824,9 @@ class FeaturePlugins:
         self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)  
         self.conditioning_dropout = ConditioningDropout(config)
         self.base_loss = BaseLoss()
-        self.masked_loss = MaskedLoss(config)
         self.is_v_prediction = config.PREDICTION_TYPE == "v_prediction"
         self.min_snr_loss = MinSNRLoss(config, noise_scheduler, self.is_v_prediction)
+
 
 
 class TrainingDiagnostics:
@@ -1072,17 +1021,18 @@ def main():
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True); CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     
     for ds in config.INSTANCE_DATASETS:
-        if not Path(ds["path"]).exists(): raise FileNotFoundError(f"Data dir not found: {ds['path']}")
+        if not Path(ds["path"]).exists():
+            raise FileNotFoundError(f"Data dir not found: {ds['path']}")
     if not config.SINGLE_FILE_CHECKPOINT_PATH or not Path(config.SINGLE_FILE_CHECKPOINT_PATH).exists():
         if config.RESUME_TRAINING and config.RESUME_MODEL_PATH and Path(config.RESUME_MODEL_PATH).exists():
-             pass
+            pass
         else:
             raise FileNotFoundError(f"Base model not found: {config.SINGLE_FILE_CHECKPOINT_PATH}")
 
-    
     total_training_steps = config.MAX_TRAIN_STEPS
     total_optimizer_steps = math.ceil(total_training_steps / config.GRADIENT_ACCUMULATION_STEPS)
     print(f"INFO: Training for {total_training_steps} batch steps.")
@@ -1094,13 +1044,28 @@ def main():
     scaler = torch.cuda.amp.GradScaler(enabled=use_scaler)
 
     print("Loading all components for embedding and latent generation...")
-    temp_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype, use_safetensors=True)
+    temp_pipe = StableDiffusionXLPipeline.from_single_file(
+        config.SINGLE_FILE_CHECKPOINT_PATH, 
+        torch_dtype=config.compute_dtype, 
+        use_safetensors=True
+    )
     if hasattr(temp_pipe, "vae"):
         print("INFO: Enabling VAE slicing and tiling for memory efficiency during caching.")
         temp_pipe.vae.enable_slicing()
         temp_pipe.vae.enable_tiling()
-    precompute_and_cache_latents(config=config, tokenizer1=temp_pipe.tokenizer, tokenizer2=temp_pipe.tokenizer_2, text_encoder1=temp_pipe.text_encoder, text_encoder2=temp_pipe.text_encoder_2, vae=temp_pipe.vae, device_for_encoding=device)
-    del temp_pipe; gc.collect(); torch.cuda.empty_cache()
+    
+    precompute_and_cache_latents(
+        config=config,
+        tokenizer1=temp_pipe.tokenizer,
+        tokenizer2=temp_pipe.tokenizer_2,
+        text_encoder1=temp_pipe.text_encoder,
+        text_encoder2=temp_pipe.text_encoder_2,
+        vae=temp_pipe.vae,
+        device_for_encoding=device
+    )
+    del temp_pipe
+    gc.collect()
+    torch.cuda.empty_cache()
 
     global_step = 0
     model_to_load = config.SINGLE_FILE_CHECKPOINT_PATH
@@ -1116,21 +1081,24 @@ def main():
             print("[WARNING] Resume paths invalid. Reverting to base model.")
 
     print(f"\nLoading model for training: {model_to_load}")
-    pipeline_temp = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype, use_safetensors=True)
+    pipeline_temp = StableDiffusionXLPipeline.from_single_file(
+        model_to_load,
+        torch_dtype=config.compute_dtype,
+        use_safetensors=True
+    )
     unet = pipeline_temp.unet
     scheduler_config = pipeline_temp.scheduler.config
     
-    # === REFACTORED SECTION START ===
-    # Set prediction type and beta schedule from config file, removing hardcoded values
     scheduler_config['prediction_type'] = config.PREDICTION_TYPE
     scheduler_config['beta_schedule'] = config.BETA_SCHEDULE
     print(f"INFO: Using Prediction Type: {config.PREDICTION_TYPE}")
     print(f"INFO: Using Beta Schedule: {config.BETA_SCHEDULE}")
-    # === REFACTORED SECTION END ===
 
     print("Loading base model state_dict into memory...")
     base_model_state_dict = load_file(model_to_load)
-    del pipeline_temp; gc.collect(); torch.cuda.empty_cache()
+    del pipeline_temp
+    gc.collect()
+    torch.cuda.empty_cache()
 
     if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
         unet.enable_xformers_memory_efficient_attention()
@@ -1141,16 +1109,19 @@ def main():
     unet.enable_gradient_checkpointing()
 
     total_params = sum(p.numel() for p in unet.parameters())
-    trainable_params_names = {name for name, _ in unet.named_parameters() if any(k in name for k in config.UNET_TRAIN_TARGETS)}
+    trainable_params_names = {name for name, _ in unet.named_parameters() 
+                              if any(k in name for k in config.UNET_TRAIN_TARGETS)}
     params_to_optimize = [p for n, p in unet.named_parameters() if n in trainable_params_names]
     trainable_params_count = sum(p.numel() for p in params_to_optimize)
-    for p in params_to_optimize: p.requires_grad_(True)
+    for p in params_to_optimize:
+        p.requires_grad_(True)
     
     print(f"Targeting UNet layers with keywords: {config.UNET_TRAIN_TARGETS}")
     param_info_str = f"{trainable_params_count/1e6:.2f}M / {total_params/1e6:.2f}M ({trainable_params_count/total_params*100:.2f}%)"
     print(f"GUI_PARAM_INFO::{param_info_str}")
 
-    if not params_to_optimize: raise ValueError("No parameters were selected for training.")
+    if not params_to_optimize:
+        raise ValueError("No parameters were selected for training.")
     
     if not config.LR_CUSTOM_CURVE:
         raise ValueError("Configuration missing 'LR_CUSTOM_CURVE'.")
@@ -1191,12 +1162,12 @@ def main():
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
         lr_scheduler.step(current_step=optimizer_step_resumed)
 
-        # Load EMA state if available
         if ema is not None and 'ema_state_dict' in state and state['ema_state_dict'] is not None:
             ema.load_state_dict(state['ema_state_dict'])
             print("[OK] Loaded EMA state from checkpoint.")
 
-        del state; gc.collect()
+        del state
+        gc.collect()
         print(f"[OK] Resumed training. Resuming at batch step: {global_step}, Optimizer step: {optimizer_step_resumed}.")
 
     noise_scheduler = DDPMScheduler(**filter_scheduler_config(scheduler_config, DDPMScheduler))
@@ -1208,8 +1179,20 @@ def main():
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
 
     train_dataset = ImageTextLatentDataset(config)
-    sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, seed=config.SEED, shuffle=True, drop_last=False)
-    train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
+    sampler = BucketBatchSampler(
+        dataset=train_dataset,
+        batch_size=config.BATCH_SIZE,
+        seed=config.SEED,
+        shuffle=True,
+        drop_last=False
+    )
+    train_dataloader = DataLoader(
+        train_dataset,
+        batch_sampler=sampler,
+        collate_fn=custom_collate_fn_latent,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True
+    )
     
     # Background saver thread
     save_queue = queue.Queue()
@@ -1234,97 +1217,111 @@ def main():
     save_thread = threading.Thread(target=background_saver)
     save_thread.start()
 
-    def train_step(batch, current_step):
-        latents = batch["latents"]
-        batch_size = latents.shape[0]
-        
-        noise = torch.randn_like(latents)
-        offset_noise = torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
-        noise = noise + 0.03 * offset_noise
-
-        timesteps = plugins.timestep_sampler(batch_size, current_step=current_step)
-        noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-        target = noise_scheduler.get_velocity(latents, noise, timesteps) if plugins.is_v_prediction else noise
-        
-        # Simple dropout - no CFG
-        prompt_embeds, pooled_embeds = plugins.conditioning_dropout(
-            batch["prompt_embeds"], 
-            batch["pooled_prompt_embeds"]
-        )
-        
-        add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) 
-                                for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], 
-                                dim=0).to(latents.device, dtype=prompt_embeds.dtype)
-        
-        with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
-            pred = unet(
-                noisy_latents.to(config.compute_dtype),
-                timesteps,
-                prompt_embeds.to(config.compute_dtype),
-                added_cond_kwargs={
-                    "text_embeds": pooled_embeds.to(config.compute_dtype),
-                    "time_ids": add_time_ids.to(config.compute_dtype)
-                }
-            ).sample
-            
-            loss_no_reduction = plugins.base_loss(pred.float(), target.float(), plugins.is_v_prediction)
-            loss_per_item = plugins.masked_loss(loss_no_reduction, batch["masks"], batch["mask_focus_factors"], batch["mask_focus_modes"])
-            loss, snr_weights = plugins.min_snr_loss(loss_per_item, timesteps)
-        
-        if not torch.isfinite(loss):
-            tqdm.write(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
-            return None, timesteps, None
-        
-        scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        
-        raw_grad_norm = 0.0
-        for p in params_to_optimize:
-            if p.grad is not None:
-                raw_grad_norm += p.grad.data.norm(2).item() ** 2
-        raw_grad_norm = raw_grad_norm ** 0.5
-        
-        return loss.item(), timesteps, raw_grad_norm
     unet.train()
-    
-    progress_bar = tqdm(range(global_step, total_training_steps), desc="Training Steps", initial=global_step, total=total_training_steps)
+    progress_bar = tqdm(
+        range(global_step, total_training_steps),
+        desc="Training Steps",
+        initial=global_step,
+        total=total_training_steps
+    )
     
     done = False
     while not done:
         for batch in train_dataloader:
             if global_step >= total_training_steps:
-                done = True; break
-            if not batch: continue
+                done = True
+                break
+            if not batch:
+                continue
 
             if global_step > 1:
-                 tqdm.write(f"Step {global_step}: Processing file: {batch['file_paths'][0]}")
+                tqdm.write(f"Step {global_step}: Processing file: {batch['file_paths'][0]}")
 
-            batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
+            batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v 
+                     for k, v in batch.items()}
             
-            loss_item, timesteps, raw_grad_norm = train_step(batch, current_step=global_step)
+            latents = batch["latents"]
+            batch_size = latents.shape[0]
             
-            # Update timestep sampler with raw micro-batch gradient
-            if raw_grad_norm is not None:
-                plugins.timestep_sampler.update_range(raw_grad_norm, global_step)
+            # Create noise with correct dtype
+            noise = torch.randn_like(latents, dtype=latents.dtype)
             
-            diagnostics.step(loss_item, timesteps)
+            # Optional offset noise with correct dtype
+            if hasattr(config, 'USE_OFFSET_NOISE') and config.USE_OFFSET_NOISE:
+                offset_noise = torch.randn(
+                    latents.shape[0], latents.shape[1], 1, 1,
+                    device=latents.device,
+                    dtype=latents.dtype  # FIXED: Match dtype
+                )
+                noise = noise + getattr(config, 'OFFSET_NOISE_STRENGTH', 0.03) * offset_noise
+
+            timesteps = plugins.timestep_sampler(batch_size, current_step=global_step)
+            noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
+            target = noise_scheduler.get_velocity(latents, noise, timesteps) if plugins.is_v_prediction else noise
+            
+            # Simple dropout
+            prompt_embeds, pooled_embeds = plugins.conditioning_dropout(
+                batch["prompt_embeds"],
+                batch["pooled_prompt_embeds"]
+            )
+            
+            add_time_ids = torch.cat([
+                torch.tensor(list(s1) + [0, 0] + list(s2)).unsqueeze(0)
+                for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])
+            ], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
+            
+            with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
+                pred = unet(
+                    noisy_latents.to(config.compute_dtype),
+                    timesteps,
+                    prompt_embeds.to(config.compute_dtype),
+                    added_cond_kwargs={
+                        "text_embeds": pooled_embeds.to(config.compute_dtype),
+                        "time_ids": add_time_ids.to(config.compute_dtype)
+                    }
+                ).sample
+                
+                loss_no_reduction = plugins.base_loss(pred.float(), target.float(), plugins.is_v_prediction)
+                loss_per_item = loss_no_reduction.mean(dim=list(range(1, len(loss_no_reduction.shape))))
+                loss, snr_weights = plugins.min_snr_loss(loss_per_item, timesteps)
+            
+            if not torch.isfinite(loss):
+                tqdm.write(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
+                global_step += 1
+                progress_bar.update(1)
+                continue
+            
+            scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+            diagnostics.step(loss.item(), timesteps)
 
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 scaler.unscale_(optimizer)
+                
+                # FIXED: Measure grad norm AFTER unscaling
+                total_norm = 0.0
+                for p in params_to_optimize:
+                    if p.grad is not None:
+                        param_norm = p.grad.data.norm(2).item()
+                        total_norm += param_norm ** 2
+                total_norm = total_norm ** 0.5
+                diagnostics.last_grad_norm = total_norm
+                
                 if config.CLIP_GRAD_NORM > 0:
                     torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
                 
                 optimizer_step = (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS
-                
                 lr_scheduler.step(current_step=optimizer_step)
                 
                 current_lr = optimizer.param_groups[0]['lr']
                 diagnostics.report(global_step + 1, current_lr, params_to_optimize)
+                
+                # FIXED: Update timestep sampler AFTER full gradient accumulation with unscaled grad
+                plugins.timestep_sampler.update_range(total_norm, global_step)
 
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 
-                # Update EMA after optimizer step
                 if ema is not None:
                     ema.update(unet)
             
@@ -1334,7 +1331,6 @@ def main():
             if global_step > 0 and (global_step % config.SAVE_EVERY_N_STEPS == 0):
                 current_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
                 
-                # Save checkpoint with EMA state
                 print(f"\nQUEUING CHECKPOINT SAVE AT STEP {current_optimizer_step}")
                 state_path = CHECKPOINT_DIR / f"training_state_step_{current_optimizer_step}.pt"
                 state = {
@@ -1357,7 +1353,6 @@ def main():
                         if sd_key in sd_to_save:
                             sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
                 
-
                 generate_and_log_save_report(trainable_params_names, unet_key_map, sd_to_save)
                 
                 torch.cuda.synchronize()
@@ -1397,10 +1392,8 @@ def main():
             if sd_key in final_sd_to_save:
                 final_sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
     
-
     print("\nGenerating final model save report...")
     generate_and_log_save_report(trainable_params_names, unet_key_map, final_sd_to_save)
-
     
     torch.cuda.synchronize()
     del unet_sd
@@ -1429,10 +1422,8 @@ def main():
                 if sd_key in ema_sd_to_save:
                     ema_sd_to_save[sd_key] = unet_sd_ema[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
 
-
         print("\nGenerating final EMA model save report...")
         generate_and_log_save_report(trainable_params_names, unet_key_map, ema_sd_to_save)
-
         
         torch.cuda.synchronize()
         del unet_sd_ema

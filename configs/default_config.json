@@ -7,12 +7,12 @@
     "TARGET_PIXEL_AREA": 1048576,
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 100,
-    "GRADIENT_ACCUMULATION_STEPS": 16,
+    "MAX_TRAIN_STEPS": 2000,
+    "GRADIENT_ACCUMULATION_STEPS": 8,
     "CLIP_GRAD_NORM": 5.6,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 69,
-    "SAVE_EVERY_N_STEPS": 150,
+    "SAVE_EVERY_N_STEPS": 4444,
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
     "LR_CUSTOM_CURVE": [
@@ -108,110 +108,20 @@
     "SNR_STRATEGY": "Min-SNR",
     "SNR_GAMMA": 5.0,
     "MIN_SNR_VARIANT": "psw",
-    "USE_ZERO_TERMINAL_SNR": true,
+    "USE_ZERO_TERMINAL_SNR": false,
     "USE_IP_NOISE_GAMMA": true,
     "IP_NOISE_GAMMA": 0.01,
     "USE_COND_DROPOUT": false,
     "COND_DROPOUT_PROB": 0.05,
-    "USE_EMA": true,
+    "USE_EMA": false,
     "EMA_DECAY": 0.9999,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by didac",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by diptip",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by madao",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by nanika iru",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by onion",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by raiden",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
             "path": "C:/Users/Administrator/Pictures/Datasets/by san p. dro",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by tiler",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by yato_hikaru",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by zds",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
+            "repeats": 1,
+            "mirror_repeats": false,
+            "darken_repeats": false,
             "use_mask": false,
             "mask_path": "",
             "mask_focus_factor": 2.0,
@@ -226,8 +136,8 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "use_grad_centralization": false,
-        "gc_alpha": 0.35
+        "use_grad_centralization": true,
+        "gc_alpha": 1.0
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

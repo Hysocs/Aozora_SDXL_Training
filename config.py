@@ -13,12 +13,6 @@ INSTANCE_DATASETS = [
     {
         "path": "./DatasetV1/",
         "repeats": 1,
-        "mirror_repeats": False,
-        "darken_repeats": False,
-        "use_mask": False,
-        "mask_path": "",
-        "mask_focus_factor": 2.0,
-        "mask_focus_mode": "Proportional (Multiply)"
     }
 ]
 
