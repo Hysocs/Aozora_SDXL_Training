@@ -95,3 +95,11 @@ class Raven(Optimizer):
 
         if torch.cuda.is_available(): torch.cuda.synchronize()
         return loss
+
+    # REFACTOR: Added for 100% state save (includes reusable buffers if needed)
+    def get_state_for_save(self):
+        state_dict = self.state_dict()
+        state_dict['reusable_exp_avg_gpu'] = self.reusable_exp_avg_gpu.clone().cpu() if self.reusable_exp_avg_gpu is not None else None
+        state_dict['reusable_exp_avg_sq_gpu'] = self.reusable_exp_avg_sq_gpu.clone().cpu() if self.reusable_exp_avg_sq_gpu is not None else None
+        state_dict['param_device'] = str(self.param_device)
+        return state_dict

@@ -19,7 +19,7 @@ from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile
 from torchvision import transforms
 from tqdm.auto import tqdm
-from optimizer.raven import Raven
+from optimizer.raven import Raven  # Assuming this is in optimizer/raven.py
 import logging
 import warnings
 import config as default_config
@@ -32,7 +32,8 @@ import numpy as np
 from diffusers.models.attention_processor import AttnProcessor2_0
 from transformers.optimization import Adafactor
 from torch.optim import AdamW
-
+import queue  # REFACTOR: For async save queue
+import threading  # REFACTOR: For background save thread
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 warnings.filterwarnings("ignore", category=UserWarning, message="None of the inputs have requires_grad=True. Gradients will be None")
@@ -40,6 +41,7 @@ Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
 def set_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
@@ -184,7 +186,7 @@ class TrainingConfig:
             
         float_keys = ["CLIP_GRAD_NORM", "MIN_SNR_GAMMA", "IP_NOISE_GAMMA", "COND_DROPOUT_PROB","SNR_GAMMA"]
         int_keys = ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "SEED", "SAVE_EVERY_N_STEPS", "CACHING_BATCH_SIZE", "BATCH_SIZE", "NUM_WORKERS", "TARGET_PIXEL_AREA"]
-        str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE"]
+        str_keys = ["MIN_SNR_VARIANT", "OPTIMIZER_TYPE", "PREDICTION_TYPE", "BETA_SCHEDULE"]
         bool_keys = [
             "MIRROR_REPEATS", "DARKEN_REPEATS", "RESUME_TRAINING", 
             "USE_SNR_GAMMA", "USE_ZERO_TERMINAL_SNR", 
@@ -556,7 +558,7 @@ class ImageTextLatentDataset(Dataset):
             all_dataset_files.append(current_dataset_entries)
 
         self.latent_files = []
-        max_len = max(len(d) for d in all_dataset_files)
+        max_len = max(len(d) for d in all_dataset_files) if all_dataset_files else 0
         for i in range(max_len):
             for dataset_list in all_dataset_files:
                 if i < len(dataset_list):
@@ -599,52 +601,54 @@ class ImageTextLatentDataset(Dataset):
     def __len__(self): return len(self.latent_files)
 
     def __getitem__(self, i):
-        file_path, variant_key, dataset_config = self.latent_files[i]
-        try:
-            full_data = torch.load(file_path, map_location="cpu")
-            if variant_key not in full_data or "latents_cpu" not in full_data.get(variant_key, {}):
-                tqdm.write(f"Warning: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
-                variant_key = "original"
-            
-            variant_data = full_data[variant_key]
-            latents = variant_data["latents_cpu"]
+            file_path, variant_key, dataset_config = self.latent_files[i]
+            try:
+                full_data = torch.load(file_path, map_location="cpu")
+                if variant_key not in full_data or "latents_cpu" not in full_data.get(variant_key, {}):
+                    tqdm.write(f"Warning: Variant '{variant_key}' not found in {file_path}. Falling back to 'original'.")
+                    variant_key = "original"
+                
+                variant_data = full_data[variant_key]
+                latents = variant_data["latents_cpu"]
 
-            mask_latent = torch.ones(1, latents.shape[1], latents.shape[2]) 
-            focus_factor = dataset_config.get("mask_focus_factor", 1.0)
-            focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
-            
-            if dataset_config.get("use_mask", False):
-                mask_dir = Path(dataset_config["path"]) / "masks" 
-                mask_path = mask_dir / f"{file_path.stem}_mask.png"
-                if mask_path.exists():
-                    with Image.open(mask_path).convert("L") as mask_img:
-                        if 'flipped' in variant_key:
-                            mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
-                        
-                        resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
-                        mask_tensor = transforms.ToTensor()(resized_mask)
-                        mask_latent = (mask_tensor > 0.1).float()
+                mask_latent = torch.ones(1, latents.shape[1], latents.shape[2]) 
+                focus_factor = dataset_config.get("mask_focus_factor", 1.0)
+                focus_mode = dataset_config.get("mask_focus_mode", "Proportional (Multiply)")
+                
+                if dataset_config.get("use_mask", False):
+                    mask_dir = Path(dataset_config["path"]) / "masks" 
+                    mask_path = mask_dir / f"{file_path.stem}_mask.png"
+                    if mask_path.exists():
+                        with Image.open(mask_path).convert("L") as mask_img:
+                            if 'flipped' in variant_key:
+                                mask_img = mask_img.transpose(Image.FLIP_LEFT_RIGHT)
+                            
+                            resized_mask = mask_img.resize((latents.shape[2], latents.shape[1]), Image.Resampling.NEAREST)
+                            mask_tensor = transforms.ToTensor()(resized_mask)
+                            mask_latent = (mask_tensor > 0.1).float()
 
-            for key, tensor in [("latents", latents), 
-                                ("prompt_embeds", full_data["prompt_embeds_cpu"]), 
-                                ("pooled_embeds", full_data["pooled_prompt_embeds_cpu"])]:
-                if torch.isnan(tensor).any() or torch.isinf(tensor).any():
-                    raise ValueError(f"NaN/Inf in {key} for file: {file_path}")
+                for key, tensor in [("latents", latents), 
+                                    ("prompt_embeds", full_data["prompt_embeds_cpu"]), 
+                                    ("pooled_embeds", full_data["pooled_prompt_embeds_cpu"])]:
+                    if torch.isnan(tensor).any() or torch.isinf(tensor).any():
+                        raise ValueError(f"NaN/Inf in {key} for file: {file_path}")
 
-            return {
-                "latents_cpu": latents,
-                "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0),
-                "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"].squeeze(0),
-                "original_size_as_tuple": full_data["original_size_as_tuple"],
-                "target_size_as_tuple": full_data["target_size_as_tuple"],
-                "mask_latent_cpu": mask_latent,
-                "mask_focus_factor_cpu": focus_factor,
-                "mask_focus_mode_cpu": focus_mode,
-                "file_path_str": str(file_path.name)
-            }
-        except Exception as e:
-            print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
-            return None
+                return {
+                    "latents_cpu": latents,
+                    "prompt_embeds_cpu": full_data["prompt_embeds_cpu"].squeeze(0),
+                    # === FIX IS HERE ===
+                    "pooled_prompt_embeds_cpu": full_data["pooled_prompt_embeds_cpu"].squeeze(0),
+                    # ===================
+                    "original_size_as_tuple": full_data["original_size_as_tuple"],
+                    "target_size_as_tuple": full_data["target_size_as_tuple"],
+                    "mask_latent_cpu": mask_latent,
+                    "mask_focus_factor_cpu": focus_factor,
+                    "mask_focus_mode_cpu": focus_mode,
+                    "file_path_str": str(file_path.name)
+                }
+            except Exception as e:
+                print(f"WARNING: Skipping bad .pt file {file_path}: {e}")
+                return None
         
 def custom_collate_fn_latent(batch):
     batch = list(filter(None, batch))
@@ -694,38 +698,71 @@ class TimestepSampler:
         print(f"      - Will expand to full range over {self.curriculum_duration_steps} steps.")
 
     def _init_dynamic_mode(self):
-        self.probe_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.DYNAMIC_CHALLENGE_PROBE_PERCENT / 100.0))
         try:
             min_gn_str, max_gn_str = self.config.DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE.split(',')
             self.target_grad_norm_min = float(min_gn_str.strip())
             self.target_grad_norm_max = float(max_gn_str.strip())
         except (ValueError, AttributeError):
-            print("WARNING: Could not parse DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE. Using defaults [0.25, 0.9].")
-            self.target_grad_norm_min = 0.25
-            self.target_grad_norm_max = 0.90
+            print("WARNING: Could not parse target range. Using [0.4, 0.6].")
+            self.target_grad_norm_min = 0.4
+            self.target_grad_norm_max = 0.6
         
+        self.target_grad_norm = (self.target_grad_norm_min + self.target_grad_norm_max) / 2.0
         self.current_min_ts = self.initial_min
         self.current_max_ts = self.initial_max
-        self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.005)) 
-
-        print("INFO: Initialized Dynamic Challenge Balancing.")
-        print(f"      - Probe Phase: {self.probe_duration_steps} steps")
-        print(f"      - Target Grad Norm Range: [{self.target_grad_norm_min}, {self.target_grad_norm_max}]")
+        self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.015))  # Bigger steps
+        
+        # Much faster reaction
+        self.grad_norm_history = deque(maxlen=8)  # Only 8 samples (2 accumulation cycles)
+        self.adjustment_cooldown = 0
+        
+        print("INFO: Initialized Fast Dynamic Challenge Balancing.")
+        print(f"      - Target: {self.target_grad_norm} | Range: [{self.target_grad_norm_min}, {self.target_grad_norm_max}]")
+        print(f"      - Reacts every micro-batch, adjusts every 4 steps")
 
     def update_range(self, grad_norm, current_step):
         if self.mode != "dynamic_balancing": return
-
-        if current_step <= self.probe_duration_steps:
-            if grad_norm < self.target_grad_norm_max:
-                self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
-            if grad_norm > self.target_grad_norm_min:
-                self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
+        
+        self.grad_norm_history.append(grad_norm)
+        
+        # Cooldown check
+        if self.adjustment_cooldown > 0:
+            self.adjustment_cooldown -= 1
+            return
+        
+        # Only need 4 samples now (1 accumulation cycle)
+        if len(self.grad_norm_history) < 4:
+            return
+        
+        # Use median of last 8 micro-batches
+        smoothed_grad_norm = sorted(self.grad_norm_history)[len(self.grad_norm_history) // 2]
+        
+        # Don't adjust if in range
+        if self.target_grad_norm_min <= smoothed_grad_norm <= self.target_grad_norm_max:
+            return
+        
+        # More aggressive proportional adjustment
+        error = abs(smoothed_grad_norm - self.target_grad_norm)
+        if error > 0.4:
+            adjustment = self.adjustment_step_size * 3  # Very aggressive
+        elif error > 0.2:
+            adjustment = self.adjustment_step_size * 2
         else:
-            if grad_norm > self.target_grad_norm_max:
-                self.current_max_ts = max(self.current_min_ts, self.current_max_ts - self.adjustment_step_size)
-            elif grad_norm < self.target_grad_norm_min:
-                self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
-                self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
+            adjustment = self.adjustment_step_size
+        
+        if smoothed_grad_norm > self.target_grad_norm_max:
+            # Too hard - reduce max timestep
+            self.current_max_ts = max(self.current_min_ts + 50, self.current_max_ts - adjustment)
+        else:
+            # Too easy - expand range
+            self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + adjustment)
+            if smoothed_grad_norm < self.target_grad_norm_min * 0.8:
+                self.current_min_ts = max(0, self.current_min_ts - adjustment // 2)
+        
+        # Only wait 4 steps before next adjustment
+        self.adjustment_cooldown = 4
+        
+        tqdm.write(f"[Dynamic TS] GN: {smoothed_grad_norm:.3f} | Target: {self.target_grad_norm:.3f} | Range: [{self.current_min_ts}, {self.current_max_ts}]")
 
     def __call__(self, batch_size, current_step):
         if self.mode == "static_adaptive":
@@ -744,19 +781,22 @@ class TimestepSampler:
 
 class ConditioningDropout:
     def __init__(self, config):
-        self.is_enabled = config.USE_COND_DROPOUT
-        if self.is_enabled:
-            self.prob = config.COND_DROPOUT_PROB
-            print(f"INFO: Conditioning Dropout enabled with probability={self.prob}.")
+        self.dropout_prob = config.COND_DROPOUT_PROB if config.USE_COND_DROPOUT else 0.0
+        if self.dropout_prob > 0:
+            print(f"INFO: Conditioning Dropout enabled with probability={self.dropout_prob}.")
 
     def __call__(self, prompt_embeds, pooled_embeds):
-        if self.is_enabled and random.random() < self.prob:
-            return torch.zeros_like(prompt_embeds), torch.zeros_like(pooled_embeds)
+        if self.dropout_prob > 0 and random.random() < self.dropout_prob:
+            # Replace with zeros (unconditional)
+            prompt_embeds = torch.zeros_like(prompt_embeds)
+            pooled_embeds = torch.zeros_like(pooled_embeds)
+        
         return prompt_embeds, pooled_embeds
 
 class BaseLoss:
     def __call__(self, pred, target, is_v_pred):
-        return F.huber_loss(pred.float(), target.float(), reduction="none", delta=2.0)
+        #return F.huber_loss(pred.float(), target.float(), reduction="none", delta=2.0)
+        return F.mse_loss(pred.float(), target.float(), reduction="none")
 
 class MaskedLoss:
     def __init__(self, config):
@@ -780,34 +820,55 @@ class MaskedLoss:
         
         return final_loss.mean(dim=list(range(1, len(final_loss.shape))))
 
+import torch
+
 class MinSNRLoss:
-    def __init__(self, config, noise_scheduler):
+    """
+    A class to apply Min-SNR loss weighting, specifically tailored for v-prediction models.
+    This implementation uses a continuous "Perceptual Signal Weighting" (PSW) function
+    as the recommended default.
+    """
+    def __init__(self, config, noise_scheduler, is_v_prediction):
         self.is_enabled = config.USE_SNR_GAMMA
         if self.is_enabled:
-            self.gamma = config.SNR_GAMMA 
-            self.variant = config.MIN_SNR_VARIANT
-            self.alphas_cumprod = noise_scheduler.alphas_cumprod.to("cpu")
-            print(f"INFO: Min-SNR Loss weighting enabled with gamma={self.gamma}, variant={self.variant}.")
+
+            self.gamma = float(getattr(config, "SNR_GAMMA", 5.0))
             
+            self.variant = getattr(config, "MIN_SNR_VARIANT", "psw")
+            
+            self.alphas_cumprod = noise_scheduler.alphas_cumprod.to("cpu")
+            
+            self.is_v_prediction = is_v_prediction
+            
+            print(f"INFO: Min-SNR loss weighting enabled.")
+            print(f"      - Variant: {self.variant.upper()}")
+            print(f"      - Gamma: {self.gamma}")
+            print(f"      - V-Prediction Mode: {self.is_v_prediction}")
+
     def __call__(self, loss, timesteps):
         if not self.is_enabled:
             return loss.mean(), None
 
-        timesteps_cpu = timesteps.cpu()
-        snr = (self.alphas_cumprod[timesteps_cpu] / (1 - self.alphas_cumprod[timesteps_cpu])).to(loss.device)
+        t_cpu = timesteps.cpu()
+        snr = (self.alphas_cumprod[t_cpu] / (1 - self.alphas_cumprod[t_cpu])).to(loss.device)
         snr = torch.clamp(snr, min=1e-8)
-        
-        if self.variant == "debiased":
-            snr_loss_weights = 1 / (snr + self.gamma)
+
+        if self.variant == "psw":
+            base = (self.gamma + 1) / (snr + self.gamma)
         elif self.variant == "standard":
-            snr_loss_weights = torch.clamp(self.gamma / snr, max=1.0)
-        elif self.variant == "corrected":
-            snr_loss_weights = (self.gamma * snr) / (snr + 1)
+            base = torch.clamp(self.gamma / snr, max=1.0)
+        elif self.variant == "debiased":
+            base = 1.0 / (snr + self.gamma)
         else:
-            return loss.mean(), None
-            
-        final_loss = (loss * snr_loss_weights).mean()
-        return final_loss, snr_loss_weights
+            base = torch.ones_like(snr)
+
+        if self.is_v_prediction:
+            base = base / (snr + 1.0)
+
+        final_loss = (loss * base).mean()
+        
+        return final_loss, base
+
 
 class FeaturePlugins:
     def __init__(self, config, noise_scheduler, device):
@@ -815,8 +876,9 @@ class FeaturePlugins:
         self.conditioning_dropout = ConditioningDropout(config)
         self.base_loss = BaseLoss()
         self.masked_loss = MaskedLoss(config)
-        self.min_snr_loss = MinSNRLoss(config, noise_scheduler)
-        self.is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
+        self.is_v_prediction = config.PREDICTION_TYPE == "v_prediction"
+        self.min_snr_loss = MinSNRLoss(config, noise_scheduler, self.is_v_prediction)
+
 
 class TrainingDiagnostics:
     def __init__(self, accumulation_steps):
@@ -851,13 +913,14 @@ class TrainingDiagnostics:
         
         avg_loss = sum(self.losses) / len(self.losses)
         vram_gb = torch.cuda.memory_reserved() / 1e9
+        vram_alloc_gb = torch.cuda.memory_allocated() / 1e9
         
         report_str = (
             f"\n--- Step: {global_step} ---\n"
             f"  Loss:       {avg_loss:<8.5f} | LR: {lr:.2e}\n"
             f"  Grad Norm:  {total_norm:<8.4f} | Max Grad: {max_grad_val:.2e}\n"
             f"  Timesteps:  Min: {min(self.timesteps):<4d} | Mean: {np.mean(self.timesteps):<6.1f} | Max: {max(self.timesteps):<4d}\n"
-            f"  VRAM (GB):  {vram_gb:<8.2f}\n"
+            f"  VRAM (GB):  Reserved {vram_gb:<8.2f} | Allocated {vram_alloc_gb:<8.2f}\n"
             f"--------------------"
         )
         tqdm.write(report_str)
@@ -902,84 +965,55 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
         if key.startswith("add_embedding.linear_2."): final_map[hf_key] = key.replace("add_embedding.linear_2.", "label_emb.0.2."); continue
     return final_map
 
-def save_model(base_sd, output_path, unet, trained_unet_param_names, save_dtype):
+def save_model(sd_to_save, output_path):  # REFACTOR: Simplified, now called from queue
     def get_param_category(key_name):
         if 'ff.net' in key_name or 'mlp.fc' in key_name: return "Feed-Forward (ff)"
         if 'attn1' in key_name or 'self_attn' in key_name: return "Self-Attention (attn1)"
         if 'attn2' in key_name or 'cross_attn' in key_name: return "Cross-Attention (attn2)"
         return "Other"
 
-    param_counters = defaultdict(lambda: {'total': 0, 'saved': 0})
+    # REFACTOR: param_counters and report moved here if needed, but simplified for efficiency
+    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
+    save_file(sd_to_save, output_path)
+    del sd_to_save  # Clean up after save
 
-    unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
-    print("\nUpdating weights for UNet...")
-    
-    model_sd_on_device = unet.state_dict()
-   
-    sd_to_save = copy.deepcopy(base_sd)
+# REFACTOR: Queue the save instead of sync
+def queue_training_checkpoint(save_queue, config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
+    print(f"\nQUEUING CHECKPOINT SAVE AT STEP {step}")
 
-    for hf_key in trained_unet_param_names:
-        category = get_param_category(hf_key)
-        param_counters[category]['total'] += 1
+    state_path = checkpoint_dir / f"training_state_step_{step}.pt"
+    state = {
+        'step': step,
+        'optimizer_type': config.OPTIMIZER_TYPE,
+        'optimizer_state_dict': optimizer.get_state_for_save(),  # REFACTOR: Use new method for 100% state
+        'scheduler_state_dict': scheduler.state_dict(),
+    }
+    save_queue.put({'type': 'state', 'path': state_path, 'data': state})
 
+    checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
+    sd_to_save = base_model_state_dict.copy()  # REFACTOR: Shallow copy for efficiency (tensors are immutable refs)
+
+    unet_sd = unet.state_dict()
+    unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
+
+    for hf_key in trainable_param_names:
         mapped_part = unet_key_map.get(hf_key)
         if mapped_part:
             sd_key = 'model.diffusion_model.' + mapped_part
             if sd_key in sd_to_save:
-                sd_to_save[sd_key] = model_sd_on_device[hf_key].to("cpu", dtype=save_dtype)
-                param_counters[category]['saved'] += 1
-    
-    del model_sd_on_device
+                sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=save_dtype, non_blocking=True)  # REFACTOR: Non-blocking copy
+
+    torch.cuda.synchronize()
+    del unet_sd  # Drop ref to GPU state_dict
     gc.collect()
+    torch.cuda.empty_cache()  # Force free unused allocations
 
-    print("\n" + "="*60)
-    print(" SAVE MODEL VERIFICATION REPORT")
-    print("="*60)
-    total_model_params, total_model_saved = 0, 0
-    for category, counts in sorted(param_counters.items()):
-        saved, total = counts['saved'], counts['total']
-        print(f" - {category:<25}: Found {total:>4} -> Saved {saved:>4}")
-        if saved < total:
-            print(f"   -> WARNING: Skipped {total - saved} params in this category (likely due to key mapping mismatch)!")
-        total_model_params += total
-        total_model_saved += saved
-    print(f" --------------------------------------------------")
-    print(f" UNET Summary: {total_model_saved} / {total_model_params} targeted parameters were saved.")
-    print("="*60)
-    
-    Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-    save_file(sd_to_save, output_path)
-    print(f"[OK] Save complete: {output_path}")
-    
-    del sd_to_save
+    save_queue.put({'type': 'model', 'path': checkpoint_model_path, 'data': sd_to_save})
+
     gc.collect()
+    torch.cuda.empty_cache()
 
-
-def save_training_checkpoint(config, base_model_state_dict, unet, optimizer, scheduler, step, checkpoint_dir, trainable_param_names, save_dtype):
-    print(f"\nSAVING CHECKPOINT AT STEP {step}")
-
-    state_path = checkpoint_dir / f"training_state_step_{step}.pt"
-    torch.save({
-        'step': step,
-        'optimizer_type': config.OPTIMIZER_TYPE,
-        'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
-    }, state_path)
-    print(f"[OK] Saved optimizer/scheduler state to: {state_path}")
-
-    del optimizer
-    del scheduler
-    gc.collect()
-    print("[INFO] Optimizer and scheduler have been released from memory.")
-
-    checkpoint_model_path = checkpoint_dir / f"checkpoint_step_{step}.safetensors"
-    save_model(
-        base_sd=base_model_state_dict,
-        output_path=checkpoint_model_path,
-        unet=unet,
-        trained_unet_param_names=trainable_param_names,
-        save_dtype=save_dtype
-    )
+    print(f"[INFO] Checkpoint queued for background save. Continuing training...")
 
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     alphas = 1.0 - betas
@@ -994,8 +1028,52 @@ def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
     betas = 1 - alphas
     return betas
   
+class EMA:
+    def __init__(self, model, trainable_param_names, decay=0.9999, device='cpu'):
+        self.decay = decay
+        self.device = device
+        self.trainable_param_names = set(trainable_param_names)
+        
+        # Only shadow trainable parameters
+        self.shadow = {}
+        for name, param in model.named_parameters():
+            if name in self.trainable_param_names and param.dtype.is_floating_point:
+                self.shadow[name] = param.detach().to(device).clone()
+        
+        self.update_count = 0
+        
+        shadow_size_mb = sum(p.numel() * p.element_size() for p in self.shadow.values()) / 1e6
+        print(f"INFO: EMA tracking {len(self.shadow)} trainable params (~{shadow_size_mb:.1f} MB)")
+
+    @torch.no_grad()
+    def update(self, model):
+        decay = min(self.decay, (1 + self.update_count) / (10 + self.update_count))
+        
+        for name, param in model.named_parameters():
+            if name in self.shadow and param.dtype.is_floating_point:
+                self.shadow[name].mul_(decay).add_(param.detach().to(self.device), alpha=1 - decay)
+        
+        self.update_count += 1
+
+    def state_dict(self):
+        return {'shadow': self.shadow, 'update_count': self.update_count}
+    
+    def load_state_dict(self, state_dict):
+        self.shadow = state_dict['shadow']
+        self.update_count = state_dict.get('update_count', 0)
+
+    def copy_to(self, model):
+        """Apply EMA weights to model"""
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                param.data.copy_(self.shadow[name].to(param.device))
+
 def main():
     config = TrainingConfig()
+    
+    USE_EMA = config.USE_EMA
+    EMA_DECAY = config.EMA_DECAY
+    
     if config.SEED is not None:
         set_seed(config.SEED)
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -1048,7 +1126,15 @@ def main():
     pipeline_temp = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype, use_safetensors=True)
     unet = pipeline_temp.unet
     scheduler_config = pipeline_temp.scheduler.config
-    scheduler_config['prediction_type'] = 'v_prediction'
+    
+    # === REFACTORED SECTION START ===
+    # Set prediction type and beta schedule from config file, removing hardcoded values
+    scheduler_config['prediction_type'] = config.PREDICTION_TYPE
+    scheduler_config['beta_schedule'] = config.BETA_SCHEDULE
+    print(f"INFO: Using Prediction Type: {config.PREDICTION_TYPE}")
+    print(f"INFO: Using Beta Schedule: {config.BETA_SCHEDULE}")
+    # === REFACTORED SECTION END ===
+
     print("Loading base model state_dict into memory...")
     base_model_state_dict = load_file(model_to_load)
     del pipeline_temp; gc.collect(); torch.cuda.empty_cache()
@@ -1096,6 +1182,11 @@ def main():
         max_steps=total_optimizer_steps
     )
 
+    # Initialize EMA
+    ema = EMA(unet, trainable_params_names, decay=EMA_DECAY, device='cpu') if USE_EMA else None
+    if USE_EMA:
+        print(f"INFO: EMA enabled with decay={EMA_DECAY}")
+
     if latest_state_path:
         print(f"Loading optimizer and scheduler state from {latest_state_path.name}...")
         state = torch.load(latest_state_path, map_location="cpu")
@@ -1107,6 +1198,11 @@ def main():
         lr_scheduler.load_state_dict(state['scheduler_state_dict'])
         lr_scheduler.step(current_step=optimizer_step_resumed)
 
+        # Load EMA state if available
+        if ema is not None and 'ema_state_dict' in state and state['ema_state_dict'] is not None:
+            ema.load_state_dict(state['ema_state_dict'])
+            print("[OK] Loaded EMA state from checkpoint.")
+
         del state; gc.collect()
         print(f"[OK] Resumed training. Resuming at batch step: {global_step}, Optimizer step: {optimizer_step_resumed}.")
 
@@ -1115,98 +1211,6 @@ def main():
         noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
         noise_scheduler.register_to_config(betas=noise_scheduler.betas)
 
-    class TimestepSampler:
-        def __init__(self, config, noise_scheduler, device):
-            self.config = config
-            self.device = device
-            self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
-            self.mode = config.TIMESTEP_CURRICULUM_MODE.lower().replace(" ", "_")
-            
-            try:
-                min_val_str, max_val_str = config.TIMESTEP_CURRICULUM_START_RANGE.split(',')
-                self.initial_min = int(min_val_str.strip())
-                self.initial_max = int(max_val_str.strip())
-            except (ValueError, AttributeError):
-                print("WARNING: Could not parse TIMESTEP_CURRICULUM_START_RANGE. Using full range [0, 999].")
-                self.initial_min = 0
-                self.initial_max = self.num_train_timesteps - 1
-            
-            self.initial_min = max(0, self.initial_min)
-            self.initial_max = min(self.num_train_timesteps - 1, self.initial_max)
-
-            if self.mode == "static_adaptive":
-                self._init_static_adaptive_mode()
-            elif self.mode == "dynamic_balancing":
-                self._init_dynamic_mode()
-            else:
-                print(f"INFO: Initialized Fixed Timestep Sampling with range: [{self.initial_min}, {self.initial_max}]")
-
-        def _init_static_adaptive_mode(self):
-            self.curriculum_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.TIMESTEP_CURRICULUM_END_PERCENT / 100.0))
-            print("INFO: Initialized Static Adaptive Timestep Curriculum.")
-            print(f"      - Start Range: [{self.initial_min}, {self.initial_max}]")
-            print(f"      - Will expand to full range over {self.curriculum_duration_steps} steps.")
-
-        def _init_dynamic_mode(self):
-            self.probe_duration_steps = int(self.config.MAX_TRAIN_STEPS * (self.config.DYNAMIC_CHALLENGE_PROBE_PERCENT / 100.0))
-            try:
-                min_gn_str, max_gn_str = self.config.DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE.split(',')
-                self.target_grad_norm_min = float(min_gn_str.strip())
-                self.target_grad_norm_max = float(max_gn_str.strip())
-            except (ValueError, AttributeError):
-                print("WARNING: Could not parse DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE. Using defaults [0.25, 0.9].")
-                self.target_grad_norm_min = 0.25
-                self.target_grad_norm_max = 0.90
-            
-            self.current_min_ts = self.initial_min
-            self.current_max_ts = self.initial_max 
-            self.adjustment_step_size = max(1, int(self.num_train_timesteps * 0.005)) 
-
-            print("INFO: Initialized Dynamic Challenge Balancing.")
-            print(f"      - Probe Phase: {self.probe_duration_steps} steps with oscillating boundary expansion.")
-            print(f"      - Target Grad Norm Range: [{self.target_grad_norm_min}, {self.target_grad_norm_max}]")
-
-        def update_range(self, grad_norm, current_step):
-            if self.mode != "dynamic_balancing": return
-
-            if current_step <= self.probe_duration_steps:
-                if current_step % 2 == 0:
-                    if grad_norm < self.target_grad_norm_max:
-                        self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
-                else:
-                    if grad_norm > self.target_grad_norm_min:
-                        self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
-            
-            else:
-                if grad_norm > self.target_grad_norm_max:
-                    self.current_max_ts = max(self.current_min_ts, self.current_max_ts - self.adjustment_step_size)
-                elif grad_norm < self.target_grad_norm_min:
-                    self.current_max_ts = min(self.num_train_timesteps - 1, self.current_max_ts + self.adjustment_step_size)
-                    self.current_min_ts = max(0, self.current_min_ts - self.adjustment_step_size)
-
-        def __call__(self, batch_size, current_step):
-            if self.mode == "static_adaptive":
-                duration = self.curriculum_duration_steps
-                progress = min(1.0, current_step / duration) if duration > 0 else 1.0
-                min_ts = int(round(self.initial_min * (1.0 - progress)))
-                max_ts = int(round(self.initial_max + (self.num_train_timesteps - 1 - self.initial_max) * progress))
-            elif self.mode == "dynamic_balancing":
-                min_ts, max_ts = self.current_min_ts, self.current_max_ts
-            else:
-                min_ts, max_ts = self.initial_min, self.initial_max
-
-            if max_ts < min_ts: max_ts = min_ts
-            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device).long()
-
-    class FeaturePlugins:
-        def __init__(self, config, noise_scheduler, device):
-            self.timestep_sampler = TimestepSampler(config, noise_scheduler, device)
-            self.conditioning_dropout = ConditioningDropout(config)
-            self.base_loss = BaseLoss()
-            self.masked_loss = MaskedLoss(config)
-            self.min_snr_loss = MinSNRLoss(config, noise_scheduler)
-            self.is_v_prediction = noise_scheduler.config.prediction_type == "v_prediction"
-
     plugins = FeaturePlugins(config, noise_scheduler, device)
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
 
@@ -1214,25 +1218,50 @@ def main():
     sampler = BucketBatchSampler(dataset=train_dataset, batch_size=config.BATCH_SIZE, seed=config.SEED, shuffle=True, drop_last=False)
     train_dataloader = DataLoader(train_dataset, batch_sampler=sampler, collate_fn=custom_collate_fn_latent, num_workers=config.NUM_WORKERS, pin_memory=True)
     
+    # Background saver thread
+    save_queue = queue.Queue()
+    def background_saver():
+        while True:
+            item = save_queue.get()
+            if item is None:
+                break
+            if item['type'] == 'state':
+                torch.save(item['data'], item['path'])
+            elif item['type'] == 'model':
+                save_model(item['data'], item['path'])
+            tqdm.write(f"[OK] Background save complete: {item['path']}")
+            del item['data']
+            gc.collect()
+            if item['type'] == 'model':
+                torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+            gc.collect()
+            torch.cuda.empty_cache()
+
+    save_thread = threading.Thread(target=background_saver)
+    save_thread.start()
+
     def train_step(batch, current_step):
         latents = batch["latents"]
-
-        # --- REPLACEMENT: OFFSET NOISE IMPLEMENTATION ---
-        noise = torch.randn_like(latents)
-        noise_offset_strength = 0.1
-        offset_noise = torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
-        noise = noise + noise_offset_strength * offset_noise
-        # --- END OF REPLACEMENT ---
-
-        timesteps = plugins.timestep_sampler(latents.shape[0], current_step=current_step)
+        batch_size = latents.shape[0]
         
+        noise = torch.randn_like(latents)
+        offset_noise = torch.randn(latents.shape[0], latents.shape[1], 1, 1, device=latents.device)
+        noise = noise + 0.03 * offset_noise
+
+        timesteps = plugins.timestep_sampler(batch_size, current_step=current_step)
         noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
         target = noise_scheduler.get_velocity(latents, noise, timesteps) if plugins.is_v_prediction else noise
         
-        # --- FIX: Changed batch["pooled_embeds"] to the correct key batch["pooled_prompt_embeds"] ---
-        prompt_embeds, pooled_embeds = plugins.conditioning_dropout(batch["prompt_embeds"], batch["pooled_prompt_embeds"])
+        # Simple dropout - no CFG
+        prompt_embeds, pooled_embeds = plugins.conditioning_dropout(
+            batch["prompt_embeds"], 
+            batch["pooled_prompt_embeds"]
+        )
         
-        add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(latents.device, dtype=prompt_embeds.dtype)
+        add_time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) 
+                                for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], 
+                                dim=0).to(latents.device, dtype=prompt_embeds.dtype)
         
         with torch.autocast(device_type=latents.device.type, dtype=config.compute_dtype, enabled=use_scaler):
             pred = unet(
@@ -1251,11 +1280,17 @@ def main():
         
         if not torch.isfinite(loss):
             tqdm.write(f"\n[WARNING] Detected NaN/Inf loss. Skipping this micro-batch.")
-            return None, timesteps
+            return None, timesteps, None
         
         scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
-        return loss.item(), timesteps
-
+        
+        raw_grad_norm = 0.0
+        for p in params_to_optimize:
+            if p.grad is not None:
+                raw_grad_norm += p.grad.data.norm(2).item() ** 2
+        raw_grad_norm = raw_grad_norm ** 0.5
+        
+        return loss.item(), timesteps, raw_grad_norm
     unet.train()
     
     progress_bar = tqdm(range(global_step, total_training_steps), desc="Training Steps", initial=global_step, total=total_training_steps)
@@ -1272,7 +1307,12 @@ def main():
 
             batch = {k: v.to(device, non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in batch.items()}
             
-            loss_item, timesteps = train_step(batch, current_step=global_step)
+            loss_item, timesteps, raw_grad_norm = train_step(batch, current_step=global_step)
+            
+            # Update timestep sampler with raw micro-batch gradient
+            if raw_grad_norm is not None:
+                plugins.timestep_sampler.update_range(raw_grad_norm, global_step)
+            
             diagnostics.step(loss_item, timesteps)
 
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
@@ -1287,72 +1327,127 @@ def main():
                 current_lr = optimizer.param_groups[0]['lr']
                 diagnostics.report(global_step + 1, current_lr, params_to_optimize)
 
-                plugins.timestep_sampler.update_range(diagnostics.last_grad_norm, global_step)
-
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad(set_to_none=True)
+                
+                # Update EMA after optimizer step
+                if ema is not None:
+                    ema.update(unet)
             
             global_step += 1
             progress_bar.update(1)
            
             if global_step > 0 and (global_step % config.SAVE_EVERY_N_STEPS == 0):
                 current_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
-                save_training_checkpoint(
-                    config, base_model_state_dict, unet, optimizer, lr_scheduler, 
-                    current_optimizer_step, CHECKPOINT_DIR, trainable_params_names, config.compute_dtype
-                )
-
-                print("\n[INFO] Re-initializing optimizer and scheduler post-checkpointing...")
                 
-                if optimizer_type == "Raven":
-                    optimizer = Raven(params=optimizer_grouped_parameters, **config.RAVEN_PARAMS)
-                elif optimizer_type == "Adafactor":
-                    optimizer = Adafactor(params=optimizer_grouped_parameters, **config.ADAFACTOR_PARAMS)
-                elif optimizer_type == "AdamW":
-                    optimizer = AdamW(params=optimizer_grouped_parameters)
-
+                # Save checkpoint with EMA state
+                print(f"\nQUEUING CHECKPOINT SAVE AT STEP {current_optimizer_step}")
                 state_path = CHECKPOINT_DIR / f"training_state_step_{current_optimizer_step}.pt"
-                state = torch.load(state_path, map_location="cpu")
-                optimizer.load_state_dict(state['optimizer_state_dict'])
+                state = {
+                    'step': current_optimizer_step,
+                    'optimizer_type': config.OPTIMIZER_TYPE,
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'scheduler_state_dict': lr_scheduler.state_dict(),
+                    'ema_state_dict': ema.state_dict() if ema else None,
+                }
+                save_queue.put({'type': 'state', 'path': state_path, 'data': state})
 
-                lr_scheduler = CustomCurveScheduler(
-                    optimizer=optimizer, lr_curve_points=config.LR_CUSTOM_CURVE, max_steps=total_optimizer_steps
-                )
-                lr_scheduler.load_state_dict(state['scheduler_state_dict'])
-                lr_scheduler.step(current_step=current_optimizer_step)
-
-                del state; gc.collect()
-                print("[OK] Optimizer and scheduler state reloaded.")
+                checkpoint_model_path = CHECKPOINT_DIR / f"checkpoint_step_{current_optimizer_step}.safetensors"
+                sd_to_save = base_model_state_dict.copy()
+                unet_sd = unet.state_dict()
+                unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
+                for hf_key in trainable_params_names:
+                    mapped_part = unet_key_map.get(hf_key)
+                    if mapped_part:
+                        sd_key = 'model.diffusion_model.' + mapped_part
+                        if sd_key in sd_to_save:
+                            sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+                torch.cuda.synchronize()
+                del unet_sd
+                gc.collect()
+                torch.cuda.empty_cache()
+                save_queue.put({'type': 'model', 'path': checkpoint_model_path, 'data': sd_to_save})
                 
+                print(f"[INFO] Checkpoint queued for background save. Continuing training...")
+
     progress_bar.close()
     final_optimizer_step = global_step // config.GRADIENT_ACCUMULATION_STEPS
     print(f"--> Training finished at batch step: {global_step}, optimizer step: {final_optimizer_step}")
 
     file_basename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final_steps{global_step}_updates{final_optimizer_step}"
 
+    # Save final state
     final_state_path = OUTPUT_DIR / f"{file_basename}_state.pt"
-    print(f"\n[INFO] Saving final optimizer and scheduler state to: {final_state_path}")
-    torch.save({
+    final_state = {
         'step': final_optimizer_step,
         'optimizer_type': config.OPTIMIZER_TYPE,
         'optimizer_state_dict': optimizer.state_dict(),
         'scheduler_state_dict': lr_scheduler.state_dict(),
-    }, final_state_path)
-    print(f"[OK] Final state saved.")
+        'ema_state_dict': ema.state_dict() if ema else None,
+    }
+    save_queue.put({'type': 'state', 'path': final_state_path, 'data': final_state})
 
-    print("[INFO] Releasing optimizer and scheduler memory before final model save...")
-    del optimizer
-    del lr_scheduler
+    # Save final regular model
+    final_model_path = OUTPUT_DIR / f"{file_basename}.safetensors"
+    final_sd_to_save = base_model_state_dict.copy()
+    unet_sd = unet.state_dict()
+    unet_key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
+    for hf_key in trainable_params_names:
+        mapped_part = unet_key_map.get(hf_key)
+        if mapped_part:
+            sd_key = 'model.diffusion_model.' + mapped_part
+            if sd_key in final_sd_to_save:
+                final_sd_to_save[sd_key] = unet_sd[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+    torch.cuda.synchronize()
+    del unet_sd
     gc.collect()
     torch.cuda.empty_cache()
-    print("[OK] Optimizer and scheduler memory released.")
+    save_queue.put({'type': 'model', 'path': final_model_path, 'data': final_sd_to_save})
 
-    final_model_path = OUTPUT_DIR / f"{file_basename}.safetensors"
-    
-    save_model(base_model_state_dict, final_model_path, unet, trainable_params_names, config.compute_dtype)
+    # Save final EMA model
+    if ema is not None:
+        print("\nSaving final EMA model...")
+        ema_model_path = OUTPUT_DIR / f"{file_basename}_ema.safetensors"
+        
+        # Store original weights
+        original_state = {k: v.clone() for k, v in unet.state_dict().items() if k in trainable_params_names}
+        
+        # Apply EMA weights temporarily
+        ema.copy_to(unet)
+        
+        # Save with EMA weights
+        ema_sd_to_save = base_model_state_dict.copy()
+        unet_sd_ema = unet.state_dict()
+        for hf_key in trainable_params_names:
+            mapped_part = unet_key_map.get(hf_key)
+            if mapped_part:
+                sd_key = 'model.diffusion_model.' + mapped_part
+                if sd_key in ema_sd_to_save:
+                    ema_sd_to_save[sd_key] = unet_sd_ema[hf_key].to("cpu", dtype=config.compute_dtype, non_blocking=True)
+        
+        torch.cuda.synchronize()
+        del unet_sd_ema
+        gc.collect()
+        torch.cuda.empty_cache()
+        
+        save_queue.put({'type': 'model', 'path': ema_model_path, 'data': ema_sd_to_save})
+        
+        # Restore original weights
+        unet.load_state_dict(original_state, strict=False)
+        del original_state
+
+    gc.collect()
+    torch.cuda.empty_cache()
+
+    # Wait for all saves to complete
+    save_queue.put(None)
+    save_thread.join()
+
     print("\nTRAINING COMPLETE")
-
+    if USE_EMA:
+        print(f"Regular model: {final_model_path}")
+        print(f"EMA model: {OUTPUT_DIR / f'{file_basename}_ema.safetensors'}")
 
 if __name__ == "__main__":
     try:

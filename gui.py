@@ -23,14 +23,13 @@ pattern = re.compile(
     r"Loss:\s*([\d.]+)\s*\|\s*LR:\s*([\deE\+\-\.]+)\s*"
     r"Grad Norm:\s*([\d.]+)\s*\|\s*Max Grad:\s*([\deE\+\-\.]+)\s*"
     r"Timesteps:\s*Min:\s*(\d+)\s*\|\s*Mean:\s*([\d.]+)\s*\|\s*Max:\s*(\d+)\s*"
-    r"VRAM \(GB\):\s*([\d.]+)",
+    r"VRAM \(GB\):\s*Reserved\s*([\d.]+)\s*\|\s*Allocated\s*([\d.]+)",
     re.MULTILINE
 )
-
 def extract_data(text: str):
     data = []
     for m in pattern.finditer(text):
-        step, loss, lr, grad_norm, max_grad, tmin, tmean, tmax, vram = m.groups()
+        step, loss, lr, grad_norm, max_grad, tmin, tmean, tmax, vram_reserved, vram_allocated = m.groups()
         data.append({
             "Step": int(step),
             "Loss": float(loss),
@@ -40,7 +39,8 @@ def extract_data(text: str):
             "TimestepMin": int(tmin),
             "TimestepMean": float(tmean),
             "TimestepMax": int(tmax),
-            "VRAM": float(vram)
+            "VRAM_Reserved": float(vram_reserved),
+            "VRAM_Allocated": float(vram_allocated)
         })
     return pd.DataFrame(data)
 
@@ -573,6 +573,8 @@ class TrainingGUI(QtWidgets.QWidget):
         "CACHING_BATCH_SIZE": {"label": "Caching Batch Size", "tooltip": "Adjust based on VRAM (e.g., 2-4).", "widget": "QLineEdit"},
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QLineEdit"},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
+        "PREDICTION_TYPE": {"label": "Prediction Type:", "tooltip": "v_prediction or epsilon. Must match the base model.", "widget": "QComboBox", "options": ["v_prediction", "epsilon"]},
+        "BETA_SCHEDULE": {"label": "Beta Schedule:", "tooltip": "Noise schedule for the diffuser.", "widget": "QComboBox", "options": ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
         "SAVE_EVERY_N_STEPS": {"label": "Save Every N Steps:", "tooltip": "How often to save a checkpoint.", "widget": "QLineEdit"},
         "GRADIENT_ACCUMULATION_STEPS": {"label": "Gradient Accumulation:", "tooltip": "Simulates a larger batch size.", "widget": "QLineEdit"},
@@ -584,7 +586,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "SNR_STRATEGY": {"label": "Strategy:", "tooltip": "Min-SNR focuses on noisy steps, Max-SNR focuses on cleaner steps.", "widget": "QComboBox", "options": ["Min-SNR", "Max-SNR"]},
         "SNR_GAMMA": {"label": "Gamma Value:", "tooltip": "For Min-SNR, common range is 5-20. For Max-SNR, this acts as a clamp.", "widget": "QLineEdit"},
-        "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["debiased", "corrected", "standard"]},
+        "MIN_SNR_VARIANT": {"label": "Variant (Min-SNR only):", "tooltip": "Select the Min-SNR weighting variant.", "widget": "QComboBox", "options": ["debiased", "standard", "psw"]},
         "COND_DROPOUT_PROB": {"label": "Dropout Probability:", "tooltip": "e.g., 0.1 (5-15% common).", "widget": "QLineEdit"},
         "TIMESTEP_CURRICULUM_MODE": {
             "label": "Curriculum Mode:",
@@ -595,7 +597,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
         "TIMESTEP_CURRICULUM_START_RANGE": {"label": "Timestep Range (Start/Fixed):", "tooltip": "The timestep range to sample from, e.g., '200, 800'.\nIf Adaptive Curriculum is off, this range is used for the entire run.\nIf on, this is the starting range that will expand.", "widget": "QLineEdit"},
         "TIMESTEP_CURRICULUM_END_PERCENT": {"label": "Expand until X% of run:", "tooltip": "The percentage of the total training steps over which the\ntimestep range will expand to its maximum (0-999).", "widget": "QLineEdit"},
-        "DYNAMIC_CHALLENGE_PROBE_PERCENT": {"label": "Probe % of Run:", "tooltip": "The percentage of training steps (e.g., 5% = first 5% of max steps) over which the model will 'probe' its performance for dynamic adjustment. This is where the model will be evaluated for its current grad norm.", "widget": "QLineEdit"},
         "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": {"label": "Target Grad Norm Range:", "tooltip": "The desired range for the gradient norm, e.g., '0.25, 0.90'. The curriculum will adjust timesteps to keep the grad norm within this range.", "widget": "QLineEdit"},
 
         "MEMORY_EFFICIENT_ATTENTION": {
@@ -604,7 +605,19 @@ class TrainingGUI(QtWidgets.QWidget):
             "widget": "QComboBox",
             "options": ["xformers", "sdpa"]
         },
+
+        "USE_EMA": {
+            "label": "Use EMA",
+            "tooltip": "Enable Exponential Moving Average for smoother, more stable model weights.",
+            "widget": "QCheckBox"
+        },
+        "EMA_DECAY": {
+            "label": "EMA Decay Rate:",
+            "tooltip": "How much to preserve old weights (0.999-0.9999). Higher = smoother but slower adaptation.",
+            "widget": "QLineEdit"
+        },
     }
+
     def __init__(self):
         super().__init__()
         self.setObjectName("TrainingGUI")
@@ -983,7 +996,15 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_core_training_group(self):
         core_group = QtWidgets.QGroupBox("Core Training")
         layout = QtWidgets.QFormLayout(core_group)
-        core_keys = ["MAX_TRAIN_STEPS", "SAVE_EVERY_N_STEPS", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "SEED"]
+        core_keys = [
+            "PREDICTION_TYPE", 
+            "BETA_SCHEDULE", 
+            "MAX_TRAIN_STEPS", 
+            "SAVE_EVERY_N_STEPS", 
+            "GRADIENT_ACCUMULATION_STEPS", 
+            "MIXED_PRECISION", 
+            "SEED"
+        ]
         for key in core_keys:
             label, widget = self._create_widget(key)
             layout.addRow(label, widget)
@@ -1218,9 +1239,6 @@ class TrainingGUI(QtWidgets.QWidget):
         dynamic_form = QtWidgets.QFormLayout()
         dynamic_form.setContentsMargins(0, 0, 0, 0)
         
-        label, widget = self._create_widget("DYNAMIC_CHALLENGE_PROBE_PERCENT")
-        dynamic_form.addRow(label, widget)
-        
         label, widget = self._create_widget("DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE")
         dynamic_form.addRow(label, widget)
 
@@ -1246,26 +1264,105 @@ class TrainingGUI(QtWidgets.QWidget):
         
         left_layout = QtWidgets.QVBoxLayout()
 
+        # --- Memory Efficient Attention ---
         attention_group = QtWidgets.QGroupBox("Memory Efficient Attention")
         attention_layout = QtWidgets.QFormLayout(attention_group)
         label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
         attention_layout.addRow(label, widget)
         left_layout.addWidget(attention_group)
 
+        # --- EMA Group ---
+        ema_group = QtWidgets.QGroupBox("Exponential Moving Average (EMA)")
+        ema_layout = QtWidgets.QVBoxLayout(ema_group)
+        
+        ema_enable_layout = QtWidgets.QHBoxLayout()
+        self._create_bool_option(ema_enable_layout, "USE_EMA", "Enable EMA", 
+                                "Maintains smoothed weights for better generalization.", 
+                                self.toggle_ema_widget)
+        
+        ema_help_button = QtWidgets.QPushButton("?")
+        ema_help_button.setFixedSize(22, 22)
+        ema_help_button.setToolTip("Click for information about EMA.")
+        ema_help_button.setStyleSheet("""
+            QPushButton {
+                font-weight: bold; font-size: 14px; color: #e0e0e0;
+                background-color: #4a4668; border: 1px solid #5c5a70;
+                border-radius: 11px; padding: 0px; margin: 0px;
+                min-height: 20px; max-height: 20px; min-width: 20px; max-width: 20px;
+            }
+            QPushButton:hover { background-color: #6a48d7; color: #ffffff; border: 1px solid #ab97e6; }
+            QPushButton:pressed { background-color: #383552; }
+        """)
+        
+        ema_help_text = """
+        <h2>Exponential Moving Average (EMA)</h2>
+        <p>EMA maintains a smoothed copy of your model weights during training, which often produces better results than the final training checkpoint.</p>
+        <hr>
+        <h3>How It Works</h3>
+        <p>At each optimizer step, EMA updates a shadow copy of the weights using:</p>
+        <p><code>EMA_weight = decay × EMA_weight + (1 - decay) × current_weight</code></p>
+        <p>This creates a running average that filters out training noise and sudden changes.</p>
+        <hr>
+        <h3>Benefits</h3>
+        <ul>
+            <li><b>Better Generalization:</b> Smoothed weights often work better on new prompts</li>
+            <li><b>Reduced Noise:</b> Averages out random fluctuations from stochastic gradients</li>
+            <li><b>Industry Standard:</b> Used in Stable Diffusion, DALL-E, and most SOTA models</li>
+        </ul>
+        <hr>
+        <h3>Settings</h3>
+        <ul>
+            <li><b>Decay Rate (0.9999 recommended):</b> Higher values = slower, smoother adaptation
+                <ul>
+                    <li>0.999: Faster reaction, good for short training runs</li>
+                    <li>0.9999: Standard for most diffusion models</li>
+                    <li>0.99999: Very slow, only for extremely long training</li>
+                </ul>
+            </li>
+        </ul>
+        <p><b>Memory Cost:</b> EMA stores a CPU copy of trainable parameters (~500MB-5GB depending on what you're training).</p>
+        <p><b>Output:</b> Training will save both a regular model and an <code>_ema.safetensors</code> model at the end. Try both!</p>
+        """
+        
+        def show_ema_help():
+            dialog = InfoDialog("EMA Information", ema_help_text, self)
+            dialog.exec()
+        ema_help_button.clicked.connect(show_ema_help)
+        
+        ema_enable_layout.addWidget(ema_help_button, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
+        ema_enable_layout.addStretch()
+        ema_layout.addLayout(ema_enable_layout)
+        
+        self.ema_sub_widget = SubOptionWidget()
+        ema_sub_layout = QtWidgets.QFormLayout()
+        ema_sub_layout.setContentsMargins(0, 0, 0, 0)
+        label, widget = self._create_widget("EMA_DECAY")
+        ema_sub_layout.addRow(label, widget)
+        self.ema_sub_widget.get_layout().addLayout(ema_sub_layout)
+        ema_layout.addWidget(self.ema_sub_widget)
+        
+        left_layout.addWidget(ema_group)
+
+        # --- Noise & Regularization ---
         noise_group = QtWidgets.QGroupBox("Noise & Regularization")
         noise_layout = QtWidgets.QVBoxLayout(noise_group)
 
-        self.ip_sub_widget = SubOptionWidget()
-        noise_layout.addWidget(QtWidgets.QFrame(frameShape=QtWidgets.QFrame.Shape.HLine))
-        self._create_bool_option(noise_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", "Improves classifier-free guidance.", self.toggle_cond_dropout_widget)
+        # --- Conditioning Dropout ---
+        self._create_bool_option(noise_layout, "USE_COND_DROPOUT", "Use Text Conditioning Dropout", 
+                                "Improves classifier-free guidance.", self.toggle_cond_dropout_widget)
         self.cond_sub_widget = SubOptionWidget()
-        label, widget = self._create_widget("COND_DROPOUT_PROB"); self.cond_sub_widget.get_layout().addWidget(label); self.cond_sub_widget.get_layout().addWidget(widget)
+        label, widget = self._create_widget("COND_DROPOUT_PROB")
+        self.cond_sub_widget.get_layout().addWidget(label)
+        self.cond_sub_widget.get_layout().addWidget(widget)
         noise_layout.addWidget(self.cond_sub_widget)
+        
         left_layout.addWidget(noise_group)
         
+        # --- Loss Weighting ---
         loss_group = QtWidgets.QGroupBox("Loss Weighting")
         loss_layout = QtWidgets.QVBoxLayout(loss_group)
-        self._create_bool_option(loss_layout, "USE_SNR_GAMMA", "Use SNR Gamma Weighting", "Reweights the loss based on Signal-to-Noise Ratio.", self.toggle_snr_gamma_widget)
+        self._create_bool_option(loss_layout, "USE_SNR_GAMMA", "Use SNR Gamma Weighting", 
+                                "Reweights the loss based on Signal-to-Noise Ratio.", self.toggle_snr_gamma_widget)
         self.snr_sub_widget = SubOptionWidget()
         snr_sub_layout = QtWidgets.QFormLayout()
         self.snr_sub_widget.get_layout().addLayout(snr_sub_layout)
@@ -1280,6 +1377,7 @@ class TrainingGUI(QtWidgets.QWidget):
         left_layout.addWidget(loss_group)
         left_layout.addStretch()
         
+        # --- Right Column: UNet Layer Targeting ---
         right_layout = QtWidgets.QVBoxLayout()
         layers_group = QtWidgets.QGroupBox("UNet Layer Targeting")
         layers_layout = QtWidgets.QVBoxLayout(layers_group)
@@ -1473,8 +1571,11 @@ class TrainingGUI(QtWidgets.QWidget):
             # --- Call all toggle functions to ensure UI state is correct ---
             for toggle_func in [
                 self.toggle_snr_gamma_widget,
-                self.toggle_cond_dropout_widget, self._toggle_optimizer_widgets,
-                self.toggle_curriculum_sub_widgets
+                self.toggle_cond_dropout_widget,
+                self._toggle_optimizer_widgets,
+                self.toggle_curriculum_sub_widgets,
+                self.toggle_ema_widget,
+                self.toggle_cfg_interval_widget  # ADD THIS
             ]:
                 toggle_func()
             
@@ -1511,6 +1612,14 @@ class TrainingGUI(QtWidgets.QWidget):
             self.snr_sub_widget.setVisible(is_checked)
             if is_checked:
                 self.toggle_snr_variant_widget()
+    def toggle_ema_widget(self):
+        if hasattr(self, 'ema_sub_widget'):
+            is_checked = self.widgets.get("USE_EMA", QtWidgets.QCheckBox()).isChecked()
+            self.ema_sub_widget.setVisible(is_checked)
+    def toggle_cfg_interval_widget(self):
+        if hasattr(self, 'cfg_interval_sub_widget'):
+            is_checked = self.widgets.get("USE_LIMITED_INTERVAL_GUIDANCE", QtWidgets.QCheckBox()).isChecked()
+            self.cfg_interval_sub_widget.setVisible(is_checked)
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
@@ -1678,7 +1787,7 @@ class TrainingGUI(QtWidgets.QWidget):
             return
         formatted_text = df.to_string(
             index=False,
-            columns=["Step", "Loss", "LR", "GradNorm", "MaxGrad", "TimestepMin", "TimestepMean", "TimestepMax", "VRAM"],
+            columns=["Step", "Loss", "LR", "GradNorm", "MaxGrad", "TimestepMin", "TimestepMean", "TimestepMax", "VRAM_Reserved", "VRAM_Allocated"],
             formatters={
                 "Step": "{:>4}".format,
                 "Loss": "{:.5f}".format,
@@ -1688,13 +1797,14 @@ class TrainingGUI(QtWidgets.QWidget):
                 "TimestepMin": "{:>3}".format,
                 "TimestepMean": "{:.1f}".format,
                 "TimestepMax": "{:>3}".format,
-                "VRAM": "{:.2f}".format
+                "VRAM_Reserved": "{:.2f}".format,
+                "VRAM_Allocated": "{:.2f}".format
             },
             justify="right"
         )
         dialog = QtWidgets.QDialog(self)
         dialog.setWindowTitle("Extracted Training Data")
-        dialog.setMinimumSize(600, 400)
+        dialog.setMinimumSize(800, 550)
         dialog.setStyleSheet("""
             QDialog { background-color: #2c2a3e; }
             QTextEdit {

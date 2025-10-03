@@ -1,11 +1,11 @@
-# ====================================================================================
-# DEFAULT CONFIGURATION
-# All values here are the default settings for the UNet-only trainer.
-# The GUI will load these and save user changes to a separate user_config.json file.
+# ==================================================================================== 
+# DEFAULT CONFIGURATION 
+# All values here are the default settings for the UNet-only trainer. 
+# The GUI will load these and save user changes to a separate user_config.json file. 
 # ====================================================================================
 
 # --- Paths ---
-SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safensors"
+SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safetensors"
 OUTPUT_DIR = "./sdxl_finetune_output"
 
 # --- Dataset Configuration ---
@@ -29,7 +29,10 @@ NUM_WORKERS = 4
 
 # --- Aspect Ratio Bucketing ---
 TARGET_PIXEL_AREA = 1327104
+
 # --- Training Parameters ---
+PREDICTION_TYPE = "v_prediction"
+BETA_SCHEDULE = "scaled_linear"
 MAX_TRAIN_STEPS = 35000
 GRADIENT_ACCUMULATION_STEPS = 64
 CLIP_GRAD_NORM = 1.25
@@ -65,15 +68,11 @@ UNET_TRAIN_TARGETS = [
 ]
 
 # TIMESTEP CURRICULUM
-# Defines the strategy for sampling timesteps during training.
-# "Fixed": Samples from the exact TIMESTEP_CURRICULUM_START_RANGE for the entire run.
-# "Static Adaptive": Starts with START_RANGE and linearly expands to [0, 999] over END_PERCENT of training.
-# "Dynamic Balancing": Self-tunes the range in real-time to keep Grad Norm within a target zone.
-TIMESTEP_CURRICULUM_MODE = "Fixed"  # Options: "Fixed", "Static Adaptive", "Dynamic Balancing"
+TIMESTEP_CURRICULUM_MODE = "Fixed"
 TIMESTEP_CURRICULUM_START_RANGE = "0, 999"
 TIMESTEP_CURRICULUM_END_PERCENT = 80
 
-# DYNAMIC CHALLENGE BALANCING (Sub-settings for the "Dynamic Balancing" mode)
+# DYNAMIC CHALLENGE BALANCING
 DYNAMIC_CHALLENGE_PROBE_PERCENT = 5
 DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE = "0.25, 0.90"
 
@@ -82,12 +81,16 @@ MEMORY_EFFICIENT_ATTENTION = "xformers"
 USE_SNR_GAMMA = True
 SNR_STRATEGY = "Min-SNR"
 SNR_GAMMA = 20.0
-MIN_SNR_VARIANT = "standard"
+MIN_SNR_VARIANT = "min_snr_gamma"
 USE_ZERO_TERMINAL_SNR = True
 USE_IP_NOISE_GAMMA = True
 IP_NOISE_GAMMA = 0.01
 USE_COND_DROPOUT = True
 COND_DROPOUT_PROB = 0.1
+
+# --- EMA (Exponential Moving Average) Configuration ---
+USE_EMA = True
+EMA_DECAY = 0.9999  # Standard decay rate (0.999-0.9999 typical range)
 
 # --- Optimizer Configuration ---
 OPTIMIZER_TYPE = "Raven"

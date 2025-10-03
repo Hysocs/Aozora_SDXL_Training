@@ -5,66 +5,72 @@
     "BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
-    "MAX_TRAIN_STEPS": 15000,
+    "PREDICTION_TYPE": "v_prediction",
+    "BETA_SCHEDULE": "scaled_linear",
+    "MAX_TRAIN_STEPS": 12500,
     "GRADIENT_ACCUMULATION_STEPS": 16,
-    "CLIP_GRAD_NORM": 1.25,
+    "CLIP_GRAD_NORM": 5.6,
     "MIXED_PRECISION": "bfloat16",
     "SEED": 69,
     "SAVE_EVERY_N_STEPS": 15000,
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/checkpoint_step_15000.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/checkpoints/training_state_step_15000.pt",
+    "RESUME_MODEL_PATH": "",
+    "RESUME_STATE_PATH": "",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            1e-06
+            3e-06
         ],
         [
-            0.12171838,
-            1e-05
+            0.1,
+            3e-05
+        ],
+        [
+            0.1,
+            3e-05
         ],
         [
             0.19,
-            9.7798e-06
+            2.93393e-05
         ],
         [
             0.28,
-            9.1406e-06
+            2.74217e-05
         ],
         [
             0.37,
-            8.145e-06
+            2.44351e-05
         ],
         [
             0.46,
-            6.8906e-06
+            2.06717e-05
         ],
         [
             0.55,
-            5.5e-06
+            1.65e-05
         ],
         [
             0.64,
-            4.1094e-06
+            1.23283e-05
         ],
         [
             0.73,
-            2.855e-06
+            8.5649e-06
         ],
         [
             0.82,
-            1.8594e-06
+            5.5783e-06
         ],
         [
             0.91,
-            1.2202e-06
+            3.6607e-06
         ],
         [
             1.0,
-            1e-06
+            3e-06
         ]
     ],
-    "LR_GRAPH_MIN": 1e-06,
-    "LR_GRAPH_MAX": 1e-05,
+    "LR_GRAPH_MIN": 3e-06,
+    "LR_GRAPH_MAX": 3e-05,
     "WEIGHT_DECAY": 0.01,
     "UNET_TRAIN_TARGETS": [
         "attn1",
@@ -92,25 +98,27 @@
         "norm3",
         "conv_norm_out"
     ],
-    "TIMESTEP_CURRICULUM_MODE": "Dynamic Balancing",
-    "TIMESTEP_CURRICULUM_START_RANGE": "200, 850",
-    "TIMESTEP_CURRICULUM_END_PERCENT": 65,
-    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 8,
-    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.19, 0.99",
+    "TIMESTEP_CURRICULUM_MODE": "Fixed",
+    "TIMESTEP_CURRICULUM_START_RANGE": "0, 999",
+    "TIMESTEP_CURRICULUM_END_PERCENT": 35,
+    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 5,
+    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.25, 0.55",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_SNR_GAMMA": true,
     "SNR_STRATEGY": "Min-SNR",
     "SNR_GAMMA": 5.0,
-    "MIN_SNR_VARIANT": "debiased",
+    "MIN_SNR_VARIANT": "psw",
     "USE_ZERO_TERMINAL_SNR": true,
     "USE_IP_NOISE_GAMMA": true,
     "IP_NOISE_GAMMA": 0.01,
-    "USE_COND_DROPOUT": false,
+    "USE_COND_DROPOUT": true,
     "COND_DROPOUT_PROB": 0.05,
+    "USE_EMA": true,
+    "EMA_DECAY": 0.9999,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Didac",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by didac",
             "repeats": 2,
             "mirror_repeats": true,
             "darken_repeats": true,
@@ -130,26 +138,6 @@
             "mask_focus_mode": "Proportional (Multiply)"
         },
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by eluthel",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by jinze",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
             "path": "C:/Users/Administrator/Pictures/Datasets/by madao",
             "repeats": 2,
             "mirror_repeats": true,
@@ -160,7 +148,7 @@
             "mask_focus_mode": "Proportional (Multiply)"
         },
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by nanika_iru",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by nanika iru",
             "repeats": 2,
             "mirror_repeats": true,
             "darken_repeats": true,
@@ -170,17 +158,7 @@
             "mask_focus_mode": "Proportional (Multiply)"
         },
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by Onion",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by ooguni",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by onion",
             "repeats": 2,
             "mirror_repeats": true,
             "darken_repeats": true,
@@ -200,27 +178,7 @@
             "mask_focus_mode": "Proportional (Multiply)"
         },
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by san_p._dro",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by tsukisiro",
-            "repeats": 2,
-            "mirror_repeats": true,
-            "darken_repeats": true,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by zds",
+            "path": "C:/Users/Administrator/Pictures/Datasets/by san p. dro",
             "repeats": 2,
             "mirror_repeats": true,
             "darken_repeats": true,
@@ -238,18 +196,38 @@
             "mask_path": "",
             "mask_focus_factor": 2.0,
             "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by yato_hikaru",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Datasets/by zds",
+            "repeats": 2,
+            "mirror_repeats": true,
+            "darken_repeats": true,
+            "use_mask": false,
+            "mask_path": "",
+            "mask_focus_factor": 2.0,
+            "mask_focus_mode": "Proportional (Multiply)"
         }
     ],
     "OPTIMIZER_TYPE": "Raven",
     "RAVEN_PARAMS": {
         "betas": [
-            0.95,
+            0.9,
             0.999
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
         "use_grad_centralization": true,
-        "gc_alpha": 1.0
+        "gc_alpha": 0.35
     },
     "ADAFACTOR_PARAMS": {
         "eps": [
