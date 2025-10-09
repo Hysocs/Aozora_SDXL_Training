@@ -571,20 +571,25 @@ def main():
         del state; gc.collect(); print(f"Resumed at step {global_step}")
 
 
-    # Determine if the model is fp32
-    is_fp32 = next(unet.parameters()).dtype == torch.float32
+    # 1. Check if the base model's parameters are in FP32.
+    is_fp32_model = next(unet.parameters()).dtype == torch.float32
 
-    # Conditionally enable the GradScaler
-    scaler = torch.cuda.amp.GradScaler("cuda", enabled=is_fp32 and config.MIXED_PRECISION in ["float16", "fp16"])
+    # 2. Determine if the GradScaler should be used. It should ONLY be used for the
+    #    classic mixed-precision case: an FP32 model being trained with FP16 autocast.
+    use_grad_scaler = is_fp32_model and config.MIXED_PRECISION in ["float16", "fp16"]
 
-    if is_fp32 and config.MIXED_PRECISION in ["float16", "fp16"]:
-        print("INFO: Base model is fp32, GradScaler is enabled.")
-    elif not is_fp32:
-        print("INFO: Base model is not fp32, GradScaler is disabled.")
+    # 3. Create the scaler using the NEW, correct syntax to fix the warning.
+    #    The `enabled` flag will be correctly set to False when using bfloat16.
+    scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
+
+    # 4. Add a clear printout to confirm the status.
+    if use_grad_scaler:
+        print("INFO: Base model is FP32 and MIXED_PRECISION is 'fp16'. GradScaler is ENABLED.")
     else:
-        print("INFO: MIXED_PRECISION is not 'float16' or 'fp16', GradScaler is disabled.")
+        print(f"INFO: GradScaler is DISABLED. (Reason: Is base model FP32? {is_fp32_model}. Is precision 'fp16'? {config.MIXED_PRECISION in ['float16', 'fp16']})")
 
     is_v_pred = config.PREDICTION_TYPE == "v_prediction"
+    
     
     test_param_name = trainable_layer_names[0] if trainable_layer_names else None
     if not test_param_name: raise ValueError("No trainable layers found to monitor.")
