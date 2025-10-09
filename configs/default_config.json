@@ -1,143 +1,94 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred_baked_new_Vae.safetensors",
+    "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
+    "RESUME_MODEL_PATH": "",
+    "RESUME_STATE_PATH": "",
     "CACHING_BATCH_SIZE": 3,
-    "BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
     "PREDICTION_TYPE": "v_prediction",
-    "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 2000,
+    "BETA_SCHEDULE": "squaredcos_cap_v2",
+    "MAX_TRAIN_STEPS": 910,
+    "LEARNING_RATE": 3e-06,
+    "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 8,
-    "CLIP_GRAD_NORM": 5.6,
-    "MIXED_PRECISION": "bfloat16",
+    "MIXED_PRECISION": "f16",
+    "CLIP_GRAD_NORM": 1.0,
     "SEED": 69,
-    "SAVE_EVERY_N_STEPS": 4444,
-    "RESUME_MODEL_PATH": "",
-    "RESUME_STATE_PATH": "",
+    "SAVE_EVERY_N_STEPS": 25000,
+    "UNET_EXCLUDE_TARGETS": "conv1, conv2",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
+            3e-07
+        ],
+        [
+            0.1,
             3e-06
-        ],
-        [
-            0.1,
-            3e-05
-        ],
-        [
-            0.1,
-            3e-05
         ],
         [
             0.19,
-            2.93393e-05
+            2.9339e-06
         ],
         [
             0.28,
-            2.74217e-05
+            2.7422e-06
         ],
         [
             0.37,
-            2.44351e-05
+            2.4435e-06
         ],
         [
             0.46,
-            2.06717e-05
+            2.0672e-06
         ],
         [
             0.55,
-            1.65e-05
+            1.65e-06
         ],
         [
             0.64,
-            1.23283e-05
+            1.2328e-06
         ],
         [
             0.73,
-            8.5649e-06
+            8.565e-07
         ],
         [
             0.82,
-            5.5783e-06
+            5.578e-07
         ],
         [
             0.91,
-            3.6607e-06
+            3.661e-07
         ],
         [
             1.0,
-            3e-06
+            3e-07
         ]
     ],
-    "LR_GRAPH_MIN": 3e-06,
-    "LR_GRAPH_MAX": 3e-05,
-    "WEIGHT_DECAY": 0.01,
-    "UNET_TRAIN_TARGETS": [
-        "attn1",
-        "attn2",
-        "mid_block.attentions",
-        "ff",
-        "to_q",
-        "to_k",
-        "to_v",
-        "to_out.0",
-        "proj_in",
-        "proj_out",
-        "time_embedding",
-        "time_emb_proj",
-        "add_embedding",
-        "conv_in",
-        "conv2",
-        "conv_shortcut",
-        "downsamplers",
-        "upsamplers",
-        "conv_out",
-        "norm",
-        "norm1",
-        "norm2",
-        "norm3",
-        "conv_norm_out"
-    ],
-    "TIMESTEP_CURRICULUM_MODE": "Dynamic Balancing",
-    "TIMESTEP_CURRICULUM_START_RANGE": "0, 999",
-    "TIMESTEP_CURRICULUM_END_PERCENT": 35,
-    "DYNAMIC_CHALLENGE_PROBE_PERCENT": 5,
-    "DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE": "0.25, 0.55",
-    "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_SNR_GAMMA": false,
-    "SNR_STRATEGY": "Min-SNR",
-    "SNR_GAMMA": 5.0,
-    "MIN_SNR_VARIANT": "psw",
-    "USE_ZERO_TERMINAL_SNR": false,
-    "USE_IP_NOISE_GAMMA": true,
-    "IP_NOISE_GAMMA": 0.01,
-    "USE_COND_DROPOUT": false,
-    "COND_DROPOUT_PROB": 0.05,
-    "USE_EMA": false,
-    "EMA_DECAY": 0.9999,
+    "LR_GRAPH_MIN": 3e-07,
+    "LR_GRAPH_MAX": 3e-06,
+    "MEMORY_EFFICIENT_ATTENTION": "sdpa",
+    "USE_ZERO_TERMINAL_SNR": true,
+    "GRAD_SPIKE_THRESHOLD_HIGH": 75.0,
+    "GRAD_SPIKE_THRESHOLD_LOW": 0.2,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by san p. dro",
-            "repeats": 1,
-            "mirror_repeats": false,
-            "darken_repeats": false,
-            "use_mask": false,
-            "mask_path": "",
-            "mask_focus_factor": 2.0,
-            "mask_focus_mode": "Proportional (Multiply)"
+            "path": "C:/Users/Administrator/Pictures/Datasets/by diptip",
+            "repeats": 1
         }
     ],
-    "OPTIMIZER_TYPE": "Raven",
+    "OPTIMIZER_TYPE": "raven",
     "RAVEN_PARAMS": {
         "betas": [
             0.9,
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
-        "use_grad_centralization": true,
-        "gc_alpha": 1.0
+        "weight_decay": 0.01
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

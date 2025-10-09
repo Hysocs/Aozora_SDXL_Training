@@ -1,45 +1,51 @@
 # ==================================================================================== 
 # DEFAULT CONFIGURATION 
-# All values here are the default settings for the UNet-only trainer. 
-# The GUI will load these and save user changes to a separate user_config.json file. 
+# Simplified configuration matching the refactored training script
 # ====================================================================================
 
 # --- Paths ---
-SINGLE_FILE_CHECKPOINT_PATH = "./Aozora-XL_vPredV1-Final.safetensors"
-OUTPUT_DIR = "./sdxl_finetune_output"
+SINGLE_FILE_CHECKPOINT_PATH = "./model.safetensors"
+VAE_PATH = ""  # Optional separate VAE path, leave empty to use VAE from model
+OUTPUT_DIR = "./output"
+
+# --- Resume Training ---
+RESUME_TRAINING = False
+RESUME_MODEL_PATH = ""
+RESUME_STATE_PATH = ""
 
 # --- Dataset Configuration ---
 INSTANCE_DATASETS = [
     {
-        "path": "./DatasetV1/",
+        "path": "./data",
         "repeats": 1,
     }
 ]
 
 # --- Caching & Data Loaders ---
-CACHING_BATCH_SIZE = 3
-BATCH_SIZE = 1
+CACHING_BATCH_SIZE = 8
 NUM_WORKERS = 4
 
 # --- Aspect Ratio Bucketing ---
-TARGET_PIXEL_AREA = 1327104
+TARGET_PIXEL_AREA = 1048576  # 1024*1024
 
-# --- Training Parameters ---
+# --- Core Training Parameters ---
 PREDICTION_TYPE = "v_prediction"
 BETA_SCHEDULE = "scaled_linear"
-MAX_TRAIN_STEPS = 35000
-GRADIENT_ACCUMULATION_STEPS = 64
-CLIP_GRAD_NORM = 1.25
-MIXED_PRECISION = "bfloat16"
+MAX_TRAIN_STEPS = 10000
+LEARNING_RATE = 3e-6
+BATCH_SIZE = 1
+GRADIENT_ACCUMULATION_STEPS = 4
+MIXED_PRECISION = "fp16"
+CLIP_GRAD_NORM = 1.0
 SEED = 42
-SAVE_EVERY_N_STEPS = 5000
 
-# --- Resume from Checkpoint (Manual Paths) ---
-RESUME_TRAINING = False
-RESUME_MODEL_PATH = ""
-RESUME_STATE_PATH = ""
+# --- Saving ---
+SAVE_EVERY_N_STEPS = 1000
 
-# --- Learning Rate & Optimizer ---
+# --- UNet Layer Exclusion (Blacklist) ---
+UNET_EXCLUDE_TARGETS = "conv1, conv2"  # Comma-separated keywords to exclude from training
+
+# --- Learning Rate Scheduler ---
 LR_CUSTOM_CURVE = [
     [0.0, 0.0],
     [0.05, 8.0e-7],
@@ -48,53 +54,22 @@ LR_CUSTOM_CURVE = [
 ]
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
-WEIGHT_DECAY = 0.01
-
-# --- Layer Training Targets (UNet-Only) ---
-UNET_TRAIN_TARGETS = [
-    "attn1",
-    "attn2",
-    "ff",
-    "time_emb_proj",
-    "conv_in",
-    "conv_out",
-    "time_embedding",
-]
-
-# TIMESTEP CURRICULUM
-TIMESTEP_CURRICULUM_MODE = "Fixed"
-TIMESTEP_CURRICULUM_START_RANGE = "0, 999"
-TIMESTEP_CURRICULUM_END_PERCENT = 80
-
-# DYNAMIC CHALLENGE BALANCING
-DYNAMIC_CHALLENGE_PROBE_PERCENT = 5
-DYNAMIC_CHALLENGE_TARGET_GRAD_NORM_RANGE = "0.25, 0.90"
 
 # --- Advanced ---
 MEMORY_EFFICIENT_ATTENTION = "xformers"
-USE_SNR_GAMMA = True
-SNR_STRATEGY = "Min-SNR"
-SNR_GAMMA = 20.0
-MIN_SNR_VARIANT = "min_snr_gamma"
 USE_ZERO_TERMINAL_SNR = True
-USE_IP_NOISE_GAMMA = True
-IP_NOISE_GAMMA = 0.01
-USE_COND_DROPOUT = True
-COND_DROPOUT_PROB = 0.1
-
-# --- EMA (Exponential Moving Average) Configuration ---
-USE_EMA = True
-EMA_DECAY = 0.9999  # Standard decay rate (0.999-0.9999 typical range)
 
 # --- Optimizer Configuration ---
-OPTIMIZER_TYPE = "Raven"
+OPTIMIZER_TYPE = "raven"  # "raven" or "adafactor"
+
+# Raven Optimizer Parameters
 RAVEN_PARAMS = {
     "betas": [0.9, 0.999],
     "eps": 1e-8,
     "weight_decay": 0.01,
-    "use_grad_centralization": False,
-    "gc_alpha": 1.0,
 }
+
+# Adafactor Optimizer Parameters
 ADAFACTOR_PARAMS = {
     "eps": [1e-30, 1e-3],
     "clip_threshold": 1.0,
@@ -105,3 +80,7 @@ ADAFACTOR_PARAMS = {
     "relative_step": False,
     "warmup_init": False
 }
+
+# --- Gradient Spike Detection ---
+GRAD_SPIKE_THRESHOLD_HIGH = 75.0
+GRAD_SPIKE_THRESHOLD_LOW = 0.2
