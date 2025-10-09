@@ -570,8 +570,20 @@ def main():
         optimizer.load_state_dict(state['optimizer_state_dict'])
         del state; gc.collect(); print(f"Resumed at step {global_step}")
 
-    # Fix: Check for both "fp16" and "float16" 
-    scaler = torch.amp.GradScaler("cuda", enabled=(config.MIXED_PRECISION in ["float16", "float16"]))
+
+    # Determine if the model is fp32
+    is_fp32 = next(unet.parameters()).dtype == torch.float32
+
+    # Conditionally enable the GradScaler
+    scaler = torch.cuda.amp.GradScaler("cuda", enabled=is_fp32 and config.MIXED_PRECISION in ["float16", "fp16"])
+
+    if is_fp32 and config.MIXED_PRECISION in ["float16", "fp16"]:
+        print("INFO: Base model is fp32, GradScaler is enabled.")
+    elif not is_fp32:
+        print("INFO: Base model is not fp32, GradScaler is disabled.")
+    else:
+        print("INFO: MIXED_PRECISION is not 'float16' or 'fp16', GradScaler is disabled.")
+
     is_v_pred = config.PREDICTION_TYPE == "v_prediction"
     
     test_param_name = trainable_layer_names[0] if trainable_layer_names else None

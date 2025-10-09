@@ -755,7 +755,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "BATCH_SIZE": {"label": "Batch Size:", "tooltip": "Number of samples per batch.", "widget": "QSpinBox", "range": (1, 32)},
         "SAVE_EVERY_N_STEPS": {"label": "Save Every N Steps:", "tooltip": "How often to save a checkpoint.", "widget": "QLineEdit"},
         "GRADIENT_ACCUMULATION_STEPS": {"label": "Gradient Accumulation:", "tooltip": "Simulates a larger batch size.", "widget": "QLineEdit"},
-        "MIXED_PRECISION": {"label": "Mixed Precision:", "tooltip": "bfloat16 for modern GPUs, fp16 for older.", "widget": "QComboBox", "options": ["bfloat16", "float16"]},
+        "MIXED_PRECISION": {"label": "Mixed Precision:", "tooltip": "bfloat16 for modern GPUs, float16 for older.", "widget": "QComboBox", "options": ["bfloat16", "float16"]},
         "CLIP_GRAD_NORM": {"label": "Gradient Clipping:", "tooltip": "Maximum gradient norm. Set to 0 to disable.", "widget": "QLineEdit"},
         "SEED": {"label": "Seed:", "tooltip": "Ensures reproducible training.", "widget": "QLineEdit"},
         "RESUME_MODEL_PATH": {"label": "Resume Model:", "tooltip": "The .safetensors checkpoint file.", "widget": "Path", "file_type": "file_safetensors"},
