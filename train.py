@@ -571,7 +571,7 @@ def main():
         del state; gc.collect(); print(f"Resumed at step {global_step}")
 
     # Fix: Check for both "fp16" and "float16" 
-    scaler = torch.amp.GradScaler("cuda", enabled=(config.MIXED_PRECISION in ["float16", "fp16"]))
+    scaler = torch.amp.GradScaler("cuda", enabled=(config.MIXED_PRECISION in ["float16", "float16"]))
     is_v_pred = config.PREDICTION_TYPE == "v_prediction"
     
     test_param_name = trainable_layer_names[0] if trainable_layer_names else None
