@@ -1,15 +1,16 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred_baked_new_Vae.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
-    "CACHING_BATCH_SIZE": 3,
-    "NUM_WORKERS": 0,
+    "CACHING_BATCH_SIZE": 1,
+    "NUM_WORKERS": 6,
     "TARGET_PIXEL_AREA": 1048576,
+    "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
-    "BETA_SCHEDULE": "squaredcos_cap_v2",
-    "MAX_TRAIN_STEPS": 910,
+    "BETA_SCHEDULE": "scaled_linear",
+    "MAX_TRAIN_STEPS": 2535,
     "LEARNING_RATE": 3e-06,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 16,
@@ -21,64 +22,32 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            3e-07
+            0.0
         ],
         [
-            0.1,
+            0.05,
             3e-06
         ],
         [
-            0.19,
-            2.9339e-06
-        ],
-        [
-            0.28,
-            2.7422e-06
-        ],
-        [
-            0.37,
-            2.4435e-06
-        ],
-        [
-            0.46,
-            2.0672e-06
-        ],
-        [
-            0.55,
-            1.65e-06
-        ],
-        [
-            0.64,
-            1.2328e-06
-        ],
-        [
-            0.73,
-            8.565e-07
-        ],
-        [
-            0.82,
-            5.578e-07
-        ],
-        [
-            0.91,
-            3.661e-07
+            0.9,
+            3e-06
         ],
         [
             1.0,
-            3e-07
+            0.0
         ]
     ],
-    "LR_GRAPH_MIN": 3e-07,
+    "LR_GRAPH_MIN": 0.0,
     "LR_GRAPH_MAX": 3e-06,
-    "MEMORY_EFFICIENT_ATTENTION": "sdpa",
+    "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
-    "GRAD_SPIKE_THRESHOLD_HIGH": 75.0,
+    "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.2,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures/Datasets/by diptip",
-            "repeats": 1
+            "repeats": 15
         }
     ],
     "OPTIMIZER_TYPE": "raven",

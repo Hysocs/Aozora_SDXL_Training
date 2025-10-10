@@ -763,6 +763,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "UNET_EXCLUDE_TARGETS": {"label": "Exclude Layers (Keywords):", "tooltip": "Comma-separated keywords for layers to exclude from training (e.g., 'conv1, conv2, norm').", "widget": "QLineEdit"},
         "LR_GRAPH_MIN": {"label": "Graph Min LR:", "tooltip": "The minimum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
+        "NOISE_SCHEDULER": {"label": "Noise Scheduler:", "tooltip": "The noise scheduler to use for training. EulerDiscrete is experimental.", "widget": "QComboBox", "options": ["DDPMScheduler", "DDIMScheduler", "EulerDiscreteScheduler (Experimental)"]},
         "MEMORY_EFFICIENT_ATTENTION": {"label": "Attention Backend:", "tooltip": "Select the attention mechanism to use.", "widget": "QComboBox", "options": ["xformers", "sdpa"]},
         "USE_ZERO_TERMINAL_SNR": {"label": "Use Zero-Terminal SNR", "tooltip": "Rescales noise schedule for better dynamic range.", "widget": "QCheckBox"},
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
@@ -1334,6 +1335,9 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_advanced_group(self):
         advanced_group = QtWidgets.QGroupBox("Advanced Settings")
         layout = QtWidgets.QFormLayout(advanced_group)
+        
+        label, widget = self._create_widget("NOISE_SCHEDULER")
+        layout.addRow(label, widget)
         
         label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
         layout.addRow(label, widget)

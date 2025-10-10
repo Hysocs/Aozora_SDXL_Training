@@ -22,13 +22,14 @@ INSTANCE_DATASETS = [
 ]
 
 # --- Caching & Data Loaders ---
-CACHING_BATCH_SIZE = 8
+CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 4
 
 # --- Aspect Ratio Bucketing ---
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
 
 # --- Core Training Parameters ---
+NOISE_SCHEDULER = "DDPMScheduler"
 PREDICTION_TYPE = "v_prediction"
 BETA_SCHEDULE = "scaled_linear"
 MAX_TRAIN_STEPS = 10000

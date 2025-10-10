@@ -11,7 +11,7 @@ import math
 import torch
 import torch.nn.functional as F
 from torch.utils.data import Dataset, DataLoader, Sampler
-from diffusers import StableDiffusionXLPipeline, DDPMScheduler, AutoencoderKL, EulerDiscreteScheduler
+from diffusers import StableDiffusionXLPipeline, DDPMScheduler, AutoencoderKL, EulerDiscreteScheduler, DDIMScheduler
 from diffusers.optimization import get_scheduler
 from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile
@@ -94,7 +94,12 @@ class TrainingConfig:
             
             # Handle UNET_EXCLUDE_TARGETS conversion from string to list
             if key == "UNET_EXCLUDE_TARGETS" and isinstance(value, str):
-                setattr(self, key, [item.strip() for item in value.split(',')])
+                # Filter out empty strings!
+                setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
+            
+            # NEW: Also filter if it's already a list with empty strings
+            if key == "UNET_EXCLUDE_TARGETS" and isinstance(value, list):
+                setattr(self, key, [item for item in value if item])
         
         print("INFO: Configuration types checked and corrected.")
 
@@ -250,96 +255,263 @@ def resize_to_fit(image, target_w, target_h):
 def validate_and_assign_resolution(args):
     ip, calculator = args
     try:
-        with Image.open(ip) as img: img.verify()
-        with Image.open(ip) as img: img.load(); w, h = img.size
+        # Image validation
+        with Image.open(ip) as img: 
+            img.verify()
+        with Image.open(ip) as img: 
+            img.load()
+            w, h = img.size
+        
         cp = ip.with_suffix('.txt')
-        caption = ip.stem.replace('_', ' ')
+        
+        # Check for the caption file
         if cp.exists():
-            with open(cp, 'r', encoding='utf-8') as f: caption = f.read().strip()
+            with open(cp, 'r', encoding='utf-8') as f: 
+                caption = f.read().strip()
+            # If the caption file is empty after stripping whitespace, it's a problem.
+            if not caption:
+                tqdm.write(f"\n[WARNING] Caption file found for {ip.name}, but it is EMPTY. Image will be skipped.")
+                return None
+        else:
+            # If the caption file does NOT exist, use the filename as a fallback AND WARN THE USER.
+            fallback_caption = ip.stem.replace('_', ' ')
+            tqdm.write(f"\n[CAPTION WARNING] No .txt file found for {ip.name}. Using fallback caption: '{fallback_caption}'")
+            caption = fallback_caption
+            
         return {"ip": ip, "caption": caption, "target_resolution": calculator.calculate_resolution(w, h), "original_size": (w, h)}
+
     except Exception as e:
-        tqdm.write(f"\n[CORRUPT IMAGE] {ip}, Reason: {e}")
+        tqdm.write(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
         return None
 
 
 def compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device):
-    with torch.no_grad():
-        i1 = t1(captions, padding="max_length", max_length=t1.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
-        i2 = t2(captions, padding="max_length", max_length=t2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
-        e1 = te1(i1, output_hidden_states=True).hidden_states[-2]
-        out2 = te2(i2, output_hidden_states=True)
-        return torch.cat((e1, out2.hidden_states[-2]), dim=-1), out2[0]
-
-
-def load_vae(config, device):
-    """Loads a VAE, either from a separate path or from the main model."""
-    if config.VAE_PATH and Path(config.VAE_PATH).exists():
-        print(f"INFO: Loading separate VAE from {config.VAE_PATH}")
-        return AutoencoderKL.from_single_file(config.VAE_PATH, torch_dtype=config.compute_dtype).to(device)
-    else:
-        print("INFO: Using VAE from the main model file for caching.")
-        pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype)
-        vae = pipe.vae
-        del pipe
-        gc.collect()
-        torch.cuda.empty_cache()
-        return vae.to(device)
-
-
-def precompute_and_cache_latents(config, t1, t2, te1, te2, device):
-    calc = ResolutionCalculator(config.TARGET_PIXEL_AREA)
+    """Process captions ONE AT A TIME to minimize VRAM usage during caching."""
+    prompt_embeds_list = []
+    pooled_prompt_embeds_list = []
     
-    vae = load_vae(config, device)
+    for caption in captions:  # Process individually to save VRAM
+        with torch.no_grad():
+            i1 = t1(caption, padding="max_length", max_length=t1.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
+            i2 = t2(caption, padding="max_length", max_length=t2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
+            e1 = te1(i1, output_hidden_states=True).hidden_states[-2]
+            out2 = te2(i2, output_hidden_states=True)
+            prompt_embeds = torch.cat((e1, out2.hidden_states[-2]), dim=-1)
+            pooled_embeds = out2[0]
+            
+            prompt_embeds_list.append(prompt_embeds)
+            pooled_prompt_embeds_list.append(pooled_embeds)
     
-    te1.to(device); te2.to(device); vae.enable_tiling()
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+    return torch.cat(prompt_embeds_list), torch.cat(pooled_prompt_embeds_list)
+
+
+def check_if_caching_needed(config):
+    """Check if any dataset needs caching before loading heavy models."""
+    needs_caching = False
     
     for dataset in config.INSTANCE_DATASETS:
-        root = Path(dataset["path"]); print(f"Processing dataset: {root}")
-        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
-        if not paths: print(f"WARNING: No images in {root}."); continue
-        stems = {p.stem for p in root.rglob(".precomputed_embeddings_cache/*.pt")}
-        to_process = [p for p in paths if p.stem not in stems]
-        if not to_process: print("All images cached."); continue
+        root = Path(dataset["path"])
+        if not root.exists():
+            print(f"WARNING: Dataset path {root} does not exist, skipping.")
+            continue
+            
+        # Check for images
+        image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+                      for p in root.rglob(f"*{ext}")]
         
-        with Pool(processes=cpu_count()) as pool:
-            results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]), total=len(to_process), desc="Validating"))
+        if not image_paths:
+            print(f"INFO: No images found in {root}, skipping.")
+            continue
+        
+        # Check for cached files
+        cache_dir = root / ".precomputed_embeddings_cache"
+        if not cache_dir.exists():
+            print(f"INFO: Cache directory doesn't exist for {root}, caching needed.")
+            needs_caching = True
+            continue
+            
+        cached_stems = {p.stem for p in cache_dir.rglob("*.pt")}
+        uncached = [p for p in image_paths if p.stem not in cached_stems]
+        
+        if uncached:
+            print(f"INFO: Found {len(uncached)} uncached images in {root}")
+            needs_caching = True
+        else:
+            print(f"INFO: All {len(image_paths)} images already cached in {root}")
+    
+    return needs_caching
+
+
+def load_vae_only(config, device):
+    """Load ONLY the VAE efficiently from a dedicated VAE file."""
+    vae_path = config.VAE_PATH
+    
+    if not vae_path or not Path(vae_path).exists():
+        return None  # Signal that we need to use the VAE from the main pipeline
+    
+    print(f"INFO: Loading dedicated VAE from: {vae_path}")
+    # Load VAE directly from the single file
+    vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=torch.float32)
+    
+    print(f"INFO: VAE in float32 for high-quality caching")
+    print(f"INFO: Moving VAE to {device}...")
+    vae = vae.to(device)
+    
+    # Report actual VRAM usage after loading
+    vram_gb = torch.cuda.memory_allocated() / 1e9
+    print(f"INFO: VAE loaded. Current VRAM usage: {vram_gb:.2f} GB")
+    
+    return vae
+
+
+def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
+    """Streamlined caching with minimal memory footprint."""
+    
+    # Check if caching is even needed
+    if not check_if_caching_needed(config):
+        print("\n" + "="*60)
+        print("INFO: All datasets are already cached. Skipping caching step.")
+        print("="*60 + "\n")
+        return
+    
+    print("\n" + "="*60)
+    print("STARTING CACHING PROCESS")
+    print("="*60 + "\n")
+    
+    calc = ResolutionCalculator(config.TARGET_PIXEL_AREA)
+    
+    # VAE is already loaded and passed in
+    vae.enable_tiling()
+    
+    # Load text encoders
+    print("INFO: Loading text encoders to device...")
+    te1.to(device)
+    te2.to(device)
+    
+    # Report memory usage
+    vram_gb = torch.cuda.memory_allocated() / 1e9
+    print(f"INFO: Current VRAM usage: {vram_gb:.2f} GB")
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(), 
+        transforms.Normalize([0.5], [0.5])
+    ])
+    
+    for dataset in config.INSTANCE_DATASETS:
+        root = Path(dataset["path"])
+        print(f"\n{'='*60}")
+        print(f"Processing dataset: {root}")
+        print(f"{'='*60}")
+        
+        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+                for p in root.rglob(f"*{ext}")]
+        
+        if not paths: 
+            print(f"WARNING: No images found in {root}.")
+            continue
+        
+        # Check what's already cached
+        cache_dir = root / ".precomputed_embeddings_cache"
+        cache_dir.mkdir(exist_ok=True)
+        
+        stems = {p.stem for p in cache_dir.rglob("*.pt")}
+        to_process = [p for p in paths if p.stem not in stems]
+        
+        if not to_process: 
+            print(f"INFO: All {len(paths)} images already cached for this dataset.")
+            continue
+        
+        print(f"INFO: Found {len(to_process)} images to cache (out of {len(paths)} total)")
+        
+        # Validate and assign resolutions using multiprocessing
+        print("INFO: Validating images and calculating resolutions...")
+        with Pool(processes=min(cpu_count(), 8)) as pool:  # Limit to 8 processes max
+            results = list(tqdm(
+                pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]), 
+                total=len(to_process), 
+                desc="Validating"
+            ))
         
         metadata = [r for r in results if r]
-        if not metadata: print(f"WARNING: No valid images found in {root}."); continue
+        if not metadata: 
+            print(f"WARNING: No valid images found to process in {root}.")
+            continue
         
+        print(f"INFO: {len(metadata)} images validated successfully")
+        
+        # Save metadata for bucketing
         res_meta = {m['ip'].stem: m['target_resolution'] for m in metadata}
-        with open(root / "metadata.json", 'w', encoding='utf-8') as f: json.dump(res_meta, f, indent=4)
+        metadata_path = root / "metadata.json"
+        with open(metadata_path, 'w', encoding='utf-8') as f: 
+            json.dump(res_meta, f, indent=4)
+        print(f"INFO: Saved metadata to {metadata_path}")
 
+        # Group images by resolution for efficient batch processing
         grouped = defaultdict(list)
-        for m in metadata: grouped[m["target_resolution"]].append(m)
-        batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE]) for res in grouped for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)]
+        for m in metadata: 
+            grouped[m["target_resolution"]].append(m)
+        
+        print(f"INFO: Images grouped into {len(grouped)} resolution buckets")
+        
+        batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE]) 
+                  for res in grouped 
+                  for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)]
         random.shuffle(batches)
         
-        for (w, h), batch_meta in tqdm(batches, desc="Caching latents and embeddings"):
+        print(f"INFO: Processing {len(batches)} batches...")
+        
+        for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc="Caching")):
+            # Encode text
             captions = [m['caption'] for m in batch_meta]
             embeds, pooled = compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device)
+            
+            # Load and process images
             images, valid_meta = [], []
             for m in batch_meta:
                 try:
-                    with Image.open(m['ip']) as img: img = img.convert("RGB")
-                    images.append(transform(resize_to_fit(img, w, h))); valid_meta.append(m)
-                except Exception as e: tqdm.write(f"\n[ERROR] Skipping {m['ip']}: {e}")
+                    with Image.open(m['ip']) as img: 
+                        img = img.convert("RGB")
+                    images.append(transform(resize_to_fit(img, w, h)))
+                    valid_meta.append(m)
+                except Exception as e: 
+                    tqdm.write(f"\n[ERROR] Skipping {m['ip']}: {e}")
             
-            if not images: continue
+            if not images: 
+                continue
+
+            # Encode latents
+            image_batch_tensor = torch.stack(images).to(device, dtype=torch.float32)
+            
             with torch.no_grad():
-                latents = vae.encode(torch.stack(images).to(device, dtype=vae.dtype)).latent_dist.mean * vae.config.scaling_factor
+                latents = vae.encode(image_batch_tensor).latent_dist.mean * vae.config.scaling_factor
             
+            # Save each item
             for j, m in enumerate(valid_meta):
-                cache_dir = m['ip'].parent / ".precomputed_embeddings_cache"; cache_dir.mkdir(exist_ok=True)
+                cache_path = cache_dir / f"{m['ip'].stem}.pt"
                 torch.save({
-                    "original_size": m["original_size"], "target_size": (w, h),
-                    "embeds": embeds[j].cpu().to(torch.float32), "pooled": pooled[j].cpu().to(torch.float32),
+                    "original_size": m["original_size"], 
+                    "target_size": (w, h),
+                    "embeds": embeds[j].cpu().to(torch.float32), 
+                    "pooled": pooled[j].cpu().to(torch.float32),
                     "latents": latents[j].cpu().to(torch.float32)
-                }, cache_dir / f"{m['ip'].stem}.pt")
-                
-    del vae
-    te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
+                }, cache_path)
+            
+            # Clear memory periodically
+            if (batch_idx + 1) % 10 == 0:
+                torch.cuda.empty_cache()
+        
+        print(f"INFO: Completed caching for {root}")
+    
+    # Cleanup - move text encoders back to CPU (VAE cleanup handled by main())
+    print("\nINFO: Moving text encoders back to CPU...")
+    te1.cpu()
+    te2.cpu()
+    gc.collect()
+    torch.cuda.empty_cache()
+    
+    print("\n" + "="*60)
+    print("CACHING COMPLETE")
+    print("="*60 + "\n")
 
 
 class ImageTextLatentDataset(Dataset):
@@ -349,9 +521,16 @@ class ImageTextLatentDataset(Dataset):
             root = Path(ds["path"])
             cache_dir = root / ".precomputed_embeddings_cache"
             if not cache_dir.exists(): continue
-            files = sorted(list(cache_dir.glob("*.pt")))
+            
+            # Load files and shuffle
+            files = list(cache_dir.glob("*.pt")) 
             self.latent_files.extend(files * int(ds.get("repeats", 1)))
+            
         if not self.latent_files: raise ValueError("No cached files found.")
+        
+        # Shuffle the entire collection of files ONCE at the start.
+        print("INFO: Shuffling the entire dataset order...")
+        random.shuffle(self.latent_files)
         
         self.bucket_keys = []
         all_meta = {}
@@ -359,6 +538,8 @@ class ImageTextLatentDataset(Dataset):
             meta_path = Path(ds["path"]) / "metadata.json"
             if meta_path.exists():
                 with open(meta_path, 'r') as f: all_meta.update(json.load(f))
+        
+        # Build bucket keys based on the now-shuffled file list
         for f in self.latent_files:
             key = all_meta.get(f.stem)
             self.bucket_keys.append(tuple(key) if key else None)
@@ -377,7 +558,6 @@ class ImageTextLatentDataset(Dataset):
         except Exception as e:
             print(f"WARNING: Skipping {self.latent_files[i]}: {e}")
             return None
-
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
@@ -476,12 +656,80 @@ def main():
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True); CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
     
-    print("Loading text encoders for caching...")
-    pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=config.compute_dtype)
-    precompute_and_cache_latents(config, pipe.tokenizer, pipe.tokenizer_2, pipe.text_encoder, pipe.text_encoder_2, device)
-    del pipe; gc.collect(); torch.cuda.empty_cache()
+    # Only load models for caching if caching is needed
+    if check_if_caching_needed(config):
+        print("="*60)
+        print("LOADING MODELS FOR CACHING")
+        print("="*60)
+        
+        # Check if we have a dedicated VAE file
+        vae = load_vae_only(config, device)
+        
+        if vae is None:
+            # No dedicated VAE, need to load from main checkpoint
+            print("WARNING: No dedicated VAE file. Loading pipeline once to extract text encoders AND VAE...")
+            print(f"Loading pipeline to CPU from: {config.SINGLE_FILE_CHECKPOINT_PATH}")
+            
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                config.SINGLE_FILE_CHECKPOINT_PATH, 
+                torch_dtype=torch.float32,
+                device_map=None  # Keep on CPU
+            )
+            
+            # Extract everything we need
+            tokenizer = pipe.tokenizer
+            tokenizer_2 = pipe.tokenizer_2
+            text_encoder = pipe.text_encoder
+            text_encoder_2 = pipe.text_encoder_2
+            vae = pipe.vae
+            
+            # Move VAE to device
+            print(f"INFO: Moving VAE to {device}...")
+            vae = vae.to(device)
+            
+            # Delete pipeline
+            del pipe
+            gc.collect()
+            
+            print("INFO: Extracted all components from pipeline")
+        else:
+            # We have a dedicated VAE, just load text encoders
+            print("Loading text encoders from main checkpoint...")
+            pipe = StableDiffusionXLPipeline.from_single_file(
+                config.SINGLE_FILE_CHECKPOINT_PATH, 
+                torch_dtype=config.compute_dtype
+            )
+            tokenizer = pipe.tokenizer
+            tokenizer_2 = pipe.tokenizer_2
+            text_encoder = pipe.text_encoder
+            text_encoder_2 = pipe.text_encoder_2
+            
+            del pipe
+            gc.collect()
+            torch.cuda.empty_cache()
+        
+        # Now cache with all the components
+        precompute_and_cache_latents(
+            config, 
+            tokenizer,
+            tokenizer_2,
+            text_encoder,
+            text_encoder_2,
+            vae,
+            device
+        )
+        
+        # Clean up after caching
+        del tokenizer, tokenizer_2, text_encoder, text_encoder_2, vae
+        gc.collect()
+        torch.cuda.empty_cache()
+    else:
+        print("\n" + "="*60)
+        print("SKIPPING CACHING - All datasets already cached")
+        print("="*60 + "\n")
 
     model_to_load = Path(config.RESUME_MODEL_PATH) if config.RESUME_TRAINING and Path(config.RESUME_MODEL_PATH).exists() else Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     print(f"\nLoading UNet for training from: {model_to_load}")
@@ -490,25 +738,54 @@ def main():
     original_scheduler_config = pipe.scheduler.config
     unet = pipe.unet
     del pipe
-    gc.collect(); torch.cuda.empty_cache()
+    gc.collect()
+    torch.cuda.empty_cache()
 
     base_model_state_dict = load_file(model_to_load)
 
     print("\n--- Using Original Scheduler Config as Base ---")
     print(f"Original model's scheduler config: {original_scheduler_config}")
 
+    # --- Dynamic Noise Scheduler Selection ---
+    SCHEDULER_MAP = {
+        "DDPMScheduler": DDPMScheduler,
+        "DDIMScheduler": DDIMScheduler,
+        "EulerDiscreteScheduler": EulerDiscreteScheduler,
+    }
+
+    scheduler_name_from_config = getattr(config, 'NOISE_SCHEDULER', 'DDPMScheduler')
+    scheduler_name = scheduler_name_from_config.replace(" (Experimental)", "")
+    scheduler_class = SCHEDULER_MAP.get(scheduler_name)
+
+    if not scheduler_class:
+        raise ValueError(f"Unknown noise scheduler: '{scheduler_name_from_config}'. Available options are: {list(SCHEDULER_MAP.keys())}")
+        
     training_scheduler_config = original_scheduler_config.copy()
     training_scheduler_config['prediction_type'] = config.PREDICTION_TYPE
 
-    noise_scheduler = EulerDiscreteScheduler.from_config(training_scheduler_config)
+    valid_scheduler_config = filter_scheduler_config(training_scheduler_config, scheduler_class)
+    noise_scheduler = scheduler_class.from_config(valid_scheduler_config)
+    
     print(f"INFO: Training with {type(noise_scheduler).__name__} and prediction type '{noise_scheduler.config.prediction_type}'")
+    if "Euler" in scheduler_name:
+        print("WARNING: EulerDiscreteScheduler is experimental for training and may produce unstable results.")
+
+    # Sanity checks for scheduler compatibility
+    if config.PREDICTION_TYPE == 'v_prediction' and not hasattr(noise_scheduler, 'get_velocity'):
+        raise ValueError(f"Scheduler {scheduler_name} does not support 'v_prediction'. Please use 'epsilon' or select a different scheduler (e.g., DDPMScheduler).")
 
     if config.USE_ZERO_TERMINAL_SNR:
         print("INFO: Rescaling betas for Zero Terminal SNR.")
-        noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
+        if hasattr(noise_scheduler, 'betas'):
+            noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
+            noise_scheduler.alphas = 1.0 - noise_scheduler.betas
+            noise_scheduler.alphas_cumprod = torch.cumprod(noise_scheduler.alphas, dim=0)
+        else:
+            print(f"WARNING: Scheduler {scheduler_name} does not have a 'betas' attribute. Cannot apply Zero Terminal SNR.")
     
     unet.enable_xformers_memory_efficient_attention() if config.MEMORY_EFFICIENT_ATTENTION == "xformers" else unet.set_attn_processor(AttnProcessor2_0())
-    unet.to(device); unet.enable_gradient_checkpointing()
+    unet.to(device)
+    unet.enable_gradient_checkpointing()
     
     print("\n--- UNet Layer Selection Report ---")
     print(f"Exclusion Keywords: {config.UNET_EXCLUDE_TARGETS}")
@@ -541,10 +818,8 @@ def main():
     
     if not params_to_optimize: raise ValueError("No parameters were selected for training. Check exclusion list.")
 
-    # Create optimizer based on config
     optimizer = create_optimizer(config, params_to_optimize)
 
-    # Use custom curve scheduler
     lr_custom_curve = getattr(config, 'LR_CUSTOM_CURVE', [[0.0, 0.0], [0.1, config.LEARNING_RATE], [1.0, 0.0]])
 
     print(f"\n--- Custom LR Scheduler ---")
@@ -568,28 +843,20 @@ def main():
         state = torch.load(state_path, map_location="cpu")
         global_step = state['step'] * config.GRADIENT_ACCUMULATION_STEPS
         optimizer.load_state_dict(state['optimizer_state_dict'])
-        del state; gc.collect(); print(f"Resumed at step {global_step}")
+        del state
+        gc.collect()
+        print(f"Resumed at step {global_step}")
 
-
-    # 1. Check if the base model's parameters are in FP32.
     is_fp32_model = next(unet.parameters()).dtype == torch.float32
-
-    # 2. Determine if the GradScaler should be used. It should ONLY be used for the
-    #    classic mixed-precision case: an FP32 model being trained with FP16 autocast.
     use_grad_scaler = is_fp32_model and config.MIXED_PRECISION in ["float16", "fp16"]
-
-    # 3. Create the scaler using the NEW, correct syntax to fix the warning.
-    #    The `enabled` flag will be correctly set to False when using bfloat16.
     scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
-    # 4. Add a clear printout to confirm the status.
     if use_grad_scaler:
         print("INFO: Base model is FP32 and MIXED_PRECISION is 'fp16'. GradScaler is ENABLED.")
     else:
         print(f"INFO: GradScaler is DISABLED. (Reason: Is base model FP32? {is_fp32_model}. Is precision 'fp16'? {config.MIXED_PRECISION in ['float16', 'fp16']})")
 
     is_v_pred = config.PREDICTION_TYPE == "v_prediction"
-    
     
     test_param_name = trainable_layer_names[0] if trainable_layer_names else None
     if not test_param_name: raise ValueError("No trainable layers found to monitor.")
@@ -622,8 +889,6 @@ def main():
 
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                
-                if not torch.isfinite(loss): tqdm.write(f"\n[WARNING] NaN/Inf loss. Skipping."); continue
             
             diagnostics.step(loss.item())
             scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
@@ -645,7 +910,6 @@ def main():
                 else:
                     clipped_grad_norm = raw_grad_norm
 
-                # Gradient spike detector
                 if raw_grad_norm > config.GRAD_SPIKE_THRESHOLD_HIGH or raw_grad_norm < config.GRAD_SPIKE_THRESHOLD_LOW:
                     tqdm.write("\n" + "="*20 + " GRADIENT ANOMALY DETECTED " + "="*20)
                     tqdm.write(f"  Step: {global_step + 1}")
