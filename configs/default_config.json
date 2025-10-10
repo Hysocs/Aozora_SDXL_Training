@@ -10,10 +10,10 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 2535,
-    "LEARNING_RATE": 3e-06,
+    "MAX_TRAIN_STEPS": 4500,
+    "LEARNING_RATE": 2.5e-06,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 16,
+    "GRADIENT_ACCUMULATION_STEPS": 32,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 1.0,
     "SEED": 69,
@@ -26,11 +26,11 @@
         ],
         [
             0.05,
-            3e-06
+            2.5e-06
         ],
         [
             0.9,
-            3e-06
+            2.5e-06
         ],
         [
             1.0,
@@ -38,7 +38,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 3e-06,
+    "LR_GRAPH_MAX": 2.5e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
@@ -46,8 +46,8 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by diptip",
-            "repeats": 15
+            "path": "C:/Users/Administrator/Pictures/Datasets/by san p. dro",
+            "repeats": 3
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -57,7 +57,8 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01
+        "weight_decay": 0.01,
+        "debias_strength": 0.3
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

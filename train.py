@@ -622,7 +622,8 @@ def create_optimizer(config, params_to_optimize):
             lr=config.LEARNING_RATE,
             betas=tuple(raven_params.get('betas', [0.9, 0.999])),
             eps=raven_params.get('eps', 1e-8),
-            weight_decay=raven_params.get('weight_decay', 0.01)
+            weight_decay=raven_params.get('weight_decay', 0.01),
+            debias_strength=raven_params.get('debias_strength', 1.0)
         )
     
     elif optimizer_type == "adafactor":

@@ -68,6 +68,7 @@ RAVEN_PARAMS = {
     "betas": [0.9, 0.999],
     "eps": 1e-8,
     "weight_decay": 0.01,
+    "debias_strength": 0.3 
 }
 
 # Adafactor Optimizer Parameters

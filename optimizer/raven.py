@@ -6,12 +6,8 @@ class RavenAdamW(Optimizer):
     """
     A VRAM-efficient AdamW optimizer that offloads momentum states to the CPU.
 
-    This version has been corrected to fix critical bugs in the original implementation:
-    1.  A `torch.cuda.synchronize()` is added inside the parameter loop to prevent a
-        race condition where the shared GPU buffer was being overwritten. This makes
-        the optimizer slower but guarantees correctness.
-    2.  The first moment (exp_avg) is now stored in float32 on the CPU to prevent
-        precision loss and training instability.
+    This version has been corrected to fix critical bugs in the original implementation
+    and adds a 'debias_strength' parameter for partial bias correction.
     """
     def __init__(
         self,
@@ -20,12 +16,16 @@ class RavenAdamW(Optimizer):
         betas: tuple[float, float] = (0.9, 0.999),
         weight_decay: float = 0.01,
         eps: float = 1e-8,
+        debias_strength: float = 1.0,  # ## NEW ##: Add debias_strength parameter
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid learning rate: {lr}")
         if not 0.0 <= betas[0] < 1.0 or not 0.0 <= betas[1] < 1.0: raise ValueError(f"Betas must be in [0, 1), got {betas}")
         if not 0.0 <= weight_decay: raise ValueError(f"Invalid weight_decay value: {weight_decay}")
+        # ## NEW ##: Add validation for the new parameter
+        if not 0.0 <= debias_strength <= 1.0: raise ValueError(f"debias_strength must be between 0.0 and 1.0, got {debias_strength}")
 
-        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, eps=eps)
+        # ## MODIFIED ##: Add debias_strength to the defaults dictionary
+        defaults = dict(lr=lr, betas=betas, weight_decay=weight_decay, eps=eps, debias_strength=debias_strength)
         super(RavenAdamW, self).__init__(params, defaults)
 
         # Find the largest parameter tensor to determine the required buffer size
@@ -86,11 +86,16 @@ class RavenAdamW(Optimizer):
                 exp_avg_gpu_view.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq_gpu_view.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-                bias_correction1 = 1.0 - beta1 ** state["step"]
-                bias_correction2 = 1.0 - beta2 ** state["step"]
+                # ## MODIFIED ##: Implement partial debiasing
+                # This interpolates between no correction (1.0) and full correction.
+                debias_strength = group["debias_strength"]
+                bias_correction1 = 1.0 - (beta1 ** state["step"]) * debias_strength
+                bias_correction2 = 1.0 - (beta2 ** state["step"]) * debias_strength
                 
+                # Denominator calculation remains the same, but uses the modified bias_correction2
                 denom = (exp_avg_sq_gpu_view.sqrt() / math.sqrt(bias_correction2)).add_(group["eps"])
                 
+                # Step size calculation remains the same, but uses the modified bias_correction1
                 step_size = group["lr"] / bias_correction1
                 p.addcdiv_(exp_avg_gpu_view, denom, value=-step_size)
                 
