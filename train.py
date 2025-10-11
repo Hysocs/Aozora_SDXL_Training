@@ -256,28 +256,31 @@ def validate_and_assign_resolution(args):
     ip, calculator = args
     try:
         # Image validation
-        with Image.open(ip) as img: 
+        with Image.open(ip) as img:
             img.verify()
-        with Image.open(ip) as img: 
+        with Image.open(ip) as img:
             img.load()
+            # ADDED: Check for image data issues after loading
+            img_tensor = transforms.ToTensor()(img)
+            if torch.isnan(img_tensor).any() or torch.isinf(img_tensor).any():
+                tqdm.write(f"\n[INVALID DATA] Image {ip.name} contains NaN or Inf values. Skipping.")
+                return None
             w, h = img.size
-        
+
         cp = ip.with_suffix('.txt')
-        
+
         # Check for the caption file
         if cp.exists():
-            with open(cp, 'r', encoding='utf-8') as f: 
+            with open(cp, 'r', encoding='utf-8') as f:
                 caption = f.read().strip()
-            # If the caption file is empty after stripping whitespace, it's a problem.
             if not caption:
-                tqdm.write(f"\n[WARNING] Caption file found for {ip.name}, but it is EMPTY. Image will be skipped.")
+                tqdm.write(f"\n[WARNING] Caption file for {ip.name} is EMPTY. Image will be skipped.")
                 return None
         else:
-            # If the caption file does NOT exist, use the filename as a fallback AND WARN THE USER.
             fallback_caption = ip.stem.replace('_', ' ')
-            tqdm.write(f"\n[CAPTION WARNING] No .txt file found for {ip.name}. Using fallback caption: '{fallback_caption}'")
+            tqdm.write(f"\n[CAPTION WARNING] No .txt file for {ip.name}. Using fallback: '{fallback_caption}'")
             caption = fallback_caption
-            
+
         return {"ip": ip, "caption": caption, "target_resolution": calculator.calculate_resolution(w, h), "original_size": (w, h)}
 
     except Exception as e:

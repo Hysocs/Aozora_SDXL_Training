@@ -47,7 +47,7 @@
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures/TrainingData/by wanitaroo",
-            "repeats": 1
+            "repeats": 10
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -58,7 +58,9 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "debias_strength": 0.3
+        "debias_strength": 0.3,
+        "use_grad_centralization": false,
+        "gc_alpha": 1.0
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

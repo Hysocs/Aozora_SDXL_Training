@@ -913,80 +913,82 @@ class TrainingGUI(QtWidgets.QWidget):
         self._apply_config_to_widgets()
     
     def _prepare_config_to_save(self):
-            config_to_save = {}
-            for key in self.default_config.keys():
-                if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "ADAFACTOR_PARAMS"]:
-                    continue
-                
-                live_val = self.current_config.get(key)
-                if live_val is None:
-                    continue
+        config_to_save = {}
+        for key in self.default_config.keys():
+            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "ADAFACTOR_PARAMS"]:
+                continue
+            
+            live_val = self.current_config.get(key)
+            if live_val is None:
+                continue
 
-                default_val = self.default_config.get(key)
-                try:
-                    if key == "LR_CUSTOM_CURVE":
-                        rounded_curve = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
-                        config_to_save[key] = rounded_curve
-                        continue
-                    converted_val = None
-                    if isinstance(live_val, (bool, list)):
-                        converted_val = live_val
-                    elif default_val is not None:
-                        default_type = type(default_val)
-                        if default_type == bool:
-                            converted_val = str(live_val).strip().lower() in ('true', '1', 't', 'y', 'yes')
-                        elif default_type == int:
-                            converted_val = int(str(live_val).strip()) if str(live_val).strip() else 0
-                        elif default_type == float:
-                            converted_val = float(str(live_val).strip()) if str(live_val).strip() else 0.0
-                        else:
-                            converted_val = str(live_val)
+            default_val = self.default_config.get(key)
+            try:
+                if key == "LR_CUSTOM_CURVE":
+                    rounded_curve = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
+                    config_to_save[key] = rounded_curve
+                    continue
+                converted_val = None
+                if isinstance(live_val, (bool, list)):
+                    converted_val = live_val
+                elif default_val is not None:
+                    default_type = type(default_val)
+                    if default_type == bool:
+                        converted_val = str(live_val).strip().lower() in ('true', '1', 't', 'y', 'yes')
+                    elif default_type == int:
+                        converted_val = int(str(live_val).strip()) if str(live_val).strip() else 0
+                    elif default_type == float:
+                        converted_val = float(str(live_val).strip()) if str(live_val).strip() else 0.0
                     else:
                         converted_val = str(live_val)
-                    config_to_save[key] = converted_val
-                except (ValueError, TypeError) as e:
-                    self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
+                else:
+                    converted_val = str(live_val)
+                config_to_save[key] = converted_val
+            except (ValueError, TypeError) as e:
+                self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
 
-            config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
-            config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
-            config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
+        config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
+        config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
+        config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
 
-            # Save Raven params
-            raven_params = {}
-            try:
-                betas_str = self.widgets['RAVEN_betas'].text().strip()
-                raven_params["betas"] = [float(x.strip()) for x in betas_str.split(',')]
-            except (ValueError, IndexError):
-                raven_params["betas"] = default_config.RAVEN_PARAMS["betas"]
-            try:
-                raven_params["eps"] = float(self.widgets['RAVEN_eps'].text().strip())
-            except ValueError:
-                raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
-            raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
-            # ## SAVE THE NEW VALUE ##
-            raven_params["debias_strength"] = self.widgets['RAVEN_debias_strength'].value()
-            config_to_save["RAVEN_PARAMS"] = raven_params
+        # Save Raven params
+        raven_params = {}
+        try:
+            betas_str = self.widgets['RAVEN_betas'].text().strip()
+            raven_params["betas"] = [float(x.strip()) for x in betas_str.split(',')]
+        except (ValueError, IndexError):
+            raven_params["betas"] = default_config.RAVEN_PARAMS["betas"]
+        try:
+            raven_params["eps"] = float(self.widgets['RAVEN_eps'].text().strip())
+        except ValueError:
+            raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
+        raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
+        raven_params["debias_strength"] = self.widgets['RAVEN_debias_strength'].value()
+        # NEW: Save gradient centralization params
+        raven_params["use_grad_centralization"] = self.widgets['RAVEN_use_grad_centralization'].isChecked()
+        raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
+        config_to_save["RAVEN_PARAMS"] = raven_params
 
-            # Save Adafactor params
-            adafactor_params = {}
-            try:
-                eps_str = self.widgets['ADAFACTOR_eps'].text().strip()
-                adafactor_params["eps"] = [float(x.strip()) for x in eps_str.split(',')]
-            except (ValueError, IndexError):
-                adafactor_params["eps"] = default_config.ADAFACTOR_PARAMS["eps"]
-            adafactor_params["clip_threshold"] = self.widgets['ADAFACTOR_clip_threshold'].value()
-            adafactor_params["decay_rate"] = self.widgets['ADAFACTOR_decay_rate'].value()
-            if self.widgets['ADAFACTOR_beta1_enabled'].isChecked():
-                adafactor_params["beta1"] = self.widgets['ADAFACTOR_beta1_value'].value()
-            else:
-                adafactor_params["beta1"] = None
-            adafactor_params["weight_decay"] = self.widgets['ADAFACTOR_weight_decay'].value()
-            adafactor_params["scale_parameter"] = self.widgets['ADAFACTOR_scale_parameter'].isChecked()
-            adafactor_params["relative_step"] = self.widgets['ADAFACTOR_relative_step'].isChecked()
-            adafactor_params["warmup_init"] = self.widgets['ADAFACTOR_warmup_init'].isChecked()
-            config_to_save["ADAFACTOR_PARAMS"] = adafactor_params
+        # Save Adafactor params (unchanged)
+        adafactor_params = {}
+        try:
+            eps_str = self.widgets['ADAFACTOR_eps'].text().strip()
+            adafactor_params["eps"] = [float(x.strip()) for x in eps_str.split(',')]
+        except (ValueError, IndexError):
+            adafactor_params["eps"] = default_config.ADAFACTOR_PARAMS["eps"]
+        adafactor_params["clip_threshold"] = self.widgets['ADAFACTOR_clip_threshold'].value()
+        adafactor_params["decay_rate"] = self.widgets['ADAFACTOR_decay_rate'].value()
+        if self.widgets['ADAFACTOR_beta1_enabled'].isChecked():
+            adafactor_params["beta1"] = self.widgets['ADAFACTOR_beta1_value'].value()
+        else:
+            adafactor_params["beta1"] = None
+        adafactor_params["weight_decay"] = self.widgets['ADAFACTOR_weight_decay'].value()
+        adafactor_params["scale_parameter"] = self.widgets['ADAFACTOR_scale_parameter'].isChecked()
+        adafactor_params["relative_step"] = self.widgets['ADAFACTOR_relative_step'].isChecked()
+        adafactor_params["warmup_init"] = self.widgets['ADAFACTOR_warmup_init'].isChecked()
+        config_to_save["ADAFACTOR_PARAMS"] = adafactor_params
 
-            return config_to_save
+        return config_to_save
 
     def save_config(self):
         config_to_save = self._prepare_config_to_save()
@@ -1179,94 +1181,109 @@ class TrainingGUI(QtWidgets.QWidget):
         return core_group
 
     def _create_optimizer_group(self):
-            optimizer_group = QtWidgets.QGroupBox("Optimizer")
-            main_layout = QtWidgets.QVBoxLayout(optimizer_group)
-            
-            selector_layout = QtWidgets.QHBoxLayout()
-            selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
-            
-            self.widgets["OPTIMIZER_TYPE"] = QtWidgets.QComboBox()
-            self.widgets["OPTIMIZER_TYPE"].addItems(["Raven", "Adafactor"])
-            self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
-            selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
-            main_layout.addLayout(selector_layout)
+        optimizer_group = QtWidgets.QGroupBox("Optimizer")
+        main_layout = QtWidgets.QVBoxLayout(optimizer_group)
+        
+        selector_layout = QtWidgets.QHBoxLayout()
+        selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
+        
+        self.widgets["OPTIMIZER_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["OPTIMIZER_TYPE"].addItems(["Raven", "Adafactor"])
+        self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
+        selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
+        main_layout.addLayout(selector_layout)
 
-            # Raven Settings Group
-            self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
-            raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
-            
-            self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
-            self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
-            self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0)
-            self.widgets['RAVEN_weight_decay'].setSingleStep(0.001)
-            self.widgets['RAVEN_weight_decay'].setDecimals(3)
+        # Raven Settings Group
+        self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
+        raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
+        
+        self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
+        self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
+        self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0)
+        self.widgets['RAVEN_weight_decay'].setSingleStep(0.001)
+        self.widgets['RAVEN_weight_decay'].setDecimals(3)
 
-            # ## NEW WIDGET ##
-            self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0)
-            self.widgets['RAVEN_debias_strength'].setSingleStep(0.01)
-            self.widgets['RAVEN_debias_strength'].setDecimals(3)
-            self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of the initial bias correction. 1.0 is full correction (standard), 0.3 is 30%. Lower values give a 'softer start'.")
-            
-            raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
-            raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
-            raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
-            # ## ADD WIDGET TO LAYOUT ##
-            raven_layout.addRow("Debias Strength:", self.widgets['RAVEN_debias_strength'])
-            
-            main_layout.addWidget(self.raven_settings_group)
-            
-            # Adafactor Settings Group
-            self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
-            adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
-            
-            self.widgets['ADAFACTOR_eps'] = QtWidgets.QLineEdit()
-            self.widgets['ADAFACTOR_clip_threshold'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['ADAFACTOR_clip_threshold'].setRange(0.1, 10.0)
-            self.widgets['ADAFACTOR_clip_threshold'].setSingleStep(0.1)
-            self.widgets['ADAFACTOR_clip_threshold'].setDecimals(2)
-            
-            self.widgets['ADAFACTOR_decay_rate'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['ADAFACTOR_decay_rate'].setRange(-1.0, 0.0)
-            self.widgets['ADAFACTOR_decay_rate'].setSingleStep(0.01)
-            self.widgets['ADAFACTOR_decay_rate'].setDecimals(3)
-            
-            beta1_widget = QtWidgets.QWidget()
-            beta1_layout = QtWidgets.QHBoxLayout(beta1_widget)
-            beta1_layout.setContentsMargins(0,0,0,0)
-            self.widgets['ADAFACTOR_beta1_enabled'] = QtWidgets.QCheckBox("Enable")
-            self.widgets['ADAFACTOR_beta1_value'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['ADAFACTOR_beta1_value'].setRange(0.0, 1.0)
-            self.widgets['ADAFACTOR_beta1_value'].setSingleStep(0.01)
-            self.widgets['ADAFACTOR_beta1_value'].setDecimals(3)
-            beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_enabled'])
-            beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_value'], 1)
-            self.widgets['ADAFACTOR_beta1_enabled'].stateChanged.connect(
-                lambda state: self.widgets['ADAFACTOR_beta1_value'].setEnabled(bool(state))
-            )
+        self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0)
+        self.widgets['RAVEN_debias_strength'].setSingleStep(0.01)
+        self.widgets['RAVEN_debias_strength'].setDecimals(3)
+        self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
+        
+        # NEW: Gradient Centralization widgets
+        self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
+        self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
+        
+        self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0)
+        self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1)
+        self.widgets['RAVEN_gc_alpha'].setDecimals(1)
+        self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
+        
+        # Connect checkbox to enable/disable gc_alpha
+        self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(
+            lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state))
+        )
+        
+        raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
+        raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
+        raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
+        raven_layout.addRow("Debias Strength:", self.widgets['RAVEN_debias_strength'])
+        raven_layout.addRow(self.widgets['RAVEN_use_grad_centralization'])  # Checkbox on its own row
+        raven_layout.addRow("GC Alpha:", self.widgets['RAVEN_gc_alpha'])
+        
+        main_layout.addWidget(self.raven_settings_group)
+        
+        # Adafactor Settings Group (unchanged)
+        self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
+        adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
+        
+        self.widgets['ADAFACTOR_eps'] = QtWidgets.QLineEdit()
+        self.widgets['ADAFACTOR_clip_threshold'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['ADAFACTOR_clip_threshold'].setRange(0.1, 10.0)
+        self.widgets['ADAFACTOR_clip_threshold'].setSingleStep(0.1)
+        self.widgets['ADAFACTOR_clip_threshold'].setDecimals(2)
+        
+        self.widgets['ADAFACTOR_decay_rate'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['ADAFACTOR_decay_rate'].setRange(-1.0, 0.0)
+        self.widgets['ADAFACTOR_decay_rate'].setSingleStep(0.01)
+        self.widgets['ADAFACTOR_decay_rate'].setDecimals(3)
+        
+        beta1_widget = QtWidgets.QWidget()
+        beta1_layout = QtWidgets.QHBoxLayout(beta1_widget)
+        beta1_layout.setContentsMargins(0,0,0,0)
+        self.widgets['ADAFACTOR_beta1_enabled'] = QtWidgets.QCheckBox("Enable")
+        self.widgets['ADAFACTOR_beta1_value'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['ADAFACTOR_beta1_value'].setRange(0.0, 1.0)
+        self.widgets['ADAFACTOR_beta1_value'].setSingleStep(0.01)
+        self.widgets['ADAFACTOR_beta1_value'].setDecimals(3)
+        beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_enabled'])
+        beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_value'], 1)
+        self.widgets['ADAFACTOR_beta1_enabled'].stateChanged.connect(
+            lambda state: self.widgets['ADAFACTOR_beta1_value'].setEnabled(bool(state))
+        )
 
-            self.widgets['ADAFACTOR_weight_decay'] = QtWidgets.QDoubleSpinBox()
-            self.widgets['ADAFACTOR_weight_decay'].setRange(0.0, 1.0)
-            self.widgets['ADAFACTOR_weight_decay'].setSingleStep(0.001)
-            self.widgets['ADAFACTOR_weight_decay'].setDecimals(3)
-            
-            self.widgets['ADAFACTOR_scale_parameter'] = QtWidgets.QCheckBox("Scale Parameter")
-            self.widgets['ADAFACTOR_relative_step'] = QtWidgets.QCheckBox("Relative Step")
-            self.widgets['ADAFACTOR_warmup_init'] = QtWidgets.QCheckBox("Warmup Init")
-            
-            adafactor_layout.addRow("Eps (e1, e2):", self.widgets['ADAFACTOR_eps'])
-            adafactor_layout.addRow("Clip Threshold:", self.widgets['ADAFACTOR_clip_threshold'])
-            adafactor_layout.addRow("Decay Rate:", self.widgets['ADAFACTOR_decay_rate'])
-            adafactor_layout.addRow("Beta1:", beta1_widget)
-            adafactor_layout.addRow("Weight Decay:", self.widgets['ADAFACTOR_weight_decay'])
-            adafactor_layout.addRow(self.widgets['ADAFACTOR_scale_parameter'])
-            adafactor_layout.addRow(self.widgets['ADAFACTOR_relative_step'])
-            adafactor_layout.addRow(self.widgets['ADAFACTOR_warmup_init'])
-            
-            main_layout.addWidget(self.adafactor_settings_group)
-            
-            return optimizer_group
+        self.widgets['ADAFACTOR_weight_decay'] = QtWidgets.QDoubleSpinBox()
+        self.widgets['ADAFACTOR_weight_decay'].setRange(0.0, 1.0)
+        self.widgets['ADAFACTOR_weight_decay'].setSingleStep(0.001)
+        self.widgets['ADAFACTOR_weight_decay'].setDecimals(3)
+        
+        self.widgets['ADAFACTOR_scale_parameter'] = QtWidgets.QCheckBox("Scale Parameter")
+        self.widgets['ADAFACTOR_relative_step'] = QtWidgets.QCheckBox("Relative Step")
+        self.widgets['ADAFACTOR_warmup_init'] = QtWidgets.QCheckBox("Warmup Init")
+        
+        adafactor_layout.addRow("Eps (e1, e2):", self.widgets['ADAFACTOR_eps'])
+        adafactor_layout.addRow("Clip Threshold:", self.widgets['ADAFACTOR_clip_threshold'])
+        adafactor_layout.addRow("Decay Rate:", self.widgets['ADAFACTOR_decay_rate'])
+        adafactor_layout.addRow("Beta1:", beta1_widget)
+        adafactor_layout.addRow("Weight Decay:", self.widgets['ADAFACTOR_weight_decay'])
+        adafactor_layout.addRow(self.widgets['ADAFACTOR_scale_parameter'])
+        adafactor_layout.addRow(self.widgets['ADAFACTOR_relative_step'])
+        adafactor_layout.addRow(self.widgets['ADAFACTOR_warmup_init'])
+        
+        main_layout.addWidget(self.adafactor_settings_group)
+        
+        return optimizer_group
     
     def _toggle_optimizer_widgets(self):
         selected_optimizer = self.widgets["OPTIMIZER_TYPE"].currentText()
@@ -1417,70 +1434,76 @@ class TrainingGUI(QtWidgets.QWidget):
             self.current_config[key] = widget.get_points()
     
     def _apply_config_to_widgets(self):
+        for widget in self.widgets.values():
+            widget.blockSignals(True)
+        try:
+            if hasattr(self, 'model_load_strategy_combo'):
+                is_resuming = self.current_config.get("RESUME_TRAINING", False)
+                self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
+                self.toggle_resume_widgets()
+            
+            for key, widget in self.widgets.items():
+                if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
+                    continue
+                
+                value = self.current_config.get(key)
+                if value is None: continue
+
+                if isinstance(widget, QtWidgets.QLineEdit):
+                    widget.setText(str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox):
+                    widget.setChecked(bool(value))
+                elif isinstance(widget, QtWidgets.QComboBox):
+                    widget.setCurrentText(str(value))
+                elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                    widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
+
+            # Apply optimizer settings
+            optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
+            self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
+            
+            user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
+            full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
+            self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
+            self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
+            self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
+            self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
+            
+            # NEW: Load gradient centralization settings
+            use_gc = full_raven_params.get("use_grad_centralization", False)
+            gc_alpha = full_raven_params.get("gc_alpha", 1.0)
+            self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc)
+            self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
+            self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)  # Enable/disable based on checkbox
+
+            user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
+            full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
+            self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
+            self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
+            self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
+            beta1_val = full_adafactor_params.get("beta1", None)
+            beta1_enabled = beta1_val is not None
+            self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
+            self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
+            self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
+            self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
+            self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
+            self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
+            self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
+            
+            # Apply LR curve
+            if hasattr(self, 'lr_curve_widget'):
+                self._update_and_clamp_lr_graph()
+            
+            self._toggle_optimizer_widgets()
+            
+            if hasattr(self, "dataset_manager"):
+                datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
+                self.dataset_manager.load_datasets_from_config(datasets_config)
+
+        finally:
             for widget in self.widgets.values():
-                widget.blockSignals(True)
-            try:
-                if hasattr(self, 'model_load_strategy_combo'):
-                    is_resuming = self.current_config.get("RESUME_TRAINING", False)
-                    self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
-                    self.toggle_resume_widgets()
-                
-                for key, widget in self.widgets.items():
-                    if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
-                        continue
-                    
-                    value = self.current_config.get(key)
-                    if value is None: continue
-
-                    if isinstance(widget, QtWidgets.QLineEdit):
-                        widget.setText(str(value))
-                    elif isinstance(widget, QtWidgets.QCheckBox):
-                        widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox):
-                        widget.setCurrentText(str(value))
-                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
-                        widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-
-                # Apply optimizer settings
-                optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
-                self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
-                
-                user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
-                full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
-                self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
-                self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
-                self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
-                # ## LOAD AND APPLY THE NEW VALUE ##
-                self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
-
-                user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
-                full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
-                self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
-                self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
-                self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
-                beta1_val = full_adafactor_params.get("beta1", None)
-                beta1_enabled = beta1_val is not None
-                self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
-                self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
-                self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
-                self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
-                self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
-                self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
-                self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
-                
-                # Apply LR curve
-                if hasattr(self, 'lr_curve_widget'):
-                    self._update_and_clamp_lr_graph()
-                
-                self._toggle_optimizer_widgets()
-                
-                if hasattr(self, "dataset_manager"):
-                    datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
-                    self.dataset_manager.load_datasets_from_config(datasets_config)
-
-            finally:
-                for widget in self.widgets.values():
-                    widget.blockSignals(False)
+                widget.blockSignals(False)
 
     def restore_defaults(self):
         index = self.config_dropdown.currentIndex()
