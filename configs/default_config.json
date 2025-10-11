@@ -5,15 +5,15 @@
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
     "CACHING_BATCH_SIZE": 1,
-    "NUM_WORKERS": 6,
+    "NUM_WORKERS": 0,
     "TARGET_PIXEL_AREA": 1048576,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 4500,
+    "MAX_TRAIN_STEPS": 2500,
     "LEARNING_RATE": 2.5e-06,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 32,
+    "GRADIENT_ACCUMULATION_STEPS": 16,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 1.0,
     "SEED": 69,
@@ -46,8 +46,8 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Datasets/by san p. dro",
-            "repeats": 3
+            "path": "C:/Users/Administrator/Pictures/TrainingData/by wanitaroo",
+            "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
