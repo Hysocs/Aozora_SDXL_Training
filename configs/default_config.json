@@ -10,7 +10,7 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 2500,
+    "MAX_TRAIN_STEPS": 5000,
     "LEARNING_RATE": 2.5e-06,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 16,
@@ -46,8 +46,40 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
+            "path": "C:/Users/Administrator/Pictures/Artists/by anon",
+            "repeats": 2
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by archinoer",
+            "repeats": 2
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by bitseon",
+            "repeats": 2
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by diptip",
+            "repeats": 1
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by doremo",
+            "repeats": 2
+        },
+        {
             "path": "C:/Users/Administrator/Pictures/Artists/by eo",
             "repeats": 1
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by hisha",
+            "repeats": 2
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by nakonisora",
+            "repeats": 2
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by wanitaroo",
+            "repeats": 2
         }
     ],
     "OPTIMIZER_TYPE": "raven",

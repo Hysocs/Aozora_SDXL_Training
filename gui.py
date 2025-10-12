@@ -145,25 +145,281 @@ QTabBar::tab:!selected:hover { background: #4a4668; }
 QScrollArea { border: none; }
 """
 
+
+
+
+class GraphPanel(QtWidgets.QWidget):
+    """Custom QPainter-based graph panel for plotting data."""
+    
+    def __init__(self, title, y_label, parent=None):
+        super().__init__(parent)
+        self.title = title
+        self.y_label = y_label
+        self.setMinimumHeight(180)
+        
+        # Data storage - list of (x, y, color, label) tuples for each line
+        self.lines = []  # Each line: {'data': deque, 'color': QColor, 'label': str}
+        
+        # Display settings
+        self.padding = {'top': 35, 'bottom': 40, 'left': 70, 'right': 20}
+        self.bg_color = QtGui.QColor("#1a1926")
+        self.graph_bg_color = QtGui.QColor("#2c2a3e")
+        self.grid_color = QtGui.QColor("#4a4668")
+        self.text_color = QtGui.QColor("#e0e0e0")
+        self.title_color = QtGui.QColor("#ab97e6")
+        
+        # Auto-scaling
+        self.x_min = 0
+        self.x_max = 100
+        self.y_min = 0
+        self.y_max = 1
+        
+        self.setMouseTracking(True)
+        self.tooltip_pos = None
+    
+    def add_line(self, color, label, max_points=500):
+        """Add a new line to the graph."""
+        self.lines.append({
+            'data': deque(maxlen=max_points),
+            'color': QtGui.QColor(color),
+            'label': label
+        })
+        return len(self.lines) - 1
+    
+    def append_data(self, line_index, x, y):
+        """Append a data point to a specific line."""
+        if 0 <= line_index < len(self.lines):
+            self.lines[line_index]['data'].append((x, y))
+            self._update_bounds()
+    
+    def clear_all_data(self):
+        """Clear all data from all lines."""
+        for line in self.lines:
+            line['data'].clear()
+        self._update_bounds()
+        self.update()
+    
+    def _update_bounds(self):
+        """Update min/max bounds based on current data."""
+        all_x = []
+        all_y = []
+        
+        for line in self.lines:
+            for x, y in line['data']:
+                all_x.append(x)
+                all_y.append(y)
+        
+        if all_x and all_y:
+            self.x_min = min(all_x)
+            self.x_max = max(all_x)
+            self.y_min = min(all_y)
+            self.y_max = max(all_y)
+            
+            # Add 5% padding to y-axis
+            y_range = self.y_max - self.y_min
+            if y_range == 0:
+                y_range = 1
+            self.y_min -= y_range * 0.05
+            self.y_max += y_range * 0.05
+        else:
+            self.x_min = 0
+            self.x_max = 100
+            self.y_min = 0
+            self.y_max = 1
+    
+    def _to_screen_coords(self, x, y):
+        """Convert data coordinates to screen coordinates."""
+        graph_width = self.width() - self.padding['left'] - self.padding['right']
+        graph_height = self.height() - self.padding['top'] - self.padding['bottom']
+        
+        x_range = self.x_max - self.x_min
+        y_range = self.y_max - self.y_min
+        
+        if x_range == 0:
+            x_range = 1
+        if y_range == 0:
+            y_range = 1
+        
+        screen_x = self.padding['left'] + ((x - self.x_min) / x_range) * graph_width
+        screen_y = self.padding['top'] + graph_height - ((y - self.y_min) / y_range) * graph_height
+        
+        return QtCore.QPointF(screen_x, screen_y)
+    
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        
+        # Fill background
+        painter.fillRect(self.rect(), self.bg_color)
+        
+        # Draw graph area
+        graph_rect = QtCore.QRect(
+            self.padding['left'],
+            self.padding['top'],
+            self.width() - self.padding['left'] - self.padding['right'],
+            self.height() - self.padding['top'] - self.padding['bottom']
+        )
+        painter.fillRect(graph_rect, self.graph_bg_color)
+        
+        # Draw grid and labels
+        self._draw_grid_and_axes(painter, graph_rect)
+        
+        # Draw title
+        self._draw_title(painter)
+        
+        # Draw legend
+        self._draw_legend(painter)
+        
+        # Draw data lines
+        self._draw_data_lines(painter)
+    
+    def _draw_grid_and_axes(self, painter, rect):
+        """Draw grid lines and axis labels."""
+        painter.setPen(QtGui.QPen(self.grid_color, 1))
+        
+        # Draw horizontal grid lines
+        num_h_lines = 5
+        for i in range(num_h_lines):
+            y = rect.top() + (i / (num_h_lines - 1)) * rect.height()
+            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
+            
+            # Y-axis labels
+            y_val = self.y_max - (i / (num_h_lines - 1)) * (self.y_max - self.y_min)
+            label = self._format_number(y_val)
+            
+            painter.setPen(self.text_color)
+            painter.drawText(
+                QtCore.QRect(5, int(y - 10), self.padding['left'] - 10, 20),
+                QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                label
+            )
+            painter.setPen(QtGui.QPen(self.grid_color, 1))
+        
+        # Draw vertical grid lines
+        num_v_lines = 6
+        for i in range(num_v_lines):
+            x = rect.left() + (i / (num_v_lines - 1)) * rect.width()
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
+            
+            # X-axis labels
+            x_val = self.x_min + (i / (num_v_lines - 1)) * (self.x_max - self.x_min)
+            label = str(int(x_val))
+            
+            painter.setPen(self.text_color)
+            painter.drawText(
+                QtCore.QRect(int(x - 30), rect.bottom() + 5, 60, 20),
+                QtCore.Qt.AlignmentFlag.AlignCenter,
+                label
+            )
+            painter.setPen(QtGui.QPen(self.grid_color, 1))
+        
+        # Draw axis labels
+        painter.setPen(self.text_color)
+        font = painter.font()
+        font.setPointSize(9)
+        painter.setFont(font)
+        
+        # Y-axis label
+        painter.save()
+        painter.translate(15, self.height() / 2)
+        painter.rotate(-90)
+        painter.drawText(
+            QtCore.QRect(-50, -10, 100, 20),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            self.y_label
+        )
+        painter.restore()
+        
+        # X-axis label
+        painter.drawText(
+            QtCore.QRect(0, self.height() - 20, self.width(), 20),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            "Step"
+        )
+    
+    def _draw_title(self, painter):
+        """Draw the graph title."""
+        painter.setPen(self.title_color)
+        font = painter.font()
+        font.setPointSize(11)
+        font.setBold(True)
+        painter.setFont(font)
+        
+        painter.drawText(
+            QtCore.QRect(0, 5, self.width(), 25),
+            QtCore.Qt.AlignmentFlag.AlignCenter,
+            self.title
+        )
+    
+    def _draw_legend(self, painter):
+        """Draw the legend."""
+        if not self.lines:
+            return
+        
+        legend_x = self.width() - self.padding['right'] - 120
+        legend_y = self.padding['top'] + 10
+        
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+        
+        for line in self.lines:
+            if not line['data']:
+                continue
+            
+            # Draw colored line
+            painter.setPen(QtGui.QPen(line['color'], 2))
+            painter.drawLine(legend_x, legend_y + 5, legend_x + 20, legend_y + 5)
+            
+            # Draw label
+            painter.setPen(self.text_color)
+            painter.drawText(
+                QtCore.QRect(legend_x + 25, legend_y, 80, 15),
+                QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                line['label']
+            )
+            
+            legend_y += 20
+    
+    def _draw_data_lines(self, painter):
+        """Draw the actual data lines."""
+        for line in self.lines:
+            if len(line['data']) < 2:
+                continue
+            
+            painter.setPen(QtGui.QPen(line['color'], 2))
+            
+            points = [self._to_screen_coords(x, y) for x, y in line['data']]
+            
+            # Draw line segments
+            for i in range(len(points) - 1):
+                painter.drawLine(points[i], points[i + 1])
+    
+    def _format_number(self, value):
+        """Format number for display."""
+        if abs(value) < 0.01 or abs(value) > 10000:
+            return f"{value:.1e}"
+        elif abs(value) < 1:
+            return f"{value:.4f}"
+        else:
+            return f"{value:.2f}"
+
+
 class LiveMetricsWidget(QtWidgets.QWidget):
-    """Widget for displaying live training metrics with matplotlib graphs."""
+    """Widget for displaying live training metrics with custom QPainter graphs."""
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_points = 500  # Maximum number of points to display
+        self.max_points = 500
         
-        # Data storage
-        self.steps = deque(maxlen=self.max_points)
-        self.learning_rates = deque(maxlen=self.max_points)
-        self.grad_norms_raw = deque(maxlen=self.max_points)
-        self.grad_norms_clipped = deque(maxlen=self.max_points)
-        self.losses = deque(maxlen=self.max_points)
-        
-        # Performance optimization: batch updates
+        # Performance optimization
         self.pending_update = False
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self._perform_update)
-        self.update_interval_ms = 500  # Update every 500ms instead of on every line
+        self.update_interval_ms = 500
+        
+        # Pending data buffer
+        self.pending_data = []
         
         self._setup_ui()
     
@@ -183,64 +439,40 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.pause_button.toggled.connect(self._on_pause_toggled)
         control_layout.addWidget(self.pause_button)
         
-        # Update speed control
         control_layout.addWidget(QtWidgets.QLabel("Update Speed:"))
         self.speed_combo = QtWidgets.QComboBox()
         self.speed_combo.addItems(["Fast (100ms)", "Normal (500ms)", "Slow (1000ms)", "Very Slow (2000ms)"])
-        self.speed_combo.setCurrentIndex(1)  # Default to Normal
+        self.speed_combo.setCurrentIndex(1)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         control_layout.addWidget(self.speed_combo)
         
         control_layout.addStretch()
         
-        # Stats label
         self.stats_label = QtWidgets.QLabel("No data yet")
         self.stats_label.setStyleSheet("color: #ab97e6; font-weight: bold;")
         control_layout.addWidget(self.stats_label)
         
         layout.addLayout(control_layout)
         
-        # Create matplotlib figure with dark theme
-        self.figure = Figure(figsize=(10, 8), facecolor='#1a1926')
-        self.canvas = FigureCanvas(self.figure)
-        self.canvas.setStyleSheet("background-color: #1a1926;")
-        layout.addWidget(self.canvas)
+        # Create graph panels
+        self.lr_graph = GraphPanel("Learning Rate", "Learning Rate")
+        self.lr_line_idx = self.lr_graph.add_line("#6a48d7", "LR", self.max_points)
+        layout.addWidget(self.lr_graph, 1)
         
-        # Create subplots
-        self.ax1 = self.figure.add_subplot(311, facecolor='#2c2a3e')
-        self.ax2 = self.figure.add_subplot(312, facecolor='#2c2a3e')
-        self.ax3 = self.figure.add_subplot(313, facecolor='#2c2a3e')
+        self.grad_graph = GraphPanel("Gradient Norms", "Gradient Norm")
+        self.grad_raw_idx = self.grad_graph.add_line("#e53935", "Raw", self.max_points)
+        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points)
+        layout.addWidget(self.grad_graph, 1)
         
-        # Style the plots
-        for ax in [self.ax1, self.ax2, self.ax3]:
-            ax.tick_params(colors='#e0e0e0', labelsize=9)
-            ax.spines['bottom'].set_color('#4a4668')
-            ax.spines['top'].set_color('#4a4668')
-            ax.spines['left'].set_color('#4a4668')
-            ax.spines['right'].set_color('#4a4668')
-            ax.grid(True, alpha=0.2, color='#4a4668')
-            ax.set_xlabel('Step', color='#e0e0e0', fontsize=10)
+        self.loss_graph = GraphPanel("Training Loss", "Loss")
+        self.loss_line_idx = self.loss_graph.add_line("#ab97e6", "Loss", self.max_points)
+        layout.addWidget(self.loss_graph, 1)
         
-        self.ax1.set_ylabel('Learning Rate', color='#e0e0e0', fontsize=10)
-        self.ax1.set_title('Learning Rate', color='#ab97e6', fontsize=12, fontweight='bold')
-        
-        self.ax2.set_ylabel('Gradient Norm', color='#e0e0e0', fontsize=10)
-        self.ax2.set_title('Gradient Norms', color='#ab97e6', fontsize=12, fontweight='bold')
-        
-        self.ax3.set_ylabel('Loss', color='#e0e0e0', fontsize=10)
-        self.ax3.set_title('Training Loss', color='#ab97e6', fontsize=12, fontweight='bold')
-        
-        self.figure.tight_layout()
-        
-        # Initial empty plot - use lines without markers for better performance
-        self.lr_line, = self.ax1.plot([], [], '-', color='#6a48d7', linewidth=2, label='LR')
-        self.grad_raw_line, = self.ax2.plot([], [], '-', color='#e53935', linewidth=2, label='Raw')
-        self.grad_clipped_line, = self.ax2.plot([], [], '-', color='#ffdd57', linewidth=2, label='Clipped')
-        self.loss_line, = self.ax3.plot([], [], '-', color='#ab97e6', linewidth=2, label='Loss')
-        
-        self.ax1.legend(loc='upper right', facecolor='#2c2a3e', edgecolor='#4a4668', fontsize=9)
-        self.ax2.legend(loc='upper right', facecolor='#2c2a3e', edgecolor='#4a4668', fontsize=9)
-        self.ax3.legend(loc='upper right', facecolor='#2c2a3e', edgecolor='#4a4668', fontsize=9)
+        # Store latest values for stats
+        self.latest_step = 0
+        self.latest_lr = 0.0
+        self.latest_loss = 0.0
+        self.latest_grad = 0.0
     
     def _on_pause_toggled(self, checked):
         """Handle pause button toggle."""
@@ -252,7 +484,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
     
     def _on_speed_changed(self, index):
         """Update the refresh interval based on speed selection."""
-        speeds = [100, 500, 1000, 2000]  # milliseconds
+        speeds = [100, 500, 1000, 2000]
         self.update_interval_ms = speeds[index]
         if self.update_timer.isActive():
             self.update_timer.stop()
@@ -263,6 +495,8 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         if self.pause_button.isChecked():
             return
         
+        data_added = False
+        
         # Parse step report format:
         # --- Step: {step} | Loss: {loss} | LR: {lr} ---
         step_match = re.search(r'--- Step:\s*(\d+)\s*\|\s*Loss:\s*([\d.]+)\s*\|\s*LR:\s*([\d.e+-]+)\s*---', text)
@@ -271,10 +505,11 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             loss = float(step_match.group(2))
             lr = float(step_match.group(3))
             
-            self.steps.append(step)
-            self.learning_rates.append(lr)
-            self.losses.append(loss)
-            self.pending_update = True
+            self.pending_data.append(('step', step, loss, lr))
+            self.latest_step = step
+            self.latest_lr = lr
+            self.latest_loss = loss
+            data_added = True
         
         # Parse gradient norm format:
         # Grad Norm (Raw/Clipped): {raw} / {clipped}
@@ -283,78 +518,69 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             raw_norm = float(grad_match.group(1))
             clipped_norm = float(grad_match.group(2))
             
-            # Only add if we have a corresponding step
-            if len(self.grad_norms_raw) < len(self.steps):
-                self.grad_norms_raw.append(raw_norm)
-                self.grad_norms_clipped.append(clipped_norm)
-                self.pending_update = True
+            self.pending_data.append(('grad', raw_norm, clipped_norm))
+            self.latest_grad = raw_norm
+            data_added = True
         
-        # Start timer if we have pending updates and it's not already running
-        if self.pending_update and not self.update_timer.isActive() and not self.pause_button.isChecked():
-            self.update_timer.start(self.update_interval_ms)
+        if data_added:
+            self.pending_update = True
+            # Start timer if not already running
+            if not self.update_timer.isActive() and not self.pause_button.isChecked():
+                self.update_timer.start(self.update_interval_ms)
     
     def _perform_update(self):
         """Actually perform the plot update. Called by timer."""
-        if not self.pending_update or not self.steps:
+        if not self.pending_update or not self.pending_data:
             self.update_timer.stop()
             return
         
-        steps_list = list(self.steps)
+        # Process all pending data
+        last_step = None
+        for data in self.pending_data:
+            if data[0] == 'step':
+                _, step, loss, lr = data
+                last_step = step
+                self.lr_graph.append_data(self.lr_line_idx, step, lr)
+                self.loss_graph.append_data(self.loss_line_idx, step, loss)
+            elif data[0] == 'grad' and last_step is not None:
+                _, raw_norm, clipped_norm = data
+                self.grad_graph.append_data(self.grad_raw_idx, last_step, raw_norm)
+                self.grad_graph.append_data(self.grad_clipped_idx, last_step, clipped_norm)
         
-        # Update learning rate plot
-        if self.learning_rates:
-            self.lr_line.set_data(steps_list, list(self.learning_rates))
-            self.ax1.relim()
-            self.ax1.autoscale_view()
-        
-        # Update gradient norm plot
-        if self.grad_norms_raw:
-            grad_steps = steps_list[:len(self.grad_norms_raw)]
-            self.grad_raw_line.set_data(grad_steps, list(self.grad_norms_raw))
-            self.grad_clipped_line.set_data(grad_steps, list(self.grad_norms_clipped))
-            self.ax2.relim()
-            self.ax2.autoscale_view()
-        
-        # Update loss plot
-        if self.losses:
-            self.loss_line.set_data(steps_list, list(self.losses))
-            self.ax3.relim()
-            self.ax3.autoscale_view()
+        # Clear pending data
+        self.pending_data.clear()
         
         # Update stats label
-        if self.steps:
-            latest_step = steps_list[-1]
-            latest_lr = self.learning_rates[-1] if self.learning_rates else 0
-            latest_loss = self.losses[-1] if self.losses else 0
-            latest_grad = self.grad_norms_raw[-1] if self.grad_norms_raw else 0
-            
-            self.stats_label.setText(
-                f"Latest - Step: {latest_step} | LR: {latest_lr:.2e} | "
-                f"Loss: {latest_loss:.4f} | Grad: {latest_grad:.4f}"
-            )
+        self.stats_label.setText(
+            f"Latest - Step: {self.latest_step} | LR: {self.latest_lr:.2e} | "
+            f"Loss: {self.latest_loss:.4f} | Grad: {self.latest_grad:.4f}"
+        )
         
-        # Use draw_idle for better performance - only redraws when idle
-        self.canvas.draw_idle()
+        # Trigger repaints
+        self.lr_graph.update()
+        self.grad_graph.update()
+        self.loss_graph.update()
+        
         self.pending_update = False
     
     def clear_data(self):
         """Clear all stored data and reset plots."""
         self.update_timer.stop()
         self.pending_update = False
+        self.pending_data.clear()
         
-        self.steps.clear()
-        self.learning_rates.clear()
-        self.grad_norms_raw.clear()
-        self.grad_norms_clipped.clear()
-        self.losses.clear()
+        # Clear all graphs
+        self.lr_graph.clear_all_data()
+        self.grad_graph.clear_all_data()
+        self.loss_graph.clear_all_data()
         
-        self.lr_line.set_data([], [])
-        self.grad_raw_line.set_data([], [])
-        self.grad_clipped_line.set_data([], [])
-        self.loss_line.set_data([], [])
+        # Reset stats
+        self.latest_step = 0
+        self.latest_lr = 0.0
+        self.latest_loss = 0.0
+        self.latest_grad = 0.0
         
         self.stats_label.setText("No data yet")
-        self.canvas.draw_idle()
     
     def showEvent(self, event):
         """Resume updates when tab becomes visible."""
