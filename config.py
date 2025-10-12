@@ -23,7 +23,7 @@ INSTANCE_DATASETS = [
 
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
-NUM_WORKERS = 4
+NUM_WORKERS = 0
 
 # --- Aspect Ratio Bucketing ---
 TARGET_PIXEL_AREA = 1048576  # 1024*1024

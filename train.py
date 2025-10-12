@@ -366,9 +366,44 @@ def load_vae_only(config, device):
     
     return vae
 
+def verify_cached_dataset(dataset_path):
+    """Verify all cached files are valid and free of NaN/Inf values."""
+    cache_dir = dataset_path / ".precomputed_embeddings_cache"
+    if not cache_dir.exists():
+        print(f"INFO: No cache directory found at {cache_dir}")
+        return True
+    
+    cache_files = list(cache_dir.glob("*.pt"))
+    if not cache_files:
+        print(f"INFO: No cached files to verify in {cache_dir}")
+        return True
+    
+    corrupted = []
+    for cache_file in tqdm(cache_files, desc="Verifying cache"):
+        try:
+            data = torch.load(cache_file, map_location="cpu")
+            
+            # Check for NaN/Inf in all components
+            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any() or
+                torch.isnan(data["embeds"]).any() or torch.isinf(data["embeds"]).any() or
+                torch.isnan(data["pooled"]).any() or torch.isinf(data["pooled"]).any()):
+                corrupted.append(cache_file)
+        except Exception as e:
+            print(f"\nWARNING: Could not load {cache_file.name}: {e}")
+            corrupted.append(cache_file)
+    
+    if corrupted:
+        print(f"\nWARNING: Found {len(corrupted)} corrupted cache files:")
+        for f in corrupted:
+            print(f"  - {f.name}")
+        print("These files will be skipped during training. Consider deleting them and recaching.")
+        return False
+    else:
+        print(f"INFO: All {len(cache_files)} cached files verified successfully!")
+        return True
 
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
-    """Streamlined caching with minimal memory footprint."""
+    """Streamlined caching with minimal memory footprint and NaN validation."""
     
     # Check if caching is even needed
     if not check_if_caching_needed(config):
@@ -428,7 +463,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         
         # Validate and assign resolutions using multiprocessing
         print("INFO: Validating images and calculating resolutions...")
-        with Pool(processes=min(cpu_count(), 8)) as pool:  # Limit to 8 processes max
+        with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
                 pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]), 
                 total=len(to_process), 
@@ -468,13 +503,30 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             captions = [m['caption'] for m in batch_meta]
             embeds, pooled = compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device)
             
+            # Validate text embeddings
+            if torch.isnan(embeds).any() or torch.isinf(embeds).any():
+                tqdm.write(f"\n[NaN/Inf DETECTED] Text embeddings contain invalid values! Skipping batch.")
+                tqdm.write(f"  Affected captions: {captions}")
+                continue
+            if torch.isnan(pooled).any() or torch.isinf(pooled).any():
+                tqdm.write(f"\n[NaN/Inf DETECTED] Pooled embeddings contain invalid values! Skipping batch.")
+                tqdm.write(f"  Affected captions: {captions}")
+                continue
+            
             # Load and process images
             images, valid_meta = [], []
             for m in batch_meta:
                 try:
                     with Image.open(m['ip']) as img: 
                         img = img.convert("RGB")
-                    images.append(transform(resize_to_fit(img, w, h)))
+                    processed_img = transform(resize_to_fit(img, w, h))
+                    
+                    # Validate processed image tensor
+                    if torch.isnan(processed_img).any() or torch.isinf(processed_img).any():
+                        tqdm.write(f"\n[NaN/Inf DETECTED] Processed image {m['ip'].name} contains invalid values. Skipping.")
+                        continue
+                    
+                    images.append(processed_img)
                     valid_meta.append(m)
                 except Exception as e: 
                     tqdm.write(f"\n[ERROR] Skipping {m['ip']}: {e}")
@@ -488,15 +540,35 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             with torch.no_grad():
                 latents = vae.encode(image_batch_tensor).latent_dist.mean * vae.config.scaling_factor
             
+            # Validate VAE latents
+            if torch.isnan(latents).any() or torch.isinf(latents).any():
+                tqdm.write(f"\n[NaN/Inf DETECTED] VAE produced invalid latents! Skipping entire batch.")
+                tqdm.write(f"  Affected images:")
+                for m in valid_meta:
+                    tqdm.write(f"    - {m['ip'].name}")
+                continue
+            
             # Save each item
             for j, m in enumerate(valid_meta):
                 cache_path = cache_dir / f"{m['ip'].stem}.pt"
+                
+                # Final validation before saving
+                latent_to_save = latents[j].cpu().to(torch.float32)
+                embed_to_save = embeds[j].cpu().to(torch.float32)
+                pooled_to_save = pooled[j].cpu().to(torch.float32)
+                
+                if (torch.isnan(latent_to_save).any() or torch.isinf(latent_to_save).any() or
+                    torch.isnan(embed_to_save).any() or torch.isinf(embed_to_save).any() or
+                    torch.isnan(pooled_to_save).any() or torch.isinf(pooled_to_save).any()):
+                    tqdm.write(f"\n[NaN/Inf DETECTED] Invalid values before saving {m['ip'].stem}. Skipping.")
+                    continue
+                
                 torch.save({
                     "original_size": m["original_size"], 
                     "target_size": (w, h),
-                    "embeds": embeds[j].cpu().to(torch.float32), 
-                    "pooled": pooled[j].cpu().to(torch.float32),
-                    "latents": latents[j].cpu().to(torch.float32)
+                    "embeds": embed_to_save, 
+                    "pooled": pooled_to_save,
+                    "latents": latent_to_save
                 }, cache_path)
             
             # Clear memory periodically
@@ -504,6 +576,10 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 torch.cuda.empty_cache()
         
         print(f"INFO: Completed caching for {root}")
+        
+        # Verify the cached dataset after completion
+        print(f"INFO: Verifying cached files for {root}...")
+        verify_cached_dataset(root)
     
     # Cleanup - move text encoders back to CPU (VAE cleanup handled by main())
     print("\nINFO: Moving text encoders back to CPU...")
@@ -553,6 +629,14 @@ class ImageTextLatentDataset(Dataset):
     def __getitem__(self, i):
         try:
             data = torch.load(self.latent_files[i], map_location="cpu")
+            
+            # Validate loaded cache for NaN/Inf
+            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any() or
+                torch.isnan(data["embeds"]).any() or torch.isinf(data["embeds"]).any() or
+                torch.isnan(data["pooled"]).any() or torch.isinf(data["pooled"]).any()):
+                print(f"WARNING: Corrupted cache detected in {self.latent_files[i].name} (contains NaN/Inf). Skipping.")
+                return None
+            
             return {
                 "latents": data["latents"], "embeds": data["embeds"], "pooled": data["pooled"],
                 "original_sizes": data["original_size"], "target_sizes": data["target_size"],

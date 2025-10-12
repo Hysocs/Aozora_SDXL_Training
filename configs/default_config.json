@@ -46,8 +46,8 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/TrainingData/by wanitaroo",
-            "repeats": 10
+            "path": "C:/Users/Administrator/Pictures/Artists/by eo",
+            "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -59,7 +59,7 @@
         "eps": 1e-08,
         "weight_decay": 0.01,
         "debias_strength": 0.3,
-        "use_grad_centralization": false,
+        "use_grad_centralization": true,
         "gc_alpha": 1.0
     },
     "ADAFACTOR_PARAMS": {
