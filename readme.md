@@ -1,5 +1,11 @@
 # Aozora SDXL Trainer
 
+<details>
+  <summary>⚠️ <strong>The script isnt production ready, please understand what and why your training (this will be removed once the script it stable! making training work on 12gb is hard. sorry!).</strong></summary>
+
+This action is irreversible.
+</details>
+
 A user-friendly graphical interface (GUI) for fine-tuning Stable Diffusion XL (SDXL) models. This tool is built on a powerful, memory-efficient training script that allows for targeted layer training, latent caching, and easy configuration management.
 
 The goal of this project is to provide a simple yet powerful way for users to fine-tune SDXL without needing to edit scripts or manage complex command-line arguments. Everything is controlled through the GUI.
