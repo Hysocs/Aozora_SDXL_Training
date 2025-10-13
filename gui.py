@@ -157,8 +157,8 @@ class GraphPanel(QtWidgets.QWidget):
         self.y_label = y_label
         self.setMinimumHeight(180)
         
-        # Data storage - list of (x, y, color, label) tuples for each line
-        self.lines = []  # Each line: {'data': deque, 'color': QColor, 'label': str}
+        # Data storage - list of (x, y, color, label, linewidth) tuples for each line
+        self.lines = []  # Each line: {'data': deque, 'color': QColor, 'label': str, 'linewidth': int}
         
         # Display settings
         self.padding = {'top': 35, 'bottom': 40, 'left': 70, 'right': 20}
@@ -177,12 +177,13 @@ class GraphPanel(QtWidgets.QWidget):
         self.setMouseTracking(True)
         self.tooltip_pos = None
     
-    def add_line(self, color, label, max_points=500):
+    def add_line(self, color, label, max_points=500, linewidth=2):
         """Add a new line to the graph."""
         self.lines.append({
             'data': deque(maxlen=max_points),
             'color': QtGui.QColor(color),
-            'label': label
+            'label': label,
+            'linewidth': linewidth
         })
         return len(self.lines) - 1
     
@@ -367,8 +368,8 @@ class GraphPanel(QtWidgets.QWidget):
             if not line['data']:
                 continue
             
-            # Draw colored line
-            painter.setPen(QtGui.QPen(line['color'], 2))
+            # Draw colored line with appropriate thickness
+            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
             painter.drawLine(legend_x, legend_y + 5, legend_x + 20, legend_y + 5)
             
             # Draw label
@@ -387,7 +388,8 @@ class GraphPanel(QtWidgets.QWidget):
             if len(line['data']) < 2:
                 continue
             
-            painter.setPen(QtGui.QPen(line['color'], 2))
+            # Use the line's specified width
+            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
             
             points = [self._to_screen_coords(x, y) for x, y in line['data']]
             
@@ -458,12 +460,12 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.lr_graph = GraphPanel("Learning Rate", "Learning Rate")
         self.lr_line_idx = self.lr_graph.add_line("#6a48d7", "LR", self.max_points)
         layout.addWidget(self.lr_graph, 1)
-        
+
         self.grad_graph = GraphPanel("Gradient Norms", "Gradient Norm")
-        self.grad_raw_idx = self.grad_graph.add_line("#e53935", "Raw", self.max_points)
-        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points)
+        self.grad_raw_idx = self.grad_graph.add_line("#e53935", "Raw", self.max_points, linewidth=4)
+        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points, linewidth=2)  # Half thickness
         layout.addWidget(self.grad_graph, 1)
-        
+
         self.loss_graph = GraphPanel("Training Loss", "Loss")
         self.loss_line_idx = self.loss_graph.add_line("#ab97e6", "Loss", self.max_points)
         layout.addWidget(self.loss_graph, 1)

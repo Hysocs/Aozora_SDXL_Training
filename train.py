@@ -84,25 +84,42 @@ class TrainingConfig:
             print("INFO: No config file specified. Using defaults from config.py.")
             
     def _type_check_and_correct(self):
-        """Convert string representations of booleans and handle special types."""
+        """
+        Dynamically checks and corrects the types of configuration attributes,
+        with special handling for comma-separated strings and float-like integers.
+        """
+        print("INFO: Checking and correcting configuration types...")
         for key, value in list(self.__dict__.items()):
-            if isinstance(value, str):
-                if value.lower() in ['true', '1', 't', 'y', 'yes']: 
-                    setattr(self, key, True)
-                elif value.lower() in ['false', '0', 'f', 'n', 'no']: 
-                    setattr(self, key, False)
+            # Handle UNET_EXCLUDE_TARGETS as a special case first
+            if key == "UNET_EXCLUDE_TARGETS":
+                if isinstance(value, str):
+                    setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
+                elif isinstance(value, list):
+                    setattr(self, key, [item for item in value if item])
+                continue
+
+            default_value = getattr(default_config, key, None)
+            if default_value is None or isinstance(value, type(default_value)):
+                continue
+
+            expected_type = type(default_value)
             
-            # Handle UNET_EXCLUDE_TARGETS conversion from string to list
-            if key == "UNET_EXCLUDE_TARGETS" and isinstance(value, str):
-                # Filter out empty strings!
-                setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
-            
-            # NEW: Also filter if it's already a list with empty strings
-            if key == "UNET_EXCLUDE_TARGETS" and isinstance(value, list):
-                setattr(self, key, [item for item in value if item])
+            if expected_type == bool and isinstance(value, str):
+                setattr(self, key, value.lower() in ['true', '1', 't', 'y', 'yes'])
+                continue
+
+            try:
+                if expected_type == int:
+                    setattr(self, key, int(float(value)))
+                else:
+                    setattr(self, key, expected_type(value))
+
+            except (ValueError, TypeError):
+                print(f"WARNING: Could not convert '{key}' value '{value}' to {expected_type.__name__}. "
+                    f"Using default value: {default_value}")
+                setattr(self, key, default_value)
         
         print("INFO: Configuration types checked and corrected.")
-
 
 class CustomCurveLRScheduler:
     """Custom LR scheduler that interpolates along a user-defined curve."""

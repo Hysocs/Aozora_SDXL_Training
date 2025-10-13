@@ -10,12 +10,12 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 5000,
+    "MAX_TRAIN_STEPS": 3500,
     "LEARNING_RATE": 2.5e-06,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 16,
+    "GRADIENT_ACCUMULATION_STEPS": 8,
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": 1.0,
+    "CLIP_GRAD_NORM": 1.5,
     "SEED": 69,
     "SAVE_EVERY_N_STEPS": 25000,
     "UNET_EXCLUDE_TARGETS": "conv1, conv2",
@@ -26,11 +26,11 @@
         ],
         [
             0.05,
-            2.5e-06
+            5.5e-06
         ],
         [
             0.9,
-            2.5e-06
+            5.5e-06
         ],
         [
             1.0,
@@ -38,7 +38,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 2.5e-06,
+    "LR_GRAPH_MAX": 5.5e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
@@ -46,40 +46,8 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Artists/by anon",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by archinoer",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by bitseon",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by diptip",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by doremo",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by eo",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by hisha",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by nakonisora",
-            "repeats": 2
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures/Artists/by wanitaroo",
-            "repeats": 2
+            "path": "C:/Users/Administrator/Pictures/GameCG/from Sickly Days and Summer Traces",
+            "repeats": 11
         }
     ],
     "OPTIMIZER_TYPE": "raven",
