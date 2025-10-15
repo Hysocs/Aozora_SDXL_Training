@@ -1,16 +1,16 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/new_model_with_baked_vae.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
-    "TARGET_PIXEL_AREA": 589824,
+    "TARGET_PIXEL_AREA": 1048576,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 1000,
+    "MAX_TRAIN_STEPS": 8400,
     "LEARNING_RATE": 8e-06,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 13,
@@ -26,11 +26,11 @@
         ],
         [
             0.05,
-            6e-06
+            3e-06
         ],
         [
             0.9,
-            6e-06
+            3e-06
         ],
         [
             1.0,
@@ -38,7 +38,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 6e-06,
+    "LR_GRAPH_MAX": 3e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
@@ -47,7 +47,7 @@
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures/GameCG/from Heroines Chord",
-            "repeats": 10
+            "repeats": 100
         }
     ],
     "OPTIMIZER_TYPE": "raven",
