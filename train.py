@@ -1050,7 +1050,7 @@ def main():
                     key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
                     for hf_key in trainable_layer_names:
                         if (mapped := key_map.get(hf_key)) and (sd_key := 'model.diffusion_model.' + mapped) in sd_to_save:
-                            sd_to_save[sd_key] = unet_sd[hf_key].cpu().to(config.compute_dtype)
+                            sd_to_save[sd_key] = unet_sd[hf_key].to(config.compute_dtype)
                     save_file(sd_to_save, model_path)
                     del sd_to_save, unet_sd
                     print(f"Checkpoint saved.")
@@ -1073,7 +1073,7 @@ def main():
     key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
     for hf_key in trainable_layer_names:
         if (mapped := key_map.get(hf_key)) and (sd_key := 'model.diffusion_model.' + mapped) in final_sd:
-            final_sd[sd_key] = unet_sd[hf_key].cpu().to(config.compute_dtype)
+            final_sd[sd_key] = unet_sd[hf_key].to(config.compute_dtype)
     save_file(final_sd, final_model_path)
     print(f"Final model saved to: {final_model_path}")
 

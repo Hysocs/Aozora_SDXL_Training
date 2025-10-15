@@ -1,21 +1,21 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/new_model_with_baked_vae.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "",
     "RESUME_STATE_PATH": "",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
-    "TARGET_PIXEL_AREA": 1048576,
+    "TARGET_PIXEL_AREA": 589824,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 3500,
-    "LEARNING_RATE": 2.5e-06,
+    "MAX_TRAIN_STEPS": 1000,
+    "LEARNING_RATE": 8e-06,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 8,
+    "GRADIENT_ACCUMULATION_STEPS": 13,
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": 1.5,
+    "CLIP_GRAD_NORM": 0.8,
     "SEED": 69,
     "SAVE_EVERY_N_STEPS": 25000,
     "UNET_EXCLUDE_TARGETS": "conv1, conv2",
@@ -26,11 +26,11 @@
         ],
         [
             0.05,
-            5.5e-06
+            6e-06
         ],
         [
             0.9,
-            5.5e-06
+            6e-06
         ],
         [
             1.0,
@@ -38,7 +38,7 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 5.5e-06,
+    "LR_GRAPH_MAX": 6e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
@@ -46,8 +46,8 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/GameCG/from Sickly Days and Summer Traces",
-            "repeats": 11
+            "path": "C:/Users/Administrator/Pictures/GameCG/from Heroines Chord",
+            "repeats": 10
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -58,7 +58,7 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "debias_strength": 0.3,
+        "debias_strength": 0.6,
         "use_grad_centralization": true,
         "gc_alpha": 1.0
     },
