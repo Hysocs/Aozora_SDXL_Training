@@ -1970,11 +1970,9 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         return dataset_info
     
     def _cache_exists(self, path):
-        """Check if cache directory exists and has files."""
+        """Check if cache directory exists."""
         cache_dir = Path(path) / ".precomputed_embeddings_cache"
-        if cache_dir.exists() and cache_dir.is_dir():
-            return len(list(cache_dir.glob("*.pt"))) > 0
-        return False
+        return cache_dir.exists() and cache_dir.is_dir()
     
     def load_datasets_from_config(self, datasets_config):
         self.datasets = []
