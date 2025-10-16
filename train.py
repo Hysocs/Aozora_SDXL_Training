@@ -312,17 +312,15 @@ def resize_to_fit(image, target_w, target_h):
 def validate_and_assign_resolution(args):
     ip, calculator = args
     try:
-        # Image validation
+        # Image validation - lightweight checks only
         with Image.open(ip) as img:
             img.verify()
         with Image.open(ip) as img:
             img.load()
-            # ADDED: Check for image data issues after loading
-            img_tensor = transforms.ToTensor()(img)
-            if torch.isnan(img_tensor).any() or torch.isinf(img_tensor).any():
-                tqdm.write(f"\n[INVALID DATA] Image {ip.name} contains NaN or Inf values. Skipping.")
-                return None
             w, h = img.size
+            if w <= 0 or h <= 0:
+                tqdm.write(f"\n[INVALID] Image {ip.name} has invalid dimensions. Skipping.")
+                return None
 
         cp = ip.with_suffix('.txt')
 

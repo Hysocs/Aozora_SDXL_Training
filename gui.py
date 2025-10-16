@@ -463,7 +463,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
         self.grad_graph = GraphPanel("Gradient Norms", "Gradient Norm")
         self.grad_raw_idx = self.grad_graph.add_line("#e53935", "Raw", self.max_points, linewidth=4)
-        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points, linewidth=2)  # Half thickness
+        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points, linewidth=2)
         layout.addWidget(self.grad_graph, 1)
 
         self.loss_graph = GraphPanel("Training Loss", "Loss")
@@ -910,7 +910,8 @@ class ProcessRunner(QThread):
     progressSignal = pyqtSignal(str, bool)
     finishedSignal = pyqtSignal(int)
     errorSignal = pyqtSignal(str)
-    metricsSignal = pyqtSignal(str)  # NEW: For live metrics parsing
+    metricsSignal = pyqtSignal(str)
+    cacheCreatedSignal = pyqtSignal()  # NEW: Signal for cache creation
     
     def __init__(self, executable, args, working_dir, env=None, creation_flags=0):
         super().__init__()
@@ -952,6 +953,11 @@ class ProcessRunner(QThread):
                     
                     # Emit for metrics parsing
                     self.metricsSignal.emit(line)
+                    
+                    # NEW: Detect cache creation
+                    if "saved latents cache" in line.lower() or "caching complete" in line.lower():
+                        self.cacheCreatedSignal.emit()
+            
             exit_code = self.process.wait()
             self.finishedSignal.emit(exit_code)
         except Exception as e:
@@ -1076,7 +1082,6 @@ class TrainingGUI(QtWidgets.QWidget):
         model_scroll.setWidget(model_content_widget)
         self.tab_view.addTab(model_scroll, "Model && Training Parameters")
         
-        # NEW: Live Metrics Tab
         self.live_metrics_widget = LiveMetricsWidget()
         self.tab_view.addTab(self.live_metrics_widget, "Live Metrics")
         
@@ -1194,12 +1199,11 @@ class TrainingGUI(QtWidgets.QWidget):
             raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
         raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
         raven_params["debias_strength"] = self.widgets['RAVEN_debias_strength'].value()
-        # NEW: Save gradient centralization params
         raven_params["use_grad_centralization"] = self.widgets['RAVEN_use_grad_centralization'].isChecked()
         raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
         config_to_save["RAVEN_PARAMS"] = raven_params
 
-        # Save Adafactor params (unchanged)
+        # Save Adafactor params
         adafactor_params = {}
         try:
             eps_str = self.widgets['ADAFACTOR_eps'].text().strip()
@@ -1323,7 +1327,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
         
-        # Connect SHOULD_UPSCALE to enable/disable MAX_AREA_TOLERANCE
         if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(
                 lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state))
@@ -1360,7 +1363,6 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.addLayout(left_vbox, 1)
         layout.addLayout(right_vbox, 1)
 
-        # Connect updates for LR graph
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
         self._update_lr_button_states(-1)
@@ -1434,7 +1436,6 @@ class TrainingGUI(QtWidgets.QWidget):
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
         main_layout.addLayout(selector_layout)
 
-        # Raven Settings Group
         self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
         raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
         
@@ -1451,7 +1452,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets['RAVEN_debias_strength'].setDecimals(3)
         self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
         
-        # NEW: Gradient Centralization widgets
         self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
         self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
         
@@ -1461,7 +1461,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets['RAVEN_gc_alpha'].setDecimals(1)
         self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
         
-        # Connect checkbox to enable/disable gc_alpha
         self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(
             lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state))
         )
@@ -1470,12 +1469,11 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
         raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
         raven_layout.addRow("Debias Strength:", self.widgets['RAVEN_debias_strength'])
-        raven_layout.addRow(self.widgets['RAVEN_use_grad_centralization'])  # Checkbox on its own row
+        raven_layout.addRow(self.widgets['RAVEN_use_grad_centralization'])
         raven_layout.addRow("GC Alpha:", self.widgets['RAVEN_gc_alpha'])
         
         main_layout.addWidget(self.raven_settings_group)
         
-        # Adafactor Settings Group (unchanged)
         self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
         adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
         
@@ -1614,7 +1612,6 @@ class TrainingGUI(QtWidgets.QWidget):
         label, widget = self._create_widget("USE_ZERO_TERMINAL_SNR")
         layout.addRow(label, widget)
         
-        # Gradient spike detection
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
         separator.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
@@ -1698,7 +1695,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
                     widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
 
-            # Apply optimizer settings
             optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
             self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
             
@@ -1730,12 +1726,10 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
             self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
             
-            # Enable/disable MAX_AREA_TOLERANCE based on SHOULD_UPSCALE
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
             
-            # Apply LR curve
             if hasattr(self, 'lr_curve_widget'):
                 self._update_and_clamp_lr_graph()
             
@@ -1844,7 +1838,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         
-        # Clear live metrics when starting new training
         self.live_metrics_widget.clear_data()
         
         env_dict = os.environ.copy()
@@ -1866,9 +1859,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner.progressSignal.connect(self.handle_process_output)
         self.process_runner.finishedSignal.connect(self.training_finished)
         self.process_runner.errorSignal.connect(self.log)
-        
-        # NEW: Connect metrics signal to live metrics widget
         self.process_runner.metricsSignal.connect(self.live_metrics_widget.parse_and_update)
+        
+        # NEW: Connect cache creation signal to update dataset UI
+        self.process_runner.cacheCreatedSignal.connect(self.dataset_manager.refresh_cache_buttons)
         
         if os.name == 'nt':
             prevent_sleep(True)
@@ -1891,12 +1885,17 @@ class TrainingGUI(QtWidgets.QWidget):
         self.param_info_label.setText("Parameters: (training complete)" if exit_code == 0 else "Parameters: (training failed or stopped)")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
+        
+
+        if hasattr(self, 'dataset_manager'):
+            self.dataset_manager.refresh_cache_buttons()
+        
         if os.name == 'nt':
             prevent_sleep(False)
 
 class NoScrollSpinBox(QtWidgets.QSpinBox):
     def wheelEvent(self, event):
-        event.ignore()  # Ignore scroll events completely
+        event.ignore()
 
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()
@@ -1916,12 +1915,10 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         add_button.clicked.connect(self.add_dataset_folder)
         layout.addWidget(add_button)
         
-        # Create scroll area for dataset grid
         scroll_area = QtWidgets.QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
         
-        # Container for grid layout
         self.grid_container = QtWidgets.QWidget()
         self.dataset_grid = QtWidgets.QGridLayout(self.grid_container)
         self.dataset_grid.setSpacing(15)
@@ -2031,25 +2028,21 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         
         current_data = ds["images_data"][ds["current_preview_idx"]]
         
-        # Update image
         pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
-            159, 159, 
+            183, 183, 
             QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
             QtCore.Qt.TransformationMode.SmoothTransformation
         )
         widgets["preview_label"].setPixmap(pixmap)
         
-        # Update caption
         caption_text = current_data["caption"]
         if len(caption_text) > 200:
             caption_text = caption_text[:200] + "..."
         widgets["caption_label"].setText(caption_text)
         
-        # Update counter
         widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
     
     def repopulate_dataset_grid(self):
-        # Clear existing widgets
         while self.dataset_grid.count():
             item = self.dataset_grid.takeAt(0)
             if item.widget():
@@ -2057,7 +2050,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         
         self.dataset_widgets = []
         
-        # Determine columns based on dataset count
         dataset_count = len(self.datasets)
         if dataset_count == 1:
             COLUMNS = 1
@@ -2070,7 +2062,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             row = idx // COLUMNS
             col = idx % COLUMNS
             
-            # Create card widget
             card = QtWidgets.QGroupBox()
             card.setStyleSheet("""
                 QGroupBox {
@@ -2085,15 +2076,12 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             card_layout = QtWidgets.QVBoxLayout(card)
             card_layout.setSpacing(10)
             
-            # Top section: Image preview (left) + Caption (right)
             top_section = QtWidgets.QHBoxLayout()
             top_section.setSpacing(12)
             
-            # Left: Image preview with navigation
             preview_section = QtWidgets.QVBoxLayout()
             preview_section.setSpacing(5)
             
-            # Image preview (centered)
             image_container = QtWidgets.QHBoxLayout()
             image_container.addStretch()
             
@@ -2115,11 +2103,9 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             
             preview_section.addLayout(image_container)
             
-            # Counter with arrows
             counter_nav_layout = QtWidgets.QHBoxLayout()
             counter_nav_layout.setSpacing(8)
             
-            # Left arrow
             left_arrow = QtWidgets.QPushButton("◄")
             left_arrow.setFixedHeight(22)
             left_arrow.setMinimumWidth(35)
@@ -2133,13 +2119,11 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             """)
             counter_nav_layout.addWidget(left_arrow)
             
-            # Counter
             counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
             counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
             counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;")
             counter_nav_layout.addWidget(counter_label, 1)
             
-            # Right arrow
             right_arrow = QtWidgets.QPushButton("►")
             right_arrow.setFixedHeight(22)
             right_arrow.setMinimumWidth(35)
@@ -2157,7 +2141,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             
             top_section.addLayout(preview_section)
             
-            # Right: Caption preview
             caption_container = QtWidgets.QWidget()
             caption_container.setStyleSheet("""
                 QWidget {
@@ -2186,13 +2169,11 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             top_section.addWidget(caption_container, 1)
             card_layout.addLayout(top_section)
             
-            # Separator
             separator = QtWidgets.QFrame()
             separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
             separator.setStyleSheet("border: 1px solid #4a4668;")
             card_layout.addWidget(separator)
             
-            # Path
             path_label = QtWidgets.QLabel()
             path_short = Path(ds['path']).name
             if len(path_short) > 30:
@@ -2202,7 +2183,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             path_label.setStyleSheet("color: #e0e0e0;")
             card_layout.addWidget(path_label)
             
-            # Image counts
             count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}")
             count_label.setStyleSheet("color: #e0e0e0;")
             card_layout.addWidget(count_label)
@@ -2211,13 +2191,12 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             repeats_total_label.setStyleSheet("color: #ab97e6;")
             card_layout.addWidget(repeats_total_label)
             
-            # Repeats control
             repeats_container = QtWidgets.QWidget()
             repeats_layout = QtWidgets.QHBoxLayout(repeats_container)
             repeats_layout.setContentsMargins(0, 5, 0, 0)
             repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
             
-            repeats_spin = NoScrollSpinBox()  # Changed from QSpinBox
+            repeats_spin = NoScrollSpinBox()
             repeats_spin.setMinimum(1)
             repeats_spin.setMaximum(10000)
             repeats_spin.setValue(ds["repeats"])
@@ -2230,7 +2209,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             repeats_layout.addWidget(repeats_spin, 1)
             card_layout.addWidget(repeats_container)
             
-            # Action buttons
             btn_layout = QtWidgets.QHBoxLayout()
             btn_layout.setSpacing(5)
 
@@ -2243,21 +2221,17 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
             clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
 
-            # Check if cache exists and grey out if not
             cache_exists = self._cache_exists(ds["path"])
             clear_btn.setEnabled(cache_exists)
             if not cache_exists:
                 clear_btn.setToolTip("No cache found")
-                # Keep the height style even when disabled
                 clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
 
             btn_layout.addWidget(clear_btn)
             card_layout.addLayout(btn_layout)
             
-            # Add card to grid
             self.dataset_grid.addWidget(card, row, col)
             
-            # Store widget references for updates
             self.dataset_widgets.append({
                 "preview_label": preview_label,
                 "caption_label": caption_label,
@@ -2266,41 +2240,13 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                 "clear_btn": clear_btn
             })
         
-        # Add stretch to remaining columns if not full
         if dataset_count % COLUMNS != 0:
             for empty_col in range((dataset_count % COLUMNS), COLUMNS):
                 self.dataset_grid.setColumnStretch(empty_col, 1)
 
-    def _update_preview_for_card(self, idx):
-        """Update just the preview and caption for a specific card."""
-        if idx >= len(self.dataset_widgets):
-            return
-        
-        ds = self.datasets[idx]
-        widgets = self.dataset_widgets[idx]
-        
-        current_data = ds["images_data"][ds["current_preview_idx"]]
-        
-        # Update image
-        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
-            183, 183, 
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
-            QtCore.Qt.TransformationMode.SmoothTransformation
-        )
-        widgets["preview_label"].setPixmap(pixmap)
-        
-        # Update caption
-        caption_text = current_data["caption"]
-        if len(caption_text) > 200:
-            caption_text = caption_text[:200] + "..."
-        widgets["caption_label"].setText(caption_text)
-        
-        # Update counter
-        widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
         
-        # Update the repeats total label
         if idx < len(self.dataset_widgets):
             ds = self.datasets[idx]
             total = ds['image_count'] * ds['repeats']
@@ -2344,11 +2290,22 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                     self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
         
         if deleted:
-            # Update clear button state
-            self.repopulate_dataset_grid()
+            self.refresh_cache_buttons()
         
         if not deleted:
             self.parent_gui.log("No cached latent directories found to delete.")
+    
+    def refresh_cache_buttons(self):
+        """Refresh the enabled state of all Clear Cache buttons."""
+        for idx, ds in enumerate(self.datasets):
+            if idx < len(self.dataset_widgets):
+                cache_exists = self._cache_exists(ds["path"])
+                clear_btn = self.dataset_widgets[idx]["clear_btn"]
+                clear_btn.setEnabled(cache_exists)
+                if not cache_exists:
+                    clear_btn.setToolTip("No cache found")
+                else:
+                    clear_btn.setToolTip("")
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
