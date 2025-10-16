@@ -24,9 +24,10 @@ INSTANCE_DATASETS = [
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
-
+SHOULD_UPSCALE = False
 # --- Aspect Ratio Bucketing ---
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
+MAX_AREA_TOLERANCE = 1.1
 
 # --- Core Training Parameters ---
 NOISE_SCHEDULER = "DDPMScheduler"

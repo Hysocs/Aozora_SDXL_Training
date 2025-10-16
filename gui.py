@@ -976,6 +976,8 @@ class TrainingGUI(QtWidgets.QWidget):
         "CACHING_BATCH_SIZE": {"label": "Caching Batch Size", "tooltip": "Adjust based on VRAM (e.g., 2-8).", "widget": "QSpinBox", "range": (1, 64)},
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QSpinBox", "range": (0, 16)},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
+        "SHOULD_UPSCALE": {"label": "Upscale Images", "tooltip": "If enabled, upscale small images closer to bucket limit while maintaining aspect ratio.", "widget": "QCheckBox"},
+        "MAX_AREA_TOLERANCE": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
         "PREDICTION_TYPE": {"label": "Prediction Type:", "tooltip": "v_prediction or epsilon. Must match the base model.", "widget": "QComboBox", "options": ["v_prediction", "epsilon"]},
         "BETA_SCHEDULE": {"label": "Beta Schedule:", "tooltip": "Noise schedule for the diffuser.", "widget": "QComboBox", "options": ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
@@ -1003,7 +1005,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.setObjectName("TrainingGUI")
         self.setWindowTitle("AOZORA SDXL Trainer (Simplified)")
         self.setMinimumSize(QtCore.QSize(1000, 800))
-        self.resize(1200, 950)
+        self.resize(1350, 1000)
         self.config_dir = "configs"
         self.widgets = {}
         self.process_runner = None
@@ -1303,18 +1305,29 @@ class TrainingGUI(QtWidgets.QWidget):
     def _populate_dataset_tab(self, parent_widget):
         layout = QtWidgets.QVBoxLayout(parent_widget)
         layout.setContentsMargins(15, 15, 15, 15)
+        
         top_hbox = QtWidgets.QHBoxLayout()
         top_hbox.setSpacing(20)
+        
         groups = {
             "Batching & DataLoaders": ["CACHING_BATCH_SIZE", "NUM_WORKERS"],
-            "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA"]
+            "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]
         }
+        
         for title, keys in groups.items():
             top_hbox.addWidget(self._create_form_group(title, keys))
+        
         layout.addLayout(top_hbox)
+        
         self.dataset_manager = DatasetManagerWidget(self)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
+        
+        # Connect SHOULD_UPSCALE to enable/disable MAX_AREA_TOLERANCE
+        if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
+            self.widgets["SHOULD_UPSCALE"].stateChanged.connect(
+                lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state))
+            )
     
     def _populate_model_training_tab(self, parent_widget):
         layout = QtWidgets.QHBoxLayout(parent_widget)
@@ -1639,13 +1652,12 @@ class TrainingGUI(QtWidgets.QWidget):
     def _browse_path(self, entry_widget, file_type):
         path = ""
         current_path = os.path.dirname(entry_widget.text()) if entry_widget.text() else ""
-        options = QtWidgets.QFileDialog.Option.DontUseNativeDialog
         if file_type == "folder":
-            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", current_path, options=options)
+            path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", current_path)
         elif file_type == "file_safetensors":
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", current_path, "Safetensors Files (*.safetensors)", options=options)
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", current_path, "Safetensors Files (*.safetensors)")
         elif file_type == "file_pt":
-            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)", options=options)
+            path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", current_path, "PyTorch State Files (*.pt)")
         if path:
             entry_widget.setText(path.replace('\\', '/'))
     
@@ -1697,12 +1709,11 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
             self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
             
-            # NEW: Load gradient centralization settings
             use_gc = full_raven_params.get("use_grad_centralization", False)
             gc_alpha = full_raven_params.get("gc_alpha", 1.0)
             self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc)
             self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
-            self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)  # Enable/disable based on checkbox
+            self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
 
             user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
             full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
@@ -1718,6 +1729,11 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
             self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
             self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
+            
+            # Enable/disable MAX_AREA_TOLERANCE based on SHOULD_UPSCALE
+            if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
+                should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
+                self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
             
             # Apply LR curve
             if hasattr(self, 'lr_curve_widget'):
@@ -1878,6 +1894,10 @@ class TrainingGUI(QtWidgets.QWidget):
         if os.name == 'nt':
             prevent_sleep(False)
 
+class NoScrollSpinBox(QtWidgets.QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()  # Ignore scroll events completely
+
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()
     
@@ -1891,11 +1911,25 @@ class DatasetManagerWidget(QtWidgets.QWidget):
     def _init_ui(self):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0,0,0,0)
+        
         add_button = QtWidgets.QPushButton("Add Dataset Folder")
         add_button.clicked.connect(self.add_dataset_folder)
         layout.addWidget(add_button)
-        self.dataset_vbox = QtWidgets.QVBoxLayout()
-        layout.addLayout(self.dataset_vbox)
+        
+        # Create scroll area for dataset grid
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        
+        # Container for grid layout
+        self.grid_container = QtWidgets.QWidget()
+        self.dataset_grid = QtWidgets.QGridLayout(self.grid_container)
+        self.dataset_grid.setSpacing(15)
+        self.dataset_grid.setContentsMargins(5, 5, 5, 5)
+        
+        scroll_area.setWidget(self.grid_container)
+        layout.addWidget(scroll_area)
+        
         bottom_hbox = QtWidgets.QHBoxLayout()
         bottom_hbox.addStretch(1)
         bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:"))
@@ -1906,7 +1940,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         bottom_hbox.addWidget(self.total_repeats_label)
         bottom_hbox.addStretch()
         layout.addLayout(bottom_hbox)
-        layout.addStretch()
     
     def get_total_repeats(self):
         return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
@@ -1914,75 +1947,367 @@ class DatasetManagerWidget(QtWidgets.QWidget):
     def get_datasets_config(self):
         return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
     
+    def _load_dataset_images(self, path):
+        """Load all images and their captions from a dataset path."""
+        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
+        images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]
+        
+        dataset_info = []
+        for img_path in images:
+            caption_path = img_path.with_suffix('.txt')
+            caption = ""
+            if caption_path.exists():
+                try:
+                    with open(caption_path, 'r', encoding='utf-8') as f:
+                        caption = f.read().strip()
+                except:
+                    caption = "[Error reading caption]"
+            else:
+                caption = "[No caption file]"
+            
+            dataset_info.append({
+                "image_path": str(img_path),
+                "caption": caption
+            })
+        
+        return dataset_info
+    
+    def _cache_exists(self, path):
+        """Check if cache directory exists and has files."""
+        cache_dir = Path(path) / ".precomputed_embeddings_cache"
+        if cache_dir.exists() and cache_dir.is_dir():
+            return len(list(cache_dir.glob("*.pt"))) > 0
+        return False
+    
     def load_datasets_from_config(self, datasets_config):
         self.datasets = []
         for d in datasets_config:
             path = d.get("path")
             if path and os.path.exists(path):
-                exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-                images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]
-                if images:
+                images_data = self._load_dataset_images(path)
+                if images_data:
                     self.datasets.append({
-                        "path": path, "image_count": len(images),
-                        "preview_path": str(random.choice(images)),
+                        "path": path,
+                        "images_data": images_data,
+                        "image_count": len(images_data),
+                        "current_preview_idx": 0,
                         "repeats": d.get("repeats", 1),
                     })
         self.repopulate_dataset_grid()
         self.update_dataset_totals()
     
     def add_dataset_folder(self):
-        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", "", options=QtWidgets.QFileDialog.Option.DontUseNativeDialog)
+        path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", "")
         if not path: return
-        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-        images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]
-        if not images:
+        
+        images_data = self._load_dataset_images(path)
+        if not images_data:
             QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder.")
             return
+        
         self.datasets.append({
             "path": path,
-            "image_count": len(images),
-            "preview_path": str(random.choice(images)),
+            "images_data": images_data,
+            "image_count": len(images_data),
+            "current_preview_idx": 0,
             "repeats": 1,
         })
         self.repopulate_dataset_grid()
         self.update_dataset_totals()
     
+    def _cycle_preview(self, idx, direction):
+        """Cycle through preview images. Direction: 1 for next, -1 for previous."""
+        ds = self.datasets[idx]
+        ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"])
+        self._update_preview_for_card(idx)
+    
+    def _update_preview_for_card(self, idx):
+        """Update just the preview and caption for a specific card."""
+        if idx >= len(self.dataset_widgets):
+            return
+        
+        ds = self.datasets[idx]
+        widgets = self.dataset_widgets[idx]
+        
+        current_data = ds["images_data"][ds["current_preview_idx"]]
+        
+        # Update image
+        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
+            159, 159, 
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
+            QtCore.Qt.TransformationMode.SmoothTransformation
+        )
+        widgets["preview_label"].setPixmap(pixmap)
+        
+        # Update caption
+        caption_text = current_data["caption"]
+        if len(caption_text) > 200:
+            caption_text = caption_text[:200] + "..."
+        widgets["caption_label"].setText(caption_text)
+        
+        # Update counter
+        widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+    
     def repopulate_dataset_grid(self):
-        for i in reversed(range(self.dataset_vbox.count())):
-            item = self.dataset_vbox.itemAt(i)
+        # Clear existing widgets
+        while self.dataset_grid.count():
+            item = self.dataset_grid.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+        
         self.dataset_widgets = []
+        
+        # Determine columns based on dataset count
+        dataset_count = len(self.datasets)
+        if dataset_count == 1:
+            COLUMNS = 1
+        elif dataset_count == 2:
+            COLUMNS = 2
+        else:
+            COLUMNS = 3
+        
         for idx, ds in enumerate(self.datasets):
-            main_widget = QtWidgets.QWidget()
-            main_layout = QtWidgets.QHBoxLayout(main_widget)
-            main_layout.setContentsMargins(0, 10, 0, 5)
+            row = idx // COLUMNS
+            col = idx % COLUMNS
+            
+            # Create card widget
+            card = QtWidgets.QGroupBox()
+            card.setStyleSheet("""
+                QGroupBox {
+                    border: 2px solid #4a4668;
+                    border-radius: 8px;
+                    margin-top: 5px;
+                    padding: 12px;
+                    background-color: #383552;
+                }
+            """)
+            
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setSpacing(10)
+            
+            # Top section: Image preview (left) + Caption (right)
+            top_section = QtWidgets.QHBoxLayout()
+            top_section.setSpacing(12)
+            
+            # Left: Image preview with navigation
+            preview_section = QtWidgets.QVBoxLayout()
+            preview_section.setSpacing(5)
+            
+            # Image preview (centered)
+            image_container = QtWidgets.QHBoxLayout()
+            image_container.addStretch()
+            
             preview_label = QtWidgets.QLabel()
-            pixmap = QtGui.QPixmap(ds["preview_path"]).scaled(128, 128, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            preview_label.setFixedSize(183, 183)
+            preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #2c2a3e;")
+            preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            preview_label.setScaledContents(False)
+            
+            current_data = ds["images_data"][ds["current_preview_idx"]]
+            pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
+                183, 183, 
+                QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
+                QtCore.Qt.TransformationMode.SmoothTransformation
+            )
             preview_label.setPixmap(pixmap)
-            main_layout.addWidget(preview_label)
-            path_label = QtWidgets.QLabel(f"<b>Path:</b><br>{ds['path']}")
-            path_label.setWordWrap(True)
-            main_layout.addWidget(path_label, 1)
-            repeats_spin = QtWidgets.QSpinBox()
-            repeats_spin.setMinimum(1); repeats_spin.setMaximum(10000)
+            image_container.addWidget(preview_label)
+            image_container.addStretch()
+            
+            preview_section.addLayout(image_container)
+            
+            # Counter with arrows
+            counter_nav_layout = QtWidgets.QHBoxLayout()
+            counter_nav_layout.setSpacing(8)
+            
+            # Left arrow
+            left_arrow = QtWidgets.QPushButton("◄")
+            left_arrow.setFixedHeight(22)
+            left_arrow.setMinimumWidth(35)
+            left_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, -1))
+            left_arrow.setStyleSheet("""
+                QPushButton {
+                    font-size: 16px;
+                    font-weight: bold;
+                    padding: 0px;
+                }
+            """)
+            counter_nav_layout.addWidget(left_arrow)
+            
+            # Counter
+            counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+            counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;")
+            counter_nav_layout.addWidget(counter_label, 1)
+            
+            # Right arrow
+            right_arrow = QtWidgets.QPushButton("►")
+            right_arrow.setFixedHeight(22)
+            right_arrow.setMinimumWidth(35)
+            right_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1))
+            right_arrow.setStyleSheet("""
+                QPushButton {
+                    font-size: 16px;
+                    font-weight: bold;
+                    padding: 0px;
+                }
+            """)
+            counter_nav_layout.addWidget(right_arrow)
+            
+            preview_section.addLayout(counter_nav_layout)
+            
+            top_section.addLayout(preview_section)
+            
+            # Right: Caption preview
+            caption_container = QtWidgets.QWidget()
+            caption_container.setStyleSheet("""
+                QWidget {
+                    background-color: #2c2a3e;
+                    border: 1px solid #4a4668;
+                    border-radius: 4px;
+                }
+            """)
+            caption_layout = QtWidgets.QVBoxLayout(caption_container)
+            caption_layout.setContentsMargins(8, 8, 8, 8)
+            
+            caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>")
+            caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;")
+            caption_layout.addWidget(caption_title)
+            
+            caption_label = QtWidgets.QLabel()
+            caption_text = current_data["caption"]
+            if len(caption_text) > 200:
+                caption_text = caption_text[:200] + "..."
+            caption_label.setText(caption_text)
+            caption_label.setWordWrap(True)
+            caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;")
+            caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+            caption_layout.addWidget(caption_label, 1)
+            
+            top_section.addWidget(caption_container, 1)
+            card_layout.addLayout(top_section)
+            
+            # Separator
+            separator = QtWidgets.QFrame()
+            separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator.setStyleSheet("border: 1px solid #4a4668;")
+            card_layout.addWidget(separator)
+            
+            # Path
+            path_label = QtWidgets.QLabel()
+            path_short = Path(ds['path']).name
+            if len(path_short) > 30:
+                path_short = path_short[:27] + "..."
+            path_label.setText(f"<b>Folder:</b> {path_short}")
+            path_label.setToolTip(ds['path'])
+            path_label.setStyleSheet("color: #e0e0e0;")
+            card_layout.addWidget(path_label)
+            
+            # Image counts
+            count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}")
+            count_label.setStyleSheet("color: #e0e0e0;")
+            card_layout.addWidget(count_label)
+            
+            repeats_total_label = QtWidgets.QLabel(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}")
+            repeats_total_label.setStyleSheet("color: #ab97e6;")
+            card_layout.addWidget(repeats_total_label)
+            
+            # Repeats control
+            repeats_container = QtWidgets.QWidget()
+            repeats_layout = QtWidgets.QHBoxLayout(repeats_container)
+            repeats_layout.setContentsMargins(0, 5, 0, 0)
+            repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
+            
+            repeats_spin = NoScrollSpinBox()  # Changed from QSpinBox
+            repeats_spin.setMinimum(1)
+            repeats_spin.setMaximum(10000)
             repeats_spin.setValue(ds["repeats"])
+            repeats_spin.setStyleSheet("""
+                QSpinBox::up-button, QSpinBox::down-button {
+                    width: 20px;
+                }
+            """)
             repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
-            form_layout = QtWidgets.QFormLayout()
-            form_layout.addRow("Repeats:", repeats_spin)
-            main_layout.addLayout(form_layout)
-            btn_vbox = QtWidgets.QVBoxLayout()
-            remove_btn = QtWidgets.QPushButton("Remove")
-            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
-            btn_vbox.addWidget(remove_btn)
-            clear_btn = QtWidgets.QPushButton("Clear Cached Latents")
-            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
-            btn_vbox.addWidget(clear_btn)
-            main_layout.addLayout(btn_vbox)
-            self.dataset_vbox.addWidget(main_widget)
+            repeats_layout.addWidget(repeats_spin, 1)
+            card_layout.addWidget(repeats_container)
+            
+            # Action buttons
+            btn_layout = QtWidgets.QHBoxLayout()
+            btn_layout.setSpacing(5)
 
+            remove_btn = QtWidgets.QPushButton("Remove")
+            remove_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
+            btn_layout.addWidget(remove_btn)
+
+            clear_btn = QtWidgets.QPushButton("Clear Cache")
+            clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
+
+            # Check if cache exists and grey out if not
+            cache_exists = self._cache_exists(ds["path"])
+            clear_btn.setEnabled(cache_exists)
+            if not cache_exists:
+                clear_btn.setToolTip("No cache found")
+                # Keep the height style even when disabled
+                clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+
+            btn_layout.addWidget(clear_btn)
+            card_layout.addLayout(btn_layout)
+            
+            # Add card to grid
+            self.dataset_grid.addWidget(card, row, col)
+            
+            # Store widget references for updates
+            self.dataset_widgets.append({
+                "preview_label": preview_label,
+                "caption_label": caption_label,
+                "counter_label": counter_label,
+                "repeats_total_label": repeats_total_label,
+                "clear_btn": clear_btn
+            })
+        
+        # Add stretch to remaining columns if not full
+        if dataset_count % COLUMNS != 0:
+            for empty_col in range((dataset_count % COLUMNS), COLUMNS):
+                self.dataset_grid.setColumnStretch(empty_col, 1)
+
+    def _update_preview_for_card(self, idx):
+        """Update just the preview and caption for a specific card."""
+        if idx >= len(self.dataset_widgets):
+            return
+        
+        ds = self.datasets[idx]
+        widgets = self.dataset_widgets[idx]
+        
+        current_data = ds["images_data"][ds["current_preview_idx"]]
+        
+        # Update image
+        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
+            183, 183, 
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
+            QtCore.Qt.TransformationMode.SmoothTransformation
+        )
+        widgets["preview_label"].setPixmap(pixmap)
+        
+        # Update caption
+        caption_text = current_data["caption"]
+        if len(caption_text) > 200:
+            caption_text = caption_text[:200] + "..."
+        widgets["caption_label"].setText(caption_text)
+        
+        # Update counter
+        widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
+        
+        # Update the repeats total label
+        if idx < len(self.dataset_widgets):
+            ds = self.datasets[idx]
+            total = ds['image_count'] * ds['repeats']
+            self.dataset_widgets[idx]["repeats_total_label"].setText(
+                f"<b>Total (with repeats):</b> {total}"
+            )
+        
         self.update_dataset_totals()
 
     def remove_dataset(self, idx):
@@ -1998,7 +2323,11 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.datasetsChanged.emit()
 
     def confirm_clear_cache(self, path):
-        reply = QtWidgets.QMessageBox.question(self, "Confirm", "Delete all cached latents in this dataset?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        reply = QtWidgets.QMessageBox.question(
+            self, "Confirm", 
+            "Delete all cached latents in this dataset?", 
+            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+        )
         if reply == QtWidgets.QMessageBox.StandardButton.Yes:
             self.clear_cached_latents(path)
 
@@ -2013,6 +2342,11 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                     deleted = True
                 except Exception as e:
                     self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
+        
+        if deleted:
+            # Update clear button state
+            self.repopulate_dataset_grid()
+        
         if not deleted:
             self.parent_gui.log("No cached latent directories found to delete.")
 

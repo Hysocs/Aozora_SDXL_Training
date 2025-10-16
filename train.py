@@ -250,14 +250,54 @@ class BucketBatchSampler(Sampler):
 
 
 class ResolutionCalculator:
-    def __init__(self, target_area, stride=64):
-        self.target_area, self.stride = target_area, stride
+    def __init__(self, target_area, stride=64, should_upscale=False, max_area_tolerance=1.1):
+        """
+        Args:
+            target_area: Target pixel area (e.g., 1024*1024)
+            stride: Dimension alignment (default 64)
+            should_upscale: If True, upscale to target; if False, always scale to target
+            max_area_tolerance: Allow up to this multiplier of target_area when upscaling
+        """
+        self.target_area = target_area
+        self.stride = stride
+        self.should_upscale = should_upscale
+        self.max_area_tolerance = max_area_tolerance
+        self.max_area = target_area * max_area_tolerance
 
     def calculate_resolution(self, width, height):
+        """Calculate resolution based on upscaling preference."""
         aspect_ratio = width / height
-        h = int(math.sqrt(self.target_area / aspect_ratio) // self.stride) * self.stride
-        w = int(h * aspect_ratio // self.stride) * self.stride
-        return (w if w > 0 else self.stride, h if h > 0 else self.stride)
+        
+        if not self.should_upscale:
+            # Original behavior: always scale to target_area
+            h = int(math.sqrt(self.target_area / aspect_ratio) // self.stride) * self.stride
+            w = int(h * aspect_ratio // self.stride) * self.stride
+            return (w if w > 0 else self.stride, h if h > 0 else self.stride)
+        
+        # New upscaling behavior
+        current_area = width * height
+        
+        if current_area > self.max_area:
+            scale_factor = math.sqrt(self.target_area / current_area)
+        elif current_area < self.target_area:
+            scale_factor = math.sqrt(self.target_area / current_area)
+        else:
+            scale_factor = 1.0
+        
+        new_w = int((width * scale_factor) // self.stride) * self.stride
+        new_h = int((height * scale_factor) // self.stride) * self.stride
+        new_w = max(new_w, self.stride)
+        new_h = max(new_h, self.stride)
+        
+        # Ensure we don't exceed max_area
+        if new_w * new_h > self.max_area:
+            scale_down = math.sqrt(self.max_area / (new_w * new_h))
+            new_w = int((new_w * scale_down) // self.stride) * self.stride
+            new_h = int((new_h * scale_down) // self.stride) * self.stride
+            new_w = max(new_w, self.stride)
+            new_h = max(new_h, self.stride)
+        
+        return (new_w, new_h)
 
 
 def resize_to_fit(image, target_w, target_h):
@@ -433,7 +473,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     print("STARTING CACHING PROCESS")
     print("="*60 + "\n")
     
-    calc = ResolutionCalculator(config.TARGET_PIXEL_AREA)
+    calc = ResolutionCalculator(
+    config.TARGET_PIXEL_AREA,
+    stride=64,
+    should_upscale=config.SHOULD_UPSCALE,
+    max_area_tolerance=getattr(config, 'MAX_AREA_TOLERANCE', 1.1)
+    )
     
     # VAE is already loaded and passed in
     vae.enable_tiling()

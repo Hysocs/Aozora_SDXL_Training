@@ -1,0 +1,80 @@
+{
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
+    "VAE_PATH": "",
+    "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
+    "RESUME_MODEL_PATH": "",
+    "RESUME_STATE_PATH": "",
+    "CACHING_BATCH_SIZE": 1,
+    "NUM_WORKERS": 0,
+    "SHOULD_UPSCALE": false,
+    "TARGET_PIXEL_AREA": 1048576,
+    "MAX_AREA_TOLERANCE": 1.1,
+    "NOISE_SCHEDULER": "DDPMScheduler",
+    "PREDICTION_TYPE": "v_prediction",
+    "BETA_SCHEDULE": "scaled_linear",
+    "MAX_TRAIN_STEPS": 1500,
+    "LEARNING_RATE": 8e-06,
+    "BATCH_SIZE": 1,
+    "GRADIENT_ACCUMULATION_STEPS": 6,
+    "MIXED_PRECISION": "bfloat16",
+    "CLIP_GRAD_NORM": 0.8,
+    "SEED": 69,
+    "SAVE_EVERY_N_STEPS": 25000,
+    "UNET_EXCLUDE_TARGETS": "conv1, conv2",
+    "LR_CUSTOM_CURVE": [
+        [
+            0.0,
+            0.0
+        ],
+        [
+            0.05,
+            3e-06
+        ],
+        [
+            0.9,
+            3e-06
+        ],
+        [
+            1.0,
+            0.0
+        ]
+    ],
+    "LR_GRAPH_MIN": 0.0,
+    "LR_GRAPH_MAX": 3e-06,
+    "MEMORY_EFFICIENT_ATTENTION": "xformers",
+    "USE_ZERO_TERMINAL_SNR": true,
+    "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
+    "GRAD_SPIKE_THRESHOLD_LOW": 0.2,
+    "RESUME_TRAINING": false,
+    "INSTANCE_DATASETS": [
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by sAviOr",
+            "repeats": 5
+        }
+    ],
+    "OPTIMIZER_TYPE": "raven",
+    "RAVEN_PARAMS": {
+        "betas": [
+            0.9,
+            0.999
+        ],
+        "eps": 1e-08,
+        "weight_decay": 0.01,
+        "debias_strength": 0.6,
+        "use_grad_centralization": true,
+        "gc_alpha": 1.0
+    },
+    "ADAFACTOR_PARAMS": {
+        "eps": [
+            1e-30,
+            0.001
+        ],
+        "clip_threshold": 1.0,
+        "decay_rate": -0.8,
+        "beta1": null,
+        "weight_decay": 0.01,
+        "scale_parameter": true,
+        "relative_step": false,
+        "warmup_init": false
+    }
+}

@@ -82,7 +82,12 @@ class RavenAdamW(Optimizer):
                     raise RuntimeError("RavenAdamW does not support sparse gradients.")
                 
                 if use_gc and grad.dim() > 1:
-                    grad_mean = grad.mean(dim=tuple(range(grad.dim() - 1)), keepdim=True)
+                    if grad.dim() >= 3:  # Conv layers
+                        # Center each output filter: mean over (in_channels, height, width)
+                        grad_mean = grad.mean(dim=tuple(range(1, grad.dim())), keepdim=True)
+                    else:  # Linear layers (2D)
+                        # Center each output neuron: mean over input dimension
+                        grad_mean = grad.mean(dim=1, keepdim=True)
                     grad.sub_(grad_mean, alpha=gc_alpha)
                 
                 state = self.state[p]
