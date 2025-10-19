@@ -1017,7 +1017,6 @@ class TrainingGUI(QtWidgets.QWidget):
         "PYRAMID_DISCOUNT": {"label": "Pyramid Discount:", "tooltip": "How much each pyramid level contributes (0.8-0.95). Higher = more fine detail contribution.", "widget": "QLineEdit"},
         "PYRAMID_ITERATIONS": {"label": "Pyramid Iterations:", "tooltip": "Number of pyramid levels (5-12). More = better multi-scale learning, slightly slower.", "widget": "QSpinBox", "range": (1, 20)},
         "USE_CHROMATIC_NOISE": {"label": "Use Chromatic Noise", "tooltip": "Adds a random color tint to the noise to improve color robustness and prevent desaturation. A powerful data augmentation technique.", "widget": "QCheckBox"},
-        "CHROMATIC_NOISE_STRENGTH": {"label": "Chromatic Strength:", "tooltip": "Strength of the color tint. Start with a very low value like 0.01 or 0.02. Higher values can cause color inaccuracy.", "widget": "QLineEdit"},
     }
     def __init__(self):
         super().__init__()
@@ -1645,10 +1644,13 @@ class TrainingGUI(QtWidgets.QWidget):
             label, widget = self._create_widget("USE_NOISE_OFFSET")
             layout.addRow(label, widget)
 
+            label, widget = self._create_widget("USE_CHROMATIC_NOISE")
+            layout.addRow(label, widget)
+
             label, widget = self._create_widget("NOISE_OFFSET")
             layout.addRow(label, widget)
             
-            # **MODIFIED**: Connect the master checkbox to the new master handler
+
             if "USE_NOISE_OFFSET" in self.widgets:
                 self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(
                     lambda state: self._on_master_noise_toggled(bool(state))
@@ -1663,24 +1665,13 @@ class TrainingGUI(QtWidgets.QWidget):
             label, widget = self._create_widget("PYRAMID_ITERATIONS")
             layout.addRow(label, widget)
 
-            # This connection remains, as it's controlled by the master toggle
+
             if "USE_PYRAMID_NOISE" in self.widgets:
                 self.widgets["USE_PYRAMID_NOISE"].stateChanged.connect(
-                    lambda state: self._toggle_pyramid_settings(bool(state))
+                    lambda state: self._toggle_pyramid_settings(bool(state)),
                 )
 
-            label, widget = self._create_widget("USE_CHROMATIC_NOISE")
-            layout.addRow(label, widget)
-            
-            label, widget = self._create_widget("CHROMATIC_NOISE_STRENGTH")
-            layout.addRow(label, widget)
 
-            # This connection also remains
-            if "USE_CHROMATIC_NOISE" in self.widgets:
-                self.widgets["USE_CHROMATIC_NOISE"].stateChanged.connect(
-                    lambda state: self._toggle_chromatic_settings(bool(state))
-                )
-                
             # --- Separator and Gradient Spike Detection Subheading ---
             separator2 = QtWidgets.QFrame()
             separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
@@ -1839,27 +1830,29 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log("Console cleared.")
 
     def _on_master_noise_toggled(self, enabled):
-            """
-            Master handler for the main noise enhancement checkbox.
-            Enables or disables all child noise options.
-            """
-            # Enable/disable the direct child widgets
+        """
+        Master handler for the main noise enhancement checkbox.
+        Enables or disables all child noise options.
+        """
+        # Enable/disable the direct child widgets
+        if "NOISE_OFFSET" in self.widgets:
             self.widgets["NOISE_OFFSET"].setEnabled(enabled)
+        
+        if "USE_PYRAMID_NOISE" in self.widgets:
             self.widgets["USE_PYRAMID_NOISE"].setEnabled(enabled)
+        
+        if "USE_CHROMATIC_NOISE" in self.widgets:
             self.widgets["USE_CHROMATIC_NOISE"].setEnabled(enabled)
 
-            # If the master switch is enabled, restore the state of sub-settings
-            if enabled:
-                # Let the sub-checkboxes control their own children
+        # If the master switch is enabled, restore the state of sub-settings
+        if enabled:
+            # Let the sub-checkboxes control their own children
+            if "USE_PYRAMID_NOISE" in self.widgets:
                 is_pyramid_checked = self.widgets["USE_PYRAMID_NOISE"].isChecked()
                 self._toggle_pyramid_settings(is_pyramid_checked)
-                
-                is_chromatic_checked = self.widgets["USE_CHROMATIC_NOISE"].isChecked()
-                self._toggle_chromatic_settings(is_chromatic_checked)
-            else:
-                # If the master switch is disabled, force all sub-settings off
-                self._toggle_pyramid_settings(False)
-                self._toggle_chromatic_settings(False)    
+        else:
+            # If the master switch is disabled, force all sub-settings off
+            self._toggle_pyramid_settings(False)
 
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
@@ -1879,10 +1872,7 @@ class TrainingGUI(QtWidgets.QWidget):
         if "PYRAMID_ITERATIONS" in self.widgets:
             self.widgets["PYRAMID_ITERATIONS"].setEnabled(enabled)
 
-    def _toggle_chromatic_settings(self, enabled):
-        """Enable or disable chromatic noise strength setting based on the checkbox."""
-        if "CHROMATIC_NOISE_STRENGTH" in self.widgets:
-            self.widgets["CHROMATIC_NOISE_STRENGTH"].setEnabled(enabled)
+
 
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return

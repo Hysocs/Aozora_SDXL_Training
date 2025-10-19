@@ -47,62 +47,57 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
-def apply_noise_offset(noise, offset_value):
-    if offset_value > 0:
-        noise += offset_value * torch.randn(
-            noise.shape[0], 1, 1, 1, 
-            device=noise.device, dtype=noise.dtype
-        )
-    return noise
-
-
 def pyramid_noise_like(x, discount=0.9, iterations=10):
     b, c, h, w = x.shape
     noise = torch.randn_like(x)
-    
     for i in range(1, iterations):
-        scale = 2 ** i
-        scaled_h = h // scale
-        scaled_w = w // scale
-        
-        if scaled_h < 1 or scaled_w < 1:
-            break
-        
-        noise_at_scale = torch.randn(b, c, scaled_h, scaled_w, device=x.device, dtype=x.dtype)
-        
-        noise_at_scale = F.interpolate(
-            noise_at_scale, 
-            size=(h, w), 
-            mode='bilinear', 
-            align_corners=False
-        )
-        
-        noise += noise_at_scale * (discount ** i)
-    
-    return noise / noise.std()
+        sh, sw = h // (2**i), w // (2**i)
+        if sh < 1 or sw < 1: break
+        n = torch.randn(b, c, sh, sw, device=x.device, dtype=x.dtype)
+        n = F.interpolate(n, size=(h, w), mode="bilinear", align_corners=False)
+        noise = noise + (discount ** i) * n
+    # standardize per-sample so base field is unit-std
+    std = noise.flatten(1).std(dim=1, keepdim=True).clamp_min(1e-6)
+    return noise / std.view(b, 1, 1, 1)
 
+def _make_base_noise_like(x, config):
+    return (pyramid_noise_like(
+                x,
+                discount=getattr(config, "PYRAMID_DISCOUNT", 0.9),
+                iterations=getattr(config, "PYRAMID_ITERATIONS", 10))
+            if getattr(config, "USE_PYRAMID_NOISE", False)
+            else torch.randn_like(x))
 
-def generate_training_noise(latents, config):
-    if getattr(config, 'USE_PYRAMID_NOISE', False):
-        noise = pyramid_noise_like(
-            latents,
-            discount=getattr(config, 'PYRAMID_DISCOUNT', 0.9),
-            iterations=getattr(config, 'PYRAMID_ITERATIONS', 10)
-        )
+def _apply_bias_offset(noise, strength, chromatic: bool):
+    if strength <= 0: return noise
+    b, c, _, _ = noise.shape
+    if chromatic:
+        bias = torch.randn(b, c, 1, 1, device=noise.device, dtype=noise.dtype)
     else:
-        noise = torch.randn_like(latents)
+        bias = torch.randn(b, 1, 1, 1, device=noise.device, dtype=noise.dtype)
+    return noise + strength * bias
 
-    if getattr(config, 'USE_NOISE_OFFSET', False):
-        noise = apply_noise_offset(noise, getattr(config, 'NOISE_OFFSET', 0.0))
+def generate_training_noise(latents, config, keep_unit_std: bool = False):
+    """
+    - Base: pyramid or Gaussian (unit-std if pyramid).
+    - If USE_NOISE_OFFSET: add bias with strength NOISE_OFFSET.
+      * USE_CHROMATIC_NOISE=False -> global bias (B,1,1,1)
+      * USE_CHROMATIC_NOISE=True  -> per-channel bias (B,C,1,1)
+    - If keep_unit_std=True, re-standardize after bias.
+    """
+    noise = _make_base_noise_like(latents, config)
 
-    if getattr(config, 'USE_CHROMATIC_NOISE', False):
-        tint_strength = getattr(config, 'CHROMATIC_NOISE_STRENGTH', 0.0)
-        if tint_strength > 0:
-            b, c, _, _ = noise.shape
-            tint = torch.randn(b, c, 1, 1, device=noise.device, dtype=noise.dtype)
-            noise = noise + (tint_strength * tint)
+    if getattr(config, "USE_NOISE_OFFSET", False):
+        strength = float(getattr(config, "NOISE_OFFSET", 0.0))
+        chroma = bool(getattr(config, "USE_CHROMATIC_NOISE", False))
+        noise = _apply_bias_offset(noise, strength, chroma)
 
+    if keep_unit_std:
+        std = noise.flatten(1).std(dim=1, keepdim=True).clamp_min(1e-6)
+        noise = noise / std.view(noise.size(0), 1, 1, 1)
     return noise
+
+
 
 class TrainingConfig:
     """Consolidates all training configurations."""

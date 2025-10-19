@@ -109,8 +109,3 @@ PYRAMID_ITERATIONS = 10
 # Adds a random color tint to the noise to improve color robustness.
 # This is a powerful technique to combat color loss/desaturation.
 USE_CHROMATIC_NOISE = False
-
-# Strength of the random color tint (if enabled).
-# Start with a very low value.
-# Recommended Range: 0.01 to 0.03
-CHROMATIC_NOISE_STRENGTH = 0.01
