@@ -47,56 +47,52 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
-def pyramid_noise_like(x, discount=0.9, iterations=10):
-    b, c, h, w = x.shape
-    noise = torch.randn_like(x)
-    for i in range(1, iterations):
-        sh, sw = h // (2**i), w // (2**i)
-        if sh < 1 or sw < 1: break
-        n = torch.randn(b, c, sh, sw, device=x.device, dtype=x.dtype)
-        n = F.interpolate(n, size=(h, w), mode="bilinear", align_corners=False)
-        noise = noise + (discount ** i) * n
-    # standardize per-sample so base field is unit-std
-    std = noise.flatten(1).std(dim=1, keepdim=True).clamp_min(1e-6)
-    return noise / std.view(b, 1, 1, 1)
-
-def _make_base_noise_like(x, config):
-    return (pyramid_noise_like(
-                x,
-                discount=getattr(config, "PYRAMID_DISCOUNT", 0.9),
-                iterations=getattr(config, "PYRAMID_ITERATIONS", 10))
-            if getattr(config, "USE_PYRAMID_NOISE", False)
-            else torch.randn_like(x))
-
-def _apply_bias_offset(noise, strength, chromatic: bool):
-    if strength <= 0: return noise
-    b, c, _, _ = noise.shape
-    if chromatic:
-        bias = torch.randn(b, c, 1, 1, device=noise.device, dtype=noise.dtype)
-    else:
-        bias = torch.randn(b, 1, 1, 1, device=noise.device, dtype=noise.dtype)
-    return noise + strength * bias
-
-def generate_training_noise(latents, config, keep_unit_std: bool = False):
+def generate_offset_noise(latents, config):
     """
-    - Base: pyramid or Gaussian (unit-std if pyramid).
-    - If USE_NOISE_OFFSET: add bias with strength NOISE_OFFSET.
-      * USE_CHROMATIC_NOISE=False -> global bias (B,1,1,1)
-      * USE_CHROMATIC_NOISE=True  -> per-channel bias (B,C,1,1)
-    - If keep_unit_std=True, re-standardize after bias.
+    Generates training noise with an optional offset for better dark/bright image generation.
+    
+    Standard noise offset: Adds a consistent random offset to all channels per sample.
+    Multiscale noise: Adds noise at different resolutions (recommended over chromatic for SDXL).
     """
-    noise = _make_base_noise_like(latents, config)
+    # Always generate noise with explicit device and dtype to avoid autocast issues
+    noise = torch.randn(
+        latents.shape, 
+        device=latents.device, 
+        dtype=latents.dtype,
+        generator=None
+    )
 
-    if getattr(config, "USE_NOISE_OFFSET", False):
-        strength = float(getattr(config, "NOISE_OFFSET", 0.0))
-        chroma = bool(getattr(config, "USE_CHROMATIC_NOISE", False))
-        noise = _apply_bias_offset(noise, strength, chroma)
+    if not getattr(config, "USE_NOISE_OFFSET", False):
+        return noise
 
-    if keep_unit_std:
-        std = noise.flatten(1).std(dim=1, keepdim=True).clamp_min(1e-6)
-        noise = noise / std.view(noise.size(0), 1, 1, 1)
+    strength = float(getattr(config, "NOISE_OFFSET", 0.1))
+    
+    if strength <= 0:
+        return noise
+
+    b, c, h, w = noise.shape
+    
+    # Standard noise offset - single offset applied to all channels
+    offset = torch.randn(b, 1, 1, 1, device=noise.device, dtype=noise.dtype)
+    noise = noise + strength * offset
+    
+    # Optional: Multiscale noise
+    if getattr(config, "USE_MULTISCALE_NOISE", False):
+        scale_factor = 8
+        coarse_noise = torch.randn(
+            b, c, h // scale_factor, w // scale_factor,
+            device=noise.device, dtype=noise.dtype
+        )
+        coarse_noise = torch.nn.functional.interpolate(
+            coarse_noise,
+            size=(h, w),
+            mode='bilinear',
+            align_corners=False
+        )
+        multiscale_strength = strength * 0.5
+        noise = noise + multiscale_strength * coarse_noise
+    
     return noise
-
 
 
 class TrainingConfig:
@@ -1061,7 +1057,25 @@ def main():
     if not test_param_name: raise ValueError("No trainable layers found to monitor.")
     test_param = dict(unet.named_parameters())[test_param_name]
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS, test_param_name)
-    
+
+    print("\n" + "="*50)
+    print("NOISE CONFIGURATION")
+    print("="*50)
+    if getattr(config, "USE_NOISE_OFFSET", False):
+        noise_offset_strength = float(getattr(config, "NOISE_OFFSET", 0.1))
+        print(f"Noise Offset: ENABLED (strength: {noise_offset_strength})")
+        
+        if getattr(config, "USE_MULTISCALE_NOISE", False):
+            print(f"Multiscale Noise: ENABLED")
+            print("Mode: Standard Offset + Multiscale Enhancement")
+        else:
+            print("Multiscale Noise: DISABLED")
+            print("Mode: Standard Brightness Offset Only")
+    else:
+        print("Noise Offset: DISABLED")
+        print("Mode: Pure Gaussian Noise (no enhancements)")
+    print("="*50 + "\n")
+
     unet.train()
     progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
     
@@ -1081,7 +1095,12 @@ def main():
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(device, dtype=embeds.dtype)
-                noise = generate_training_noise(latents, config)
+
+                if getattr(config, "USE_NOISE_OFFSET", False):
+                    noise = generate_offset_noise(latents, config)
+                else:
+                    noise = torch.randn_like(latents)
+
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_pred else noise

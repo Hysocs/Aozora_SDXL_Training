@@ -12,7 +12,7 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 2500,
+    "MAX_TRAIN_STEPS": 1500,
     "LEARNING_RATE": 8e-06,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 6,
@@ -28,11 +28,11 @@
         ],
         [
             0.05,
-            8e-06
+            8.5e-06
         ],
         [
             0.9,
-            8e-06
+            8.5e-06
         ],
         [
             1.0,
@@ -40,17 +40,14 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 8e-06,
+    "LR_GRAPH_MAX": 8.5e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.06,
     "USE_NOISE_OFFSET": true,
-    "NOISE_OFFSET": 0.02,
-    "USE_PYRAMID_NOISE": true,
-    "PYRAMID_DISCOUNT": 0.9,
-    "PYRAMID_ITERATIONS": 10,
-    "USE_CHROMATIC_NOISE": true,
+    "NOISE_OFFSET": 0.025,
+    "USE_MULTISCALE_NOISE": false,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {

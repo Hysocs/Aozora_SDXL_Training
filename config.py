@@ -93,19 +93,4 @@ GRAD_SPIKE_THRESHOLD_LOW = 0.2
 
 USE_NOISE_OFFSET = False
 NOISE_OFFSET = 0.0
-
-# Pyramidal/Multi-resolution Noise: Helps learn multi-scale details
-# Good for complex lighting and artistic styles
-USE_PYRAMID_NOISE = False
-
-# How much each pyramid level contributes (if enabled)
-# Range: 0.8-0.95 (higher = more contribution from fine details)
-PYRAMID_DISCOUNT = 0.9
-
-# Number of pyramid levels to generate
-# Range: 5-12 (more = better multi-scale learning, slightly slower)
-PYRAMID_ITERATIONS = 10
-
-# Adds a random color tint to the noise to improve color robustness.
-# This is a powerful technique to combat color loss/desaturation.
-USE_CHROMATIC_NOISE = False
+USE_MULTISCALE_NOISE = False 

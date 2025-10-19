@@ -1013,10 +1013,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
         "USE_NOISE_OFFSET": {"label": "Use Noise Offset", "tooltip": "Enable to add noise offset, improving learning of very dark/bright images.", "widget": "QCheckBox"},
         "NOISE_OFFSET": {"label": "Noise Offset:", "tooltip": "Improves learning of very dark/bright images. Range: 0.0-0.15. Try 0.05 first, 0.1 for high-contrast styles.", "widget": "QLineEdit"},
-        "USE_PYRAMID_NOISE": {"label": "Use Multi-Res Noise", "tooltip": "Helps learn multi-scale details. Good for complex lighting and artistic styles.", "widget": "QCheckBox"},
-        "PYRAMID_DISCOUNT": {"label": "Pyramid Discount:", "tooltip": "How much each pyramid level contributes (0.8-0.95). Higher = more fine detail contribution.", "widget": "QLineEdit"},
-        "PYRAMID_ITERATIONS": {"label": "Pyramid Iterations:", "tooltip": "Number of pyramid levels (5-12). More = better multi-scale learning, slightly slower.", "widget": "QSpinBox", "range": (1, 20)},
-        "USE_CHROMATIC_NOISE": {"label": "Use Chromatic Noise", "tooltip": "Adds a random color tint to the noise to improve color robustness and prevent desaturation. A powerful data augmentation technique.", "widget": "QCheckBox"},
+        "USE_MULTISCALE_NOISE": {"label": "Use Multiscale Noise", "tooltip": "Adds coarse-scale noise patterns to improve texture learning. Works well with noise offset.", "widget": "QCheckBox"},
     }
     def __init__(self):
         super().__init__()
@@ -1644,32 +1641,18 @@ class TrainingGUI(QtWidgets.QWidget):
             label, widget = self._create_widget("USE_NOISE_OFFSET")
             layout.addRow(label, widget)
 
-            label, widget = self._create_widget("USE_CHROMATIC_NOISE")
-            layout.addRow(label, widget)
-
             label, widget = self._create_widget("NOISE_OFFSET")
             layout.addRow(label, widget)
-            
+
+            label, widget = self._create_widget("USE_MULTISCALE_NOISE")
+            layout.addRow(label, widget)
 
             if "USE_NOISE_OFFSET" in self.widgets:
                 self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(
                     lambda state: self._on_master_noise_toggled(bool(state))
                 )
 
-            label, widget = self._create_widget("USE_PYRAMID_NOISE")
-            layout.addRow(label, widget)
 
-            label, widget = self._create_widget("PYRAMID_DISCOUNT")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("PYRAMID_ITERATIONS")
-            layout.addRow(label, widget)
-
-
-            if "USE_PYRAMID_NOISE" in self.widgets:
-                self.widgets["USE_PYRAMID_NOISE"].stateChanged.connect(
-                    lambda state: self._toggle_pyramid_settings(bool(state)),
-                )
 
 
             # --- Separator and Gradient Spike Detection Subheading ---
@@ -1794,7 +1777,6 @@ class TrainingGUI(QtWidgets.QWidget):
                     should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
                     self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
 
-                # **MODIFIED**: Centralize the logic for setting initial noise UI state
                 if "USE_NOISE_OFFSET" in self.widgets:
                     is_master_enabled = self.current_config.get("USE_NOISE_OFFSET", False)
                     self._on_master_noise_toggled(is_master_enabled)
@@ -1837,22 +1819,12 @@ class TrainingGUI(QtWidgets.QWidget):
         # Enable/disable the direct child widgets
         if "NOISE_OFFSET" in self.widgets:
             self.widgets["NOISE_OFFSET"].setEnabled(enabled)
-        
-        if "USE_PYRAMID_NOISE" in self.widgets:
-            self.widgets["USE_PYRAMID_NOISE"].setEnabled(enabled)
-        
-        if "USE_CHROMATIC_NOISE" in self.widgets:
-            self.widgets["USE_CHROMATIC_NOISE"].setEnabled(enabled)
 
-        # If the master switch is enabled, restore the state of sub-settings
-        if enabled:
-            # Let the sub-checkboxes control their own children
-            if "USE_PYRAMID_NOISE" in self.widgets:
-                is_pyramid_checked = self.widgets["USE_PYRAMID_NOISE"].isChecked()
-                self._toggle_pyramid_settings(is_pyramid_checked)
-        else:
-            # If the master switch is disabled, force all sub-settings off
-            self._toggle_pyramid_settings(False)
+        if "USE_MULTISCALE_NOISE" in self.widgets:
+            self.widgets["USE_MULTISCALE_NOISE"].setEnabled(enabled)
+            # If master is disabled, also uncheck multiscale
+            if not enabled:
+                self.widgets["USE_MULTISCALE_NOISE"].setChecked(False)
 
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
@@ -1865,12 +1837,7 @@ class TrainingGUI(QtWidgets.QWidget):
         if "NOISE_OFFSET" in self.widgets:
             self.widgets["NOISE_OFFSET"].setEnabled(enabled)
 
-    def _toggle_pyramid_settings(self, enabled):
-        """Enable or disable pyramid noise settings based on the checkbox state."""
-        if "PYRAMID_DISCOUNT" in self.widgets:
-            self.widgets["PYRAMID_DISCOUNT"].setEnabled(enabled)
-        if "PYRAMID_ITERATIONS" in self.widgets:
-            self.widgets["PYRAMID_ITERATIONS"].setEnabled(enabled)
+
 
 
 
