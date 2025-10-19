@@ -89,3 +89,17 @@ ADAFACTOR_PARAMS = {
 # --- Gradient Spike Detection ---
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
+
+NOISE_OFFSET = 0.0
+
+# Pyramidal/Multi-resolution Noise: Helps learn multi-scale details
+# Good for complex lighting and artistic styles
+USE_PYRAMID_NOISE = False
+
+# How much each pyramid level contributes (if enabled)
+# Range: 0.8-0.95 (higher = more contribution from fine details)
+PYRAMID_DISCOUNT = 0.9
+
+# Number of pyramid levels to generate
+# Range: 5-12 (more = better multi-scale learning, slightly slower)
+PYRAMID_ITERATIONS = 10

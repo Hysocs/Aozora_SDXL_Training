@@ -6,18 +6,18 @@
     "RESUME_STATE_PATH": "",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
-    "SHOULD_UPSCALE": false,
+    "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": 1048576,
-    "MAX_AREA_TOLERANCE": 1.1,
+    "MAX_AREA_TOLERANCE": 1.0,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 1500,
+    "MAX_TRAIN_STEPS": 2500,
     "LEARNING_RATE": 8e-06,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 6,
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": 0.8,
+    "CLIP_GRAD_NORM": 1.0,
     "SEED": 69,
     "SAVE_EVERY_N_STEPS": 25000,
     "UNET_EXCLUDE_TARGETS": "conv1, conv2",
@@ -28,11 +28,11 @@
         ],
         [
             0.05,
-            3e-06
+            8e-06
         ],
         [
             0.9,
-            3e-06
+            8e-06
         ],
         [
             1.0,
@@ -40,16 +40,20 @@
         ]
     ],
     "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 3e-06,
+    "LR_GRAPH_MAX": 8e-06,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
-    "GRAD_SPIKE_THRESHOLD_LOW": 0.01,
+    "GRAD_SPIKE_THRESHOLD_LOW": 0.06,
+    "NOISE_OFFSET": 0.02,
+    "USE_PYRAMID_NOISE": true,
+    "PYRAMID_DISCOUNT": 0.9,
+    "PYRAMID_ITERATIONS": 10,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Artists/by sAviOr",
-            "repeats": 5
+            "path": "C:/Users/Administrator/Pictures/GameCG/from Nightmare School ~Mayoiba no Shoujo-tachi~",
+            "repeats": 14
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -60,9 +64,9 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "debias_strength": 0.6,
+        "debias_strength": 0.45,
         "use_grad_centralization": true,
-        "gc_alpha": 1.0
+        "gc_alpha": 0.5
     },
     "ADAFACTOR_PARAMS": {
         "eps": [

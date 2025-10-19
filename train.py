@@ -47,7 +47,79 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
+def apply_noise_offset(noise, offset_value):
+    """
+    Applies noise offset to improve contrast learning.
+    
+    Args:
+        noise: Base noise tensor
+        offset_value: Magnitude of offset (typically 0.05-0.15)
+    """
+    if offset_value > 0:
+        # Add offset per-sample, per-channel
+        noise += offset_value * torch.randn(
+            noise.shape[0], noise.shape[1], 1, 1, 
+            device=noise.device, dtype=noise.dtype
+        )
+    return noise
 
+
+def pyramid_noise_like(x, discount=0.9, iterations=10):
+    """
+    Generates multi-resolution pyramidal noise.
+    
+    Args:
+        x: Reference tensor for shape
+        discount: How much each scale contributes (0.8-0.95 typical)
+        iterations: Number of scales to generate
+    """
+    b, c, h, w = x.shape
+    noise = torch.randn_like(x)
+    
+    for i in range(iterations):
+        scale = 2 ** i
+        scaled_h = h // scale
+        scaled_w = w // scale
+        
+        # Stop if resolution too small
+        if scaled_h < 1 or scaled_w < 1:
+            break
+        
+        # Generate noise at this scale
+        noise_at_scale = torch.randn(b, c, scaled_h, scaled_w, device=x.device, dtype=x.dtype)
+        
+        # Upscale to original resolution
+        noise_at_scale = F.interpolate(
+            noise_at_scale, 
+            size=(h, w), 
+            mode='bilinear', 
+            align_corners=False
+        )
+        
+        # Add with diminishing contribution
+        noise += noise_at_scale * (discount ** i)
+    
+    # Normalize to maintain similar magnitude
+    return noise / noise.std()
+
+
+def generate_training_noise(latents, config):
+    """
+    Unified function to generate noise with all enhancements.
+    """
+    if config.USE_PYRAMID_NOISE:
+        noise = pyramid_noise_like(
+            latents, 
+            discount=config.PYRAMID_DISCOUNT,
+            iterations=config.PYRAMID_ITERATIONS
+        )
+        # Apply offset after pyramid if both enabled
+        noise = apply_noise_offset(noise, config.NOISE_OFFSET)
+    else:
+        noise = torch.randn_like(latents)
+        noise = apply_noise_offset(noise, config.NOISE_OFFSET)
+    
+    return noise
 class TrainingConfig:
     """Consolidates all training configurations."""
     def __init__(self):
@@ -1030,7 +1102,7 @@ def main():
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(device, dtype=embeds.dtype)
-                noise = torch.randn_like(latents)
+                noise = generate_training_noise(latents, config)
                 timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_pred else noise

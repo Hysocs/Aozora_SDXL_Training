@@ -475,7 +475,9 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.latest_lr = 0.0
         self.latest_loss = 0.0
         self.latest_grad = 0.0
-    
+
+
+
     def _on_pause_toggled(self, checked):
         """Handle pause button toggle."""
         if checked:
@@ -1004,6 +1006,12 @@ class TrainingGUI(QtWidgets.QWidget):
         "USE_ZERO_TERMINAL_SNR": {"label": "Use Zero-Terminal SNR", "tooltip": "Rescales noise schedule for better dynamic range.", "widget": "QCheckBox"},
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
+        
+        # NEW: Noise Enhancement Parameters
+        "NOISE_OFFSET": {"label": "Noise Offset:", "tooltip": "Improves learning of very dark/bright images. Range: 0.0-0.15. Try 0.05 first, 0.1 for high-contrast styles.", "widget": "QLineEdit"},
+        "USE_PYRAMID_NOISE": {"label": "Use Multi-Res Noise", "tooltip": "Helps learn multi-scale details. Good for complex lighting and artistic styles.", "widget": "QCheckBox"},
+        "PYRAMID_DISCOUNT": {"label": "Pyramid Discount:", "tooltip": "How much each pyramid level contributes (0.8-0.95). Higher = more fine detail contribution.", "widget": "QLineEdit"},
+        "PYRAMID_ITERATIONS": {"label": "Pyramid Iterations:", "tooltip": "Number of pyramid levels (5-12). More = better multi-scale learning, slightly slower.", "widget": "QSpinBox", "range": (1, 20)},
     }
 
     def __init__(self):
@@ -1600,33 +1608,72 @@ class TrainingGUI(QtWidgets.QWidget):
         return unet_group
     
     def _create_advanced_group(self):
-        advanced_group = QtWidgets.QGroupBox("Advanced Settings")
-        layout = QtWidgets.QFormLayout(advanced_group)
-        
-        label, widget = self._create_widget("NOISE_SCHEDULER")
-        layout.addRow(label, widget)
-        
-        label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
-        layout.addRow(label, widget)
-        
-        label, widget = self._create_widget("USE_ZERO_TERMINAL_SNR")
-        layout.addRow(label, widget)
-        
-        separator = QtWidgets.QFrame()
-        separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-        separator.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
-        layout.addRow(separator)
-        
-        spike_label = QtWidgets.QLabel("<b>Gradient Spike Detection</b>")
-        layout.addRow(spike_label)
-        
-        label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_HIGH")
-        layout.addRow(label, widget)
-        
-        label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_LOW")
-        layout.addRow(label, widget)
-        
-        return advanced_group
+            """Creates the 'Advanced Settings' group box with visual separators and subheadings."""
+            advanced_group = QtWidgets.QGroupBox("Advanced Settings")
+            layout = QtWidgets.QFormLayout(advanced_group)
+
+            # --- General Advanced Settings ---
+            label, widget = self._create_widget("NOISE_SCHEDULER")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("USE_ZERO_TERMINAL_SNR")
+            layout.addRow(label, widget)
+
+            # --- Separator and Noise Enhancements Subheading ---
+            separator1 = QtWidgets.QFrame()
+            separator1.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator1.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
+            layout.addRow(separator1)
+
+            noise_heading = QtWidgets.QLabel("<b>Noise Enhancements</b>")
+            noise_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
+            layout.addRow(noise_heading)
+            
+            noise_info_label = QtWidgets.QLabel("<i>Techniques to improve learning on high-contrast or artistic datasets.</i>")
+            noise_info_label.setStyleSheet("color: #7a788c; font-size: 12px; margin-bottom: 5px;")
+            layout.addRow(noise_info_label)
+
+            # --- Noise Enhancement Widgets ---
+            label, widget = self._create_widget("NOISE_OFFSET")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("USE_PYRAMID_NOISE")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("PYRAMID_DISCOUNT")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("PYRAMID_ITERATIONS")
+            layout.addRow(label, widget)
+
+            # Connect checkbox to enable/disable related pyramid settings
+            if "USE_PYRAMID_NOISE" in self.widgets:
+                self.widgets["USE_PYRAMID_NOISE"].stateChanged.connect(
+                    lambda state: self._toggle_pyramid_settings(bool(state))
+                )
+
+            # --- Separator and Gradient Spike Detection Subheading ---
+            separator2 = QtWidgets.QFrame()
+            separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator2.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
+            layout.addRow(separator2)
+
+            spike_heading = QtWidgets.QLabel("<b>Gradient Spike Detection</b>")
+            spike_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
+            layout.addRow(spike_heading)
+
+            # --- Gradient Spike Detection Widgets ---
+            label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_HIGH")
+            layout.addRow(label, widget)
+
+            label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_LOW")
+            layout.addRow(label, widget)
+
+            return advanced_group
+
     
     def _populate_console_tab(self, layout):
         layout.setContentsMargins(15, 15, 15, 15)
@@ -1729,7 +1776,12 @@ class TrainingGUI(QtWidgets.QWidget):
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
-            
+
+            if "USE_PYRAMID_NOISE" in self.widgets and "PYRAMID_DISCOUNT" in self.widgets:
+                use_pyramid = self.current_config.get("USE_PYRAMID_NOISE", False)
+                self.widgets["PYRAMID_DISCOUNT"].setEnabled(bool(use_pyramid))
+                self.widgets["PYRAMID_ITERATIONS"].setEnabled(bool(use_pyramid))
+                            
             if hasattr(self, 'lr_curve_widget'):
                 self._update_and_clamp_lr_graph()
             
@@ -1765,7 +1817,14 @@ class TrainingGUI(QtWidgets.QWidget):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
             self.resume_sub_widget.setVisible(is_resuming)
             self.base_model_sub_widget.setVisible(not is_resuming)
-    
+
+    def _toggle_pyramid_settings(self, enabled):
+        """Enable or disable pyramid noise settings based on the checkbox state."""
+        if "PYRAMID_DISCOUNT" in self.widgets:
+            self.widgets["PYRAMID_DISCOUNT"].setEnabled(enabled)
+        if "PYRAMID_ITERATIONS" in self.widgets:
+            self.widgets["PYRAMID_ITERATIONS"].setEnabled(enabled)
+
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return
         try: steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
