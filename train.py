@@ -53,7 +53,7 @@ def apply_noise_offset(noise, offset_value):
     
     Args:
         noise: Base noise tensor
-        offset_value: Magnitude of offset (typically 0.05-0.15)
+        offset_value: Magnitude of offset (typically 0.01-0.05)
     """
     if offset_value > 0:
         # Add offset per-sample, per-channel
@@ -74,21 +74,23 @@ def pyramid_noise_like(x, discount=0.9, iterations=10):
         iterations: Number of scales to generate
     """
     b, c, h, w = x.shape
+    # Start with standard Gaussian noise as the base high-frequency layer
     noise = torch.randn_like(x)
     
-    for i in range(iterations):
+    # Generate and add lower-frequency noise layers
+    for i in range(1, iterations): # Start from 1 since base noise is already iteration 0
         scale = 2 ** i
         scaled_h = h // scale
         scaled_w = w // scale
         
-        # Stop if resolution too small
+        # Stop if the resolution gets too small
         if scaled_h < 1 or scaled_w < 1:
             break
         
-        # Generate noise at this scale
+        # Generate noise at this smaller scale
         noise_at_scale = torch.randn(b, c, scaled_h, scaled_w, device=x.device, dtype=x.dtype)
         
-        # Upscale to original resolution
+        # Upscale the low-frequency noise to the original resolution
         noise_at_scale = F.interpolate(
             noise_at_scale, 
             size=(h, w), 
@@ -96,29 +98,49 @@ def pyramid_noise_like(x, discount=0.9, iterations=10):
             align_corners=False
         )
         
-        # Add with diminishing contribution
+        # Add the lower-frequency noise with a diminishing contribution
         noise += noise_at_scale * (discount ** i)
     
-    # Normalize to maintain similar magnitude
+    # Normalize the final noise to maintain a standard deviation of 1.0
     return noise / noise.std()
 
 
 def generate_training_noise(latents, config):
     """
-    Unified function to generate noise with all enhancements.
+    Unified function to generate noise with all enhancements in a sequential pipeline.
+    Pipeline: Base Noise -> Luminance Offset -> Chromatic Tint
     """
-    if config.USE_PYRAMID_NOISE:
+    # --- Step 1: Generate the base noise (either standard or pyramid) ---
+    if getattr(config, 'USE_PYRAMID_NOISE', False):
         noise = pyramid_noise_like(
-            latents, 
-            discount=config.PYRAMID_DISCOUNT,
-            iterations=config.PYRAMID_ITERATIONS
+            latents,
+            discount=getattr(config, 'PYRAMID_DISCOUNT', 0.9),
+            iterations=getattr(config, 'PYRAMID_ITERATIONS', 10)
         )
-        # Apply offset after pyramid if both enabled
-        noise = apply_noise_offset(noise, config.NOISE_OFFSET)
     else:
         noise = torch.randn_like(latents)
-        noise = apply_noise_offset(noise, config.NOISE_OFFSET)
-    
+
+    # --- Step 2: Apply the luminance noise offset (Now Conditional) ---
+    # This is applied before the color tint to establish a stable brightness base.
+    if getattr(config, 'USE_NOISE_OFFSET', False):
+        noise = apply_noise_offset(noise, getattr(config, 'NOISE_OFFSET', 0.0))
+
+    # --- Step 3: Apply random chromatic noise augmentation (color jitter) ---
+    # This directly combats color loss by forcing the model to predict random color tints.
+    if getattr(config, 'USE_CHROMATIC_NOISE', False):
+        tint_strength = getattr(config, 'CHROMATIC_NOISE_STRENGTH', 0.0)
+        if tint_strength > 0:
+            # Get batch size (b) and channels (c)
+            b, c, _, _ = noise.shape
+
+            # Create a random color vector for EACH sample in the batch.
+            # The shape (b, c, 1, 1) allows broadcasting to apply a unique,
+            # consistent color tint across each entire image in the batch.
+            tint = torch.randn(b, c, 1, 1, device=noise.device, dtype=noise.dtype)
+
+            # Add the scaled tint to the existing noise to augment it
+            noise = noise + (tint_strength * tint)
+
     return noise
 class TrainingConfig:
     """Consolidates all training configurations."""

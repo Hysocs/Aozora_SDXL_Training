@@ -90,6 +90,8 @@ ADAFACTOR_PARAMS = {
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
 
+
+USE_NOISE_OFFSET = False
 NOISE_OFFSET = 0.0
 
 # Pyramidal/Multi-resolution Noise: Helps learn multi-scale details
@@ -103,3 +105,12 @@ PYRAMID_DISCOUNT = 0.9
 # Number of pyramid levels to generate
 # Range: 5-12 (more = better multi-scale learning, slightly slower)
 PYRAMID_ITERATIONS = 10
+
+# Adds a random color tint to the noise to improve color robustness.
+# This is a powerful technique to combat color loss/desaturation.
+USE_CHROMATIC_NOISE = False
+
+# Strength of the random color tint (if enabled).
+# Start with a very low value.
+# Recommended Range: 0.01 to 0.03
+CHROMATIC_NOISE_STRENGTH = 0.01

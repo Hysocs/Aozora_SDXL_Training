@@ -138,6 +138,11 @@ QSpinBox, QDoubleSpinBox {
     border-radius: 4px;
 }
 QSpinBox:focus, QDoubleSpinBox:focus { border: 1px solid #ab97e6; }
+QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background-color: #242233;
+    color: #7a788c;
+    border: 1px solid #383552;
+}
 QTabWidget::pane { border: 1px solid #4a4668; border-top: none; }
 QTabBar::tab { background: #2c2a3e; border: 1px solid #4a4668; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; padding: 10px 20px; color: #e0e0e0; font-weight: bold; min-height: 40px; }
 QTabBar::tab:selected { background: #383552; color: #ffffff; border-bottom: 3px solid #ab97e6; }
@@ -985,7 +990,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QSpinBox", "range": (0, 16)},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
         "SHOULD_UPSCALE": {"label": "Upscale Images", "tooltip": "If enabled, upscale small images closer to bucket limit while maintaining aspect ratio.", "widget": "QCheckBox"},
-        "MAX_AREA_TOLERANCE": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
+        "MAX_AREA_Tolerance": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
         "PREDICTION_TYPE": {"label": "Prediction Type:", "tooltip": "v_prediction or epsilon. Must match the base model.", "widget": "QComboBox", "options": ["v_prediction", "epsilon"]},
         "BETA_SCHEDULE": {"label": "Beta Schedule:", "tooltip": "Noise schedule for the diffuser.", "widget": "QComboBox", "options": ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
@@ -1006,14 +1011,14 @@ class TrainingGUI(QtWidgets.QWidget):
         "USE_ZERO_TERMINAL_SNR": {"label": "Use Zero-Terminal SNR", "tooltip": "Rescales noise schedule for better dynamic range.", "widget": "QCheckBox"},
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
-        
-        # NEW: Noise Enhancement Parameters
+        "USE_NOISE_OFFSET": {"label": "Use Noise Offset", "tooltip": "Enable to add noise offset, improving learning of very dark/bright images.", "widget": "QCheckBox"},
         "NOISE_OFFSET": {"label": "Noise Offset:", "tooltip": "Improves learning of very dark/bright images. Range: 0.0-0.15. Try 0.05 first, 0.1 for high-contrast styles.", "widget": "QLineEdit"},
         "USE_PYRAMID_NOISE": {"label": "Use Multi-Res Noise", "tooltip": "Helps learn multi-scale details. Good for complex lighting and artistic styles.", "widget": "QCheckBox"},
         "PYRAMID_DISCOUNT": {"label": "Pyramid Discount:", "tooltip": "How much each pyramid level contributes (0.8-0.95). Higher = more fine detail contribution.", "widget": "QLineEdit"},
         "PYRAMID_ITERATIONS": {"label": "Pyramid Iterations:", "tooltip": "Number of pyramid levels (5-12). More = better multi-scale learning, slightly slower.", "widget": "QSpinBox", "range": (1, 20)},
+        "USE_CHROMATIC_NOISE": {"label": "Use Chromatic Noise", "tooltip": "Adds a random color tint to the noise to improve color robustness and prevent desaturation. A powerful data augmentation technique.", "widget": "QCheckBox"},
+        "CHROMATIC_NOISE_STRENGTH": {"label": "Chromatic Strength:", "tooltip": "Strength of the color tint. Start with a very low value like 0.01 or 0.02. Higher values can cause color inaccuracy.", "widget": "QLineEdit"},
     }
-
     def __init__(self):
         super().__init__()
         self.setObjectName("TrainingGUI")
@@ -1637,8 +1642,17 @@ class TrainingGUI(QtWidgets.QWidget):
             layout.addRow(noise_info_label)
 
             # --- Noise Enhancement Widgets ---
+            label, widget = self._create_widget("USE_NOISE_OFFSET")
+            layout.addRow(label, widget)
+
             label, widget = self._create_widget("NOISE_OFFSET")
             layout.addRow(label, widget)
+            
+            # **MODIFIED**: Connect the master checkbox to the new master handler
+            if "USE_NOISE_OFFSET" in self.widgets:
+                self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(
+                    lambda state: self._on_master_noise_toggled(bool(state))
+                )
 
             label, widget = self._create_widget("USE_PYRAMID_NOISE")
             layout.addRow(label, widget)
@@ -1649,12 +1663,24 @@ class TrainingGUI(QtWidgets.QWidget):
             label, widget = self._create_widget("PYRAMID_ITERATIONS")
             layout.addRow(label, widget)
 
-            # Connect checkbox to enable/disable related pyramid settings
+            # This connection remains, as it's controlled by the master toggle
             if "USE_PYRAMID_NOISE" in self.widgets:
                 self.widgets["USE_PYRAMID_NOISE"].stateChanged.connect(
                     lambda state: self._toggle_pyramid_settings(bool(state))
                 )
 
+            label, widget = self._create_widget("USE_CHROMATIC_NOISE")
+            layout.addRow(label, widget)
+            
+            label, widget = self._create_widget("CHROMATIC_NOISE_STRENGTH")
+            layout.addRow(label, widget)
+
+            # This connection also remains
+            if "USE_CHROMATIC_NOISE" in self.widgets:
+                self.widgets["USE_CHROMATIC_NOISE"].stateChanged.connect(
+                    lambda state: self._toggle_chromatic_settings(bool(state))
+                )
+                
             # --- Separator and Gradient Spike Detection Subheading ---
             separator2 = QtWidgets.QFrame()
             separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
@@ -1718,82 +1744,82 @@ class TrainingGUI(QtWidgets.QWidget):
             self.current_config[key] = widget.get_points()
     
     def _apply_config_to_widgets(self):
-        for widget in self.widgets.values():
-            widget.blockSignals(True)
-        try:
-            if hasattr(self, 'model_load_strategy_combo'):
-                is_resuming = self.current_config.get("RESUME_TRAINING", False)
-                self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
-                self.toggle_resume_widgets()
-            
-            for key, widget in self.widgets.items():
-                if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
-                    continue
-                
-                value = self.current_config.get(key)
-                if value is None: continue
-
-                if isinstance(widget, QtWidgets.QLineEdit):
-                    widget.setText(str(value))
-                elif isinstance(widget, QtWidgets.QCheckBox):
-                    widget.setChecked(bool(value))
-                elif isinstance(widget, QtWidgets.QComboBox):
-                    widget.setCurrentText(str(value))
-                elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
-                    widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-
-            optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
-            self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
-            
-            user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
-            full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
-            self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
-            self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
-            self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
-            self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
-            
-            use_gc = full_raven_params.get("use_grad_centralization", False)
-            gc_alpha = full_raven_params.get("gc_alpha", 1.0)
-            self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc)
-            self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
-            self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
-
-            user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
-            full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
-            self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
-            self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
-            self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
-            beta1_val = full_adafactor_params.get("beta1", None)
-            beta1_enabled = beta1_val is not None
-            self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
-            self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
-            self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
-            self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
-            self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
-            self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
-            self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
-            
-            if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
-                should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
-                self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
-
-            if "USE_PYRAMID_NOISE" in self.widgets and "PYRAMID_DISCOUNT" in self.widgets:
-                use_pyramid = self.current_config.get("USE_PYRAMID_NOISE", False)
-                self.widgets["PYRAMID_DISCOUNT"].setEnabled(bool(use_pyramid))
-                self.widgets["PYRAMID_ITERATIONS"].setEnabled(bool(use_pyramid))
-                            
-            if hasattr(self, 'lr_curve_widget'):
-                self._update_and_clamp_lr_graph()
-            
-            self._toggle_optimizer_widgets()
-            
-            if hasattr(self, "dataset_manager"):
-                datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
-                self.dataset_manager.load_datasets_from_config(datasets_config)
-
-        finally:
             for widget in self.widgets.values():
-                widget.blockSignals(False)
+                widget.blockSignals(True)
+            try:
+                if hasattr(self, 'model_load_strategy_combo'):
+                    is_resuming = self.current_config.get("RESUME_TRAINING", False)
+                    self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
+                    self.toggle_resume_widgets()
+                
+                for key, widget in self.widgets.items():
+                    if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
+                        continue
+                    
+                    value = self.current_config.get(key)
+                    if value is None: continue
+
+                    if isinstance(widget, QtWidgets.QLineEdit):
+                        widget.setText(str(value))
+                    elif isinstance(widget, QtWidgets.QCheckBox):
+                        widget.setChecked(bool(value))
+                    elif isinstance(widget, QtWidgets.QComboBox):
+                        widget.setCurrentText(str(value))
+                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                        widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
+
+                optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
+                self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
+                
+                user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
+                full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
+                self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
+                self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
+                self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
+                self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
+                
+                use_gc = full_raven_params.get("use_grad_centralization", False)
+                gc_alpha = full_raven_params.get("gc_alpha", 1.0)
+                self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc)
+                self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
+                self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
+
+                user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
+                full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
+                self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
+                self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
+                self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
+                beta1_val = full_adafactor_params.get("beta1", None)
+                beta1_enabled = beta1_val is not None
+                self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
+                self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
+                self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
+                self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
+                self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
+                self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
+                self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
+                
+                if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
+                    should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
+                    self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
+
+                # **MODIFIED**: Centralize the logic for setting initial noise UI state
+                if "USE_NOISE_OFFSET" in self.widgets:
+                    is_master_enabled = self.current_config.get("USE_NOISE_OFFSET", False)
+                    self._on_master_noise_toggled(is_master_enabled)
+
+                if hasattr(self, 'lr_curve_widget'):
+                    self._update_and_clamp_lr_graph()
+                
+                self._toggle_optimizer_widgets()
+                
+                if hasattr(self, "dataset_manager"):
+                    datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
+                    self.dataset_manager.load_datasets_from_config(datasets_config)
+
+            finally:
+                for widget in self.widgets.values():
+                    widget.blockSignals(False)
 
     def restore_defaults(self):
         index = self.config_dropdown.currentIndex()
@@ -1811,12 +1837,40 @@ class TrainingGUI(QtWidgets.QWidget):
     def clear_console_log(self):
         self.log_textbox.clear()
         self.log("Console cleared.")
-    
+
+    def _on_master_noise_toggled(self, enabled):
+            """
+            Master handler for the main noise enhancement checkbox.
+            Enables or disables all child noise options.
+            """
+            # Enable/disable the direct child widgets
+            self.widgets["NOISE_OFFSET"].setEnabled(enabled)
+            self.widgets["USE_PYRAMID_NOISE"].setEnabled(enabled)
+            self.widgets["USE_CHROMATIC_NOISE"].setEnabled(enabled)
+
+            # If the master switch is enabled, restore the state of sub-settings
+            if enabled:
+                # Let the sub-checkboxes control their own children
+                is_pyramid_checked = self.widgets["USE_PYRAMID_NOISE"].isChecked()
+                self._toggle_pyramid_settings(is_pyramid_checked)
+                
+                is_chromatic_checked = self.widgets["USE_CHROMATIC_NOISE"].isChecked()
+                self._toggle_chromatic_settings(is_chromatic_checked)
+            else:
+                # If the master switch is disabled, force all sub-settings off
+                self._toggle_pyramid_settings(False)
+                self._toggle_chromatic_settings(False)    
+
     def toggle_resume_widgets(self):
         if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
             is_resuming = self.model_load_strategy_combo.currentIndex() == 1
             self.resume_sub_widget.setVisible(is_resuming)
             self.base_model_sub_widget.setVisible(not is_resuming)
+
+    def _toggle_noise_offset_settings(self, enabled):
+        """Enable or disable noise offset strength setting based on the checkbox."""
+        if "NOISE_OFFSET" in self.widgets:
+            self.widgets["NOISE_OFFSET"].setEnabled(enabled)
 
     def _toggle_pyramid_settings(self, enabled):
         """Enable or disable pyramid noise settings based on the checkbox state."""
@@ -1824,6 +1878,11 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["PYRAMID_DISCOUNT"].setEnabled(enabled)
         if "PYRAMID_ITERATIONS" in self.widgets:
             self.widgets["PYRAMID_ITERATIONS"].setEnabled(enabled)
+
+    def _toggle_chromatic_settings(self, enabled):
+        """Enable or disable chromatic noise strength setting based on the checkbox."""
+        if "CHROMATIC_NOISE_STRENGTH" in self.widgets:
+            self.widgets["CHROMATIC_NOISE_STRENGTH"].setEnabled(enabled)
 
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return
