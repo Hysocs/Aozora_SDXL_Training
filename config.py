@@ -34,7 +34,6 @@ NOISE_SCHEDULER = "DDPMScheduler"
 PREDICTION_TYPE = "v_prediction"
 BETA_SCHEDULE = "scaled_linear"
 MAX_TRAIN_STEPS = 10000
-LEARNING_RATE = 3e-6
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 4
 MIXED_PRECISION = "float16"
@@ -57,6 +56,13 @@ LR_CUSTOM_CURVE = [
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 
+TIMESTEP_SAMPLING_METHOD = "Random Integer (Default)"
+
+TIMESTEP_SAMPLING_MIN = 0
+TIMESTEP_SAMPLING_MAX = 999
+TIMESTEP_SAMPLING_GRAD_MIN = 0.1
+TIMESTEP_SAMPLING_GRAD_MAX = 0.9
+
 # --- Advanced ---
 MEMORY_EFFICIENT_ATTENTION = "xformers"
 USE_ZERO_TERMINAL_SNR = True
@@ -70,27 +76,15 @@ RAVEN_PARAMS = {
     "eps": 1e-8,
     "weight_decay": 0.01,
     "debias_strength": 0.3,
-    "use_grad_centralization": False,  # NEW
-    "gc_alpha": 1.0  # NEW
-}
-
-# Adafactor Optimizer Parameters
-ADAFACTOR_PARAMS = {
-    "eps": [1e-30, 1e-3],
-    "clip_threshold": 1.0,
-    "decay_rate": -0.8,
-    "beta1": None,
-    "weight_decay": 0.01,
-    "scale_parameter": True,
-    "relative_step": False,
-    "warmup_init": False
+    "use_grad_centralization": False,
+    "gc_alpha": 1.0
 }
 
 # --- Gradient Spike Detection ---
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
 
-
+# --- Noise Enhancements ---
 USE_NOISE_OFFSET = False
 NOISE_OFFSET = 0.0
-USE_MULTISCALE_NOISE = False 
+USE_MULTISCALE_NOISE = False

@@ -10,6 +10,7 @@ import time
 import math
 import torch
 import torch.nn.functional as F
+from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader, Sampler
 from diffusers import StableDiffusionXLPipeline, DDPMScheduler, AutoencoderKL, EulerDiscreteScheduler, DDIMScheduler
 from diffusers.optimization import get_scheduler
@@ -22,12 +23,14 @@ import warnings
 import argparse
 import numpy as np
 from diffusers.models.attention_processor import AttnProcessor2_0
-from optimizer.raven import RavenAdamW
-from transformers.optimization import Adafactor
 import multiprocessing
 from multiprocessing import Pool, cpu_count
-import config as default_config  # Import default configuration
+import config as default_config
+import threading
+import queue
 
+# --- Import the custom optimizer ---
+from optimizer.raven import RavenAdamW
 
 # --- Global Settings ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -36,9 +39,8 @@ ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
 
-
+# region Helper Functions & Classes
 def set_seed(seed):
-    """Sets the random seed for reproducibility."""
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
@@ -48,35 +50,20 @@ def set_seed(seed):
     print(f"INFO: Set random seed to {seed}")
 
 def generate_offset_noise(latents, config):
-    """
-    Generates training noise with an optional offset for better dark/bright image generation.
-    
-    Standard noise offset: Adds a consistent random offset to all channels per sample.
-    Multiscale noise: Adds noise at different resolutions (recommended over chromatic for SDXL).
-    """
-    # Always generate noise with explicit device and dtype to avoid autocast issues
     noise = torch.randn(
-        latents.shape, 
-        device=latents.device, 
+        latents.shape,
+        device=latents.device,
         dtype=latents.dtype,
         generator=None
     )
-
     if not getattr(config, "USE_NOISE_OFFSET", False):
         return noise
-
     strength = float(getattr(config, "NOISE_OFFSET", 0.1))
-    
     if strength <= 0:
         return noise
-
     b, c, h, w = noise.shape
-    
-    # Standard noise offset - single offset applied to all channels
     offset = torch.randn(b, 1, 1, 1, device=noise.device, dtype=noise.dtype)
     noise = noise + strength * offset
-    
-    # Optional: Multiscale noise
     if getattr(config, "USE_MULTISCALE_NOISE", False):
         scale_factor = 8
         coarse_noise = torch.randn(
@@ -91,23 +78,15 @@ def generate_offset_noise(latents, config):
         )
         multiscale_strength = strength * 0.5
         noise = noise + multiscale_strength * coarse_noise
-    
     return noise
 
-
 class TrainingConfig:
-    """Consolidates all training configurations."""
     def __init__(self):
-        # Load all defaults from config.py first
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
-        
-        # Now load from user config file if provided (this will override defaults)
         self._load_from_user_config()
         self._type_check_and_correct()
-        
-        # Set compute dtype based on mixed precision setting
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
 
     def _load_from_user_config(self):
@@ -129,145 +108,196 @@ class TrainingConfig:
                 print(f"WARNING: Config {path} not found. Using defaults.")
         else:
             print("INFO: No config file specified. Using defaults from config.py.")
-            
+
     def _type_check_and_correct(self):
-        """
-        Dynamically checks and corrects the types of configuration attributes,
-        with special handling for comma-separated strings and float-like integers.
-        """
         print("INFO: Checking and correcting configuration types...")
         for key, value in list(self.__dict__.items()):
-            # Handle UNET_EXCLUDE_TARGETS as a special case first
+            if key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"] and getattr(self, "RESUME_TRAINING", False):
+                if not value or not Path(value).exists():
+                    raise FileNotFoundError(f"RESUME_TRAINING is enabled, but {key}='{value}' is not a valid file path.")
             if key == "UNET_EXCLUDE_TARGETS":
                 if isinstance(value, str):
                     setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
                 elif isinstance(value, list):
                     setattr(self, key, [item for item in value if item])
                 continue
-
             default_value = getattr(default_config, key, None)
             if default_value is None or isinstance(value, type(default_value)):
                 continue
-
             expected_type = type(default_value)
-            
             if expected_type == bool and isinstance(value, str):
                 setattr(self, key, value.lower() in ['true', '1', 't', 'y', 'yes'])
                 continue
-
             try:
                 if expected_type == int:
                     setattr(self, key, int(float(value)))
                 else:
                     setattr(self, key, expected_type(value))
-
             except (ValueError, TypeError):
                 print(f"WARNING: Could not convert '{key}' value '{value}' to {expected_type.__name__}. "
                     f"Using default value: {default_value}")
                 setattr(self, key, default_value)
-        
         print("INFO: Configuration types checked and corrected.")
 
 class CustomCurveLRScheduler:
-    """Custom LR scheduler that interpolates along a user-defined curve."""
-    
     def __init__(self, optimizer, curve_points, max_train_steps):
-        """
-        Args:
-            optimizer: The optimizer to adjust
-            curve_points: List of [normalized_x, lr_value] where x is 0.0 to 1.0
-            max_train_steps: Total training steps (not optimizer steps)
-        """
         self.optimizer = optimizer
         self.curve_points = sorted(curve_points, key=lambda p: p[0])
         self.max_train_steps = max(max_train_steps, 1)
         self.current_training_step = 0
-        
-        # Validate curve
         if not self.curve_points:
             raise ValueError("LR_CUSTOM_CURVE cannot be empty")
         if self.curve_points[0][0] != 0.0:
-            print("WARNING: First LR curve point should start at x=0.0. Prepending [0.0, first_lr].")
             self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
         if self.curve_points[-1][0] != 1.0:
-            print("WARNING: Last LR curve point should end at x=1.0. Appending [1.0, last_lr].")
             self.curve_points.append([1.0, self.curve_points[-1][1]])
-        
-        # Set initial LR
         self._update_lr()
-    
+
     def _interpolate_lr(self, normalized_position):
-        """Linear interpolation between curve points."""
         normalized_position = max(0.0, min(1.0, normalized_position))
-        
         for i in range(len(self.curve_points) - 1):
             x1, y1 = self.curve_points[i]
             x2, y2 = self.curve_points[i + 1]
-            
             if x1 <= normalized_position <= x2:
                 if x2 - x1 == 0:
                     return y1
                 t = (normalized_position - x1) / (x2 - x1)
                 return y1 + t * (y2 - y1)
-        
         return self.curve_points[-1][1]
-    
+
     def _update_lr(self):
-        """Update LR based on current training step."""
         normalized_position = self.current_training_step / max(self.max_train_steps - 1, 1)
         lr = self._interpolate_lr(normalized_position)
-        
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
-    
+
     def step(self, training_step):
-        """Update LR. Call this ONCE per optimizer step with the current training step."""
         self.current_training_step = training_step
         self._update_lr()
-    
+
     def get_last_lr(self):
-        """Return current learning rates."""
         return [group['lr'] for group in self.optimizer.param_groups]
 
-
 class TrainingDiagnostics:
-    """A streamlined class to handle collection and reporting of training metrics."""
-    def __init__(self, accumulation_steps, test_param_name):
+    def __init__(self, accumulation_steps):
         self.accumulation_steps = accumulation_steps
-        self.test_param_name = test_param_name
         self.losses = deque(maxlen=accumulation_steps)
 
     def step(self, loss):
-        """Record the loss for the current accumulation step."""
         if loss is not None:
             self.losses.append(loss)
 
-    def report(self, global_step, optimizer, raw_grad_norm, clipped_grad_norm, before_val, after_val):
-        """Prints a formatted report of the current training state."""
-        if not self.losses: return
-
-        avg_loss = sum(self.losses) / len(self.losses)
-        current_lr = optimizer.param_groups[0]['lr']
-        update_delta = torch.abs(after_val - before_val).max().item()
-        update_status = "[OK]" if update_delta > 1e-9 else "[NO UPDATE!]"
-        
-        # Fixed VRAM reporting - show total training memory used, not just allocated
-        vram_reserved_gb = torch.cuda.memory_reserved() / 1e9  # This is total VRAM used by training
-        vram_allocated_gb = torch.cuda.memory_allocated() / 1e9  # This is just actively allocated tensors
-
-        report_str = (
-            f"\n--- Step: {global_step:<5} | Loss: {avg_loss:<8.5f} | LR: {current_lr:.2e} ---\n"
-            f"  Grad Norm (Raw/Clipped): {raw_grad_norm:<8.4f} / {clipped_grad_norm:<8.4f}\n"
-            f"  VRAM: Training={vram_reserved_gb:.2f}GB | Model={vram_allocated_gb:.2f}GB\n"
-            f"  Test Param: {self.test_param_name}\n"
-            f"  |- Update : {update_delta:.4e} {update_status}"
-        )
-        tqdm.write(report_str)
-        self.reset()
+    def get_average_loss(self):
+        if not self.losses: return 0.0
+        return sum(self.losses) / len(self.losses)
 
     def reset(self):
         self.losses.clear()
 
+class AsyncReporter:
+    def __init__(self, total_steps, test_param_name):
+        self.total_steps = total_steps
+        self.test_param_name = test_param_name
+        self.task_queue = queue.Queue()
+        self.stop_event = threading.Event()
+        self.worker_thread = threading.Thread(target=self._worker, daemon=True)
+        self.worker_thread.start()
+
+    def _format_time(self, seconds):
+        if seconds is None or not math.isfinite(seconds):
+            return "N/A"
+        seconds = int(seconds)
+        hours = seconds // 3600
+        minutes = (seconds % 3600) // 60
+        secs = seconds % 60
+        return f"{hours:02}:{minutes:02}:{secs:02}"
+
+    def _generate_progress_string(self, current_step, timing_data):
+        bar_width = 30
+        percentage = (current_step + 1) / self.total_steps
+        filled_length = int(bar_width * percentage)
+        bar = '#' * filled_length + '-' * (bar_width - filled_length)
+        
+        s_per_step = timing_data.get('raw_step_time', 0)
+        time_spent_str = self._format_time(timing_data.get('elapsed_time'))
+        eta_str = self._format_time(timing_data.get('eta'))
+        
+        # --- MODIFICATION START ---
+        loss_val = timing_data.get('loss', 0.0)
+        timestep_val = timing_data.get('timestep', 'N/A')
+        
+        progress_bar = f'Training |{bar}| {current_step + 1}/{self.total_steps} [{percentage:.2%}]'
+        step_info = f" [Loss: {loss_val:.4f}, Timestep: {timestep_val}]"
+        timing_info = f" [{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]"
+        
+        return progress_bar + step_info + timing_info
+        # --- MODIFICATION END ---
+
+    def _worker(self):
+        while not self.stop_event.is_set():
+            try:
+                task_type, data = self.task_queue.get(timeout=1)
+                if task_type == 'log_step':
+                    self._handle_log_step(**data)
+                elif task_type == 'anomaly':
+                    self._handle_anomaly(**data)
+                self.task_queue.task_done()
+            except queue.Empty:
+                continue
+
+    def _handle_log_step(self, global_step, timing_data, diag_data):
+        progress_str = self._generate_progress_string(global_step, timing_data)
+        print(progress_str, end='\r')
+
+        if diag_data:
+            print()
+            update_status = "[OK]" if diag_data['update_delta'] > 1e-12 else "[NO UPDATE!]"
+            vram_reserved_gb = torch.cuda.memory_reserved() / 1e9
+            vram_allocated_gb = torch.cuda.memory_allocated() / 1e9
+            
+            report_str = (
+                f"--- Optimizer Step: {diag_data['optim_step']:<5} | Loss: {diag_data['avg_loss']:<8.5f} | LR: {diag_data['current_lr']:.2e} ---\n"
+                f"  Time: {diag_data['optim_step_time']:.2f}s/step | Avg Speed: {diag_data['avg_optim_step_time']:.2f}s/step\n"
+                f"  Grad Norm (Raw/Clipped): {diag_data['raw_grad_norm']:<8.4f} / {diag_data['clipped_grad_norm']:<8.4f}\n"
+                f"  VRAM: Training={vram_reserved_gb:.2f}GB | Model={vram_allocated_gb:.2f}GB\n"
+                f"  Test Param: {self.test_param_name}\n"
+                f"  |- Update Magnitude : {diag_data['update_delta']:.4e} {update_status}"
+            )
+            print(report_str)
+
+    def _handle_anomaly(self, global_step, raw_grad_norm, clipped_grad_norm, low_thresh, high_thresh, paths):
+        anomaly_str = (
+            f"\n\n{'='*20} GRADIENT ANOMALY DETECTED {'='*20}\n"
+            f"  Step: {global_step}\n"
+            f"  Raw Gradient Norm: {raw_grad_norm:.4f}\n"
+            f"  Clipped Gradient Norm: {clipped_grad_norm:.4f}\n"
+            f"  Thresholds (Low/High): {low_thresh} / {high_thresh}\n"
+            f"  Images in Accumulated Batch:\n"
+            + "".join([f"    - {Path(p).stem}\n" for p in paths]) +
+            f"{'='*65}\n"
+        )
+        print(anomaly_str)
+
+    def log_step(self, global_step, timing_data, diag_data=None):
+        data = {'global_step': global_step, 'timing_data': timing_data, 'diag_data': diag_data}
+        self.task_queue.put(('log_step', data))
+
+    def check_and_report_anomaly(self, global_step, raw_grad_norm, clipped_grad_norm, config, paths):
+        low = getattr(config, "GRAD_SPIKE_THRESHOLD_LOW", 0.0)
+        high = getattr(config, "GRAD_SPIKE_THRESHOLD_HIGH", 1000.0)
+        if raw_grad_norm > high or raw_grad_norm < low:
+            data = {
+                'global_step': global_step, 'raw_grad_norm': raw_grad_norm, 'clipped_grad_norm': clipped_grad_norm,
+                'low_thresh': low, 'high_thresh': high, 'paths': list(paths)
+            }
+            self.task_queue.put(('anomaly', data))
+
+    def shutdown(self):
+        print("\nShutting down async reporter. Waiting for pending tasks...")
+        self.task_queue.join()
+        self.stop_event.set()
+        self.worker_thread.join()
+        print("Async reporter shut down.")
 
 class BucketBatchSampler(Sampler):
     def __init__(self, dataset, batch_size, seed, shuffle=True, drop_last=False):
@@ -280,72 +310,50 @@ class BucketBatchSampler(Sampler):
         buckets = defaultdict(list)
         for i in indices:
             if (key := self.dataset.bucket_keys[i]): buckets[key].append(i)
-        
         all_batches = []
         for key in sorted(buckets.keys()):
             for i in range(0, len(buckets[key]), self.batch_size):
                 batch = buckets[key][i:i + self.batch_size]
                 if not self.drop_last or len(batch) == self.batch_size: all_batches.append(batch)
-        
         if self.shuffle: all_batches = [all_batches[i] for i in torch.randperm(len(all_batches), generator=g).tolist()]
         yield from all_batches
         self.seed += 1
 
     def __len__(self):
-        return (len(self.epoch_indices) // self.batch_size if self.drop_last 
+        return (len(self.epoch_indices) // self.batch_size if self.drop_last
                 else (len(self.epoch_indices) + self.batch_size - 1) // self.batch_size)
-
 
 class ResolutionCalculator:
     def __init__(self, target_area, stride=64, should_upscale=False, max_area_tolerance=1.1):
-        """
-        Args:
-            target_area: Target pixel area (e.g., 1024*1024)
-            stride: Dimension alignment (default 64)
-            should_upscale: If True, upscale to target; if False, always scale to target
-            max_area_tolerance: Allow up to this multiplier of target_area when upscaling
-        """
         self.target_area = target_area
         self.stride = stride
         self.should_upscale = should_upscale
-        self.max_area_tolerance = max_area_tolerance
         self.max_area = target_area * max_area_tolerance
 
     def calculate_resolution(self, width, height):
-        """Calculate resolution based on upscaling preference."""
         aspect_ratio = width / height
-        
         if not self.should_upscale:
-            # Original behavior: always scale to target_area
             h = int(math.sqrt(self.target_area / aspect_ratio) // self.stride) * self.stride
             w = int(h * aspect_ratio // self.stride) * self.stride
             return (w if w > 0 else self.stride, h if h > 0 else self.stride)
-        
-        # New upscaling behavior
         current_area = width * height
-        
         if current_area > self.max_area:
             scale_factor = math.sqrt(self.target_area / current_area)
         elif current_area < self.target_area:
             scale_factor = math.sqrt(self.target_area / current_area)
         else:
             scale_factor = 1.0
-        
         new_w = int((width * scale_factor) // self.stride) * self.stride
         new_h = int((height * scale_factor) // self.stride) * self.stride
         new_w = max(new_w, self.stride)
         new_h = max(new_h, self.stride)
-        
-        # Ensure we don't exceed max_area
         if new_w * new_h > self.max_area:
             scale_down = math.sqrt(self.max_area / (new_w * new_h))
             new_w = int((new_w * scale_down) // self.stride) * self.stride
             new_h = int((new_h * scale_down) // self.stride) * self.stride
             new_w = max(new_w, self.stride)
             new_h = max(new_h, self.stride)
-        
         return (new_w, new_h)
-
 
 def resize_to_fit(image, target_w, target_h):
     w, h = image.size
@@ -355,47 +363,37 @@ def resize_to_fit(image, target_w, target_h):
         w_new, h_new = int(w * target_h / h), target_h
     return image.resize((w_new, h_new), Image.Resampling.LANCZOS).crop(((w_new - target_w) // 2, (h_new - target_h) // 2, (w_new + target_w) // 2, (h_new + target_h) // 2))
 
-
 def validate_and_assign_resolution(args):
     ip, calculator = args
     try:
-        # Image validation - lightweight checks only
         with Image.open(ip) as img:
             img.verify()
         with Image.open(ip) as img:
             img.load()
             w, h = img.size
             if w <= 0 or h <= 0:
-                tqdm.write(f"\n[INVALID] Image {ip.name} has invalid dimensions. Skipping.")
+                print(f"\n[INVALID] Image {ip.name} has invalid dimensions. Skipping.")
                 return None
-
         cp = ip.with_suffix('.txt')
-
-        # Check for the caption file
         if cp.exists():
             with open(cp, 'r', encoding='utf-8') as f:
                 caption = f.read().strip()
             if not caption:
-                tqdm.write(f"\n[WARNING] Caption file for {ip.name} is EMPTY. Image will be skipped.")
+                print(f"\n[WARNING] Caption file for {ip.name} is EMPTY. Image will be skipped.")
                 return None
         else:
             fallback_caption = ip.stem.replace('_', ' ')
-            tqdm.write(f"\n[CAPTION WARNING] No .txt file for {ip.name}. Using fallback: '{fallback_caption}'")
+            print(f"\n[CAPTION WARNING] No .txt file for {ip.name}. Using fallback: '{fallback_caption}'")
             caption = fallback_caption
-
         return {"ip": ip, "caption": caption, "target_resolution": calculator.calculate_resolution(w, h), "original_size": (w, h)}
-
     except Exception as e:
-        tqdm.write(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
+        print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
         return None
 
-
 def compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device):
-    """Process captions ONE AT A TIME to minimize VRAM usage during caching."""
     prompt_embeds_list = []
     pooled_prompt_embeds_list = []
-    
-    for caption in captions:  # Process individually to save VRAM
+    for caption in captions:
         with torch.no_grad():
             i1 = t1(caption, padding="max_length", max_length=t1.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
             i2 = t2(caption, padding="max_length", max_length=t2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
@@ -403,302 +401,147 @@ def compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device):
             out2 = te2(i2, output_hidden_states=True)
             prompt_embeds = torch.cat((e1, out2.hidden_states[-2]), dim=-1)
             pooled_embeds = out2[0]
-            
             prompt_embeds_list.append(prompt_embeds)
             pooled_prompt_embeds_list.append(pooled_embeds)
-    
     return torch.cat(prompt_embeds_list), torch.cat(pooled_prompt_embeds_list)
 
-
 def check_if_caching_needed(config):
-    """Check if any dataset needs caching before loading heavy models."""
     needs_caching = False
-    
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
         if not root.exists():
             print(f"WARNING: Dataset path {root} does not exist, skipping.")
             continue
-            
-        # Check for images
-        image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+        image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
                       for p in root.rglob(f"*{ext}")]
-        
         if not image_paths:
             print(f"INFO: No images found in {root}, skipping.")
             continue
-        
-        # Check for cached files
         cache_dir = root / ".precomputed_embeddings_cache"
         if not cache_dir.exists():
             print(f"INFO: Cache directory doesn't exist for {root}, caching needed.")
             needs_caching = True
             continue
-            
         cached_stems = {p.stem for p in cache_dir.rglob("*.pt")}
         uncached = [p for p in image_paths if p.stem not in cached_stems]
-        
         if uncached:
             print(f"INFO: Found {len(uncached)} uncached images in {root}")
             needs_caching = True
         else:
             print(f"INFO: All {len(image_paths)} images already cached in {root}")
-    
     return needs_caching
 
-
 def load_vae_only(config, device):
-    """Load ONLY the VAE efficiently from a dedicated VAE file."""
     vae_path = config.VAE_PATH
-    
     if not vae_path or not Path(vae_path).exists():
-        return None  # Signal that we need to use the VAE from the main pipeline
-    
+        return None
     print(f"INFO: Loading dedicated VAE from: {vae_path}")
-    # Load VAE directly from the single file
     vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=torch.float32)
-    
     print(f"INFO: VAE in float32 for high-quality caching")
     print(f"INFO: Moving VAE to {device}...")
     vae = vae.to(device)
-    
-    # Report actual VRAM usage after loading
     vram_gb = torch.cuda.memory_allocated() / 1e9
     print(f"INFO: VAE loaded. Current VRAM usage: {vram_gb:.2f} GB")
-    
     return vae
 
-def verify_cached_dataset(dataset_path):
-    """Verify all cached files are valid and free of NaN/Inf values."""
-    cache_dir = dataset_path / ".precomputed_embeddings_cache"
-    if not cache_dir.exists():
-        print(f"INFO: No cache directory found at {cache_dir}")
-        return True
-    
-    cache_files = list(cache_dir.glob("*.pt"))
-    if not cache_files:
-        print(f"INFO: No cached files to verify in {cache_dir}")
-        return True
-    
-    corrupted = []
-    for cache_file in tqdm(cache_files, desc="Verifying cache"):
-        try:
-            data = torch.load(cache_file, map_location="cpu")
-            
-            # Check for NaN/Inf in all components
-            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any() or
-                torch.isnan(data["embeds"]).any() or torch.isinf(data["embeds"]).any() or
-                torch.isnan(data["pooled"]).any() or torch.isinf(data["pooled"]).any()):
-                corrupted.append(cache_file)
-        except Exception as e:
-            print(f"\nWARNING: Could not load {cache_file.name}: {e}")
-            corrupted.append(cache_file)
-    
-    if corrupted:
-        print(f"\nWARNING: Found {len(corrupted)} corrupted cache files:")
-        for f in corrupted:
-            print(f"  - {f.name}")
-        print("These files will be skipped during training. Consider deleting them and recaching.")
-        return False
-    else:
-        print(f"INFO: All {len(cache_files)} cached files verified successfully!")
-        return True
-
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
-    """Streamlined caching with minimal memory footprint and NaN validation."""
-    
-    # Check if caching is even needed
     if not check_if_caching_needed(config):
         print("\n" + "="*60)
         print("INFO: All datasets are already cached. Skipping caching step.")
         print("="*60 + "\n")
         return
-    
     print("\n" + "="*60)
     print("STARTING CACHING PROCESS")
     print("="*60 + "\n")
-    
     calc = ResolutionCalculator(
     config.TARGET_PIXEL_AREA,
     stride=64,
     should_upscale=config.SHOULD_UPSCALE,
     max_area_tolerance=getattr(config, 'MAX_AREA_TOLERANCE', 1.1)
     )
-    
-    # VAE is already loaded and passed in
     vae.enable_tiling()
-    
-    # Load text encoders
     print("INFO: Loading text encoders to device...")
     te1.to(device)
     te2.to(device)
-    
-    # Report memory usage
     vram_gb = torch.cuda.memory_allocated() / 1e9
     print(f"INFO: Current VRAM usage: {vram_gb:.2f} GB")
-    
     transform = transforms.Compose([
-        transforms.ToTensor(), 
+        transforms.ToTensor(),
         transforms.Normalize([0.5], [0.5])
     ])
-    
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
         print(f"\n{'='*60}")
         print(f"Processing dataset: {root}")
         print(f"{'='*60}")
-        
-        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
                 for p in root.rglob(f"*{ext}")]
-        
-        if not paths: 
+        if not paths:
             print(f"WARNING: No images found in {root}.")
             continue
-        
-        # Check what's already cached
         cache_dir = root / ".precomputed_embeddings_cache"
         cache_dir.mkdir(exist_ok=True)
-        
         stems = {p.stem for p in cache_dir.rglob("*.pt")}
         to_process = [p for p in paths if p.stem not in stems]
-        
-        if not to_process: 
+        if not to_process:
             print(f"INFO: All {len(paths)} images already cached for this dataset.")
             continue
-        
         print(f"INFO: Found {len(to_process)} images to cache (out of {len(paths)} total)")
-        
-        # Validate and assign resolutions using multiprocessing
         print("INFO: Validating images and calculating resolutions...")
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
-                pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]), 
-                total=len(to_process), 
+                pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]),
+                total=len(to_process),
                 desc="Validating"
             ))
-        
         metadata = [r for r in results if r]
-        if not metadata: 
+        if not metadata:
             print(f"WARNING: No valid images found to process in {root}.")
             continue
-        
         print(f"INFO: {len(metadata)} images validated successfully")
-        
-        # Save metadata for bucketing
         res_meta = {m['ip'].stem: m['target_resolution'] for m in metadata}
         metadata_path = root / "metadata.json"
-        with open(metadata_path, 'w', encoding='utf-8') as f: 
+        with open(metadata_path, 'w', encoding='utf-8') as f:
             json.dump(res_meta, f, indent=4)
         print(f"INFO: Saved metadata to {metadata_path}")
-
-        # Group images by resolution for efficient batch processing
         grouped = defaultdict(list)
-        for m in metadata: 
+        for m in metadata:
             grouped[m["target_resolution"]].append(m)
-        
         print(f"INFO: Images grouped into {len(grouped)} resolution buckets")
-        
-        batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE]) 
-                  for res in grouped 
+        batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE])
+                  for res in grouped
                   for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)]
         random.shuffle(batches)
-        
         print(f"INFO: Processing {len(batches)} batches...")
-        
         for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc="Caching")):
-            # Encode text
             captions = [m['caption'] for m in batch_meta]
             embeds, pooled = compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device)
-            
-            # Validate text embeddings
-            if torch.isnan(embeds).any() or torch.isinf(embeds).any():
-                tqdm.write(f"\n[NaN/Inf DETECTED] Text embeddings contain invalid values! Skipping batch.")
-                tqdm.write(f"  Affected captions: {captions}")
-                continue
-            if torch.isnan(pooled).any() or torch.isinf(pooled).any():
-                tqdm.write(f"\n[NaN/Inf DETECTED] Pooled embeddings contain invalid values! Skipping batch.")
-                tqdm.write(f"  Affected captions: {captions}")
-                continue
-            
-            # Load and process images
             images, valid_meta = [], []
             for m in batch_meta:
                 try:
-                    with Image.open(m['ip']) as img: 
+                    with Image.open(m['ip']) as img:
                         img = img.convert("RGB")
                     processed_img = transform(resize_to_fit(img, w, h))
-                    
-                    # Validate processed image tensor
-                    if torch.isnan(processed_img).any() or torch.isinf(processed_img).any():
-                        tqdm.write(f"\n[NaN/Inf DETECTED] Processed image {m['ip'].name} contains invalid values. Skipping.")
-                        continue
-                    
                     images.append(processed_img)
                     valid_meta.append(m)
-                except Exception as e: 
-                    tqdm.write(f"\n[ERROR] Skipping {m['ip']}: {e}")
-            
-            if not images: 
-                continue
-
-            # Encode latents
+                except Exception as e:
+                    print(f"\n[ERROR] Skipping {m['ip']}: {e}")
+            if not images: continue
             image_batch_tensor = torch.stack(images).to(device, dtype=torch.float32)
-            
             with torch.no_grad():
                 latents = vae.encode(image_batch_tensor).latent_dist.mean * vae.config.scaling_factor
-            
-            # Validate VAE latents
-            if torch.isnan(latents).any() or torch.isinf(latents).any():
-                tqdm.write(f"\n[NaN/Inf DETECTED] VAE produced invalid latents! Skipping entire batch.")
-                tqdm.write(f"  Affected images:")
-                for m in valid_meta:
-                    tqdm.write(f"    - {m['ip'].name}")
-                continue
-            
-            # Save each item
             for j, m in enumerate(valid_meta):
                 cache_path = cache_dir / f"{m['ip'].stem}.pt"
-                
-                # Final validation before saving
-                latent_to_save = latents[j].cpu().to(torch.float32)
-                embed_to_save = embeds[j].cpu().to(torch.float32)
-                pooled_to_save = pooled[j].cpu().to(torch.float32)
-                
-                if (torch.isnan(latent_to_save).any() or torch.isinf(latent_to_save).any() or
-                    torch.isnan(embed_to_save).any() or torch.isinf(embed_to_save).any() or
-                    torch.isnan(pooled_to_save).any() or torch.isinf(pooled_to_save).any()):
-                    tqdm.write(f"\n[NaN/Inf DETECTED] Invalid values before saving {m['ip'].stem}. Skipping.")
-                    continue
-                
                 torch.save({
-                    "original_size": m["original_size"], 
-                    "target_size": (w, h),
-                    "embeds": embed_to_save, 
-                    "pooled": pooled_to_save,
-                    "latents": latent_to_save
+                    "original_size": m["original_size"], "target_size": (w, h),
+                    "embeds": embeds[j].cpu().to(torch.float32),
+                    "pooled": pooled[j].cpu().to(torch.float32),
+                    "latents": latents[j].cpu().to(torch.float32)
                 }, cache_path)
-            
-            # Clear memory periodically
-            if (batch_idx + 1) % 10 == 0:
-                torch.cuda.empty_cache()
-        
-        print(f"INFO: Completed caching for {root}")
-        
-        # Verify the cached dataset after completion
-        print(f"INFO: Verifying cached files for {root}...")
-        verify_cached_dataset(root)
-    
-    # Cleanup - move text encoders back to CPU (VAE cleanup handled by main())
+            if (batch_idx + 1) % 10 == 0: torch.cuda.empty_cache()
     print("\nINFO: Moving text encoders back to CPU...")
-    te1.cpu()
-    te2.cpu()
-    gc.collect()
-    torch.cuda.empty_cache()
-    
-    print("\n" + "="*60)
-    print("CACHING COMPLETE")
-    print("="*60 + "\n")
-
+    te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
+    print("\n" + "="*60); print("CACHING COMPLETE"); print("="*60 + "\n")
 
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
@@ -707,43 +550,29 @@ class ImageTextLatentDataset(Dataset):
             root = Path(ds["path"])
             cache_dir = root / ".precomputed_embeddings_cache"
             if not cache_dir.exists(): continue
-            
-            # Load files and shuffle
-            files = list(cache_dir.glob("*.pt")) 
+            files = list(cache_dir.glob("*.pt"))
             self.latent_files.extend(files * int(ds.get("repeats", 1)))
-            
         if not self.latent_files: raise ValueError("No cached files found.")
-        
-        # Shuffle the entire collection of files ONCE at the start.
         print("INFO: Shuffling the entire dataset order...")
         random.shuffle(self.latent_files)
-        
         self.bucket_keys = []
         all_meta = {}
         for ds in config.INSTANCE_DATASETS:
             meta_path = Path(ds["path"]) / "metadata.json"
             if meta_path.exists():
                 with open(meta_path, 'r') as f: all_meta.update(json.load(f))
-        
-        # Build bucket keys based on the now-shuffled file list
         for f in self.latent_files:
             key = all_meta.get(f.stem)
             self.bucket_keys.append(tuple(key) if key else None)
-        print(f"Dataset initialized with {len(self.latent_files)} samples.")
+        print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
 
     def __len__(self): return len(self.latent_files)
-    
+
     def __getitem__(self, i):
         try:
             data = torch.load(self.latent_files[i], map_location="cpu")
-            
-            # Validate loaded cache for NaN/Inf
-            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any() or
-                torch.isnan(data["embeds"]).any() or torch.isinf(data["embeds"]).any() or
-                torch.isnan(data["pooled"]).any() or torch.isinf(data["pooled"]).any()):
-                print(f"WARNING: Corrupted cache detected in {self.latent_files[i].name} (contains NaN/Inf). Skipping.")
+            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()):
                 return None
-            
             return {
                 "latents": data["latents"], "embeds": data["embeds"], "pooled": data["pooled"],
                 "original_sizes": data["original_size"], "target_sizes": data["target_size"],
@@ -753,12 +582,147 @@ class ImageTextLatentDataset(Dataset):
             print(f"WARNING: Skipping {self.latent_files[i]}: {e}")
             return None
 
+
+
+
+class TimestepSampler:
+    """
+    Handles different timestep sampling strategies, including a robust, goal-seeking mode 
+    that differentiates between single outliers and genuine instability trends.
+    """
+    def __init__(self, config, noise_scheduler, device):
+        self.method = config.TIMESTEP_SAMPLING_METHOD
+        self.config = config
+        self.noise_scheduler = noise_scheduler
+        self.device = device
+        self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+
+        if "Dynamic" in self.method:
+            self.target_min_grad = self.config.TIMESTEP_SAMPLING_GRAD_MIN
+            self.target_max_grad = self.config.TIMESTEP_SAMPLING_GRAD_MAX
+            
+            self.current_min_ts = float(self.config.TIMESTEP_SAMPLING_MIN)
+            self.current_max_ts = float(self.config.TIMESTEP_SAMPLING_MAX)
+            
+            self.global_min_ts = 0.0
+            self.global_max_ts = float(self.num_train_timesteps - 1)
+            
+            # --- NEW: More nuanced control parameters ---
+            self.adjustment_strength = 0.05 # Adjusts window by 5% of total timesteps
+            self.smoothing_factor = 0.9     # For tracking the gradient trend (EMA)
+            self.max_shift_per_step = 50.0  # Hard cap on how fast the window can move
+            
+            # Initialize smoothed_grad_norm in the middle of the target range
+            self.smoothed_grad_norm = (self.target_min_grad + self.target_max_grad) / 2.0
+            self.last_timestep_avg = self.num_train_timesteps / 2.0
+            
+            # --- NEW: State for tracking consecutive spikes ---
+            self.consecutive_spike_count = 0
+            
+            print("INFO: Initialized Trend-Aware Dynamic Sampler.")
+            print(f"      Target Grad Norm Range: [{self.target_min_grad:.3f}, {self.target_max_grad:.3f}]")
+            print(f"      Adjustment Strength: {self.adjustment_strength}, Max Shift: {int(self.max_shift_per_step)}")
+
+    def sample(self, batch_size):
+        """Public method to get a batch of timesteps based on the current strategy."""
+        if "Uniform Continuous" in self.method:
+            t_continuous = torch.rand(batch_size, device=self.device)
+            return (t_continuous * (self.num_train_timesteps - 1)).long()
+        
+        elif "Dynamic" in self.method:
+            min_ts = int(self.current_min_ts)
+            max_ts = int(self.current_max_ts)
+            # Ensure the range is valid
+            if min_ts >= max_ts:
+                min_ts = max(0, max_ts - 1)
+            
+            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device, dtype=torch.long)
+        
+        else: # Default: Random Integer
+            min_ts = self.config.TIMESTEP_SAMPLING_MIN
+            max_ts = self.config.TIMESTEP_SAMPLING_MAX
+            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device, dtype=torch.long)
+            
+    def update(self, raw_grad_norm):
+        """Update the dynamic range based on the raw gradient norm, handling outliers intelligently."""
+        if "Dynamic" not in self.method:
+            return
+
+        # --- 1. Spike Detection ---
+        # Use the raw, unsmoothed gradient for immediate spike detection.
+        is_spike = raw_grad_norm > self.target_max_grad
+        if is_spike:
+            self.consecutive_spike_count += 1
+        else:
+            self.consecutive_spike_count = 0
+            
+        # --- 2. Trend Tracking ---
+        # Use a smoothed signal for general trend direction to avoid overreacting.
+        self.smoothed_grad_norm = (self.smoothing_factor * self.smoothed_grad_norm) + \
+                                  ((1 - self.smoothing_factor) * raw_grad_norm)
+        
+        # --- 3. Core Adjustment Logic ---
+        base_shift = self.adjustment_strength * self.num_train_timesteps
+        shift_direction = 0.0 # -1 for down, 0 for hold, +1 for up
+
+        # Priority 1: Handle instability (consecutive spikes)
+        if self.consecutive_spike_count > 1:
+            # This is a real trend of instability. React decisively.
+            # Shift aggressively towards easier (lower) timesteps.
+            shift_direction = -1.5 # Amplify the downward shift
+        
+        # Priority 2: Handle a single, potential outlier spike
+        elif self.consecutive_spike_count == 1:
+            # Might be a fluke. React cautiously.
+            shift_direction = -0.5 # Dampen the downward shift
+            
+        # Priority 3: Follow the smoothed trend if training is stable
+        else:
+            if self.smoothed_grad_norm < self.target_min_grad:
+                # The trend is "too easy". Shift range UP to find a challenge.
+                shift_direction = 1.0
+            elif self.smoothed_grad_norm > self.target_max_grad:
+                # The trend is "too hard". Shift range DOWN to a more stable zone.
+                shift_direction = -1.0
+        
+        # --- 4. Apply the Shift ---
+        if shift_direction != 0.0:
+            # Calculate the final shift amount, capped by max_shift_per_step
+            final_shift = min(base_shift * abs(shift_direction), self.max_shift_per_step)
+            final_shift *= (shift_direction / abs(shift_direction)) # Re-apply sign
+
+            self.current_min_ts += final_shift
+            self.current_max_ts += final_shift
+
+        # --- 5. Robust Clamping and Validation ---
+        # Ensure window doesn't go out of the global [0, 999] bounds
+        self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
+        self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
+        
+        # Ensure the window has a minimum size to prevent collapsing
+        min_range_size = 50.0
+        current_range_size = self.current_max_ts - self.current_min_ts
+        if current_range_size < min_range_size:
+            center = (self.current_min_ts + self.current_max_ts) / 2.0
+            self.current_min_ts = center - (min_range_size / 2.0)
+            self.current_max_ts = center + (min_range_size / 2.0)
+        
+        # Final sanity checks after all adjustments
+        self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
+        self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
+        if self.current_min_ts >= self.current_max_ts:
+            self.current_min_ts = self.current_max_ts - 1.0
+
+    def record_timesteps(self, timesteps):
+        """Records the timesteps used in a batch for the next dynamic update."""
+        if "Dynamic" in self.method:
+            self.last_timestep_avg = timesteps.float().mean().item()
+
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
     if not batch: return {}
-    return {k: (torch.stack([item[k] for item in batch]) if isinstance(batch[0][k], torch.Tensor) 
+    return {k: (torch.stack([item[k] for item in batch]) if isinstance(batch[0][k], torch.Tensor)
                 else [item[k] for item in batch]) for k in batch[0]}
-
 
 def _generate_hf_to_sd_unet_key_mapping(hf_keys):
     final_map = {}
@@ -786,409 +750,314 @@ def _generate_hf_to_sd_unet_key_mapping(hf_keys):
         if key.startswith("add_embedding.linear_2."): final_map[hf_key] = key.replace("add_embedding.linear_2.", "label_emb.0.2."); continue
     return final_map
 
-
 def rescale_zero_terminal_snr(betas: torch.Tensor) -> torch.Tensor:
-    alphas = 1.0 - betas; alphas_cumprod = torch.cumprod(alphas, dim=0)
+    alphas = 1.0 - betas
+    alphas_cumprod = torch.cumprod(alphas, dim=0)
     alphas_bar_sqrt = torch.sqrt(alphas_cumprod)
-    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone(); alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
+    alphas_bar_sqrt_0 = alphas_bar_sqrt[0].clone()
+    alphas_bar_sqrt_T = alphas_bar_sqrt[-1].clone()
     alphas_bar_sqrt -= alphas_bar_sqrt_T
     alphas_bar_sqrt *= alphas_bar_sqrt_0 / (alphas_bar_sqrt_0 - alphas_bar_sqrt_T)
     alphas_bar = alphas_bar_sqrt ** 2
     alphas = alphas_bar / F.pad(alphas_bar[:-1], (1, 0), value=1.0)
     return 1 - alphas
 
-
 def filter_scheduler_config(config, scheduler_class):
     return {k: v for k, v in config.items() if k in inspect.signature(scheduler_class.__init__).parameters}
-
+# endregion
 
 def create_optimizer(config, params_to_optimize):
-    """Create optimizer based on config settings."""
+    """Creates the optimizer, supporting RavenAdamW with gradient centralization."""
     optimizer_type = config.OPTIMIZER_TYPE.lower()
-    
     if optimizer_type == "raven":
         print("\n--- Initializing Raven Optimizer ---")
-        raven_params = getattr(config, 'RAVEN_PARAMS', default_config.RAVEN_PARAMS)
-        print(f"Raven Parameters: {raven_params}")
         
-        optimizer = RavenAdamW(
+        curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
+        if curve_points:
+            initial_lr = max(point[1] for point in curve_points)
+            print(f"INFO: Initializing optimizer with max LR from custom curve: {initial_lr:.2e}")
+        else:
+            initial_lr = config.LEARNING_RATE 
+            print(f"WARNING: LR_CUSTOM_CURVE is empty. Falling back to default LEARNING_RATE: {initial_lr:.2e}")
+
+        raven_params = getattr(config, 'RAVEN_PARAMS', {})
+        return RavenAdamW(
             params_to_optimize,
-            lr=config.LEARNING_RATE,
+            lr=initial_lr,
             betas=tuple(raven_params.get('betas', [0.9, 0.999])),
             eps=raven_params.get('eps', 1e-8),
             weight_decay=raven_params.get('weight_decay', 0.01),
-            debias_strength=raven_params.get('debias_strength', 1.0)
+            debias_strength=raven_params.get('debias_strength', 1.0),
+            use_grad_centralization=raven_params.get('use_grad_centralization', False),
+            gc_alpha=raven_params.get('gc_alpha', 1.0)
         )
-    
-    elif optimizer_type == "adafactor":
-        print("\n--- Initializing Adafactor Optimizer ---")
-        adafactor_params = getattr(config, 'ADAFACTOR_PARAMS', default_config.ADAFACTOR_PARAMS)
-        print(f"Adafactor Parameters: {adafactor_params}")
-        
-        optimizer = Adafactor(
-            params_to_optimize,
-            lr=config.LEARNING_RATE,
-            eps=tuple(adafactor_params.get('eps', [1e-30, 1e-3])),
-            clip_threshold=adafactor_params.get('clip_threshold', 1.0),
-            decay_rate=adafactor_params.get('decay_rate', -0.8),
-            beta1=adafactor_params.get('beta1', None),
-            weight_decay=adafactor_params.get('weight_decay', 0.01),
-            scale_parameter=adafactor_params.get('scale_parameter', True),
-            relative_step=adafactor_params.get('relative_step', False),
-            warmup_init=adafactor_params.get('warmup_init', False)
-        )
-    
     else:
-        raise ValueError(f"Unknown optimizer type: {optimizer_type}. Use 'raven' or 'adafactor'.")
+        raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'. This script is configured to only use 'raven'.")
+
+def save_model(output_path, unet, base_model_state_dict, key_map, trainable_layer_names):
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    return optimizer
+    print(f"Saving model to: {output_path}")
+    unet.to('cpu')
+    trained_unet_state_dict = unet.state_dict()
+    final_state_dict = base_model_state_dict.copy()
+
+    for hf_key in trainable_layer_names:
+        mapped_key = key_map.get(hf_key)
+        if mapped_key is None: continue
+        sd_key = 'model.diffusion_model.' + mapped_key
+        if sd_key in final_state_dict:
+            final_state_dict[sd_key] = trained_unet_state_dict[hf_key]
+        else:
+            print(f"WARNING: Key '{sd_key}' not found in base model state dict. Skipping.")
+
+    save_file(final_state_dict, output_path)
+    print(f"Successfully saved model: {output_path.name}")
+    unet.to(torch.device("cuda" if torch.cuda.is_available() else "cpu"))
+
+def save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable_layer_names,
+                    optimizer, lr_scheduler, scaler, sampler, config):
+    output_dir = Path(config.OUTPUT_DIR)
+    model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
+    state_filename = f"training_state_step_{global_step}.pt"
+    
+    save_model(output_dir / model_filename, unet, base_model_state_dict, key_map, trainable_layer_names)
+    
+    training_state = {
+        'global_step': global_step,
+        'optimizer_state': optimizer.save_cpu_state(),
+        'scaler_state_dict': scaler.state_dict(),
+        'sampler_seed': sampler.seed,
+    }
+    torch.save(training_state, output_dir / state_filename)
+    print(f"Successfully saved training state: {state_filename}")
 
 
 def main():
     config = TrainingConfig()
     if config.SEED: set_seed(config.SEED)
-        
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
-    CHECKPOINT_DIR = OUTPUT_DIR / "checkpoints"
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    CHECKPOINT_DIR.mkdir(parents=True, exist_ok=True)
-    
-    # Only load models for caching if caching is needed
-    if check_if_caching_needed(config):
-        print("="*60)
-        print("LOADING MODELS FOR CACHING")
-        print("="*60)
+
+    # --- Prepare for Fresh Start or Resume ---
+    global_step = 0
+    model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
+    initial_sampler_seed = config.SEED
+    optimizer_state = None
+    scaler_state_dict = None
+
+    if config.RESUME_TRAINING:
+        print("\n" + "="*50); print("--- RESUMING TRAINING SESSION ---")
+        state_path = Path(config.RESUME_STATE_PATH)
         
-        # Check if we have a dedicated VAE file
-        vae = load_vae_only(config, device)
+        training_state = torch.load(state_path, map_location="cpu", weights_only=False)
+        global_step = training_state['global_step']
+        initial_sampler_seed = training_state['sampler_seed']
+        optimizer_state = training_state['optimizer_state']
+        scaler_state_dict = training_state['scaler_state_dict']
+        model_to_load = Path(config.RESUME_MODEL_PATH)
         
-        if vae is None:
-            # No dedicated VAE, need to load from main checkpoint
-            print("WARNING: No dedicated VAE file. Loading pipeline once to extract text encoders AND VAE...")
-            print(f"Loading pipeline to CPU from: {config.SINGLE_FILE_CHECKPOINT_PATH}")
-            
-            pipe = StableDiffusionXLPipeline.from_single_file(
-                config.SINGLE_FILE_CHECKPOINT_PATH, 
-                torch_dtype=torch.float32,
-                device_map=None  # Keep on CPU
-            )
-            
-            # Extract everything we need
-            tokenizer = pipe.tokenizer
-            tokenizer_2 = pipe.tokenizer_2
-            text_encoder = pipe.text_encoder
-            text_encoder_2 = pipe.text_encoder_2
-            vae = pipe.vae
-            
-            # Move VAE to device
-            print(f"INFO: Moving VAE to {device}...")
-            vae = vae.to(device)
-            
-            # Delete pipeline
-            del pipe
-            gc.collect()
-            
-            print("INFO: Extracted all components from pipeline")
-        else:
-            # We have a dedicated VAE, just load text encoders
-            print("Loading text encoders from main checkpoint...")
-            pipe = StableDiffusionXLPipeline.from_single_file(
-                config.SINGLE_FILE_CHECKPOINT_PATH, 
-                torch_dtype=config.compute_dtype
-            )
-            tokenizer = pipe.tokenizer
-            tokenizer_2 = pipe.tokenizer_2
-            text_encoder = pipe.text_encoder
-            text_encoder_2 = pipe.text_encoder_2
-            
-            del pipe
-            gc.collect()
-            torch.cuda.empty_cache()
-        
-        # Now cache with all the components
-        precompute_and_cache_latents(
-            config, 
-            tokenizer,
-            tokenizer_2,
-            text_encoder,
-            text_encoder_2,
-            vae,
-            device
-        )
-        
-        # Clean up after caching
-        del tokenizer, tokenizer_2, text_encoder, text_encoder_2, vae
-        gc.collect()
-        torch.cuda.empty_cache()
+        print(f"INFO: Resuming from global step: {global_step}")
+        print("="*50 + "\n")
     else:
-        print("\n" + "="*60)
-        print("SKIPPING CACHING - All datasets already cached")
-        print("="*60 + "\n")
+        print("\n" + "="*50); print("--- STARTING FRESH TRAINING SESSION ---"); print("="*50 + "\n")
 
-    model_to_load = Path(config.RESUME_MODEL_PATH) if config.RESUME_TRAINING and Path(config.RESUME_MODEL_PATH).exists() else Path(config.SINGLE_FILE_CHECKPOINT_PATH)
-    print(f"\nLoading UNet for training from: {model_to_load}")
+    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+    
+    # --- Caching (if needed) ---
+    if check_if_caching_needed(config):
+        print("Loading base model components for caching...")
+        base_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=torch.float32, low_cpu_mem_usage=True)
+        vae_for_caching = load_vae_only(config, device) or base_pipe.vae.to(device)
+        precompute_and_cache_latents(config, base_pipe.tokenizer, base_pipe.tokenizer_2, base_pipe.text_encoder, base_pipe.text_encoder_2, vae_for_caching, device)
+        del base_pipe, vae_for_caching; gc.collect(); torch.cuda.empty_cache()
 
-    pipe = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype)
-    original_scheduler_config = pipe.scheduler.config
+    # --- Model and Scheduler Loading ---
+    print(f"\n--- Loading Model ---")
+    print(f"INFO: Loading UNet for training from: {model_to_load.name}")
+    base_model_state_dict = load_file(model_to_load, device="cpu")
+    pipe = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype, low_cpu_mem_usage=True)
     unet = pipe.unet
-    del pipe
-    gc.collect()
-    torch.cuda.empty_cache()
-
-    base_model_state_dict = load_file(model_to_load)
-
-    print("\n--- Using Original Scheduler Config as Base ---")
-    print(f"Original model's scheduler config: {original_scheduler_config}")
-
-    # --- Dynamic Noise Scheduler Selection ---
-    SCHEDULER_MAP = {
-        "DDPMScheduler": DDPMScheduler,
-        "DDIMScheduler": DDIMScheduler,
-        "EulerDiscreteScheduler": EulerDiscreteScheduler,
+    original_scheduler_config = pipe.scheduler.config
+    del pipe; gc.collect(); torch.cuda.empty_cache()
+    
+    print("\n--- Configuring Noise Scheduler ---")
+    SCHEDULER_MAP = {"DDPMScheduler": DDPMScheduler, "DDIMScheduler": DDIMScheduler, "EulerDiscreteScheduler": EulerDiscreteScheduler}
+    scheduler_name = getattr(config, 'NOISE_SCHEDULER', 'DDPMScheduler').replace(" (Experimental)", "")
+    scheduler_class = SCHEDULER_MAP.get(scheduler_name, DDPMScheduler)
+    
+    training_scheduler_config = {
+        **original_scheduler_config, 
+        'prediction_type': config.PREDICTION_TYPE,
+        'beta_schedule': config.BETA_SCHEDULE
     }
+    noise_scheduler = scheduler_class.from_config(filter_scheduler_config(training_scheduler_config, scheduler_class))
+    print(f"INFO: Training with {type(noise_scheduler).__name__}, prediction type '{noise_scheduler.config.prediction_type}', and beta schedule '{noise_scheduler.config.beta_schedule}'")
 
-    scheduler_name_from_config = getattr(config, 'NOISE_SCHEDULER', 'DDPMScheduler')
-    scheduler_name = scheduler_name_from_config.replace(" (Experimental)", "")
-    scheduler_class = SCHEDULER_MAP.get(scheduler_name)
+    if getattr(config, 'USE_ZERO_TERMINAL_SNR', False):
+        print("INFO: Applying Zero Terminal SNR rescaling to scheduler betas.")
+        new_betas = rescale_zero_terminal_snr(noise_scheduler.betas)
+        noise_scheduler.betas = new_betas
+        noise_scheduler.alphas_cumprod = torch.cumprod(1.0 - new_betas, dim=0)
 
-    if not scheduler_class:
-        raise ValueError(f"Unknown noise scheduler: '{scheduler_name_from_config}'. Available options are: {list(SCHEDULER_MAP.keys())}")
-        
-    training_scheduler_config = original_scheduler_config.copy()
-    training_scheduler_config['prediction_type'] = config.PREDICTION_TYPE
+    # --- Dataset and Dataloader Creation ---
+    print("\n--- Initializing Dataset ---")
+    dataset = ImageTextLatentDataset(config)
+    print(f"INFO: Initializing BucketBatchSampler with seed: {initial_sampler_seed}")
+    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True, drop_last=True)
+    dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
-    valid_scheduler_config = filter_scheduler_config(training_scheduler_config, scheduler_class)
-    noise_scheduler = scheduler_class.from_config(valid_scheduler_config)
-    
-    print(f"INFO: Training with {type(noise_scheduler).__name__} and prediction type '{noise_scheduler.config.prediction_type}'")
-    if "Euler" in scheduler_name:
-        print("WARNING: EulerDiscreteScheduler is experimental for training and may produce unstable results.")
-
-    # Sanity checks for scheduler compatibility
-    if config.PREDICTION_TYPE == 'v_prediction' and not hasattr(noise_scheduler, 'get_velocity'):
-        raise ValueError(f"Scheduler {scheduler_name} does not support 'v_prediction'. Please use 'epsilon' or select a different scheduler (e.g., DDPMScheduler).")
-
-    if config.USE_ZERO_TERMINAL_SNR:
-        print("INFO: Rescaling betas for Zero Terminal SNR.")
-        if hasattr(noise_scheduler, 'betas'):
-            noise_scheduler.betas = rescale_zero_terminal_snr(noise_scheduler.betas)
-            noise_scheduler.alphas = 1.0 - noise_scheduler.betas
-            noise_scheduler.alphas_cumprod = torch.cumprod(noise_scheduler.alphas, dim=0)
-        else:
-            print(f"WARNING: Scheduler {scheduler_name} does not have a 'betas' attribute. Cannot apply Zero Terminal SNR.")
-    
+    # --- UNet and Optimizer Setup ---
+    unet.to(device).enable_gradient_checkpointing()
     unet.enable_xformers_memory_efficient_attention() if config.MEMORY_EFFICIENT_ATTENTION == "xformers" else unet.set_attn_processor(AttnProcessor2_0())
-    unet.to(device)
-    unet.enable_gradient_checkpointing()
     
     print("\n--- UNet Layer Selection Report ---")
-    print(f"Exclusion Keywords: {config.UNET_EXCLUDE_TARGETS}")
+    total_params = sum(p.numel() for p in unet.parameters())
     
-    params_to_optimize = []
-    trainable_layer_names = []
-    frozen_layer_names = []
+    exclusion_keywords = config.UNET_EXCLUDE_TARGETS
+    trainable_layer_names = [name for name, param in unet.named_parameters() if not any(k in name for k in exclusion_keywords)]
     
     for name, param in unet.named_parameters():
-        param.requires_grad = True
-        if any(k in name for k in config.UNET_EXCLUDE_TARGETS):
-            param.requires_grad = False
-            frozen_layer_names.append(name)
-        else:
-            trainable_layer_names.append(name)
-
+        param.requires_grad = (name in trainable_layer_names)
+        
     params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
-    
-    total_params = sum(p.numel() for p in unet.parameters())
-    trainable_params_count = sum(p.numel() for p in params_to_optimize)
-    
-    print(f"Total UNet Parameters: {total_params / 1e6:.2f}M")
-    print(f"Trainable Parameters: {trainable_params_count / 1e6:.2f}M ({trainable_params_count/total_params*100:.2f}%)")
-    
-    print("\nExample Trainable Layers:")
-    for name in trainable_layer_names[:5]: print(f"  + {name}")
-    print("\nExample Frozen Layers:")
-    for name in frozen_layer_names[:5]: print(f"  - {name}")
-    print("---------------------------------")
-    
-    if not params_to_optimize: raise ValueError("No parameters were selected for training. Check exclusion list.")
+    trainable_params = sum(p.numel() for p in params_to_optimize)
+    frozen_params = total_params - trainable_params
+    percentage_trainable = (trainable_params / total_params) * 100 if total_params > 0 else 0
 
+    print(f"  - Exclusion Keywords Used: {exclusion_keywords if exclusion_keywords else 'None'}")
+    print(f"  - Total UNet Parameters: {total_params / 1e6:.3f}M")
+    print(f"  - Trainable Parameters:  {trainable_params / 1e6:.3f}M")
+    print(f"  - Frozen Parameters:     {frozen_params / 1e6:.3f}M")
+    print(f"  - Percentage Being Trained: {percentage_trainable:.2f}%")
+    
+    print(f"GUI_PARAM_INFO::{trainable_params / 1e6:.2f}M ({percentage_trainable:.2f}%) of {total_params / 1e6:.2f}M total")
+    
     optimizer = create_optimizer(config, params_to_optimize)
-
-    lr_custom_curve = getattr(config, 'LR_CUSTOM_CURVE', [[0.0, 0.0], [0.1, config.LEARNING_RATE], [1.0, 0.0]])
-
-    print(f"\n--- Custom LR Scheduler ---")
-    print(f"Curve Points: {lr_custom_curve}")
-    print(f"Max Training Steps: {config.MAX_TRAIN_STEPS}")
-
-    lr_scheduler = CustomCurveLRScheduler(
-        optimizer=optimizer,
-        curve_points=lr_custom_curve,
-        max_train_steps=config.MAX_TRAIN_STEPS
-    )
-    
-    dataset = ImageTextLatentDataset(config)
-    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, config.SEED, shuffle=True, drop_last=True)
-    dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
-    
-    global_step = 0
-    state_path = Path(config.RESUME_STATE_PATH)
-    if config.RESUME_TRAINING and state_path.exists():
-        print(f"Loading optimizer state from {state_path.name}...")
-        state = torch.load(state_path, map_location="cpu")
-        global_step = state['step'] * config.GRADIENT_ACCUMULATION_STEPS
-        optimizer.load_state_dict(state['optimizer_state_dict'])
-        del state
-        gc.collect()
-        print(f"Resumed at step {global_step}")
-
-    is_fp32_model = next(unet.parameters()).dtype == torch.float32
-    use_grad_scaler = is_fp32_model and config.MIXED_PRECISION in ["float16", "fp16"]
+    lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, max_train_steps=config.MAX_TRAIN_STEPS)
+    use_grad_scaler = next(unet.parameters()).dtype == torch.float32 and config.MIXED_PRECISION in ["float16", "fp16"]
     scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
-    if use_grad_scaler:
-        print("INFO: Base model is FP32 and MIXED_PRECISION is 'fp16'. GradScaler is ENABLED.")
+    # --- Restore States if Resuming ---
+    if config.RESUME_TRAINING:
+        print("\n--- Restoring Training States ---")
+        if optimizer_state:
+            optimizer.load_cpu_state(optimizer_state)
+            print("INFO: Optimizer state loaded successfully using custom CPU method.")
+        if scaler_state_dict:
+            scaler.load_state_dict(scaler_state_dict)
+            print("INFO: GradScaler state loaded.")
+        lr_scheduler.step(global_step)
+        print(f"INFO: LR scheduler stepped to {global_step}. Current LR: {lr_scheduler.get_last_lr()[0]:.2e}")
+        print("--- Resume setup complete. Starting training loop. ---")
     else:
-        print(f"INFO: GradScaler is DISABLED. (Reason: Is base model FP32? {is_fp32_model}. Is precision 'fp16'? {config.MIXED_PRECISION in ['float16', 'fp16']})")
+        print("\n--- Fresh start setup complete. Starting training loop. ---")
 
-    is_v_pred = config.PREDICTION_TYPE == "v_prediction"
-    
-    test_param_name = trainable_layer_names[0] if trainable_layer_names else None
-    if not test_param_name: raise ValueError("No trainable layers found to monitor.")
-    test_param = dict(unet.named_parameters())[test_param_name]
-    diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS, test_param_name)
-
-    print("\n" + "="*50)
-    print("NOISE CONFIGURATION")
-    print("="*50)
-    if getattr(config, "USE_NOISE_OFFSET", False):
-        noise_offset_strength = float(getattr(config, "NOISE_OFFSET", 0.1))
-        print(f"Noise Offset: ENABLED (strength: {noise_offset_strength})")
-        
-        if getattr(config, "USE_MULTISCALE_NOISE", False):
-            print(f"Multiscale Noise: ENABLED")
-            print("Mode: Standard Offset + Multiscale Enhancement")
-        else:
-            print("Multiscale Noise: DISABLED")
-            print("Mode: Standard Brightness Offset Only")
-    else:
-        print("Noise Offset: DISABLED")
-        print("Mode: Pure Gaussian Noise (no enhancements)")
-    print("="*50 + "\n")
-
+    # --- Training Loop ---
     unet.train()
-    progress_bar = tqdm(range(global_step, config.MAX_TRAIN_STEPS), desc="Training Steps", initial=global_step, total=config.MAX_TRAIN_STEPS)
+    key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
+    test_param_name = trainable_layer_names[0] if trainable_layer_names else "N/A"
+    diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
+    reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name=test_param_name)
     
+    timestep_sampler = TimestepSampler(config, noise_scheduler, device)
+    print(f"\n--- Using Timestep Sampling Method: {timestep_sampler.method} ---\n")
+
     accumulated_latent_paths = []
+    training_start_time = time.time()
+    global_step_times = deque(maxlen=50)
+    optim_step_times = deque(maxlen=20)
+    last_step_time = time.time()
+    last_optim_step_log_time = time.time()
     done = False
+    
     while not done:
         for batch in dataloader:
-            if global_step >= config.MAX_TRAIN_STEPS: done = True; break
+            if global_step >= config.MAX_TRAIN_STEPS:
+                done = True
+                break
             if not batch: continue
-            
-            if "latent_path" in batch:
-                accumulated_latent_paths.extend(batch["latent_path"])
 
+            if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True)
             pooled = batch["pooled"].to(device, non_blocking=True)
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(device, dtype=embeds.dtype)
+                noise = generate_offset_noise(latents, config)
+                
+                timesteps = timestep_sampler.sample(latents.shape[0])
+                timestep_sampler.record_timesteps(timesteps)
 
-                if getattr(config, "USE_NOISE_OFFSET", False):
-                    noise = generate_offset_noise(latents, config)
-                else:
-                    noise = torch.randn_like(latents)
-
-                timesteps = torch.randint(0, noise_scheduler.config.num_train_timesteps, (latents.shape[0],), device=device).long()
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
-                target = noise_scheduler.get_velocity(latents, noise, timesteps) if is_v_pred else noise
-
+                
+                target = noise
+                if config.PREDICTION_TYPE == "v_prediction":
+                    target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
+                
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
-            
+
             diagnostics.step(loss.item())
             scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 
+            diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                test_param = dict(unet.named_parameters())[test_param_name]
                 before_val = test_param.data.clone()
                 scaler.unscale_(optimizer)
-
-                raw_grad_norm = 0.0
-                for p in params_to_optimize:
-                    if p.grad is not None:
-                        param_norm = p.grad.data.norm(2).item()
-                        raw_grad_norm += param_norm ** 2
-                raw_grad_norm = raw_grad_norm ** 0.5
                 
-                if config.CLIP_GRAD_NORM > 0:
-                    torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
-                    clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM)
-                else:
-                    clipped_grad_norm = raw_grad_norm
-
-                if raw_grad_norm > config.GRAD_SPIKE_THRESHOLD_HIGH or raw_grad_norm < config.GRAD_SPIKE_THRESHOLD_LOW:
-                    tqdm.write("\n" + "="*20 + " GRADIENT ANOMALY DETECTED " + "="*20)
-                    tqdm.write(f"  Step: {global_step + 1}")
-                    tqdm.write(f"  Raw Gradient Norm: {raw_grad_norm:.4f}")
-                    tqdm.write(f"  Clipped Gradient Norm: {clipped_grad_norm:.4f}")
-                    tqdm.write(f"  Thresholds (Low/High): {config.GRAD_SPIKE_THRESHOLD_LOW} / {config.GRAD_SPIKE_THRESHOLD_HIGH}")
-                    tqdm.write("  Images in Accumulated Batch:")
-                    for path in accumulated_latent_paths:
-                        tqdm.write(f"    - {Path(path).stem}")
-                    tqdm.write("="*65 + "\n")
+                raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
                 
-                scaler.step(optimizer)
-                scaler.update()
+                # --- UPDATE SAMPLER WITH THE REAL GRAD NORM ---
+                timestep_sampler.update(raw_grad_norm)
+                
+                if config.CLIP_GRAD_NORM > 0: torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
+                clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
+
+                scaler.step(optimizer); scaler.update()
                 lr_scheduler.step(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
-                after_val = test_param.data.clone()
-                
-                avg_loss = sum(diagnostics.losses) / len(diagnostics.losses) if diagnostics.losses else 0
-                progress_bar.set_postfix(loss=f"{avg_loss:.4f}")
-                
-                diagnostics.report(global_step + 1, optimizer, raw_grad_norm, clipped_grad_norm, before_val, after_val)
-                accumulated_latent_paths.clear()
 
-                current_optim_step = (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS
-                if current_optim_step > 0 and (current_optim_step % config.SAVE_EVERY_N_STEPS == 0):
-                    print(f"\nSaving checkpoint at optimizer step {current_optim_step}...")
-                    state_path = CHECKPOINT_DIR / f"state_step_{current_optim_step}.pt"
-                    torch.save({'step': current_optim_step, 'optimizer_state_dict': optimizer.state_dict()}, state_path)
-                    
-                    model_path = CHECKPOINT_DIR / f"model_step_{current_optim_step}.safetensors"
-                    sd_to_save = base_model_state_dict.copy()
-                    unet_sd = unet.state_dict()
-                    key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
-                    for hf_key in trainable_layer_names:
-                        if (mapped := key_map.get(hf_key)) and (sd_key := 'model.diffusion_model.' + mapped) in sd_to_save:
-                            sd_to_save[sd_key] = unet_sd[hf_key].to(config.compute_dtype)
-                    save_file(sd_to_save, model_path)
-                    del sd_to_save, unet_sd
-                    print(f"Checkpoint saved.")
+                update_delta = torch.abs(test_param.data - before_val).max().item()
+                optim_step_time = time.time() - last_optim_step_log_time; optim_step_times.append(optim_step_time); last_optim_step_log_time = time.time()
+                diag_data_to_log = {
+                    'optim_step': (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS, 'avg_loss': diagnostics.get_average_loss(),
+                    'current_lr': optimizer.param_groups[0]['lr'], 'raw_grad_norm': raw_grad_norm, 'clipped_grad_norm': clipped_grad_norm,
+                    'update_delta': update_delta, 'optim_step_time': optim_step_time, 'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)}
+                reporter.check_and_report_anomaly(global_step + 1, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
+                diagnostics.reset(); accumulated_latent_paths.clear()
+
+            step_duration = time.time() - last_step_time; global_step_times.append(step_duration); last_step_time = time.time()
+            elapsed_time = time.time() - training_start_time
+            eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * (sum(global_step_times) / len(global_step_times))
             
+            timing_data = {
+                'raw_step_time': step_duration, 
+                'elapsed_time': elapsed_time, 
+                'eta': eta_seconds,
+                'loss': loss.item(),
+                'timestep': timesteps[0].item()
+            }
+            
+            reporter.log_step(global_step, timing_data=timing_data, diag_data=diag_data_to_log)
             global_step += 1
-            progress_bar.update(1)
+            
+            if config.SAVE_EVERY_N_STEPS > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0:
+                 print(f"\n--- Saving checkpoint at step {global_step} ---")
+                 save_checkpoint(
+                    global_step, unet, base_model_state_dict, key_map, trainable_layer_names,
+                    optimizer, lr_scheduler, scaler, sampler, config
+                )
 
-    progress_bar.close()
     print("\nTraining complete.")
-
-    final_optim_step = config.MAX_TRAIN_STEPS // config.GRADIENT_ACCUMULATION_STEPS
-    basename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_final"
-    
-    print("Saving final model and state...")
-    torch.save({'step': final_optim_step, 'optimizer_state_dict': optimizer.state_dict()}, OUTPUT_DIR / f"{basename}_state.pt")
-    
-    final_model_path = OUTPUT_DIR / f"{basename}.safetensors"
-    final_sd = base_model_state_dict.copy()
-    unet_sd = unet.state_dict()
-    key_map = _generate_hf_to_sd_unet_key_mapping(list(unet_sd.keys()))
-    for hf_key in trainable_layer_names:
-        if (mapped := key_map.get(hf_key)) and (sd_key := 'model.diffusion_model.' + mapped) in final_sd:
-            final_sd[sd_key] = unet_sd[hf_key].to(config.compute_dtype)
-    save_file(final_sd, final_model_path)
-    print(f"Final model saved to: {final_model_path}")
+    reporter.shutdown()
+    output_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_final.safetensors"
+    save_model(output_path, unet, base_model_state_dict, key_map, trainable_layer_names)
+    print("All tasks complete. Final model saved.")
 
 
 if __name__ == "__main__":

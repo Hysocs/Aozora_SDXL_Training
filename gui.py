@@ -1,9 +1,10 @@
+
 import json
 import os
 import re
 from PyQt6 import QtWidgets, QtCore, QtGui
 import subprocess
-from PyQt6.QtCore import QThread, pyqtSignal
+from PyQt6.QtCore import QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
 import copy
 import sys
 from pathlib import Path
@@ -134,6 +135,7 @@ QSpinBox, QDoubleSpinBox {
     background-color: #1a1926;
     border: 1px solid #4a4668;
     padding: 6px;
+    padding-right: 25px; /* Add space for buttons */
     color: #e0e0e0;
     border-radius: 4px;
 }
@@ -143,29 +145,86 @@ QSpinBox:disabled, QDoubleSpinBox:disabled {
     color: #7a788c;
     border: 1px solid #383552;
 }
+QSpinBox::up-button, QDoubleSpinBox::up-button {
+    subcontrol-origin: border;
+    subcontrol-position: top right;
+    width: 22px; /* Increased width */
+    height: 17px; /* Half of the widget height */
+    background-color: #383552;
+    border-left: 1px solid #4a4668;
+    border-top-right-radius: 3px;
+}
+QSpinBox::down-button, QDoubleSpinBox::down-button {
+    subcontrol-origin: border;
+    subcontrol-position: bottom right;
+    width: 22px; /* Increased width */
+    height: 17px; /* Half of the widget height */
+    background-color: #383552;
+    border-left: 1px solid #4a4668;
+    border-bottom-right-radius: 3px;
+}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {
+    background-color: #4a4668;
+}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {
+    image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMiIgaGVpZ2h0PSIxMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBmaWxsPSIjZTBlMGUwIiBkPSJNNyAxNGw1LTUgNSg1eiIvPjwvc3ZnPg==");
+    width: 12px;
+    height: 12px;
+}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {
+    image: url("data:image/svg+xml;base64,PHN2ZyB4bWxucz0iaHR0cDovL3d3dy53My5vcmcvMjAwMC9zdmciIHdpZHRoPSIxMiIgaGVpZ2h0PSIxMiIgdmlld0JveD0iMCAwIDI0IDI0Ij48cGF0aCBmaWxsPSIjZTBlMGUwIiBkPSJNNyAxMGw1IDUgNS01eiIvPjwvc3ZnPg==");
+    width: 12px;
+    height: 12px;
+}
 QTabWidget::pane { border: 1px solid #4a4668; border-top: none; }
 QTabBar::tab { background: #2c2a3e; border: 1px solid #4a4668; border-bottom: none; border-top-left-radius: 6px; border-top-right-radius: 6px; padding: 10px 20px; color: #e0e0e0; font-weight: bold; min-height: 40px; }
 QTabBar::tab:selected { background: #383552; color: #ffffff; border-bottom: 3px solid #ab97e6; }
 QTabBar::tab:!selected:hover { background: #4a4668; }
 QScrollArea { border: none; }
+QSlider::groove:horizontal {
+    border: 1px solid #4a4668;
+    height: 8px;
+    background: #1a1926;
+    margin: 2px 0;
+    border-radius: 4px;
+}
+QSlider::handle:horizontal {
+    background: #ab97e6;
+    border: 1px solid #ffffff;
+    width: 16px;
+    margin: -4px 0;
+    border-radius: 8px;
+}
+QScrollBar:horizontal {
+    border: none;
+    background: #1a1926;
+    height: 12px;
+    margin: 0px 0px 0px 0px;
+}
+QScrollBar::handle:horizontal {
+    background: #4a4668;
+    min-width: 20px;
+    border-radius: 6px;
+}
+QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {
+    border: none;
+    background: none;
+    width: 0px;
+}
 """
 
-
-
-
 class GraphPanel(QtWidgets.QWidget):
-    """Custom QPainter-based graph panel for plotting data."""
+    """Custom QPainter-based graph panel for plotting data with advanced features."""
     
     def __init__(self, title, y_label, parent=None):
         super().__init__(parent)
         self.title = title
         self.y_label = y_label
-        self.setMinimumHeight(180)
+        self.smoothing_window_size = 15
         
-        # Data storage - list of (x, y, color, label, linewidth) tuples for each line
-        self.lines = []  # Each line: {'data': deque, 'color': QColor, 'label': str, 'linewidth': int}
+        self.lines = []
         
-        # Display settings
         self.padding = {'top': 35, 'bottom': 40, 'left': 70, 'right': 20}
         self.bg_color = QtGui.QColor("#1a1926")
         self.graph_bg_color = QtGui.QColor("#2c2a3e")
@@ -173,123 +232,158 @@ class GraphPanel(QtWidgets.QWidget):
         self.text_color = QtGui.QColor("#e0e0e0")
         self.title_color = QtGui.QColor("#ab97e6")
         
-        # Auto-scaling
-        self.x_min = 0
-        self.x_max = 100
-        self.y_min = 0
-        self.y_max = 1
+        self.x_min, self.x_max = 0, 100
+        self.y_min, self.y_max = 0, 1
         
-        self.setMouseTracking(True)
-        self.tooltip_pos = None
-    
-    def add_line(self, color, label, max_points=500, linewidth=2):
-        """Add a new line to the graph."""
+        # New state variables
+        self.smoothing_level = 0.0  # 0.0 raw, 1.0 smoothed
+        self.fill_enabled = True
+        self.zoom_level = 1.0       # 1.0 is no zoom
+        self.pan_offset = 0         # index offset
+
+    def add_line(self, color, label, max_points=2000, linewidth=2):
         self.lines.append({
             'data': deque(maxlen=max_points),
+            'smoothed_data': deque(maxlen=max_points),
+            'smoothing_window': deque(maxlen=self.smoothing_window_size),
             'color': QtGui.QColor(color),
             'label': label,
             'linewidth': linewidth
         })
         return len(self.lines) - 1
-    
+
     def append_data(self, line_index, x, y):
-        """Append a data point to a specific line."""
         if 0 <= line_index < len(self.lines):
-            self.lines[line_index]['data'].append((x, y))
+            line = self.lines[line_index]
+            line['data'].append((x, y))
+            
+            line['smoothing_window'].append(y)
+            smoothed_y = sum(line['smoothing_window']) / len(line['smoothing_window'])
+            line['smoothed_data'].append((x, smoothed_y))
+            
             self._update_bounds()
-    
+
     def clear_all_data(self):
-        """Clear all data from all lines."""
         for line in self.lines:
             line['data'].clear()
+            line['smoothed_data'].clear()
+            line['smoothing_window'].clear()
+        self.pan_offset = 0
         self._update_bounds()
         self.update()
-    
+
+    def _get_visible_data_slice(self, data_deque):
+        if not data_deque:
+            return []
+        
+        total_points = len(data_deque)
+        visible_points_count = max(2, int(total_points / self.zoom_level))
+        
+        start_index = self.pan_offset
+        end_index = min(start_index + visible_points_count, total_points)
+        
+        return list(data_deque)[start_index:end_index]
+
     def _update_bounds(self):
-        """Update min/max bounds based on current data."""
-        all_x = []
-        all_y = []
-        
+        all_visible_y = []
+        visible_data = []
+
         for line in self.lines:
-            for x, y in line['data']:
-                all_x.append(x)
-                all_y.append(y)
-        
-        if all_x and all_y:
-            self.x_min = min(all_x)
-            self.x_max = max(all_x)
-            self.y_min = min(all_y)
-            self.y_max = max(all_y)
+            visible_raw = self._get_visible_data_slice(line['data'])
+            if visible_raw:
+                visible_data = visible_raw # Use any line for X range
+                for _, y in visible_raw:
+                    all_visible_y.append(y)
+
+        if visible_data:
+            self.x_min = visible_data[0][0]
+            self.x_max = visible_data[-1][0]
             
-            # Add 5% padding to y-axis
-            y_range = self.y_max - self.y_min
-            if y_range == 0:
-                y_range = 1
-            self.y_min -= y_range * 0.05
-            self.y_max += y_range * 0.05
+            if all_visible_y:
+                self.y_min = min(all_visible_y)
+                self.y_max = max(all_visible_y)
+                y_range = self.y_max - self.y_min
+                if y_range == 0: y_range = 1
+                self.y_min -= y_range * 0.05
+                self.y_max += y_range * 0.05
+            else:
+                self.y_min, self.y_max = 0, 1
         else:
-            self.x_min = 0
-            self.x_max = 100
-            self.y_min = 0
-            self.y_max = 1
-    
+            self.x_min, self.x_max = 0, 100
+            self.y_min, self.y_max = 0, 1
+
     def _to_screen_coords(self, x, y):
-        """Convert data coordinates to screen coordinates."""
         graph_width = self.width() - self.padding['left'] - self.padding['right']
         graph_height = self.height() - self.padding['top'] - self.padding['bottom']
         
         x_range = self.x_max - self.x_min
         y_range = self.y_max - self.y_min
         
-        if x_range == 0:
-            x_range = 1
-        if y_range == 0:
-            y_range = 1
+        if x_range == 0: x_range = 1
+        if y_range == 0: y_range = 1
         
         screen_x = self.padding['left'] + ((x - self.x_min) / x_range) * graph_width
         screen_y = self.padding['top'] + graph_height - ((y - self.y_min) / y_range) * graph_height
         
         return QtCore.QPointF(screen_x, screen_y)
-    
+
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         
-        # Fill background
         painter.fillRect(self.rect(), self.bg_color)
         
-        # Draw graph area
         graph_rect = QtCore.QRect(
-            self.padding['left'],
-            self.padding['top'],
+            self.padding['left'], self.padding['top'],
             self.width() - self.padding['left'] - self.padding['right'],
             self.height() - self.padding['top'] - self.padding['bottom']
         )
         painter.fillRect(graph_rect, self.graph_bg_color)
         
-        # Draw grid and labels
         self._draw_grid_and_axes(painter, graph_rect)
-        
-        # Draw title
         self._draw_title(painter)
-        
-        # Draw legend
         self._draw_legend(painter)
-        
-        # Draw data lines
-        self._draw_data_lines(painter)
-    
+        self._draw_data_lines(painter, graph_rect)
+
+    def _draw_data_lines(self, painter, rect):
+        for line in self.lines:
+            visible_raw = self._get_visible_data_slice(line['data'])
+            visible_smoothed = self._get_visible_data_slice(line['smoothed_data'])
+
+            if len(visible_raw) < 2 or len(visible_raw) != len(visible_smoothed):
+                continue
+
+            display_points = []
+            for i in range(len(visible_raw)):
+                raw_x, raw_y = visible_raw[i]
+                _, smoothed_y = visible_smoothed[i]
+                
+                # Interpolate based on smoothing level
+                display_y = raw_y * (1 - self.smoothing_level) + smoothed_y * self.smoothing_level
+                display_points.append(self._to_screen_coords(raw_x, display_y))
+
+            if self.fill_enabled:
+                fill_poly = QtGui.QPolygonF(display_points)
+                fill_poly.append(QtCore.QPointF(display_points[-1].x(), rect.bottom()))
+                fill_poly.append(QtCore.QPointF(display_points[0].x(), rect.bottom()))
+                
+                fill_color = QtGui.QColor(line['color'])
+                fill_color.setAlpha(40) # 40/255 transparency
+                painter.setBrush(fill_color)
+                painter.setPen(QtCore.Qt.PenStyle.NoPen)
+                painter.drawPolygon(fill_poly)
+
+            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
+            painter.drawPolyline(QtGui.QPolygonF(display_points))
+
     def _draw_grid_and_axes(self, painter, rect):
-        """Draw grid lines and axis labels."""
         painter.setPen(QtGui.QPen(self.grid_color, 1))
         
-        # Draw horizontal grid lines
         num_h_lines = 5
         for i in range(num_h_lines):
             y = rect.top() + (i / (num_h_lines - 1)) * rect.height()
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
             
-            # Y-axis labels
             y_val = self.y_max - (i / (num_h_lines - 1)) * (self.y_max - self.y_min)
             label = self._format_number(y_val)
             
@@ -301,13 +395,11 @@ class GraphPanel(QtWidgets.QWidget):
             )
             painter.setPen(QtGui.QPen(self.grid_color, 1))
         
-        # Draw vertical grid lines
         num_v_lines = 6
         for i in range(num_v_lines):
             x = rect.left() + (i / (num_v_lines - 1)) * rect.width()
             painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
             
-            # X-axis labels
             x_val = self.x_min + (i / (num_v_lines - 1)) * (self.x_max - self.x_min)
             label = str(int(x_val))
             
@@ -319,13 +411,11 @@ class GraphPanel(QtWidgets.QWidget):
             )
             painter.setPen(QtGui.QPen(self.grid_color, 1))
         
-        # Draw axis labels
         painter.setPen(self.text_color)
         font = painter.font()
         font.setPointSize(9)
         painter.setFont(font)
         
-        # Y-axis label
         painter.save()
         painter.translate(15, self.height() / 2)
         painter.rotate(-90)
@@ -336,7 +426,6 @@ class GraphPanel(QtWidgets.QWidget):
         )
         painter.restore()
         
-        # X-axis label
         painter.drawText(
             QtCore.QRect(0, self.height() - 20, self.width(), 20),
             QtCore.Qt.AlignmentFlag.AlignCenter,
@@ -344,7 +433,6 @@ class GraphPanel(QtWidgets.QWidget):
         )
     
     def _draw_title(self, painter):
-        """Draw the graph title."""
         painter.setPen(self.title_color)
         font = painter.font()
         font.setPointSize(11)
@@ -358,7 +446,6 @@ class GraphPanel(QtWidgets.QWidget):
         )
     
     def _draw_legend(self, painter):
-        """Draw the legend."""
         if not self.lines:
             return
         
@@ -373,11 +460,9 @@ class GraphPanel(QtWidgets.QWidget):
             if not line['data']:
                 continue
             
-            # Draw colored line with appropriate thickness
             painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
             painter.drawLine(legend_x, legend_y + 5, legend_x + 20, legend_y + 5)
             
-            # Draw label
             painter.setPen(self.text_color)
             painter.drawText(
                 QtCore.QRect(legend_x + 25, legend_y, 80, 15),
@@ -387,29 +472,42 @@ class GraphPanel(QtWidgets.QWidget):
             
             legend_y += 20
     
-    def _draw_data_lines(self, painter):
-        """Draw the actual data lines."""
-        for line in self.lines:
-            if len(line['data']) < 2:
-                continue
-            
-            # Use the line's specified width
-            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
-            
-            points = [self._to_screen_coords(x, y) for x, y in line['data']]
-            
-            # Draw line segments
-            for i in range(len(points) - 1):
-                painter.drawLine(points[i], points[i + 1])
-    
     def _format_number(self, value):
-        """Format number for display."""
         if abs(value) < 0.01 or abs(value) > 10000:
             return f"{value:.1e}"
         elif abs(value) < 1:
             return f"{value:.4f}"
         else:
             return f"{value:.2f}"
+            
+    # --- Public Slots for Control ---
+    def set_smoothing(self, value): # 0-100 from slider
+        self.smoothing_level = value / 100.0
+        self.update()
+
+    def set_fill(self, enabled):
+        self.fill_enabled = enabled
+        self.update()
+
+    def set_zoom(self, value): # 100-1000 from slider
+        self.zoom_level = value / 100.0
+        self._update_bounds()
+        self.update()
+
+    def set_pan(self, value):
+        self.pan_offset = value
+        self._update_bounds()
+        self.update()
+
+    def get_pan_range(self):
+        if not self.lines or not self.lines[0]['data']:
+            return 0, 0, 1
+        
+        total_points = len(self.lines[0]['data'])
+        visible_points_count = max(2, int(total_points / self.zoom_level))
+        
+        max_pan = total_points - visible_points_count
+        return 0, max(0, max_pan), 1
 
 
 class LiveMetricsWidget(QtWidgets.QWidget):
@@ -417,188 +515,225 @@ class LiveMetricsWidget(QtWidgets.QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_points = 500
+        self.max_points = 20000 # Store a lot more data for zooming
         
-        # Performance optimization
         self.pending_update = False
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self._perform_update)
         self.update_interval_ms = 500
         
-        # Pending data buffer
         self.pending_data = []
+        self.graphs = {}
         
         self._setup_ui()
     
+    def _create_graph_with_controls(self, name, title, y_label):
+        container = QtWidgets.QGroupBox(title)
+        container.setStyleSheet("QGroupBox { margin-top: 10px; padding: 5px; } QGroupBox::title { subcontrol-position: top center; }")
+        layout = QtWidgets.QVBoxLayout(container)
+        
+        graph = GraphPanel(title, y_label)
+        self.graphs[name] = {'widget': graph, 'lines': {}}
+        layout.addWidget(graph, 1)
+        
+        controls_layout = QtWidgets.QHBoxLayout()
+        
+        fill_check = QtWidgets.QCheckBox("Fill")
+        fill_check.setChecked(True)
+        fill_check.stateChanged.connect(lambda state, g=graph: g.set_fill(state == QtCore.Qt.CheckState.Checked.value))
+        controls_layout.addWidget(fill_check)
+        
+        controls_layout.addWidget(QtWidgets.QLabel("Raw ↔ Smooth"))
+        smoothing_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        smoothing_slider.setRange(0, 100)
+        smoothing_slider.setValue(0)
+        smoothing_slider.valueChanged.connect(graph.set_smoothing)
+        controls_layout.addWidget(smoothing_slider, 1)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Zoom"))
+        zoom_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        zoom_slider.setRange(100, 1000) # Represents 1.0x to 10.0x
+        zoom_slider.setValue(100)
+        
+        controls_layout.addWidget(zoom_slider, 1)
+        layout.addLayout(controls_layout)
+        
+        pan_scrollbar = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Horizontal)
+        pan_scrollbar.setVisible(False)
+        pan_scrollbar.valueChanged.connect(graph.set_pan)
+        layout.addWidget(pan_scrollbar)
+
+        zoom_slider.valueChanged.connect(
+            lambda val, g=graph, sb=pan_scrollbar: self._update_pan_scrollbar(g, sb, val)
+        )
+        self.graphs[name]['scrollbar'] = pan_scrollbar
+        self.graphs[name]['zoom_slider'] = zoom_slider
+
+        return container
+
+    def _update_pan_scrollbar(self, graph, scrollbar, zoom_value):
+        graph.set_zoom(zoom_value)
+        min_pan, max_pan, step = graph.get_pan_range()
+        
+        scrollbar.blockSignals(True)
+        scrollbar.setRange(min_pan, max_pan)
+        scrollbar.setPageStep(step)
+        
+        # Adjust current pan if out of new bounds
+        if scrollbar.value() > max_pan:
+            scrollbar.setValue(max_pan)
+        
+        scrollbar.blockSignals(False)
+        
+        scrollbar.setVisible(zoom_value > 100)
+        graph.set_pan(scrollbar.value()) # Re-apply pan to redraw
+
+    def _add_line_to_graph(self, graph_name, line_name, color, linewidth=2):
+        graph_widget = self.graphs[graph_name]['widget']
+        line_idx = graph_widget.add_line(color, line_name, self.max_points, linewidth)
+        self.graphs[graph_name]['lines'][line_name] = line_idx
+
     def _setup_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(10, 10, 10, 10)
+        main_layout = QtWidgets.QVBoxLayout(self)
+        main_layout.setContentsMargins(10, 10, 10, 10)
         
-        # Control buttons
         control_layout = QtWidgets.QHBoxLayout()
-        
         self.clear_button = QtWidgets.QPushButton("Clear Data")
         self.clear_button.clicked.connect(self.clear_data)
         control_layout.addWidget(self.clear_button)
-        
         self.pause_button = QtWidgets.QPushButton("Pause Updates")
         self.pause_button.setCheckable(True)
         self.pause_button.toggled.connect(self._on_pause_toggled)
         control_layout.addWidget(self.pause_button)
-        
         control_layout.addWidget(QtWidgets.QLabel("Update Speed:"))
         self.speed_combo = QtWidgets.QComboBox()
         self.speed_combo.addItems(["Fast (100ms)", "Normal (500ms)", "Slow (1000ms)", "Very Slow (2000ms)"])
         self.speed_combo.setCurrentIndex(1)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
         control_layout.addWidget(self.speed_combo)
-        
         control_layout.addStretch()
-        
         self.stats_label = QtWidgets.QLabel("No data yet")
         self.stats_label.setStyleSheet("color: #ab97e6; font-weight: bold;")
         control_layout.addWidget(self.stats_label)
+        main_layout.addLayout(control_layout)
         
-        layout.addLayout(control_layout)
+        grid_layout = QtWidgets.QGridLayout()
+        grid_layout.setSpacing(10)
+
+        grid_layout.addWidget(self._create_graph_with_controls("step_loss", "Per-Step Loss", "Loss"), 0, 0)
+        grid_layout.addWidget(self._create_graph_with_controls("timestep", "Timestep", "Value"), 0, 1)
+        grid_layout.addWidget(self._create_graph_with_controls("optim_loss", "Optimizer Loss (Avg)", "Loss"), 1, 0)
+        grid_layout.addWidget(self._create_graph_with_controls("lr", "Learning Rate", "LR"), 1, 1)
+        grid_layout.addWidget(self._create_graph_with_controls("grad_norm", "Gradient Norms", "Norm"), 2, 0, 1, 2)
         
-        # Create graph panels
-        self.lr_graph = GraphPanel("Learning Rate", "Learning Rate")
-        self.lr_line_idx = self.lr_graph.add_line("#6a48d7", "LR", self.max_points)
-        layout.addWidget(self.lr_graph, 1)
+        self._add_line_to_graph("step_loss", "Step Loss", "#4CAF50")
+        self._add_line_to_graph("timestep", "Timestep", "#2196F3")
+        self._add_line_to_graph("optim_loss", "Avg Loss", "#ab97e6")
+        self._add_line_to_graph("lr", "LR", "#6a48d7")
+        self._add_line_to_graph("grad_norm", "Raw", "#e53935", linewidth=3)
+        self._add_line_to_graph("grad_norm", "Clipped", "#ffdd57", linewidth=2)
 
-        self.grad_graph = GraphPanel("Gradient Norms", "Gradient Norm")
-        self.grad_raw_idx = self.grad_graph.add_line("#e53935", "Raw", self.max_points, linewidth=4)
-        self.grad_clipped_idx = self.grad_graph.add_line("#ffdd57", "Clipped", self.max_points, linewidth=2)
-        layout.addWidget(self.grad_graph, 1)
-
-        self.loss_graph = GraphPanel("Training Loss", "Loss")
-        self.loss_line_idx = self.loss_graph.add_line("#ab97e6", "Loss", self.max_points)
-        layout.addWidget(self.loss_graph, 1)
+        main_layout.addLayout(grid_layout)
         
-        # Store latest values for stats
-        self.latest_step = 0
-        self.latest_lr = 0.0
-        self.latest_loss = 0.0
-        self.latest_grad = 0.0
-
-
+        # Init latest values
+        self.latest_global_step, self.latest_optim_step, self.latest_lr = 0, 0, 0.0
+        self.latest_step_loss, self.latest_optim_loss, self.latest_grad = 0.0, 0.0, 0.0
+        self.latest_timestep = 0
 
     def _on_pause_toggled(self, checked):
-        """Handle pause button toggle."""
-        if checked:
-            self.update_timer.stop()
-        else:
-            if self.pending_update:
-                self.update_timer.start(self.update_interval_ms)
+        if checked: self.update_timer.stop()
+        elif self.pending_update: self.update_timer.start(self.update_interval_ms)
     
     def _on_speed_changed(self, index):
-        """Update the refresh interval based on speed selection."""
         speeds = [100, 500, 1000, 2000]
         self.update_interval_ms = speeds[index]
         if self.update_timer.isActive():
             self.update_timer.stop()
             self.update_timer.start(self.update_interval_ms)
-    
+
     def parse_and_update(self, text):
-        """Parse console output and extract metrics. Batches updates for performance."""
-        if self.pause_button.isChecked():
-            return
+        if self.pause_button.isChecked(): return
         
         data_added = False
-        
-        # Parse step report format:
-        # --- Step: {step} | Loss: {loss} | LR: {lr} ---
-        step_match = re.search(r'--- Step:\s*(\d+)\s*\|\s*Loss:\s*([\d.]+)\s*\|\s*LR:\s*([\d.e+-]+)\s*---', text)
+        progress_match = re.search(r'Training\s*\|.*\|\s*(\d+)/(\d+)\s*\[.*?\]\s*\[Loss:\s*([\d.e+-]+),\s*Timestep:\s*(\d+)\]', text)
+        if progress_match:
+            step, loss, timestep = int(progress_match.group(1)) - 1, float(progress_match.group(3)), int(progress_match.group(4))
+            self.pending_data.append(('progress_step', step, loss, timestep))
+            self.latest_global_step, self.latest_step_loss, self.latest_timestep = step, loss, timestep
+            data_added = True
+
+        step_match = re.search(r'--- Optimizer Step:\s*(\d+)\s*\|\s*Loss:\s*([\d.e+-]+)\s*\|\s*LR:\s*([\d.e+-]+)\s*---', text)
         if step_match:
-            step = int(step_match.group(1))
-            loss = float(step_match.group(2))
-            lr = float(step_match.group(3))
-            
-            self.pending_data.append(('step', step, loss, lr))
-            self.latest_step = step
-            self.latest_lr = lr
-            self.latest_loss = loss
+            step, avg_loss, lr = int(step_match.group(1)), float(step_match.group(2)), float(step_match.group(3))
+            self.pending_data.append(('optim_step', step, avg_loss, lr))
+            self.latest_optim_step, self.latest_lr, self.latest_optim_loss = step, lr, avg_loss
             data_added = True
         
-        # Parse gradient norm format:
-        # Grad Norm (Raw/Clipped): {raw} / {clipped}
         grad_match = re.search(r'Grad Norm \(Raw/Clipped\):\s*([\d.]+)\s*/\s*([\d.]+)', text)
         if grad_match:
-            raw_norm = float(grad_match.group(1))
-            clipped_norm = float(grad_match.group(2))
-            
+            raw_norm, clipped_norm = float(grad_match.group(1)), float(grad_match.group(2))
             self.pending_data.append(('grad', raw_norm, clipped_norm))
             self.latest_grad = raw_norm
             data_added = True
         
         if data_added:
             self.pending_update = True
-            # Start timer if not already running
             if not self.update_timer.isActive() and not self.pause_button.isChecked():
                 self.update_timer.start(self.update_interval_ms)
     
     def _perform_update(self):
-        """Actually perform the plot update. Called by timer."""
         if not self.pending_update or not self.pending_data:
             self.update_timer.stop()
             return
         
-        # Process all pending data
-        last_step = None
+        last_optim_step = self.latest_optim_step
         for data in self.pending_data:
-            if data[0] == 'step':
-                _, step, loss, lr = data
-                last_step = step
-                self.lr_graph.append_data(self.lr_line_idx, step, lr)
-                self.loss_graph.append_data(self.loss_line_idx, step, loss)
-            elif data[0] == 'grad' and last_step is not None:
+            if data[0] == 'progress_step':
+                _, step, loss, timestep = data
+                self.graphs['step_loss']['widget'].append_data(self.graphs['step_loss']['lines']['Step Loss'], step, loss)
+                self.graphs['timestep']['widget'].append_data(self.graphs['timestep']['lines']['Timestep'], step, timestep)
+            elif data[0] == 'optim_step':
+                _, step, avg_loss, lr = data
+                last_optim_step = step
+                self.graphs['optim_loss']['widget'].append_data(self.graphs['optim_loss']['lines']['Avg Loss'], step, avg_loss)
+                self.graphs['lr']['widget'].append_data(self.graphs['lr']['lines']['LR'], step, lr)
+            elif data[0] == 'grad' and last_optim_step is not None:
                 _, raw_norm, clipped_norm = data
-                self.grad_graph.append_data(self.grad_raw_idx, last_step, raw_norm)
-                self.grad_graph.append_data(self.grad_clipped_idx, last_step, clipped_norm)
+                self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Raw'], last_optim_step, raw_norm)
+                self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Clipped'], last_optim_step, clipped_norm)
         
-        # Clear pending data
         self.pending_data.clear()
         
-        # Update stats label
-        self.stats_label.setText(
-            f"Latest - Step: {self.latest_step} | LR: {self.latest_lr:.2e} | "
-            f"Loss: {self.latest_loss:.4f} | Grad: {self.latest_grad:.4f}"
-        )
+        stats_text = (f"Step: {self.latest_global_step} | Step Loss: {self.latest_step_loss:.4f} | Timestep: {self.latest_timestep} | "
+                      f"Avg Loss: {self.latest_optim_loss:.4f} | LR: {self.latest_lr:.2e} | Grad: {self.latest_grad:.4f}")
+        self.stats_label.setText(stats_text)
         
-        # Trigger repaints
-        self.lr_graph.update()
-        self.grad_graph.update()
-        self.loss_graph.update()
+        for name, graph_data in self.graphs.items():
+            self._update_pan_scrollbar(graph_data['widget'], graph_data['scrollbar'], graph_data['zoom_slider'].value())
+            # No need to call update() explicitly, set_pan does it
         
         self.pending_update = False
     
     def clear_data(self):
-        """Clear all stored data and reset plots."""
         self.update_timer.stop()
         self.pending_update = False
         self.pending_data.clear()
         
-        # Clear all graphs
-        self.lr_graph.clear_all_data()
-        self.grad_graph.clear_all_data()
-        self.loss_graph.clear_all_data()
-        
-        # Reset stats
-        self.latest_step = 0
-        self.latest_lr = 0.0
-        self.latest_loss = 0.0
-        self.latest_grad = 0.0
-        
+        for name, graph_data in self.graphs.items():
+            graph_data['widget'].clear_all_data()
+            self._update_pan_scrollbar(graph_data['widget'], graph_data['scrollbar'], graph_data['zoom_slider'].value())
+
+        self.latest_global_step, self.latest_optim_step, self.latest_lr = 0, 0, 0.0
+        self.latest_step_loss, self.latest_optim_loss, self.latest_grad = 0.0, 0.0, 0.0
+        self.latest_timestep = 0
         self.stats_label.setText("No data yet")
     
     def showEvent(self, event):
-        """Resume updates when tab becomes visible."""
         super().showEvent(event)
         if self.pending_update and not self.pause_button.isChecked():
             self.update_timer.start(self.update_interval_ms)
     
     def hideEvent(self, event):
-        """Pause updates when tab is hidden to save CPU."""
         super().hideEvent(event)
         self.update_timer.stop()
 
@@ -918,7 +1053,7 @@ class ProcessRunner(QThread):
     finishedSignal = pyqtSignal(int)
     errorSignal = pyqtSignal(str)
     metricsSignal = pyqtSignal(str)
-    cacheCreatedSignal = pyqtSignal()  # NEW: Signal for cache creation
+    cacheCreatedSignal = pyqtSignal()
     
     def __init__(self, executable, args, working_dir, env=None, creation_flags=0):
         super().__init__()
@@ -958,10 +1093,8 @@ class ProcessRunner(QThread):
                     else:
                         self.progressSignal.emit(line.split('\r')[-1], is_progress)
                     
-                    # Emit for metrics parsing
                     self.metricsSignal.emit(line)
                     
-                    # NEW: Detect cache creation
                     if "saved latents cache" in line.lower() or "caching complete" in line.lower():
                         self.cacheCreatedSignal.emit()
             
@@ -990,11 +1123,10 @@ class TrainingGUI(QtWidgets.QWidget):
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QSpinBox", "range": (0, 16)},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
         "SHOULD_UPSCALE": {"label": "Upscale Images", "tooltip": "If enabled, upscale small images closer to bucket limit while maintaining aspect ratio.", "widget": "QCheckBox"},
-        "MAX_AREA_Tolerance": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
+        "MAX_AREA_TOLERANCE": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
         "PREDICTION_TYPE": {"label": "Prediction Type:", "tooltip": "v_prediction or epsilon. Must match the base model.", "widget": "QComboBox", "options": ["v_prediction", "epsilon"]},
         "BETA_SCHEDULE": {"label": "Beta Schedule:", "tooltip": "Noise schedule for the diffuser.", "widget": "QComboBox", "options": ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
-        "LEARNING_RATE": {"label": "Base Learning Rate:", "tooltip": "The base learning rate (not used if custom curve is active, kept for future reference).", "widget": "QLineEdit"},
         "BATCH_SIZE": {"label": "Batch Size:", "tooltip": "Number of samples per batch.", "widget": "QSpinBox", "range": (1, 32)},
         "SAVE_EVERY_N_STEPS": {"label": "Save Every N Steps:", "tooltip": "How often to save a checkpoint.", "widget": "QLineEdit"},
         "GRADIENT_ACCUMULATION_STEPS": {"label": "Gradient Accumulation:", "tooltip": "Simulates a larger batch size.", "widget": "QLineEdit"},
@@ -1020,7 +1152,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.setObjectName("TrainingGUI")
         self.setWindowTitle("AOZORA SDXL Trainer (Simplified)")
         self.setMinimumSize(QtCore.QSize(1000, 800))
-        self.resize(1350, 1000)
+        self.resize(1500, 1000)
         self.config_dir = "configs"
         self.widgets = {}
         self.process_runner = None
@@ -1028,6 +1160,8 @@ class TrainingGUI(QtWidgets.QWidget):
         self.last_line_is_progress = False
         self.default_config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
         self.presets = {}
+        self.optimizer_steps_label = None
+        self.epochs_label = None
         self._initialize_configs()
         self._setup_ui()
         if self.config_dropdown.count() > 0:
@@ -1100,7 +1234,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.tab_view.addTab(console_tab_widget, "Training Console")
         self.main_layout.addWidget(self.tab_view)
         self._setup_corner_widget()
-        self._setup_action_buttons()
+        self._setup_bottom_bar()
     
     def _setup_corner_widget(self):
         corner_hbox = QtWidgets.QHBoxLayout()
@@ -1130,19 +1264,66 @@ class TrainingGUI(QtWidgets.QWidget):
         corner_widget.setLayout(corner_hbox)
         self.tab_view.setCornerWidget(corner_widget, QtCore.Qt.Corner.TopRightCorner)
     
-    def _setup_action_buttons(self):
-        button_layout = QtWidgets.QHBoxLayout()
-        button_layout.addStretch()
+
+    def _setup_bottom_bar(self):
+        bottom_layout = QtWidgets.QHBoxLayout()
+        bottom_layout.setContentsMargins(0, 5, 5, 5)
+
+        calc_group = QtWidgets.QGroupBox() 
+        
+        calc_group.setStyleSheet("""
+            QGroupBox {
+                margin-top: 0px;
+                border: 1px solid #4a4668;
+                border-radius: 6px;
+                padding: 0px 8px; /* Remove top/bottom padding, keep side padding */
+            }
+        """)
+
+
+        calc_layout = QtWidgets.QHBoxLayout(calc_group)
+        calc_layout.setContentsMargins(0, 0, 0, 0) 
+        calc_layout.setSpacing(10)
+
+        self.optimizer_steps_label = QtWidgets.QLabel("N/A")
+        self.epochs_label = QtWidgets.QLabel("N/A")
+
+ 
+        label_style = "color: #ab97e6; font-weight: bold; font-size: 14px;"
+        self.optimizer_steps_label.setStyleSheet(label_style)
+        self.epochs_label.setStyleSheet(label_style)
+
+  
+        calc_layout.addWidget(QtWidgets.QLabel("Total Optimizer Steps:"))
+        calc_layout.addWidget(self.optimizer_steps_label)
+
+
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)
+        separator.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
+        calc_layout.addWidget(separator)
+
+        calc_layout.addWidget(QtWidgets.QLabel("Total Epochs:"))
+        calc_layout.addWidget(self.epochs_label)
+
+
+        bottom_layout.addWidget(calc_group)
+        bottom_layout.addStretch()
+
+  
         self.start_button = QtWidgets.QPushButton("Start Training")
         self.start_button.setObjectName("StartButton")
         self.start_button.clicked.connect(self.start_training)
+
         self.stop_button = QtWidgets.QPushButton("Stop Training")
         self.stop_button.setObjectName("StopButton")
         self.stop_button.clicked.connect(self.stop_training)
         self.stop_button.setEnabled(False)
-        button_layout.addWidget(self.start_button)
-        button_layout.addWidget(self.stop_button)
-        self.main_layout.addLayout(button_layout)
+
+        bottom_layout.addWidget(self.start_button)
+        bottom_layout.addWidget(self.stop_button)
+
+        self.main_layout.addLayout(bottom_layout)
     
     def load_selected_config(self, index):
         selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
@@ -1159,7 +1340,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _prepare_config_to_save(self):
         config_to_save = {}
         for key in self.default_config.keys():
-            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "ADAFACTOR_PARAMS"]:
+            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS"]:
                 continue
             
             live_val = self.current_config.get(key)
@@ -1194,8 +1375,14 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
-
-        # Save Raven params
+        
+        ts_method = self.widgets["TIMESTEP_SAMPLING_METHOD"].currentText()
+        config_to_save["TIMESTEP_SAMPLING_METHOD"] = ts_method
+        config_to_save["TIMESTEP_SAMPLING_MIN"] = self.widgets["TIMESTEP_SAMPLING_MIN"].value()
+        config_to_save["TIMESTEP_SAMPLING_MAX"] = self.widgets["TIMESTEP_SAMPLING_MAX"].value()
+        config_to_save["TIMESTEP_SAMPLING_GRAD_MIN"] = self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].value()
+        config_to_save["TIMESTEP_SAMPLING_GRAD_MAX"] = self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].value()
+        
         raven_params = {}
         try:
             betas_str = self.widgets['RAVEN_betas'].text().strip()
@@ -1212,24 +1399,6 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
         config_to_save["RAVEN_PARAMS"] = raven_params
 
-        # Save Adafactor params
-        adafactor_params = {}
-        try:
-            eps_str = self.widgets['ADAFACTOR_eps'].text().strip()
-            adafactor_params["eps"] = [float(x.strip()) for x in eps_str.split(',')]
-        except (ValueError, IndexError):
-            adafactor_params["eps"] = default_config.ADAFACTOR_PARAMS["eps"]
-        adafactor_params["clip_threshold"] = self.widgets['ADAFACTOR_clip_threshold'].value()
-        adafactor_params["decay_rate"] = self.widgets['ADAFACTOR_decay_rate'].value()
-        if self.widgets['ADAFACTOR_beta1_enabled'].isChecked():
-            adafactor_params["beta1"] = self.widgets['ADAFACTOR_beta1_value'].value()
-        else:
-            adafactor_params["beta1"] = None
-        adafactor_params["weight_decay"] = self.widgets['ADAFACTOR_weight_decay'].value()
-        adafactor_params["scale_parameter"] = self.widgets['ADAFACTOR_scale_parameter'].isChecked()
-        adafactor_params["relative_step"] = self.widgets['ADAFACTOR_relative_step'].isChecked()
-        adafactor_params["warmup_init"] = self.widgets['ADAFACTOR_warmup_init'].isChecked()
-        config_to_save["ADAFACTOR_PARAMS"] = adafactor_params
 
         return config_to_save
 
@@ -1298,10 +1467,11 @@ class TrainingGUI(QtWidgets.QWidget):
             widget.addItems(definition["options"])
             widget.currentTextChanged.connect(lambda text, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QCheckBox":
-            widget = QtWidgets.QCheckBox()
+            widget = QtWidgets.QCheckBox(definition["label"])
+            widget.setToolTip(definition["tooltip"])
             widget.stateChanged.connect(lambda state, k=key: self._update_config_from_widget(k, widget))
             self.widgets[key] = widget
-            return label, widget
+            return None, widget
         elif widget_type == "Path":
             container = QtWidgets.QWidget()
             hbox = QtWidgets.QHBoxLayout(container); hbox.setContentsMargins(0,0,0,0)
@@ -1314,6 +1484,15 @@ class TrainingGUI(QtWidgets.QWidget):
             return label, container
         self.widgets[key] = widget
         return label, widget
+    
+    def _add_widget_to_form(self, form_layout, key):
+        """Helper to create and add a widget from UI_DEFINITIONS to a QFormLayout."""
+        label, widget = self._create_widget(key)
+        if widget:
+            if label:
+                form_layout.addRow(label, widget)
+            else:
+                form_layout.addRow(widget)
     
     def _populate_dataset_tab(self, parent_widget):
         layout = QtWidgets.QVBoxLayout(parent_widget)
@@ -1333,6 +1512,7 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.addLayout(top_hbox)
         
         self.dataset_manager = DatasetManagerWidget(self)
+        self.dataset_manager.datasetsChanged.connect(self._update_training_calculations)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
         
@@ -1342,73 +1522,99 @@ class TrainingGUI(QtWidgets.QWidget):
             )
     
     def _populate_model_training_tab(self, parent_widget):
-        layout = QtWidgets.QHBoxLayout(parent_widget)
-        layout.setSpacing(20)
-        layout.setContentsMargins(15, 5, 15, 15)
+        main_layout = QtWidgets.QHBoxLayout(parent_widget)
+        main_layout.setSpacing(20)
+        main_layout.setContentsMargins(15, 5, 15, 15)
+
+        # --- Left Column ---
         left_vbox = QtWidgets.QVBoxLayout()
-        right_vbox = QtWidgets.QVBoxLayout()
+        left_vbox.addWidget(self._create_path_group())
+        left_vbox.addWidget(self._create_lr_scheduler_group())
+        # Add a stretch to the bottom to prevent the widgets from expanding vertically
+        left_vbox.addStretch(1)
 
-        path_group = self._create_path_group()
-        left_vbox.addWidget(path_group)
+        # --- Right Column (Grid of smaller groups) ---
+        right_container = QtWidgets.QWidget()
+        right_grid = QtWidgets.QGridLayout(right_container)
+        right_grid.setSpacing(20)
 
-        core_group = self._create_core_training_group()
-        left_vbox.addWidget(core_group)
+        right_grid.addWidget(self._create_core_training_group(), 0, 0)
+        right_grid.addWidget(self._create_optimizer_group(), 0, 1)
 
-        optimizer_group = self._create_optimizer_group()
-        left_vbox.addWidget(optimizer_group)
-        left_vbox.addStretch()
+        right_grid.addWidget(self._create_scheduler_config_group(), 1, 0)
+        right_grid.addWidget(self._create_timestep_sampling_group(), 1, 1)
 
-        lr_group = self._create_lr_scheduler_group()
-        right_vbox.addWidget(lr_group)
+        right_grid.addWidget(self._create_noise_enhancements_group(), 2, 0)
+        right_grid.addWidget(self._create_unet_group(), 2, 1)
+        
+        right_grid.addWidget(self._create_advanced_group(), 3, 0, 1, 2)
 
-        unet_group = self._create_unet_group()
-        right_vbox.addWidget(unet_group)
+        # Add a spacer to the bottom of the right grid to push content up
+        spacer = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding)
+        right_grid.addItem(spacer, 4, 0, 1, 2)
 
-        advanced_group = self._create_advanced_group()
-        right_vbox.addWidget(advanced_group)
+        right_grid.setColumnStretch(0, 1)
+        right_grid.setColumnStretch(1, 1)
 
-        right_vbox.addStretch()
+        # Adjust main layout stretch factors. Give more space to the right column
+        # which is dense with form widgets, for a more balanced layout.
+        main_layout.addLayout(left_vbox, 2) 
+        main_layout.addWidget(right_container, 3)
 
-        layout.addLayout(left_vbox, 1)
-        layout.addLayout(right_vbox, 1)
-
+        # Connect signals
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
+        self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
+        self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_training_calculations)
+        self.widgets["BATCH_SIZE"].valueChanged.connect(self._update_training_calculations)
+
         self._update_lr_button_states(-1)
 
     def _create_form_group(self, title, keys):
         group = QtWidgets.QGroupBox(title)
         layout = QtWidgets.QFormLayout(group)
         for key in keys:
-            label, widget = self._create_widget(key)
-            if label and widget:
-                layout.addRow(label, widget)
+            self._add_widget_to_form(layout, key)
         return group
     
     def _create_path_group(self):
         path_group = QtWidgets.QGroupBox("File & Directory Paths")
-        path_layout = QtWidgets.QFormLayout(path_group)
+        path_layout = QtWidgets.QVBoxLayout(path_group)
+        
+        # Top part with mode selector
+        form_layout = QtWidgets.QFormLayout()
         self.model_load_strategy_combo = QtWidgets.QComboBox()
         self.model_load_strategy_combo.addItems(["Load Base Model", "Resume from Checkpoint"])
-        path_layout.addRow("Mode:", self.model_load_strategy_combo)
-        self.base_model_sub_widget = QtWidgets.QWidget()
-        base_layout = QtWidgets.QFormLayout(self.base_model_sub_widget)
-        base_layout.setContentsMargins(0,0,0,0)
-        label, widget = self._create_widget("SINGLE_FILE_CHECKPOINT_PATH")
-        base_layout.addRow(label, widget)
-        label, widget = self._create_widget("VAE_PATH")
-        base_layout.addRow(label, widget)
-        path_layout.addRow(self.base_model_sub_widget)
-        self.resume_sub_widget = QtWidgets.QWidget()
-        resume_layout = QtWidgets.QFormLayout(self.resume_sub_widget)
-        resume_layout.setContentsMargins(0,0,0,0)
-        label, widget = self._create_widget("RESUME_MODEL_PATH")
-        resume_layout.addRow(label, widget)
-        label, widget = self._create_widget("RESUME_STATE_PATH")
-        resume_layout.addRow(label, widget)
-        path_layout.addRow(self.resume_sub_widget)
-        label, widget = self._create_widget("OUTPUT_DIR")
-        path_layout.addRow(label, widget)
+        form_layout.addRow("Mode:", self.model_load_strategy_combo)
+        path_layout.addLayout(form_layout)
+
+        # Stacked widget for swapping between modes
+        self.path_stacked_widget = QtWidgets.QStackedWidget()
+        
+        # Page 0: Base Model
+        base_model_widget = QtWidgets.QWidget()
+        base_layout = QtWidgets.QFormLayout(base_model_widget)
+        base_layout.setContentsMargins(0, 5, 0, 0)
+        self._add_widget_to_form(base_layout, "SINGLE_FILE_CHECKPOINT_PATH")
+        self._add_widget_to_form(base_layout, "VAE_PATH")
+        self.path_stacked_widget.addWidget(base_model_widget)
+
+        # Page 1: Resume
+        resume_widget = QtWidgets.QWidget()
+        resume_layout = QtWidgets.QFormLayout(resume_widget)
+        resume_layout.setContentsMargins(0, 5, 0, 0)
+        self._add_widget_to_form(resume_layout, "RESUME_MODEL_PATH")
+        self._add_widget_to_form(resume_layout, "RESUME_STATE_PATH")
+        self.path_stacked_widget.addWidget(resume_widget)
+        
+        path_layout.addWidget(self.path_stacked_widget)
+        
+        # Bottom part for output dir
+        output_form_layout = QtWidgets.QFormLayout()
+        output_form_layout.setContentsMargins(0, 5, 0, 0)
+        self._add_widget_to_form(output_form_layout, "OUTPUT_DIR")
+        path_layout.addLayout(output_form_layout)
+
         self.model_load_strategy_combo.currentIndexChanged.connect(self.toggle_resume_widgets)
         return path_group
     
@@ -1416,20 +1622,11 @@ class TrainingGUI(QtWidgets.QWidget):
         core_group = QtWidgets.QGroupBox("Core Training Parameters")
         layout = QtWidgets.QFormLayout(core_group)
         core_keys = [
-            "PREDICTION_TYPE", 
-            "BETA_SCHEDULE", 
-            "MAX_TRAIN_STEPS",
-            "LEARNING_RATE",
-            "BATCH_SIZE",
-            "SAVE_EVERY_N_STEPS", 
-            "GRADIENT_ACCUMULATION_STEPS",
-            "CLIP_GRAD_NORM",
-            "MIXED_PRECISION", 
-            "SEED"
+            "MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS",
+            "SAVE_EVERY_N_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"
         ]
         for key in core_keys:
-            label, widget = self._create_widget(key)
-            layout.addRow(label, widget)
+            self._add_widget_to_form(layout, key)
         return core_group
 
     def _create_optimizer_group(self):
@@ -1440,7 +1637,7 @@ class TrainingGUI(QtWidgets.QWidget):
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
         
         self.widgets["OPTIMIZER_TYPE"] = QtWidgets.QComboBox()
-        self.widgets["OPTIMIZER_TYPE"].addItems(["Raven", "Adafactor"])
+        self.widgets["OPTIMIZER_TYPE"].addItems(["Raven"])
         self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
         main_layout.addLayout(selector_layout)
@@ -1451,28 +1648,20 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0)
-        self.widgets['RAVEN_weight_decay'].setSingleStep(0.001)
-        self.widgets['RAVEN_weight_decay'].setDecimals(3)
+        self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
 
         self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0)
-        self.widgets['RAVEN_debias_strength'].setSingleStep(0.01)
-        self.widgets['RAVEN_debias_strength'].setDecimals(3)
+        self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
         self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
         
         self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
         self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
         
         self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0)
-        self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1)
-        self.widgets['RAVEN_gc_alpha'].setDecimals(1)
+        self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
         self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
         
-        self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(
-            lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state))
-        )
+        self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state)))
         
         raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
         raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
@@ -1482,62 +1671,12 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_layout.addRow("GC Alpha:", self.widgets['RAVEN_gc_alpha'])
         
         main_layout.addWidget(self.raven_settings_group)
-        
-        self.adafactor_settings_group = QtWidgets.QGroupBox("Adafactor Settings")
-        adafactor_layout = QtWidgets.QFormLayout(self.adafactor_settings_group)
-        
-        self.widgets['ADAFACTOR_eps'] = QtWidgets.QLineEdit()
-        self.widgets['ADAFACTOR_clip_threshold'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['ADAFACTOR_clip_threshold'].setRange(0.1, 10.0)
-        self.widgets['ADAFACTOR_clip_threshold'].setSingleStep(0.1)
-        self.widgets['ADAFACTOR_clip_threshold'].setDecimals(2)
-        
-        self.widgets['ADAFACTOR_decay_rate'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['ADAFACTOR_decay_rate'].setRange(-1.0, 0.0)
-        self.widgets['ADAFACTOR_decay_rate'].setSingleStep(0.01)
-        self.widgets['ADAFACTOR_decay_rate'].setDecimals(3)
-        
-        beta1_widget = QtWidgets.QWidget()
-        beta1_layout = QtWidgets.QHBoxLayout(beta1_widget)
-        beta1_layout.setContentsMargins(0,0,0,0)
-        self.widgets['ADAFACTOR_beta1_enabled'] = QtWidgets.QCheckBox("Enable")
-        self.widgets['ADAFACTOR_beta1_value'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['ADAFACTOR_beta1_value'].setRange(0.0, 1.0)
-        self.widgets['ADAFACTOR_beta1_value'].setSingleStep(0.01)
-        self.widgets['ADAFACTOR_beta1_value'].setDecimals(3)
-        beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_enabled'])
-        beta1_layout.addWidget(self.widgets['ADAFACTOR_beta1_value'], 1)
-        self.widgets['ADAFACTOR_beta1_enabled'].stateChanged.connect(
-            lambda state: self.widgets['ADAFACTOR_beta1_value'].setEnabled(bool(state))
-        )
-
-        self.widgets['ADAFACTOR_weight_decay'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['ADAFACTOR_weight_decay'].setRange(0.0, 1.0)
-        self.widgets['ADAFACTOR_weight_decay'].setSingleStep(0.001)
-        self.widgets['ADAFACTOR_weight_decay'].setDecimals(3)
-        
-        self.widgets['ADAFACTOR_scale_parameter'] = QtWidgets.QCheckBox("Scale Parameter")
-        self.widgets['ADAFACTOR_relative_step'] = QtWidgets.QCheckBox("Relative Step")
-        self.widgets['ADAFACTOR_warmup_init'] = QtWidgets.QCheckBox("Warmup Init")
-        
-        adafactor_layout.addRow("Eps (e1, e2):", self.widgets['ADAFACTOR_eps'])
-        adafactor_layout.addRow("Clip Threshold:", self.widgets['ADAFACTOR_clip_threshold'])
-        adafactor_layout.addRow("Decay Rate:", self.widgets['ADAFACTOR_decay_rate'])
-        adafactor_layout.addRow("Beta1:", beta1_widget)
-        adafactor_layout.addRow("Weight Decay:", self.widgets['ADAFACTOR_weight_decay'])
-        adafactor_layout.addRow(self.widgets['ADAFACTOR_scale_parameter'])
-        adafactor_layout.addRow(self.widgets['ADAFACTOR_relative_step'])
-        adafactor_layout.addRow(self.widgets['ADAFACTOR_warmup_init'])
-        
-        main_layout.addWidget(self.adafactor_settings_group)
-        
         return optimizer_group
     
     def _toggle_optimizer_widgets(self):
         selected_optimizer = self.widgets["OPTIMIZER_TYPE"].currentText()
         is_raven = (selected_optimizer == "Raven")
         self.raven_settings_group.setVisible(is_raven)
-        self.adafactor_settings_group.setVisible(not is_raven)
 
     def _create_lr_scheduler_group(self):
         lr_group = QtWidgets.QGroupBox("Learning Rate Scheduler")
@@ -1545,136 +1684,138 @@ class TrainingGUI(QtWidgets.QWidget):
         
         self.lr_curve_widget = LRCurveWidget()
         self.widgets['LR_CUSTOM_CURVE'] = self.lr_curve_widget
-        self.lr_curve_widget.pointsChanged.connect(
-            lambda pts: self._update_config_from_widget("LR_CUSTOM_CURVE", self.lr_curve_widget)
-        )
+        self.lr_curve_widget.pointsChanged.connect(lambda pts: self._update_config_from_widget("LR_CUSTOM_CURVE", self.lr_curve_widget))
         self.lr_curve_widget.selectionChanged.connect(self._update_lr_button_states)
         lr_layout.addWidget(self.lr_curve_widget)
         
         lr_controls_layout = QtWidgets.QHBoxLayout()
-        self.add_point_btn = QtWidgets.QPushButton("Add Point")
-        self.add_point_btn.clicked.connect(self.lr_curve_widget.add_point)
-        self.remove_point_btn = QtWidgets.QPushButton("Remove Selected")
-        self.remove_point_btn.clicked.connect(self.lr_curve_widget.remove_selected_point)
-        lr_controls_layout.addWidget(self.add_point_btn)
-        lr_controls_layout.addWidget(self.remove_point_btn)
-        lr_controls_layout.addStretch()
+        self.add_point_btn = QtWidgets.QPushButton("Add Point"); self.add_point_btn.clicked.connect(self.lr_curve_widget.add_point)
+        self.remove_point_btn = QtWidgets.QPushButton("Remove Selected"); self.remove_point_btn.clicked.connect(self.lr_curve_widget.remove_selected_point)
+        lr_controls_layout.addWidget(self.add_point_btn); lr_controls_layout.addWidget(self.remove_point_btn); lr_controls_layout.addStretch()
         lr_layout.addLayout(lr_controls_layout)
         
         preset_layout = QtWidgets.QHBoxLayout()
         preset_layout.addWidget(QtWidgets.QLabel("<b>Presets:</b>"))
-        presets = {
-            "Cosine": self.lr_curve_widget.set_cosine_preset,
-            "Linear": self.lr_curve_widget.set_linear_preset,
-            "Constant": self.lr_curve_widget.set_constant_preset,
-            "Step": self.lr_curve_widget.set_step_preset,
-            "Cyclical Dip": self.lr_curve_widget.set_cyclical_dip_preset
-        }
+        presets = {"Cosine": self.lr_curve_widget.set_cosine_preset, "Linear": self.lr_curve_widget.set_linear_preset, "Constant": self.lr_curve_widget.set_constant_preset, "Step": self.lr_curve_widget.set_step_preset, "Cyclical Dip": self.lr_curve_widget.set_cyclical_dip_preset}
         for name, func in presets.items():
-            btn = QtWidgets.QPushButton(name)
-            btn.clicked.connect(func)
-            preset_layout.addWidget(btn)
+            btn = QtWidgets.QPushButton(name); btn.clicked.connect(func); preset_layout.addWidget(btn)
         preset_layout.addStretch()
         lr_layout.addLayout(preset_layout)
         
         graph_bounds_layout = QtWidgets.QFormLayout()
-        min_label, min_widget = self._create_widget("LR_GRAPH_MIN")
-        max_label, max_widget = self._create_widget("LR_GRAPH_MAX")
-        graph_bounds_layout.addRow(min_label, min_widget)
-        graph_bounds_layout.addRow(max_label, max_widget)
+        self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MIN")
+        self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MAX")
         lr_layout.addLayout(graph_bounds_layout)
         
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
-        
         return lr_group
-    
+
+    def _create_scheduler_config_group(self):
+        group = QtWidgets.QGroupBox("Scheduler Configuration")
+        layout = QtWidgets.QFormLayout(group)
+        self._add_widget_to_form(layout, "NOISE_SCHEDULER")
+        self._add_widget_to_form(layout, "PREDICTION_TYPE")
+        self._add_widget_to_form(layout, "BETA_SCHEDULE")
+        return group
+
+    def _create_noise_enhancements_group(self):
+        group = QtWidgets.QGroupBox("Noise Enhancements")
+        layout = QtWidgets.QFormLayout(group)
+        self._add_widget_to_form(layout, "USE_ZERO_TERMINAL_SNR")
+        self._add_widget_to_form(layout, "USE_NOISE_OFFSET")
+        self._add_widget_to_form(layout, "NOISE_OFFSET")
+        self._add_widget_to_form(layout, "USE_MULTISCALE_NOISE")
+        
+        if "USE_NOISE_OFFSET" in self.widgets:
+            self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(lambda state: self._on_master_noise_toggled(bool(state)))
+        return group
+
+    def _create_timestep_sampling_group(self):
+        group = QtWidgets.QGroupBox("Timestep Sampling")
+        layout = QtWidgets.QFormLayout(group)
+        layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
+        
+        self.widgets["TIMESTEP_SAMPLING_METHOD"] = QtWidgets.QComboBox()
+        self.widgets["TIMESTEP_SAMPLING_METHOD"].addItems([
+            "Random Integer (Default)", 
+            "Uniform Continuous (Flow)", 
+            "Dynamic (Gradient-Based)"
+        ])
+        self.widgets["TIMESTEP_SAMPLING_METHOD"].currentIndexChanged.connect(self._toggle_timestep_widgets)
+        layout.addRow("Timestep Method:", self.widgets["TIMESTEP_SAMPLING_METHOD"])
+        
+        self.timestep_slider_container = QtWidgets.QWidget()
+        slider_layout = QtWidgets.QFormLayout(self.timestep_slider_container); slider_layout.setContentsMargins(0, 0, 0, 0)
+        min_slider_layout = QtWidgets.QHBoxLayout()
+        self.widgets["TIMESTEP_SAMPLING_MIN"] = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.widgets["TIMESTEP_SAMPLING_MIN"].setRange(0, 999)
+        min_label = QtWidgets.QLabel("0"); min_label.setMinimumWidth(35)
+        self.widgets["TIMESTEP_SAMPLING_MIN"].valueChanged.connect(lambda v, label=min_label: label.setText(str(v)))
+        self.widgets["TIMESTEP_SAMPLING_MIN"].valueChanged.connect(self._validate_timestep_sliders)
+        min_slider_layout.addWidget(self.widgets["TIMESTEP_SAMPLING_MIN"]); min_slider_layout.addWidget(min_label)
+        slider_layout.addRow("Min Timestep:", min_slider_layout)
+        self.min_timestep_value_label = min_label
+        max_slider_layout = QtWidgets.QHBoxLayout()
+        self.widgets["TIMESTEP_SAMPLING_MAX"] = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal); self.widgets["TIMESTEP_SAMPLING_MAX"].setRange(0, 999)
+        max_label = QtWidgets.QLabel("999"); max_label.setMinimumWidth(35)
+        self.widgets["TIMESTEP_SAMPLING_MAX"].valueChanged.connect(lambda v, label=max_label: label.setText(str(v)))
+        self.widgets["TIMESTEP_SAMPLING_MAX"].valueChanged.connect(self._validate_timestep_sliders)
+        max_slider_layout.addWidget(self.widgets["TIMESTEP_SAMPLING_MAX"]); max_slider_layout.addWidget(max_label)
+        slider_layout.addRow("Max Timestep:", max_slider_layout)
+        self.max_timestep_value_label = max_label
+        layout.addRow(self.timestep_slider_container)
+        
+        self.dynamic_grad_container = QtWidgets.QWidget()
+        grad_layout = QtWidgets.QFormLayout(self.dynamic_grad_container)
+        grad_layout.setContentsMargins(0, 5, 0, 0)
+        
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"] = QtWidgets.QDoubleSpinBox()
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setRange(0.0, 10.0); self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setSingleStep(0.01); self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setDecimals(3)
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setToolTip("Timesteps with gradients below this value will be sampled more frequently.")
+        grad_layout.addRow("Min Gradient:", self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"])
+
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"] = QtWidgets.QDoubleSpinBox()
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setRange(0.0, 10.0); self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setSingleStep(0.01); self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setDecimals(3)
+        self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setToolTip("Timesteps with gradients above this value will be sampled less frequently.")
+        grad_layout.addRow("Max Gradient:", self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"])
+        
+        layout.addRow(self.dynamic_grad_container)
+
+        return group
+
+    def _validate_timestep_sliders(self):
+        min_val = self.widgets["TIMESTEP_SAMPLING_MIN"].value()
+        max_val = self.widgets["TIMESTEP_SAMPLING_MAX"].value()
+        if min_val > max_val: self.widgets["TIMESTEP_SAMPLING_MAX"].setValue(min_val)
+        if max_val < min_val: self.widgets["TIMESTEP_SAMPLING_MIN"].setValue(max_val)
+
+    def _toggle_timestep_widgets(self):
+        method = self.widgets["TIMESTEP_SAMPLING_METHOD"].currentText()
+        is_random_int = "Random Integer" in method
+        is_dynamic = "Dynamic" in method
+        self.timestep_slider_container.setVisible(is_random_int or is_dynamic)
+        self.dynamic_grad_container.setVisible(is_dynamic)
+        
     def _create_unet_group(self):
         unet_group = QtWidgets.QGroupBox("UNet Layer Exclusion")
-        layout = QtWidgets.QVBoxLayout(unet_group)
-        
-        info_label = QtWidgets.QLabel(
-            "Enter comma-separated keywords for layers to <b>exclude</b> from training.<br>"
-            "Example: <i>conv1, conv2, norm</i><br><br>"
-            "Any layer name containing these keywords will be frozen."
-        )
-        info_label.setWordWrap(True)
-        info_label.setStyleSheet("color: #e0e0e0; padding: 5px;")
-        layout.addWidget(info_label)
-        
-        label, widget = self._create_widget("UNET_EXCLUDE_TARGETS")
-        layout.addWidget(label)
-        layout.addWidget(widget)
-        
+        layout = QtWidgets.QFormLayout(unet_group)
+        self._add_widget_to_form(layout, "UNET_EXCLUDE_TARGETS")
         return unet_group
     
     def _create_advanced_group(self):
-            """Creates the 'Advanced Settings' group box with visual separators and subheadings."""
-            advanced_group = QtWidgets.QGroupBox("Advanced Settings")
-            layout = QtWidgets.QFormLayout(advanced_group)
+        advanced_group = QtWidgets.QGroupBox("Miscellaneous")
+        layout = QtWidgets.QFormLayout(advanced_group)
+        self._add_widget_to_form(layout, "MEMORY_EFFICIENT_ATTENTION")
+        
+        separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
+        layout.addRow(separator)
+        
+        spike_heading = QtWidgets.QLabel("<b>Gradient Spike Detection</b>"); spike_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
+        layout.addRow(spike_heading)
+        self._add_widget_to_form(layout, "GRAD_SPIKE_THRESHOLD_HIGH")
+        self._add_widget_to_form(layout, "GRAD_SPIKE_THRESHOLD_LOW")
+        return advanced_group
 
-            # --- General Advanced Settings ---
-            label, widget = self._create_widget("NOISE_SCHEDULER")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("MEMORY_EFFICIENT_ATTENTION")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("USE_ZERO_TERMINAL_SNR")
-            layout.addRow(label, widget)
-
-            # --- Separator and Noise Enhancements Subheading ---
-            separator1 = QtWidgets.QFrame()
-            separator1.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-            separator1.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
-            layout.addRow(separator1)
-
-            noise_heading = QtWidgets.QLabel("<b>Noise Enhancements</b>")
-            noise_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
-            layout.addRow(noise_heading)
-            
-            noise_info_label = QtWidgets.QLabel("<i>Techniques to improve learning on high-contrast or artistic datasets.</i>")
-            noise_info_label.setStyleSheet("color: #7a788c; font-size: 12px; margin-bottom: 5px;")
-            layout.addRow(noise_info_label)
-
-            # --- Noise Enhancement Widgets ---
-            label, widget = self._create_widget("USE_NOISE_OFFSET")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("NOISE_OFFSET")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("USE_MULTISCALE_NOISE")
-            layout.addRow(label, widget)
-
-            if "USE_NOISE_OFFSET" in self.widgets:
-                self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(
-                    lambda state: self._on_master_noise_toggled(bool(state))
-                )
-
-
-
-
-            # --- Separator and Gradient Spike Detection Subheading ---
-            separator2 = QtWidgets.QFrame()
-            separator2.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-            separator2.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
-            layout.addRow(separator2)
-
-            spike_heading = QtWidgets.QLabel("<b>Gradient Spike Detection</b>")
-            spike_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
-            layout.addRow(spike_heading)
-
-            # --- Gradient Spike Detection Widgets ---
-            label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_HIGH")
-            layout.addRow(label, widget)
-
-            label, widget = self._create_widget("GRAD_SPIKE_THRESHOLD_LOW")
-            layout.addRow(label, widget)
-
-            return advanced_group
-
-    
     def _populate_console_tab(self, layout):
         layout.setContentsMargins(15, 15, 15, 15)
         param_group = QtWidgets.QGroupBox("Parameter Info")
@@ -1724,10 +1865,10 @@ class TrainingGUI(QtWidgets.QWidget):
                 if hasattr(self, 'model_load_strategy_combo'):
                     is_resuming = self.current_config.get("RESUME_TRAINING", False)
                     self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
-                    self.toggle_resume_widgets()
+                    self.toggle_resume_widgets(1 if is_resuming else 0)
                 
                 for key, widget in self.widgets.items():
-                    if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith(("RAVEN_", "ADAFACTOR_")):
+                    if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith("RAVEN_") or key.startswith("TIMESTEP"):
                         continue
                     
                     value = self.current_config.get(key)
@@ -1745,6 +1886,25 @@ class TrainingGUI(QtWidgets.QWidget):
                 optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
                 self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
                 
+                ts_method = self.current_config.get("TIMESTEP_SAMPLING_METHOD", "Random Integer (Default)")
+                self.widgets["TIMESTEP_SAMPLING_METHOD"].setCurrentText(ts_method)
+                
+                ts_min = self.current_config.get("TIMESTEP_SAMPLING_MIN", 0)
+                self.widgets["TIMESTEP_SAMPLING_MIN"].setValue(ts_min)
+                self.min_timestep_value_label.setText(str(ts_min))
+
+                ts_max = self.current_config.get("TIMESTEP_SAMPLING_MAX", 999)
+                self.widgets["TIMESTEP_SAMPLING_MAX"].setValue(ts_max)
+                self.max_timestep_value_label.setText(str(ts_max))
+
+                grad_min = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MIN", 0.1)
+                self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setValue(grad_min)
+
+                grad_max = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MAX", 0.9)
+                self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setValue(grad_max)
+
+                self._toggle_timestep_widgets()
+
                 user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
                 full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
                 self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
@@ -1758,20 +1918,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
                 self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
 
-                user_adafactor_params = self.current_config.get("ADAFACTOR_PARAMS", {})
-                full_adafactor_params = {**default_config.ADAFACTOR_PARAMS, **user_adafactor_params}
-                self.widgets["ADAFACTOR_eps"].setText(', '.join(map(str, full_adafactor_params["eps"])))
-                self.widgets["ADAFACTOR_clip_threshold"].setValue(full_adafactor_params["clip_threshold"])
-                self.widgets["ADAFACTOR_decay_rate"].setValue(full_adafactor_params["decay_rate"])
-                beta1_val = full_adafactor_params.get("beta1", None)
-                beta1_enabled = beta1_val is not None
-                self.widgets["ADAFACTOR_beta1_enabled"].setChecked(beta1_enabled)
-                self.widgets["ADAFACTOR_beta1_value"].setValue(beta1_val if beta1_enabled else 0.0)
-                self.widgets["ADAFACTOR_beta1_value"].setEnabled(beta1_enabled)
-                self.widgets["ADAFACTOR_weight_decay"].setValue(full_adafactor_params["weight_decay"])
-                self.widgets["ADAFACTOR_scale_parameter"].setChecked(full_adafactor_params["scale_parameter"])
-                self.widgets["ADAFACTOR_relative_step"].setChecked(full_adafactor_params["relative_step"])
-                self.widgets["ADAFACTOR_warmup_init"].setChecked(full_adafactor_params["warmup_init"])
                 
                 if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                     should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
@@ -1789,6 +1935,8 @@ class TrainingGUI(QtWidgets.QWidget):
                 if hasattr(self, "dataset_manager"):
                     datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
                     self.dataset_manager.load_datasets_from_config(datasets_config)
+                
+                self._update_training_calculations()
 
             finally:
                 for widget in self.widgets.values():
@@ -1812,34 +1960,58 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log("Console cleared.")
 
     def _on_master_noise_toggled(self, enabled):
-        """
-        Master handler for the main noise enhancement checkbox.
-        Enables or disables all child noise options.
-        """
-        # Enable/disable the direct child widgets
         if "NOISE_OFFSET" in self.widgets:
             self.widgets["NOISE_OFFSET"].setEnabled(enabled)
-
         if "USE_MULTISCALE_NOISE" in self.widgets:
             self.widgets["USE_MULTISCALE_NOISE"].setEnabled(enabled)
-            # If master is disabled, also uncheck multiscale
             if not enabled:
                 self.widgets["USE_MULTISCALE_NOISE"].setChecked(False)
 
-    def toggle_resume_widgets(self):
-        if hasattr(self, 'resume_sub_widget') and hasattr(self, 'base_model_sub_widget'):
-            is_resuming = self.model_load_strategy_combo.currentIndex() == 1
-            self.resume_sub_widget.setVisible(is_resuming)
-            self.base_model_sub_widget.setVisible(not is_resuming)
+    def toggle_resume_widgets(self, index):
+        if hasattr(self, 'path_stacked_widget'):
+            self.path_stacked_widget.setCurrentIndex(index)
 
     def _toggle_noise_offset_settings(self, enabled):
-        """Enable or disable noise offset strength setting based on the checkbox."""
         if "NOISE_OFFSET" in self.widgets:
             self.widgets["NOISE_OFFSET"].setEnabled(enabled)
 
+    def _update_training_calculations(self):
+
+        if not all(k in self.widgets for k in ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "BATCH_SIZE"]) or not hasattr(self, 'dataset_manager'):
+            return
+
+        try:
+            max_train_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
+            grad_accum_steps = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
+            batch_size = self.widgets["BATCH_SIZE"].value()
+            total_images_with_repeats = self.dataset_manager.get_total_repeats()
 
 
+            if grad_accum_steps > 0:
+                optimizer_steps = max_train_steps // grad_accum_steps
+            else:
+                optimizer_steps = 0
+            
+            if total_images_with_repeats > 0 and batch_size > 0:
+                steps_per_epoch = total_images_with_repeats // batch_size
+                if steps_per_epoch > 0:
+                    total_epochs = max_train_steps / steps_per_epoch
+                else:
+                    total_epochs = float('inf') 
+            else:
+                total_epochs = 0.0
 
+
+            self.optimizer_steps_label.setText(f"{optimizer_steps:,}")
+            if total_epochs == float('inf'):
+                 self.epochs_label.setText("∞ (Not enough images for one batch)")
+            else:
+                 self.epochs_label.setText(f"{total_epochs:.2f}")
+
+        except (ValueError, KeyError):
+
+            self.optimizer_steps_label.setText("Invalid Input")
+            self.epochs_label.setText("Invalid Input")
 
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return
@@ -1936,7 +2108,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner.errorSignal.connect(self.log)
         self.process_runner.metricsSignal.connect(self.live_metrics_widget.parse_and_update)
         
-        # NEW: Connect cache creation signal to update dataset UI
         self.process_runner.cacheCreatedSignal.connect(self.dataset_manager.refresh_cache_buttons)
         
         if os.name == 'nt':

@@ -2,10 +2,10 @@
     "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
-    "RESUME_MODEL_PATH": "",
-    "RESUME_STATE_PATH": "",
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_127.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_127.pt",
     "CACHING_BATCH_SIZE": 1,
-    "NUM_WORKERS": 0,
+    "NUM_WORKERS": 4,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": 1048576,
     "MAX_AREA_TOLERANCE": 1.0,
@@ -13,46 +13,50 @@
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
     "MAX_TRAIN_STEPS": 1500,
-    "LEARNING_RATE": 8e-06,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 6,
+    "GRADIENT_ACCUMULATION_STEPS": 1,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 1.0,
     "SEED": 69,
-    "SAVE_EVERY_N_STEPS": 25000,
+    "SAVE_EVERY_N_STEPS": 1001,
     "UNET_EXCLUDE_TARGETS": "conv1, conv2",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            0.0
+            2e-06
         ],
         [
             0.05,
-            8.5e-06
+            2e-05
         ],
         [
             0.9,
-            8.5e-06
+            2e-05
         ],
         [
             1.0,
-            0.0
+            2e-06
         ]
     ],
-    "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 8.5e-06,
+    "LR_GRAPH_MIN": 2e-06,
+    "LR_GRAPH_MAX": 2e-05,
+    "TIMESTEP_SAMPLING_METHOD": "Uniform Continuous (Flow)",
+    "TIMESTEP_SAMPLING_MIN": 0,
+    "TIMESTEP_SAMPLING_MAX": 999,
+    "TIMESTEP_SAMPLING_GRAD_MIN": 0.5,
+    "TIMESTEP_SAMPLING_GRAD_MAX": 1.5,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_ZERO_TERMINAL_SNR": true,
-    "GRAD_SPIKE_THRESHOLD_HIGH": 25.0,
-    "GRAD_SPIKE_THRESHOLD_LOW": 0.06,
+    "USE_ZERO_TERMINAL_SNR": false,
+    "GRAD_SPIKE_THRESHOLD_HIGH": 5.0,
+    "GRAD_SPIKE_THRESHOLD_LOW": 0.01,
     "USE_NOISE_OFFSET": true,
     "NOISE_OFFSET": 0.025,
-    "USE_MULTISCALE_NOISE": false,
+    "USE_MULTISCALE_NOISE": true,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/GameCG/from Nightmare School ~Mayoiba no Shoujo-tachi~",
-            "repeats": 14
+            "path": "C:/Users/Administrator/Pictures/Artists/by nakaoka ramu",
+            "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
@@ -62,22 +66,9 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
-        "debias_strength": 0.45,
+        "weight_decay": 0.001,
+        "debias_strength": 0.15,
         "use_grad_centralization": true,
         "gc_alpha": 0.5
-    },
-    "ADAFACTOR_PARAMS": {
-        "eps": [
-            1e-30,
-            0.001
-        ],
-        "clip_threshold": 1.0,
-        "decay_rate": -0.8,
-        "beta1": null,
-        "weight_decay": 0.01,
-        "scale_parameter": true,
-        "relative_step": false,
-        "warmup_init": false
     }
 }

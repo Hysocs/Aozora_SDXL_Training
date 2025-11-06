@@ -53,8 +53,33 @@ class RavenAdamW(Optimizer):
                 max_param_size, device=self.param_device, dtype=torch.float32
             )
         else:
-            self.reusable_exp_avg_gpu = None
-            self.reusable_exp_avg_sq_gpu = None
+            self.reusable_exp_avg_gpu, self.reusable_exp_avg_sq_gpu = None, None
+
+    def save_cpu_state(self):
+        """Returns a state dictionary containing only the essential, CPU-bound tensors."""
+        params_with_grad = [p for group in self.param_groups for p in group['params'] if p.requires_grad]
+        cpu_state = {}
+        for i, p in enumerate(params_with_grad):
+            if p in self.state:
+                state = self.state[p]
+                cpu_state[i] = {
+                    'step': state['step'],
+                    'exp_avg_cpu': state['exp_avg_cpu'],
+                    'exp_avg_sq_cpu': state['exp_avg_sq_cpu']
+                }
+        return cpu_state
+
+    def load_cpu_state(self, cpu_state):
+        """Loads a state dictionary created by `save_cpu_state`, ensuring all tensors remain on the CPU."""
+        params_with_grad = [p for group in self.param_groups for p in group['params'] if p.requires_grad]
+        for i, p in enumerate(params_with_grad):
+            if i in cpu_state:
+                saved_param_state = cpu_state[i]
+                self.state[p] = {
+                    'step': saved_param_state['step'],
+                    'exp_avg_cpu': saved_param_state['exp_avg_cpu'].to('cpu', non_blocking=True),
+                    'exp_avg_sq_cpu': saved_param_state['exp_avg_sq_cpu'].to('cpu', non_blocking=True)
+                }
 
     @torch.no_grad()
     def step(self, closure=None):
@@ -64,13 +89,10 @@ class RavenAdamW(Optimizer):
                 loss = closure()
 
         for group in self.param_groups:
-            lr = group['lr']
-            beta1, beta2 = group['betas']
-            weight_decay = group['weight_decay']
-            eps = group['eps']
-            debias_strength = group['debias_strength']
-            use_gc = group['use_grad_centralization']
-            gc_alpha = group['gc_alpha']
+            lr, beta1, beta2, weight_decay, eps, debias_strength, use_gc, gc_alpha = (
+                group['lr'], group['betas'][0], group['betas'][1], group['weight_decay'], 
+                group['eps'], group['debias_strength'], group['use_grad_centralization'], group['gc_alpha']
+            )
 
             for p in group["params"]:
                 if p.grad is None: 
@@ -81,12 +103,11 @@ class RavenAdamW(Optimizer):
                 if grad.is_sparse: 
                     raise RuntimeError("RavenAdamW does not support sparse gradients.")
                 
+                # --- Gradient Centralization ---
                 if use_gc and grad.dim() > 1:
-                    if grad.dim() >= 3:  # Conv layers
-                        # Center each output filter: mean over (in_channels, height, width)
+                    if grad.dim() >= 3:
                         grad_mean = grad.mean(dim=tuple(range(1, grad.dim())), keepdim=True)
-                    else:  # Linear layers (2D)
-                        # Center each output neuron: mean over input dimension
+                    else:
                         grad_mean = grad.mean(dim=1, keepdim=True)
                     grad.sub_(grad_mean, alpha=gc_alpha)
                 
@@ -95,29 +116,18 @@ class RavenAdamW(Optimizer):
 
                 if len(state) == 0:
                     state["step"] = 0
-                    state["exp_avg_cpu"] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format, 
-                        device='cpu', dtype=torch.bfloat16
-                    )
-                    state["exp_avg_sq_cpu"] = torch.zeros_like(
-                        p, memory_format=torch.preserve_format, 
-                        device='cpu', dtype=torch.float32
-                    )
+                    state["exp_avg_cpu"] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.bfloat16)
+                    state["exp_avg_sq_cpu"] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.float32)
 
                 state["step"] += 1
-                step = state["step"]
-
-                exp_avg_cpu = state["exp_avg_cpu"]
-                exp_avg_sq_cpu = state["exp_avg_sq_cpu"]
+                step, exp_avg_cpu, exp_avg_sq_cpu = state["step"], state["exp_avg_cpu"], state["exp_avg_sq_cpu"]
                 
                 exp_avg_gpu_view = self.reusable_exp_avg_gpu[:num_param_elements].view_as(p)
                 exp_avg_sq_gpu_view = self.reusable_exp_avg_sq_gpu[:num_param_elements].view_as(p)
-
                 exp_avg_gpu_view.copy_(exp_avg_cpu, non_blocking=True)
                 exp_avg_sq_gpu_view.copy_(exp_avg_sq_cpu, non_blocking=True)
                 
-                if torch.cuda.is_available():
-                    torch.cuda.synchronize()
+                if self.param_device.type == 'cuda': torch.cuda.synchronize()
                 
                 p_fp32 = p.to(torch.float32)
                 
@@ -127,40 +137,16 @@ class RavenAdamW(Optimizer):
                 exp_avg_gpu_view.mul_(beta1).add_(grad, alpha=1.0 - beta1)
                 exp_avg_sq_gpu_view.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
 
-                bias_correction1 = 1.0
-                bias_correction2 = 1.0
-                if debias_strength > 0:
-                    bias_correction1 -= math.pow(beta1, step) * debias_strength
-                    bias_correction2 -= math.pow(beta2, step) * debias_strength
-                
+                bias_correction1 = 1.0 - math.pow(beta1, step) * debias_strength if debias_strength > 0 else 1.0
+                bias_correction2 = 1.0 - math.pow(beta2, step) * debias_strength if debias_strength > 0 else 1.0
                 step_size = lr / bias_correction1 if bias_correction1 != 0 else lr
                 
-                bias_correction2_sqrt = math.sqrt(bias_correction2) if bias_correction2 > 0 else 1.0
-                denom = (exp_avg_sq_gpu_view.sqrt() / bias_correction2_sqrt).add_(eps)
+                denom = (exp_avg_sq_gpu_view.sqrt() / (math.sqrt(bias_correction2) if bias_correction2 > 0 else 1.0)).add_(eps)
                 
                 p_fp32.addcdiv_(exp_avg_gpu_view, denom, value=-step_size)
-                
                 p.copy_(p_fp32)
-                
                 exp_avg_cpu.copy_(exp_avg_gpu_view, non_blocking=True)
                 exp_avg_sq_cpu.copy_(exp_avg_sq_gpu_view, non_blocking=True)
 
-        if torch.cuda.is_available(): 
-            torch.cuda.synchronize()
-
+        if self.param_device.type == 'cuda': torch.cuda.synchronize()
         return loss
-
-    def get_state_for_save(self):
-        state_dict = self.state_dict()
-        if self.reusable_exp_avg_gpu is not None:
-            state_dict['reusable_exp_avg_gpu'] = self.reusable_exp_avg_gpu.clone().cpu()
-        else:
-            state_dict['reusable_exp_avg_gpu'] = None
-            
-        if self.reusable_exp_avg_sq_gpu is not None:
-            state_dict['reusable_exp_avg_sq_gpu'] = self.reusable_exp_avg_sq_gpu.clone().cpu()
-        else:
-            state_dict['reusable_exp_avg_sq_gpu'] = None
-            
-        state_dict['param_device'] = str(self.param_device)
-        return state_dict
