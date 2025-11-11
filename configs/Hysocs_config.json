@@ -9,7 +9,6 @@
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": 1048576,
     "MAX_AREA_TOLERANCE": 1.0,
-    "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
     "MAX_TRAIN_STEPS": 1500,
@@ -23,43 +22,46 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            2e-06
+            9e-07
         ],
         [
             0.05,
-            2e-05
+            9e-06
         ],
         [
             0.9,
-            2e-05
+            9e-06
         ],
         [
             1.0,
-            2e-06
+            9e-07
         ]
     ],
-    "LR_GRAPH_MIN": 2e-06,
-    "LR_GRAPH_MAX": 2e-05,
+    "LR_GRAPH_MIN": 9e-07,
+    "LR_GRAPH_MAX": 9e-06,
     "TIMESTEP_SAMPLING_METHOD": "Uniform Continuous (Flow)",
     "TIMESTEP_SAMPLING_MIN": 0,
-    "TIMESTEP_SAMPLING_MAX": 999,
+    "TIMESTEP_SAMPLING_MAX": 153,
     "TIMESTEP_SAMPLING_GRAD_MIN": 0.5,
     "TIMESTEP_SAMPLING_GRAD_MAX": 1.5,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_ZERO_TERMINAL_SNR": false,
+    "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 5.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.01,
-    "USE_NOISE_OFFSET": true,
-    "NOISE_OFFSET": 0.025,
-    "USE_MULTISCALE_NOISE": true,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Artists/by nakaoka ramu",
+            "path": "C:/Users/Administrator/Pictures/Artists/by sAviOr",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
+    "NOISE_SCHEDULER": "DDPMScheduler",
+    "NOISE_TYPE": "Semantic",
+    "NOISE_OFFSET": 0.025,
+    "SEMANTIC_NOISE_CHAR_WEIGHT": 2.7755575615628914e-17,
+    "SEMANTIC_NOISE_DETAIL_WEIGHT": 5.0,
+    "SEMANTIC_NOISE_NORMALIZE": true,
     "RAVEN_PARAMS": {
         "betas": [
             0.9,

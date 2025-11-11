@@ -22,6 +22,7 @@ import logging
 import warnings
 import argparse
 import numpy as np
+import cv2
 from diffusers.models.attention_processor import AttnProcessor2_0
 import multiprocessing
 from multiprocessing import Pool, cpu_count
@@ -49,36 +50,121 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
-def generate_offset_noise(latents, config):
-    noise = torch.randn(
-        latents.shape,
-        device=latents.device,
-        dtype=latents.dtype,
-        generator=None
-    )
-    if not getattr(config, "USE_NOISE_OFFSET", False):
-        return noise
-    strength = float(getattr(config, "NOISE_OFFSET", 0.1))
-    if strength <= 0:
-        return noise
-    b, c, h, w = noise.shape
-    offset = torch.randn(b, 1, 1, 1, device=noise.device, dtype=noise.dtype)
-    noise = noise + strength * offset
-    if getattr(config, "USE_MULTISCALE_NOISE", False):
-        scale_factor = 8
-        coarse_noise = torch.randn(
-            b, c, h // scale_factor, w // scale_factor,
-            device=noise.device, dtype=noise.dtype
+# --- Semantic Noise Functions ---
+
+def generate_character_map(pil_image):
+    """Generates a map focusing on the overall character/object region using color and structure."""
+    np_image_bgr = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
+    bilateral = cv2.bilateralFilter(np_image_bgr, d=9, sigmaColor=75, sigmaSpace=75)
+    lab_image = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab_image)
+    mean_a, mean_b = np.mean(a_channel), np.mean(b_channel)
+    saliency_a = np.abs(a_channel.astype(np.float32) - mean_a)
+    saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
+    color_saliency = saliency_a + saliency_b
+    if color_saliency.max() > 0:
+        color_saliency = (color_saliency / color_saliency.max() * 255).astype(np.uint8)
+    kernel = np.ones((11, 11), np.uint8)
+    dilated = cv2.dilate(color_saliency, kernel, iterations=2)
+    eroded = cv2.erode(dilated, kernel, iterations=2)
+    final_map = cv2.GaussianBlur(eroded, (11, 11), 0)
+    return Image.fromarray(final_map)
+
+def generate_detail_map(pil_image):
+    """Generates a map focusing on edges and lineart."""
+    np_image_gray = np.array(pil_image.convert("L"))
+    sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=5)
+    sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=5)
+    magnitude = np.sqrt(sobelx**2 + sobely**2)
+    if magnitude.max() > 0:
+        magnitude = (magnitude / magnitude.max() * 255).astype(np.uint8)
+    else:
+        magnitude = np.zeros_like(magnitude, dtype=np.uint8)
+    final_map = cv2.GaussianBlur(magnitude, (1, 1), 0)
+    return Image.fromarray(final_map)
+
+def _generate_semantic_noise_map_for_batch(images, char_weight, detail_weight, target_size, device, dtype, num_channels, normalize=True):
+    """
+    Internal function to process a batch of images and create a combined saliency map tensor.
+    (This function is UNCHANGED from your original and works correctly).
+    """
+    batch_maps = []
+    for img in images:
+        if img is None: # Handle cases where an image failed to load
+            salience_tensor = torch.zeros(target_size, dtype=dtype)
+            batch_maps.append(salience_tensor)
+            continue
+            
+        char_map_pil = generate_character_map(img)
+        detail_map_pil = generate_detail_map(img)
+
+        char_map_np = np.array(char_map_pil).astype(np.float32)
+        detail_map_np = np.array(detail_map_pil).astype(np.float32)
+
+        combined_map_np = (char_weight * char_map_np) + (detail_weight * detail_map_np)
+        
+        # This logic is CRITICAL and CORRECT. It handles the two modes.
+        if normalize:
+            # Rescale mode: find the max value and scale the map down
+            if combined_map_np.max() > 0:
+                combined_map_np = (combined_map_np / combined_map_np.max() * 255)
+        else:
+            # Clipping mode: just cap values at 255
+            combined_map_np = np.clip(combined_map_np, 0, 255)
+        
+        combined_map_pil = Image.fromarray(combined_map_np.astype(np.uint8)).resize(target_size, Image.Resampling.LANCZOS)
+        
+        # The final tensor is correctly scaled to a 0.0-1.0 range for modulation
+        salience_tensor = torch.from_numpy(np.array(combined_map_pil)).float() / 255.0
+        batch_maps.append(salience_tensor)
+
+    salience_tensor_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
+    return salience_tensor_batch.expand(-1, num_channels, -1, -1)
+
+def generate_train_noise(latents, config, original_images=None):
+    """
+    Generates noise for training based on the strategy defined in the config.
+    MODIFIED: SEMANTIC_NOISE_GLOBAL_STRENGTH has been removed.
+    """
+    base_noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
+
+    if config.NOISE_TYPE == "Semantic":
+        if original_images is None:
+            print("WARNING: NOISE_TYPE is 'Semantic' but no original images were provided. Falling back to default noise.")
+            return base_noise
+
+        b, c, h, w = latents.shape
+        salience_tensor = _generate_semantic_noise_map_for_batch(
+            original_images,
+            config.SEMANTIC_NOISE_CHAR_WEIGHT,
+            config.SEMANTIC_NOISE_DETAIL_WEIGHT,
+            target_size=(w, h),
+            device=latents.device,
+            dtype=latents.dtype,
+            num_channels=c,
+            normalize=config.SEMANTIC_NOISE_NORMALIZE 
         )
-        coarse_noise = torch.nn.functional.interpolate(
-            coarse_noise,
-            size=(h, w),
-            mode='bilinear',
-            align_corners=False
-        )
-        multiscale_strength = strength * 0.5
-        noise = noise + multiscale_strength * coarse_noise
-    return noise
+        
+        modulation = 1.0 + salience_tensor
+
+        structured_noise = base_noise * modulation
+        
+
+        std_structured = torch.std(structured_noise, dim=(1, 2, 3), keepdim=True)
+        std_original = torch.std(base_noise, dim=(1, 2, 3), keepdim=True)
+        final_noise = structured_noise * (std_original / (std_structured + 1e-9))
+        return final_noise
+
+    elif config.NOISE_TYPE == "Offset":
+        strength = float(getattr(config, "NOISE_OFFSET", 0.1))
+        if strength <= 0:
+            return base_noise
+        b, c, h, w = base_noise.shape
+        offset = torch.randn(b, 1, 1, 1, device=base_noise.device, dtype=base_noise.dtype)
+        return base_noise + strength * offset
+    
+    else: # "Default"
+        return base_noise
 
 class TrainingConfig:
     def __init__(self):
@@ -222,7 +308,6 @@ class AsyncReporter:
         time_spent_str = self._format_time(timing_data.get('elapsed_time'))
         eta_str = self._format_time(timing_data.get('eta'))
         
-        # --- MODIFICATION START ---
         loss_val = timing_data.get('loss', 0.0)
         timestep_val = timing_data.get('timestep', 'N/A')
         
@@ -231,7 +316,6 @@ class AsyncReporter:
         timing_info = f" [{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]"
         
         return progress_bar + step_info + timing_info
-        # --- MODIFICATION END ---
 
     def _worker(self):
         while not self.stop_event.is_set():
@@ -546,6 +630,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.latent_files = []
+        self.use_semantic_noise = (config.NOISE_TYPE == "Semantic")
+        
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             cache_dir = root / ".precomputed_embeddings_cache"
@@ -555,6 +641,7 @@ class ImageTextLatentDataset(Dataset):
         if not self.latent_files: raise ValueError("No cached files found.")
         print("INFO: Shuffling the entire dataset order...")
         random.shuffle(self.latent_files)
+        
         self.bucket_keys = []
         all_meta = {}
         for ds in config.INSTANCE_DATASETS:
@@ -565,25 +652,48 @@ class ImageTextLatentDataset(Dataset):
             key = all_meta.get(f.stem)
             self.bucket_keys.append(tuple(key) if key else None)
         print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
+        if self.use_semantic_noise:
+             print("INFO: Semantic noise is ENABLED. Original images will be loaded during training.")
 
     def __len__(self): return len(self.latent_files)
 
+    def _find_original_image_path(self, latent_path):
+        """Finds the original image file corresponding to a latent file."""
+        latent_p = Path(latent_path)
+        stem = latent_p.stem
+        parent_dir = latent_p.parent.parent
+        
+        for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
+            image_path = parent_dir / (stem + ext)
+            if image_path.exists():
+                return image_path
+        return None
+
     def __getitem__(self, i):
         try:
-            data = torch.load(self.latent_files[i], map_location="cpu")
+            latent_path = self.latent_files[i]
+            data = torch.load(latent_path, map_location="cpu")
             if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()):
                 return None
-            return {
+            
+            item_data = {
                 "latents": data["latents"], "embeds": data["embeds"], "pooled": data["pooled"],
                 "original_sizes": data["original_size"], "target_sizes": data["target_size"],
-                "latent_path": str(self.latent_files[i])
+                "latent_path": str(latent_path)
             }
+            
+            if self.use_semantic_noise:
+                original_image_path = self._find_original_image_path(latent_path)
+                if original_image_path:
+                    item_data["original_image"] = Image.open(original_image_path).convert("RGB")
+                else:
+                    print(f"WARNING: Could not find original image for {latent_path.stem}. Semantic noise will use a zero map for this item.")
+                    item_data["original_image"] = None
+
+            return item_data
         except Exception as e:
             print(f"WARNING: Skipping {self.latent_files[i]}: {e}")
             return None
-
-
-
 
 class TimestepSampler:
     """
@@ -607,16 +717,12 @@ class TimestepSampler:
             self.global_min_ts = 0.0
             self.global_max_ts = float(self.num_train_timesteps - 1)
             
-            # --- NEW: More nuanced control parameters ---
-            self.adjustment_strength = 0.05 # Adjusts window by 5% of total timesteps
-            self.smoothing_factor = 0.9     # For tracking the gradient trend (EMA)
-            self.max_shift_per_step = 50.0  # Hard cap on how fast the window can move
+            self.adjustment_strength = 0.05
+            self.smoothing_factor = 0.9
+            self.max_shift_per_step = 50.0
             
-            # Initialize smoothed_grad_norm in the middle of the target range
             self.smoothed_grad_norm = (self.target_min_grad + self.target_max_grad) / 2.0
             self.last_timestep_avg = self.num_train_timesteps / 2.0
-            
-            # --- NEW: State for tracking consecutive spikes ---
             self.consecutive_spike_count = 0
             
             print("INFO: Initialized Trend-Aware Dynamic Sampler.")
@@ -632,7 +738,6 @@ class TimestepSampler:
         elif "Dynamic" in self.method:
             min_ts = int(self.current_min_ts)
             max_ts = int(self.current_max_ts)
-            # Ensure the range is valid
             if min_ts >= max_ts:
                 min_ts = max(0, max_ts - 1)
             
@@ -648,58 +753,38 @@ class TimestepSampler:
         if "Dynamic" not in self.method:
             return
 
-        # --- 1. Spike Detection ---
-        # Use the raw, unsmoothed gradient for immediate spike detection.
         is_spike = raw_grad_norm > self.target_max_grad
         if is_spike:
             self.consecutive_spike_count += 1
         else:
             self.consecutive_spike_count = 0
             
-        # --- 2. Trend Tracking ---
-        # Use a smoothed signal for general trend direction to avoid overreacting.
         self.smoothed_grad_norm = (self.smoothing_factor * self.smoothed_grad_norm) + \
                                   ((1 - self.smoothing_factor) * raw_grad_norm)
         
-        # --- 3. Core Adjustment Logic ---
         base_shift = self.adjustment_strength * self.num_train_timesteps
-        shift_direction = 0.0 # -1 for down, 0 for hold, +1 for up
+        shift_direction = 0.0
 
-        # Priority 1: Handle instability (consecutive spikes)
         if self.consecutive_spike_count > 1:
-            # This is a real trend of instability. React decisively.
-            # Shift aggressively towards easier (lower) timesteps.
-            shift_direction = -1.5 # Amplify the downward shift
-        
-        # Priority 2: Handle a single, potential outlier spike
+            shift_direction = -1.5
         elif self.consecutive_spike_count == 1:
-            # Might be a fluke. React cautiously.
-            shift_direction = -0.5 # Dampen the downward shift
-            
-        # Priority 3: Follow the smoothed trend if training is stable
+            shift_direction = -0.5
         else:
             if self.smoothed_grad_norm < self.target_min_grad:
-                # The trend is "too easy". Shift range UP to find a challenge.
                 shift_direction = 1.0
             elif self.smoothed_grad_norm > self.target_max_grad:
-                # The trend is "too hard". Shift range DOWN to a more stable zone.
                 shift_direction = -1.0
         
-        # --- 4. Apply the Shift ---
         if shift_direction != 0.0:
-            # Calculate the final shift amount, capped by max_shift_per_step
             final_shift = min(base_shift * abs(shift_direction), self.max_shift_per_step)
-            final_shift *= (shift_direction / abs(shift_direction)) # Re-apply sign
+            final_shift *= (shift_direction / abs(shift_direction))
 
             self.current_min_ts += final_shift
             self.current_max_ts += final_shift
 
-        # --- 5. Robust Clamping and Validation ---
-        # Ensure window doesn't go out of the global [0, 999] bounds
         self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
         self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
         
-        # Ensure the window has a minimum size to prevent collapsing
         min_range_size = 50.0
         current_range_size = self.current_max_ts - self.current_min_ts
         if current_range_size < min_range_size:
@@ -707,7 +792,6 @@ class TimestepSampler:
             self.current_min_ts = center - (min_range_size / 2.0)
             self.current_max_ts = center + (min_range_size / 2.0)
         
-        # Final sanity checks after all adjustments
         self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
         self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
         if self.current_min_ts >= self.current_max_ts:
@@ -840,7 +924,6 @@ def main():
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    # --- Prepare for Fresh Start or Resume ---
     global_step = 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed = config.SEED
@@ -865,7 +948,6 @@ def main():
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
-    # --- Caching (if needed) ---
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
         base_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=torch.float32, low_cpu_mem_usage=True)
@@ -873,7 +955,6 @@ def main():
         precompute_and_cache_latents(config, base_pipe.tokenizer, base_pipe.tokenizer_2, base_pipe.text_encoder, base_pipe.text_encoder_2, vae_for_caching, device)
         del base_pipe, vae_for_caching; gc.collect(); torch.cuda.empty_cache()
 
-    # --- Model and Scheduler Loading ---
     print(f"\n--- Loading Model ---")
     print(f"INFO: Loading UNet for training from: {model_to_load.name}")
     base_model_state_dict = load_file(model_to_load, device="cpu")
@@ -901,14 +982,12 @@ def main():
         noise_scheduler.betas = new_betas
         noise_scheduler.alphas_cumprod = torch.cumprod(1.0 - new_betas, dim=0)
 
-    # --- Dataset and Dataloader Creation ---
     print("\n--- Initializing Dataset ---")
     dataset = ImageTextLatentDataset(config)
     print(f"INFO: Initializing BucketBatchSampler with seed: {initial_sampler_seed}")
     sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True, drop_last=True)
     dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
-    # --- UNet and Optimizer Setup ---
     unet.to(device).enable_gradient_checkpointing()
     unet.enable_xformers_memory_efficient_attention() if config.MEMORY_EFFICIENT_ATTENTION == "xformers" else unet.set_attn_processor(AttnProcessor2_0())
     
@@ -939,7 +1018,6 @@ def main():
     use_grad_scaler = next(unet.parameters()).dtype == torch.float32 and config.MIXED_PRECISION in ["float16", "fp16"]
     scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
-    # --- Restore States if Resuming ---
     if config.RESUME_TRAINING:
         print("\n--- Restoring Training States ---")
         if optimizer_state:
@@ -954,7 +1032,6 @@ def main():
     else:
         print("\n--- Fresh start setup complete. Starting training loop. ---")
 
-    # --- Training Loop ---
     unet.train()
     key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     test_param_name = trainable_layer_names[0] if trainable_layer_names else "N/A"
@@ -962,7 +1039,9 @@ def main():
     reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name=test_param_name)
     
     timestep_sampler = TimestepSampler(config, noise_scheduler, device)
-    print(f"\n--- Using Timestep Sampling Method: {timestep_sampler.method} ---\n")
+    print(f"\n--- Using Timestep Sampling Method: {timestep_sampler.method} ---")
+    print(f"--- Using Noise Generation Method: {config.NOISE_TYPE} ---\n")
+
 
     accumulated_latent_paths = []
     training_start_time = time.time()
@@ -983,10 +1062,12 @@ def main():
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True)
             pooled = batch["pooled"].to(device, non_blocking=True)
+            original_images = batch.get("original_image")
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(device, dtype=embeds.dtype)
-                noise = generate_offset_noise(latents, config)
+                
+                noise = generate_train_noise(latents, config, original_images=original_images)
                 
                 timesteps = timestep_sampler.sample(latents.shape[0])
                 timestep_sampler.record_timesteps(timesteps)
@@ -1012,7 +1093,6 @@ def main():
                 
                 raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
                 
-                # --- UPDATE SAMPLER WITH THE REAL GRAD NORM ---
                 timestep_sampler.update(raw_grad_norm)
                 
                 if config.CLIP_GRAD_NORM > 0: torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)

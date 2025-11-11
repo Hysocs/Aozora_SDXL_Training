@@ -235,11 +235,10 @@ class GraphPanel(QtWidgets.QWidget):
         self.x_min, self.x_max = 0, 100
         self.y_min, self.y_max = 0, 1
         
-        # New state variables
-        self.smoothing_level = 0.0  # 0.0 raw, 1.0 smoothed
+        self.smoothing_level = 0.0
         self.fill_enabled = True
-        self.zoom_level = 1.0       # 1.0 is no zoom
-        self.pan_offset = 0         # index offset
+        self.zoom_level = 1.0
+        self.pan_offset = 0
 
     def add_line(self, color, label, max_points=2000, linewidth=2):
         self.lines.append({
@@ -291,7 +290,7 @@ class GraphPanel(QtWidgets.QWidget):
         for line in self.lines:
             visible_raw = self._get_visible_data_slice(line['data'])
             if visible_raw:
-                visible_data = visible_raw # Use any line for X range
+                visible_data = visible_raw
                 for _, y in visible_raw:
                     all_visible_y.append(y)
 
@@ -358,7 +357,6 @@ class GraphPanel(QtWidgets.QWidget):
                 raw_x, raw_y = visible_raw[i]
                 _, smoothed_y = visible_smoothed[i]
                 
-                # Interpolate based on smoothing level
                 display_y = raw_y * (1 - self.smoothing_level) + smoothed_y * self.smoothing_level
                 display_points.append(self._to_screen_coords(raw_x, display_y))
 
@@ -368,7 +366,7 @@ class GraphPanel(QtWidgets.QWidget):
                 fill_poly.append(QtCore.QPointF(display_points[0].x(), rect.bottom()))
                 
                 fill_color = QtGui.QColor(line['color'])
-                fill_color.setAlpha(40) # 40/255 transparency
+                fill_color.setAlpha(40)
                 painter.setBrush(fill_color)
                 painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawPolygon(fill_poly)
@@ -480,8 +478,7 @@ class GraphPanel(QtWidgets.QWidget):
         else:
             return f"{value:.2f}"
             
-    # --- Public Slots for Control ---
-    def set_smoothing(self, value): # 0-100 from slider
+    def set_smoothing(self, value):
         self.smoothing_level = value / 100.0
         self.update()
 
@@ -489,7 +486,7 @@ class GraphPanel(QtWidgets.QWidget):
         self.fill_enabled = enabled
         self.update()
 
-    def set_zoom(self, value): # 100-1000 from slider
+    def set_zoom(self, value):
         self.zoom_level = value / 100.0
         self._update_bounds()
         self.update()
@@ -515,7 +512,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
     
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_points = 20000 # Store a lot more data for zooming
+        self.max_points = 20000
         
         self.pending_update = False
         self.update_timer = QtCore.QTimer()
@@ -552,7 +549,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
         controls_layout.addWidget(QtWidgets.QLabel("Zoom"))
         zoom_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        zoom_slider.setRange(100, 1000) # Represents 1.0x to 10.0x
+        zoom_slider.setRange(100, 1000)
         zoom_slider.setValue(100)
         
         controls_layout.addWidget(zoom_slider, 1)
@@ -579,14 +576,13 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         scrollbar.setRange(min_pan, max_pan)
         scrollbar.setPageStep(step)
         
-        # Adjust current pan if out of new bounds
         if scrollbar.value() > max_pan:
             scrollbar.setValue(max_pan)
         
         scrollbar.blockSignals(False)
         
         scrollbar.setVisible(zoom_value > 100)
-        graph.set_pan(scrollbar.value()) # Re-apply pan to redraw
+        graph.set_pan(scrollbar.value())
 
     def _add_line_to_graph(self, graph_name, line_name, color, linewidth=2):
         graph_widget = self.graphs[graph_name]['widget']
@@ -635,7 +631,6 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
         main_layout.addLayout(grid_layout)
         
-        # Init latest values
         self.latest_global_step, self.latest_optim_step, self.latest_lr = 0, 0, 0.0
         self.latest_step_loss, self.latest_optim_loss, self.latest_grad = 0.0, 0.0, 0.0
         self.latest_timestep = 0
@@ -710,7 +705,6 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         
         for name, graph_data in self.graphs.items():
             self._update_pan_scrollbar(graph_data['widget'], graph_data['scrollbar'], graph_data['zoom_slider'].value())
-            # No need to call update() explicitly, set_pan does it
         
         self.pending_update = False
     
@@ -1143,9 +1137,12 @@ class TrainingGUI(QtWidgets.QWidget):
         "USE_ZERO_TERMINAL_SNR": {"label": "Use Zero-Terminal SNR", "tooltip": "Rescales noise schedule for better dynamic range.", "widget": "QCheckBox"},
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
-        "USE_NOISE_OFFSET": {"label": "Use Noise Offset", "tooltip": "Enable to add noise offset, improving learning of very dark/bright images.", "widget": "QCheckBox"},
-        "NOISE_OFFSET": {"label": "Noise Offset:", "tooltip": "Improves learning of very dark/bright images. Range: 0.0-0.15. Try 0.05 first, 0.1 for high-contrast styles.", "widget": "QLineEdit"},
-        "USE_MULTISCALE_NOISE": {"label": "Use Multiscale Noise", "tooltip": "Adds coarse-scale noise patterns to improve texture learning. Works well with noise offset.", "widget": "QCheckBox"},
+        
+        # --- [MODIFIED] Noise widget definitions ---
+        "NOISE_OFFSET": {"label": "Noise Offset Strength:", "tooltip": "Improves learning of dark/bright images. Try 0.05.", "widget": "QDoubleSpinBox", "range": (0.0, 0.5), "step": 0.01, "decimals": 3},
+        "SEMANTIC_NOISE_NORMALIZE": {"label": "Normalize Semantic Map (recommended)", "tooltip": "Normalize the combined semantic map to 0-1 range. Disable for raw weight scaling.", "widget": "QCheckBox"},
+        "SEMANTIC_NOISE_CHAR_WEIGHT": {"label": "Character Focus:", "tooltip": "Weight for the overall character shape noise map.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
+        "SEMANTIC_NOISE_DETAIL_WEIGHT": {"label": "Detail Focus:", "tooltip": "Weight for the lineart/edge noise map.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
     }
     def __init__(self):
         super().__init__()
@@ -1264,65 +1261,38 @@ class TrainingGUI(QtWidgets.QWidget):
         corner_widget.setLayout(corner_hbox)
         self.tab_view.setCornerWidget(corner_widget, QtCore.Qt.Corner.TopRightCorner)
     
-
     def _setup_bottom_bar(self):
         bottom_layout = QtWidgets.QHBoxLayout()
         bottom_layout.setContentsMargins(0, 5, 5, 5)
-
         calc_group = QtWidgets.QGroupBox() 
-        
-        calc_group.setStyleSheet("""
-            QGroupBox {
-                margin-top: 0px;
-                border: 1px solid #4a4668;
-                border-radius: 6px;
-                padding: 0px 8px; /* Remove top/bottom padding, keep side padding */
-            }
-        """)
-
-
+        calc_group.setStyleSheet("QGroupBox { margin-top: 0px; border: 1px solid #4a4668; border-radius: 6px; padding: 0px 8px; }")
         calc_layout = QtWidgets.QHBoxLayout(calc_group)
         calc_layout.setContentsMargins(0, 0, 0, 0) 
         calc_layout.setSpacing(10)
-
         self.optimizer_steps_label = QtWidgets.QLabel("N/A")
         self.epochs_label = QtWidgets.QLabel("N/A")
-
- 
         label_style = "color: #ab97e6; font-weight: bold; font-size: 14px;"
         self.optimizer_steps_label.setStyleSheet(label_style)
         self.epochs_label.setStyleSheet(label_style)
-
-  
         calc_layout.addWidget(QtWidgets.QLabel("Total Optimizer Steps:"))
         calc_layout.addWidget(self.optimizer_steps_label)
-
-
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.VLine)
         separator.setFrameShadow(QtWidgets.QFrame.Shadow.Sunken)
         calc_layout.addWidget(separator)
-
         calc_layout.addWidget(QtWidgets.QLabel("Total Epochs:"))
         calc_layout.addWidget(self.epochs_label)
-
-
         bottom_layout.addWidget(calc_group)
         bottom_layout.addStretch()
-
-  
         self.start_button = QtWidgets.QPushButton("Start Training")
         self.start_button.setObjectName("StartButton")
         self.start_button.clicked.connect(self.start_training)
-
         self.stop_button = QtWidgets.QPushButton("Stop Training")
         self.stop_button.setObjectName("StopButton")
         self.stop_button.clicked.connect(self.stop_training)
         self.stop_button.setEnabled(False)
-
         bottom_layout.addWidget(self.start_button)
         bottom_layout.addWidget(self.stop_button)
-
         self.main_layout.addLayout(bottom_layout)
     
     def load_selected_config(self, index):
@@ -1343,6 +1313,11 @@ class TrainingGUI(QtWidgets.QWidget):
             if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS"]:
                 continue
             
+            # --- [MODIFIED] Noise config saving ---
+            if key.startswith("NOISE_") or key.startswith("SEMANTIC_NOISE_"):
+                continue # Skip old and new keys here, handle them specifically below
+            # --- End of modification ---
+
             live_val = self.current_config.get(key)
             if live_val is None:
                 continue
@@ -1375,6 +1350,15 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
+        
+        # --- [NEW] Noise config saving ---
+        config_to_save["NOISE_SCHEDULER"] = self.widgets["NOISE_SCHEDULER"].currentText()
+        config_to_save["NOISE_TYPE"] = self.widgets["NOISE_TYPE"].currentText()
+        config_to_save["NOISE_OFFSET"] = self.widgets["NOISE_OFFSET"].value()
+        config_to_save["SEMANTIC_NOISE_CHAR_WEIGHT"] = self.widgets["SEMANTIC_NOISE_CHAR_WEIGHT"].value()
+        config_to_save["SEMANTIC_NOISE_DETAIL_WEIGHT"] = self.widgets["SEMANTIC_NOISE_DETAIL_WEIGHT"].value()
+        config_to_save["SEMANTIC_NOISE_NORMALIZE"] = self.widgets["SEMANTIC_NOISE_NORMALIZE"].isChecked()
+        # --- End of new block ---
         
         ts_method = self.widgets["TIMESTEP_SAMPLING_METHOD"].currentText()
         config_to_save["TIMESTEP_SAMPLING_METHOD"] = ts_method
@@ -1459,8 +1443,13 @@ class TrainingGUI(QtWidgets.QWidget):
             widget.textChanged.connect(lambda text, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QSpinBox":
             widget = QtWidgets.QSpinBox()
-            if "range" in definition:
-                widget.setRange(*definition["range"])
+            if "range" in definition: widget.setRange(*definition["range"])
+            widget.valueChanged.connect(lambda value, k=key: self._update_config_from_widget(k, widget))
+        elif widget_type == "QDoubleSpinBox":
+            widget = QtWidgets.QDoubleSpinBox()
+            if "range" in definition: widget.setRange(*definition["range"])
+            if "step" in definition: widget.setSingleStep(definition["step"])
+            if "decimals" in definition: widget.setDecimals(definition["decimals"])
             widget.valueChanged.connect(lambda value, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QComboBox":
             widget = QtWidgets.QComboBox()
@@ -1486,7 +1475,6 @@ class TrainingGUI(QtWidgets.QWidget):
         return label, widget
     
     def _add_widget_to_form(self, form_layout, key):
-        """Helper to create and add a widget from UI_DEFINITIONS to a QFormLayout."""
         label, widget = self._create_widget(key)
         if widget:
             if label:
@@ -1526,48 +1514,34 @@ class TrainingGUI(QtWidgets.QWidget):
         main_layout.setSpacing(20)
         main_layout.setContentsMargins(15, 5, 15, 15)
 
-        # --- Left Column ---
         left_vbox = QtWidgets.QVBoxLayout()
         left_vbox.addWidget(self._create_path_group())
         left_vbox.addWidget(self._create_lr_scheduler_group())
-        # Add a stretch to the bottom to prevent the widgets from expanding vertically
         left_vbox.addStretch(1)
 
-        # --- Right Column (Grid of smaller groups) ---
         right_container = QtWidgets.QWidget()
         right_grid = QtWidgets.QGridLayout(right_container)
         right_grid.setSpacing(20)
 
         right_grid.addWidget(self._create_core_training_group(), 0, 0)
         right_grid.addWidget(self._create_optimizer_group(), 0, 1)
-
         right_grid.addWidget(self._create_scheduler_config_group(), 1, 0)
         right_grid.addWidget(self._create_timestep_sampling_group(), 1, 1)
-
         right_grid.addWidget(self._create_noise_enhancements_group(), 2, 0)
         right_grid.addWidget(self._create_unet_group(), 2, 1)
-        
         right_grid.addWidget(self._create_advanced_group(), 3, 0, 1, 2)
-
-        # Add a spacer to the bottom of the right grid to push content up
         spacer = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding)
         right_grid.addItem(spacer, 4, 0, 1, 2)
-
         right_grid.setColumnStretch(0, 1)
         right_grid.setColumnStretch(1, 1)
-
-        # Adjust main layout stretch factors. Give more space to the right column
-        # which is dense with form widgets, for a more balanced layout.
         main_layout.addLayout(left_vbox, 2) 
         main_layout.addWidget(right_container, 3)
 
-        # Connect signals
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_training_calculations)
         self.widgets["BATCH_SIZE"].valueChanged.connect(self._update_training_calculations)
-
         self._update_lr_button_states(-1)
 
     def _create_form_group(self, title, keys):
@@ -1581,17 +1555,13 @@ class TrainingGUI(QtWidgets.QWidget):
         path_group = QtWidgets.QGroupBox("File & Directory Paths")
         path_layout = QtWidgets.QVBoxLayout(path_group)
         
-        # Top part with mode selector
         form_layout = QtWidgets.QFormLayout()
         self.model_load_strategy_combo = QtWidgets.QComboBox()
         self.model_load_strategy_combo.addItems(["Load Base Model", "Resume from Checkpoint"])
         form_layout.addRow("Mode:", self.model_load_strategy_combo)
         path_layout.addLayout(form_layout)
 
-        # Stacked widget for swapping between modes
         self.path_stacked_widget = QtWidgets.QStackedWidget()
-        
-        # Page 0: Base Model
         base_model_widget = QtWidgets.QWidget()
         base_layout = QtWidgets.QFormLayout(base_model_widget)
         base_layout.setContentsMargins(0, 5, 0, 0)
@@ -1599,7 +1569,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self._add_widget_to_form(base_layout, "VAE_PATH")
         self.path_stacked_widget.addWidget(base_model_widget)
 
-        # Page 1: Resume
         resume_widget = QtWidgets.QWidget()
         resume_layout = QtWidgets.QFormLayout(resume_widget)
         resume_layout.setContentsMargins(0, 5, 0, 0)
@@ -1609,7 +1578,6 @@ class TrainingGUI(QtWidgets.QWidget):
         
         path_layout.addWidget(self.path_stacked_widget)
         
-        # Bottom part for output dir
         output_form_layout = QtWidgets.QFormLayout()
         output_form_layout.setContentsMargins(0, 5, 0, 0)
         self._add_widget_to_form(output_form_layout, "OUTPUT_DIR")
@@ -1621,10 +1589,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_core_training_group(self):
         core_group = QtWidgets.QGroupBox("Core Training Parameters")
         layout = QtWidgets.QFormLayout(core_group)
-        core_keys = [
-            "MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS",
-            "SAVE_EVERY_N_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"
-        ]
+        core_keys = ["MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "SAVE_EVERY_N_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"]
         for key in core_keys:
             self._add_widget_to_form(layout, key)
         return core_group
@@ -1632,44 +1597,30 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_optimizer_group(self):
         optimizer_group = QtWidgets.QGroupBox("Optimizer")
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
-        
         selector_layout = QtWidgets.QHBoxLayout()
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
-        
         self.widgets["OPTIMIZER_TYPE"] = QtWidgets.QComboBox()
         self.widgets["OPTIMIZER_TYPE"].addItems(["Raven"])
         self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
         main_layout.addLayout(selector_layout)
-
         self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
         raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
-        
         self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
-        self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
-
-        self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
+        self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
+        self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
         self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
-        
-        self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
-        self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
-        
-        self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox()
-        self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
+        self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization"); self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
+        self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
         self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
-        
         self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state)))
-        
         raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
         raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
         raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
         raven_layout.addRow("Debias Strength:", self.widgets['RAVEN_debias_strength'])
         raven_layout.addRow(self.widgets['RAVEN_use_grad_centralization'])
         raven_layout.addRow("GC Alpha:", self.widgets['RAVEN_gc_alpha'])
-        
         main_layout.addWidget(self.raven_settings_group)
         return optimizer_group
     
@@ -1681,19 +1632,16 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_lr_scheduler_group(self):
         lr_group = QtWidgets.QGroupBox("Learning Rate Scheduler")
         lr_layout = QtWidgets.QVBoxLayout(lr_group)
-        
         self.lr_curve_widget = LRCurveWidget()
         self.widgets['LR_CUSTOM_CURVE'] = self.lr_curve_widget
         self.lr_curve_widget.pointsChanged.connect(lambda pts: self._update_config_from_widget("LR_CUSTOM_CURVE", self.lr_curve_widget))
         self.lr_curve_widget.selectionChanged.connect(self._update_lr_button_states)
         lr_layout.addWidget(self.lr_curve_widget)
-        
         lr_controls_layout = QtWidgets.QHBoxLayout()
         self.add_point_btn = QtWidgets.QPushButton("Add Point"); self.add_point_btn.clicked.connect(self.lr_curve_widget.add_point)
         self.remove_point_btn = QtWidgets.QPushButton("Remove Selected"); self.remove_point_btn.clicked.connect(self.lr_curve_widget.remove_selected_point)
         lr_controls_layout.addWidget(self.add_point_btn); lr_controls_layout.addWidget(self.remove_point_btn); lr_controls_layout.addStretch()
         lr_layout.addLayout(lr_controls_layout)
-        
         preset_layout = QtWidgets.QHBoxLayout()
         preset_layout.addWidget(QtWidgets.QLabel("<b>Presets:</b>"))
         presets = {"Cosine": self.lr_curve_widget.set_cosine_preset, "Linear": self.lr_curve_widget.set_linear_preset, "Constant": self.lr_curve_widget.set_constant_preset, "Step": self.lr_curve_widget.set_step_preset, "Cyclical Dip": self.lr_curve_widget.set_cyclical_dip_preset}
@@ -1701,12 +1649,10 @@ class TrainingGUI(QtWidgets.QWidget):
             btn = QtWidgets.QPushButton(name); btn.clicked.connect(func); preset_layout.addWidget(btn)
         preset_layout.addStretch()
         lr_layout.addLayout(preset_layout)
-        
         graph_bounds_layout = QtWidgets.QFormLayout()
         self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MIN")
         self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MAX")
         lr_layout.addLayout(graph_bounds_layout)
-        
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return lr_group
@@ -1721,30 +1667,57 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _create_noise_enhancements_group(self):
         group = QtWidgets.QGroupBox("Noise Enhancements")
-        layout = QtWidgets.QFormLayout(group)
-        self._add_widget_to_form(layout, "USE_ZERO_TERMINAL_SNR")
-        self._add_widget_to_form(layout, "USE_NOISE_OFFSET")
-        self._add_widget_to_form(layout, "NOISE_OFFSET")
-        self._add_widget_to_form(layout, "USE_MULTISCALE_NOISE")
-        
-        if "USE_NOISE_OFFSET" in self.widgets:
-            self.widgets["USE_NOISE_OFFSET"].stateChanged.connect(lambda state: self._on_master_noise_toggled(bool(state)))
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        # Main dropdown
+        form_layout = QtWidgets.QFormLayout()
+        self.widgets["NOISE_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["NOISE_TYPE"].addItems(["Default", "Offset", "Semantic"])
+        self.widgets["NOISE_TYPE"].currentTextChanged.connect(self._toggle_noise_widgets)
+        form_layout.addRow("Noise Type:", self.widgets["NOISE_TYPE"])
+        layout.addLayout(form_layout)
+
+        # Container for Offset settings
+        self.offset_noise_container = QtWidgets.QWidget()
+        offset_layout = QtWidgets.QFormLayout(self.offset_noise_container)
+        offset_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_widget_to_form(offset_layout, "NOISE_OFFSET")
+        layout.addWidget(self.offset_noise_container)
+
+        # Container for Semantic settings
+        self.semantic_noise_container = QtWidgets.QWidget()
+        semantic_layout = QtWidgets.QFormLayout(self.semantic_noise_container)
+        semantic_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_CHAR_WEIGHT")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_DETAIL_WEIGHT")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_NORMALIZE")  # Add this line
+        layout.addWidget(self.semantic_noise_container)
+
+        # Zero-Terminal SNR checkbox
+        _label, snr_checkbox = self._create_widget("USE_ZERO_TERMINAL_SNR")
+        if snr_checkbox:
+            layout.addWidget(snr_checkbox)
+
+        layout.addStretch(1)
         return group
+
+    def _toggle_noise_widgets(self):
+        noise_type = self.widgets["NOISE_TYPE"].currentText()
+        self.offset_noise_container.setVisible(noise_type == "Offset")
+        self.semantic_noise_container.setVisible(noise_type == "Semantic")
+        # Also toggle the normalize checkbox visibility
+        if "SEMANTIC_NOISE_NORMALIZE" in self.widgets:
+            self.widgets["SEMANTIC_NOISE_NORMALIZE"].setVisible(noise_type == "Semantic")
 
     def _create_timestep_sampling_group(self):
         group = QtWidgets.QGroupBox("Timestep Sampling")
         layout = QtWidgets.QFormLayout(group)
         layout.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapAllRows)
-        
         self.widgets["TIMESTEP_SAMPLING_METHOD"] = QtWidgets.QComboBox()
-        self.widgets["TIMESTEP_SAMPLING_METHOD"].addItems([
-            "Random Integer (Default)", 
-            "Uniform Continuous (Flow)", 
-            "Dynamic (Gradient-Based)"
-        ])
+        self.widgets["TIMESTEP_SAMPLING_METHOD"].addItems(["Random Integer (Default)", "Uniform Continuous (Flow)", "Dynamic (Gradient-Based)"])
         self.widgets["TIMESTEP_SAMPLING_METHOD"].currentIndexChanged.connect(self._toggle_timestep_widgets)
         layout.addRow("Timestep Method:", self.widgets["TIMESTEP_SAMPLING_METHOD"])
-        
         self.timestep_slider_container = QtWidgets.QWidget()
         slider_layout = QtWidgets.QFormLayout(self.timestep_slider_container); slider_layout.setContentsMargins(0, 0, 0, 0)
         min_slider_layout = QtWidgets.QHBoxLayout()
@@ -1764,23 +1737,18 @@ class TrainingGUI(QtWidgets.QWidget):
         slider_layout.addRow("Max Timestep:", max_slider_layout)
         self.max_timestep_value_label = max_label
         layout.addRow(self.timestep_slider_container)
-        
         self.dynamic_grad_container = QtWidgets.QWidget()
         grad_layout = QtWidgets.QFormLayout(self.dynamic_grad_container)
         grad_layout.setContentsMargins(0, 5, 0, 0)
-        
         self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"] = QtWidgets.QDoubleSpinBox()
         self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setRange(0.0, 10.0); self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setSingleStep(0.01); self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setDecimals(3)
         self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setToolTip("Timesteps with gradients below this value will be sampled more frequently.")
         grad_layout.addRow("Min Gradient:", self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"])
-
         self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"] = QtWidgets.QDoubleSpinBox()
         self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setRange(0.0, 10.0); self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setSingleStep(0.01); self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setDecimals(3)
         self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setToolTip("Timesteps with gradients above this value will be sampled less frequently.")
         grad_layout.addRow("Max Gradient:", self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"])
-        
         layout.addRow(self.dynamic_grad_container)
-
         return group
 
     def _validate_timestep_sliders(self):
@@ -1806,10 +1774,8 @@ class TrainingGUI(QtWidgets.QWidget):
         advanced_group = QtWidgets.QGroupBox("Miscellaneous")
         layout = QtWidgets.QFormLayout(advanced_group)
         self._add_widget_to_form(layout, "MEMORY_EFFICIENT_ATTENTION")
-        
         separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668; margin: 10px 0;")
         layout.addRow(separator)
-        
         spike_heading = QtWidgets.QLabel("<b>Gradient Spike Detection</b>"); spike_heading.setStyleSheet("color: #ab97e6; margin-top: 5px;")
         layout.addRow(spike_heading)
         self._add_widget_to_form(layout, "GRAD_SPIKE_THRESHOLD_HIGH")
@@ -1827,7 +1793,6 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.addWidget(param_group, stretch=0)
         layout.addWidget(self.log_textbox, stretch=1)
         button_layout = QtWidgets.QHBoxLayout()
-        
         clear_button = QtWidgets.QPushButton("Clear Console")
         clear_button.clicked.connect(self.clear_console_log)
         button_layout.addWidget(clear_button)
@@ -1847,16 +1812,11 @@ class TrainingGUI(QtWidgets.QWidget):
             entry_widget.setText(path.replace('\\', '/'))
     
     def _update_config_from_widget(self, key, widget):
-        if isinstance(widget, QtWidgets.QLineEdit):
-            self.current_config[key] = widget.text().strip()
-        elif isinstance(widget, QtWidgets.QCheckBox):
-            self.current_config[key] = widget.isChecked()
-        elif isinstance(widget, QtWidgets.QComboBox):
-            self.current_config[key] = widget.currentText()
-        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
-            self.current_config[key] = widget.value()
-        elif isinstance(widget, LRCurveWidget):
-            self.current_config[key] = widget.get_points()
+        if isinstance(widget, QtWidgets.QLineEdit): self.current_config[key] = widget.text().strip()
+        elif isinstance(widget, QtWidgets.QCheckBox): self.current_config[key] = widget.isChecked()
+        elif isinstance(widget, QtWidgets.QComboBox): self.current_config[key] = widget.currentText()
+        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = widget.value()
+        elif isinstance(widget, LRCurveWidget): self.current_config[key] = widget.get_points()
     
     def _apply_config_to_widgets(self):
             for widget in self.widgets.values():
@@ -1867,77 +1827,56 @@ class TrainingGUI(QtWidgets.QWidget):
                     self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
                     self.toggle_resume_widgets(1 if is_resuming else 0)
                 
+                # --- General Widgets (excluding special cases) ---
+                special_keys = [
+                    "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE"
+                ] + [k for k in self.widgets.keys() if k.startswith("RAVEN_") or k.startswith("TIMESTEP") or k.startswith("SEMANTIC_") or k.startswith("NOISE_OFFSET")]
+                
                 for key, widget in self.widgets.items():
-                    if key in ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE"] or key.startswith("RAVEN_") or key.startswith("TIMESTEP"):
-                        continue
-                    
+                    if key in special_keys: continue
                     value = self.current_config.get(key)
                     if value is None: continue
+                    if isinstance(widget, QtWidgets.QLineEdit): widget.setText(str(value))
+                    elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
+                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
+                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
 
-                    if isinstance(widget, QtWidgets.QLineEdit):
-                        widget.setText(str(value))
-                    elif isinstance(widget, QtWidgets.QCheckBox):
-                        widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox):
-                        widget.setCurrentText(str(value))
-                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
-                        widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-
+                # --- Special Cases ---
                 optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
                 self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
                 
+                # Timestep
                 ts_method = self.current_config.get("TIMESTEP_SAMPLING_METHOD", "Random Integer (Default)")
                 self.widgets["TIMESTEP_SAMPLING_METHOD"].setCurrentText(ts_method)
-                
-                ts_min = self.current_config.get("TIMESTEP_SAMPLING_MIN", 0)
-                self.widgets["TIMESTEP_SAMPLING_MIN"].setValue(ts_min)
-                self.min_timestep_value_label.setText(str(ts_min))
-
-                ts_max = self.current_config.get("TIMESTEP_SAMPLING_MAX", 999)
-                self.widgets["TIMESTEP_SAMPLING_MAX"].setValue(ts_max)
-                self.max_timestep_value_label.setText(str(ts_max))
-
-                grad_min = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MIN", 0.1)
-                self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setValue(grad_min)
-
-                grad_max = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MAX", 0.9)
-                self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setValue(grad_max)
-
+                ts_min = self.current_config.get("TIMESTEP_SAMPLING_MIN", 0); self.widgets["TIMESTEP_SAMPLING_MIN"].setValue(ts_min); self.min_timestep_value_label.setText(str(ts_min))
+                ts_max = self.current_config.get("TIMESTEP_SAMPLING_MAX", 999); self.widgets["TIMESTEP_SAMPLING_MAX"].setValue(ts_max); self.max_timestep_value_label.setText(str(ts_max))
+                grad_min = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MIN", 0.1); self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].setValue(grad_min)
+                grad_max = self.current_config.get("TIMESTEP_SAMPLING_GRAD_MAX", 0.9); self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].setValue(grad_max)
                 self._toggle_timestep_widgets()
 
-                user_raven_params = self.current_config.get("RAVEN_PARAMS", {})
-                full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
-                self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"])))
-                self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
-                self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"])
-                self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
-                
-                use_gc = full_raven_params.get("use_grad_centralization", False)
-                gc_alpha = full_raven_params.get("gc_alpha", 1.0)
-                self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc)
-                self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha)
-                self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
-
-                
-                if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
-                    should_upscale = self.current_config.get("SHOULD_UPSCALE", False)
-                    self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(should_upscale))
-
-                if "USE_NOISE_OFFSET" in self.widgets:
-                    is_master_enabled = self.current_config.get("USE_NOISE_OFFSET", False)
-                    self._on_master_noise_toggled(is_master_enabled)
-
-                if hasattr(self, 'lr_curve_widget'):
-                    self._update_and_clamp_lr_graph()
-                
+                # Raven
+                user_raven_params = self.current_config.get("RAVEN_PARAMS", {}); full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
+                self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"]))); self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
+                self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"]); self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
+                use_gc = full_raven_params.get("use_grad_centralization", False); gc_alpha = full_raven_params.get("gc_alpha", 1.0)
+                self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc); self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha); self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
                 self._toggle_optimizer_widgets()
-                
-                if hasattr(self, "dataset_manager"):
-                    datasets_config = self.current_config.get("INSTANCE_DATASETS", [])
-                    self.dataset_manager.load_datasets_from_config(datasets_config)
-                
-                self._update_training_calculations()
 
+
+                noise_type = self.current_config.get("NOISE_TYPE", "Default")
+                self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
+                self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
+                self.widgets["SEMANTIC_NOISE_CHAR_WEIGHT"].setValue(self.current_config.get("SEMANTIC_NOISE_CHAR_WEIGHT", 1.0))
+                self.widgets["SEMANTIC_NOISE_DETAIL_WEIGHT"].setValue(self.current_config.get("SEMANTIC_NOISE_DETAIL_WEIGHT", 0.5))
+                self.widgets["SEMANTIC_NOISE_NORMALIZE"].setChecked(self.current_config.get("SEMANTIC_NOISE_NORMALIZE", True))
+                self._toggle_noise_widgets()
+                # --- End of new block ---
+
+                if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
+                    self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
+                if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
+                if hasattr(self, "dataset_manager"): self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
+                self._update_training_calculations()
             finally:
                 for widget in self.widgets.values():
                     widget.blockSignals(False)
@@ -1946,9 +1885,7 @@ class TrainingGUI(QtWidgets.QWidget):
         index = self.config_dropdown.currentIndex()
         if index < 0: return
         selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
-        reply = QtWidgets.QMessageBox.question(self, "Restore Defaults",
-            f"This will overwrite '{selected_key}.json' with hardcoded defaults. Are you sure?",
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        reply = QtWidgets.QMessageBox.question(self, "Restore Defaults", f"This will overwrite '{selected_key}.json' with hardcoded defaults. Are you sure?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
         if reply == QtWidgets.QMessageBox.StandardButton.Yes:
             self.presets[selected_key] = copy.deepcopy(self.default_config)
             self.save_config()
@@ -1959,59 +1896,21 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log_textbox.clear()
         self.log("Console cleared.")
 
-    def _on_master_noise_toggled(self, enabled):
-        if "NOISE_OFFSET" in self.widgets:
-            self.widgets["NOISE_OFFSET"].setEnabled(enabled)
-        if "USE_MULTISCALE_NOISE" in self.widgets:
-            self.widgets["USE_MULTISCALE_NOISE"].setEnabled(enabled)
-            if not enabled:
-                self.widgets["USE_MULTISCALE_NOISE"].setChecked(False)
-
     def toggle_resume_widgets(self, index):
-        if hasattr(self, 'path_stacked_widget'):
-            self.path_stacked_widget.setCurrentIndex(index)
-
-    def _toggle_noise_offset_settings(self, enabled):
-        if "NOISE_OFFSET" in self.widgets:
-            self.widgets["NOISE_OFFSET"].setEnabled(enabled)
+        if hasattr(self, 'path_stacked_widget'): self.path_stacked_widget.setCurrentIndex(index)
 
     def _update_training_calculations(self):
-
-        if not all(k in self.widgets for k in ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "BATCH_SIZE"]) or not hasattr(self, 'dataset_manager'):
-            return
-
+        if not all(k in self.widgets for k in ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "BATCH_SIZE"]) or not hasattr(self, 'dataset_manager'): return
         try:
-            max_train_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-            grad_accum_steps = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
-            batch_size = self.widgets["BATCH_SIZE"].value()
-            total_images_with_repeats = self.dataset_manager.get_total_repeats()
-
-
-            if grad_accum_steps > 0:
-                optimizer_steps = max_train_steps // grad_accum_steps
-            else:
-                optimizer_steps = 0
-            
-            if total_images_with_repeats > 0 and batch_size > 0:
-                steps_per_epoch = total_images_with_repeats // batch_size
-                if steps_per_epoch > 0:
-                    total_epochs = max_train_steps / steps_per_epoch
-                else:
-                    total_epochs = float('inf') 
-            else:
-                total_epochs = 0.0
-
-
+            max_train_steps = int(self.widgets["MAX_TRAIN_STEPS"].text()); grad_accum_steps = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
+            batch_size = self.widgets["BATCH_SIZE"].value(); total_images_with_repeats = self.dataset_manager.get_total_repeats()
+            optimizer_steps = max_train_steps // grad_accum_steps if grad_accum_steps > 0 else 0
+            steps_per_epoch = total_images_with_repeats // batch_size if total_images_with_repeats > 0 and batch_size > 0 else 0
+            total_epochs = max_train_steps / steps_per_epoch if steps_per_epoch > 0 else float('inf')
             self.optimizer_steps_label.setText(f"{optimizer_steps:,}")
-            if total_epochs == float('inf'):
-                 self.epochs_label.setText("∞ (Not enough images for one batch)")
-            else:
-                 self.epochs_label.setText(f"{total_epochs:.2f}")
-
+            self.epochs_label.setText("∞ (Not enough images for one batch)" if total_epochs == float('inf') else f"{total_epochs:.2f}")
         except (ValueError, KeyError):
-
-            self.optimizer_steps_label.setText("Invalid Input")
-            self.epochs_label.setText("Invalid Input")
+            self.optimizer_steps_label.setText("Invalid Input"); self.epochs_label.setText("Invalid Input")
 
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return
@@ -2026,21 +1925,16 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_epoch_markers_on_graph()
     
     def _update_epoch_markers_on_graph(self):
-        if not hasattr(self, 'lr_curve_widget') or not hasattr(self, 'dataset_manager'):
-            return
+        if not hasattr(self, 'lr_curve_widget') or not hasattr(self, 'dataset_manager'): return
         try:
-            total_images = self.dataset_manager.get_total_repeats()
-            max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
+            total_images = self.dataset_manager.get_total_repeats(); max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
         except (ValueError, KeyError):
-            self.lr_curve_widget.set_epoch_data([])
-            return
+            self.lr_curve_widget.set_epoch_data([]); return
         epoch_data = []
         if total_images > 0 and max_steps > 0:
-            steps_per_epoch = total_images
-            current_epoch_step = steps_per_epoch
+            steps_per_epoch = total_images; current_epoch_step = steps_per_epoch
             while current_epoch_step < max_steps:
-                normalized_x = current_epoch_step / max_steps
-                epoch_data.append((normalized_x, int(current_epoch_step)))
+                epoch_data.append((current_epoch_step / max_steps, int(current_epoch_step)))
                 current_epoch_step += steps_per_epoch
         self.lr_curve_widget.set_epoch_data(epoch_data)
     
@@ -2049,177 +1943,87 @@ class TrainingGUI(QtWidgets.QWidget):
             is_removable = selected_index > 0 and selected_index < len(self.lr_curve_widget.get_points()) - 1
             self.remove_point_btn.setEnabled(is_removable)
     
-    def log(self, message):
-        self.append_log(message.strip(), replace=False)
+    def log(self, message): self.append_log(message.strip(), replace=False)
     
     def append_log(self, text, replace=False):
-        scrollbar = self.log_textbox.verticalScrollBar()
-        scroll_at_bottom = (scrollbar.value() >= scrollbar.maximum() - 4)
-        cursor = self.log_textbox.textCursor()
-        cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        if replace:
-            cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
-            cursor.removeSelectedText()
-            cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        self.log_textbox.setTextCursor(cursor)
-        self.log_textbox.insertPlainText(text.rstrip() + '\n')
-        if scroll_at_bottom:
-            scrollbar.setValue(scrollbar.maximum())
-    
+        scrollbar = self.log_textbox.verticalScrollBar(); scroll_at_bottom = (scrollbar.value() >= scrollbar.maximum() - 4)
+        cursor = self.log_textbox.textCursor(); cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        if replace: cursor.select(QtGui.QTextCursor.SelectionType.LineUnderCursor); cursor.removeSelectedText(); cursor.movePosition(QtGui.QTextCursor.MoveOperation.End)
+        self.log_textbox.setTextCursor(cursor); self.log_textbox.insertPlainText(text.rstrip() + '\n')
+        if scroll_at_bottom: scrollbar.setValue(scrollbar.maximum())
+
     def handle_process_output(self, text, is_progress):
         if text:
             self.append_log(text, replace=is_progress and self.last_line_is_progress)
             self.last_line_is_progress = is_progress
 
     def start_training(self):
-        self.save_config()
-        self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
+        self.save_config(); self.log("\n" + "="*50 + "\nStarting training process...\n" + "="*50)
         selected_key = self.config_dropdown.itemData(self.config_dropdown.currentIndex()) if self.config_dropdown.itemData(self.config_dropdown.currentIndex()) else self.config_dropdown.itemText(self.config_dropdown.currentIndex()).replace(" ", "_").lower()
         config_path = os.path.join(self.config_dir, f"{selected_key}.json")
         if not os.path.exists(config_path):
-            self.log(f"CRITICAL ERROR: Config file not found: {config_path}. Aborting.")
-            return
-        script_dir = os.path.dirname(os.path.abspath(__file__))
-        config_path = os.path.abspath(config_path)
-        train_py_path = os.path.abspath("train.py")
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        
+            self.log(f"CRITICAL ERROR: Config file not found: {config_path}. Aborting."); return
+        script_dir = os.path.dirname(os.path.abspath(__file__)); config_path = os.path.abspath(config_path)
+        train_py_path = os.path.abspath("train.py"); self.start_button.setEnabled(False); self.stop_button.setEnabled(True)
         self.live_metrics_widget.clear_data()
-        
-        env_dict = os.environ.copy()
-        python_dir = os.path.dirname(sys.executable)
+        env_dict = os.environ.copy(); python_dir = os.path.dirname(sys.executable)
         env_dict["PATH"] = f"{python_dir};{os.path.join(python_dir, 'Scripts')};{env_dict.get('PATH', '')}"
         env_dict["PYTHONPATH"] = f"{script_dir};{env_dict.get('PYTHONPATH', '')}"
-        creation_flags = 0
-        if os.name == 'nt':
-            creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP
-        self.process_runner = ProcessRunner(
-            executable=sys.executable,
-            args=["-u", train_py_path, "--config", config_path],
-            working_dir=script_dir,
-            env=env_dict,
-            creation_flags=creation_flags
-        )
+        creation_flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        self.process_runner = ProcessRunner(executable=sys.executable, args=["-u", train_py_path, "--config", config_path], working_dir=script_dir, env=env_dict, creation_flags=creation_flags)
         self.process_runner.logSignal.connect(self.log)
         self.process_runner.paramInfoSignal.connect(lambda info: self.param_info_label.setText(f"Trainable Parameters: {info}"))
         self.process_runner.progressSignal.connect(self.handle_process_output)
         self.process_runner.finishedSignal.connect(self.training_finished)
         self.process_runner.errorSignal.connect(self.log)
         self.process_runner.metricsSignal.connect(self.live_metrics_widget.parse_and_update)
-        
         self.process_runner.cacheCreatedSignal.connect(self.dataset_manager.refresh_cache_buttons)
-        
-        if os.name == 'nt':
-            prevent_sleep(True)
+        if os.name == 'nt': prevent_sleep(True)
         self.process_runner.start()
         self.log(f"INFO: Starting train.py with config: {config_path}")
     
     def stop_training(self):
-        if self.process_runner and self.process_runner.isRunning():
-            self.process_runner.stop()
-        else:
-            self.log("No active training process to stop.")
+        if self.process_runner and self.process_runner.isRunning(): self.process_runner.stop()
+        else: self.log("No active training process to stop.")
     
     def training_finished(self, exit_code=0):
-        if self.process_runner:
-            self.process_runner.quit()
-            self.process_runner.wait()
-            self.process_runner = None
+        if self.process_runner: self.process_runner.quit(); self.process_runner.wait(); self.process_runner = None
         status = "successfully" if exit_code == 0 else f"with an error (Code: {exit_code})"
         self.log(f"\n" + "="*50 + f"\nTraining finished {status}.\n" + "="*50)
         self.param_info_label.setText("Parameters: (training complete)" if exit_code == 0 else "Parameters: (training failed or stopped)")
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        
-
-        if hasattr(self, 'dataset_manager'):
-            self.dataset_manager.refresh_cache_buttons()
-        
-        if os.name == 'nt':
-            prevent_sleep(False)
+        self.start_button.setEnabled(True); self.stop_button.setEnabled(False)
+        if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
+        if os.name == 'nt': prevent_sleep(False)
 
 class NoScrollSpinBox(QtWidgets.QSpinBox):
-    def wheelEvent(self, event):
-        event.ignore()
+    def wheelEvent(self, event): event.ignore()
 
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()
-    
     def __init__(self, parent_gui):
-        super().__init__()
-        self.parent_gui = parent_gui
-        self.datasets = []
-        self.dataset_widgets = []
-        self._init_ui()
-    
+        super().__init__(); self.parent_gui = parent_gui; self.datasets = []; self.dataset_widgets = []; self._init_ui()
     def _init_ui(self):
-        layout = QtWidgets.QVBoxLayout(self)
-        layout.setContentsMargins(0,0,0,0)
-        
-        add_button = QtWidgets.QPushButton("Add Dataset Folder")
-        add_button.clicked.connect(self.add_dataset_folder)
-        layout.addWidget(add_button)
-        
-        scroll_area = QtWidgets.QScrollArea()
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        
-        self.grid_container = QtWidgets.QWidget()
-        self.dataset_grid = QtWidgets.QGridLayout(self.grid_container)
-        self.dataset_grid.setSpacing(15)
-        self.dataset_grid.setContentsMargins(5, 5, 5, 5)
-        
-        scroll_area.setWidget(self.grid_container)
-        layout.addWidget(scroll_area)
-        
-        bottom_hbox = QtWidgets.QHBoxLayout()
-        bottom_hbox.addStretch(1)
-        bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:"))
-        self.total_label = QtWidgets.QLabel("0")
-        bottom_hbox.addWidget(self.total_label)
-        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:"))
-        self.total_repeats_label = QtWidgets.QLabel("0")
-        bottom_hbox.addWidget(self.total_repeats_label)
-        bottom_hbox.addStretch()
-        layout.addLayout(bottom_hbox)
-    
-    def get_total_repeats(self):
-        return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
-    
-    def get_datasets_config(self):
-        return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-    
+        layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(0,0,0,0)
+        add_button = QtWidgets.QPushButton("Add Dataset Folder"); add_button.clicked.connect(self.add_dataset_folder); layout.addWidget(add_button)
+        scroll_area = QtWidgets.QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.grid_container = QtWidgets.QWidget(); self.dataset_grid = QtWidgets.QGridLayout(self.grid_container); self.dataset_grid.setSpacing(15); self.dataset_grid.setContentsMargins(5, 5, 5, 5)
+        scroll_area.setWidget(self.grid_container); layout.addWidget(scroll_area)
+        bottom_hbox = QtWidgets.QHBoxLayout(); bottom_hbox.addStretch(1); bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:")); self.total_label = QtWidgets.QLabel("0"); bottom_hbox.addWidget(self.total_label)
+        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:")); self.total_repeats_label = QtWidgets.QLabel("0"); bottom_hbox.addWidget(self.total_repeats_label); bottom_hbox.addStretch(); layout.addLayout(bottom_hbox)
+    def get_total_repeats(self): return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
+    def get_datasets_config(self): return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
     def _load_dataset_images(self, path):
-        """Load all images and their captions from a dataset path."""
-        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']
-        images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]
-        
-        dataset_info = []
+        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']; images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]; dataset_info = []
         for img_path in images:
-            caption_path = img_path.with_suffix('.txt')
-            caption = ""
+            caption_path = img_path.with_suffix('.txt'); caption = "";
             if caption_path.exists():
                 try:
-                    with open(caption_path, 'r', encoding='utf-8') as f:
-                        caption = f.read().strip()
-                except:
-                    caption = "[Error reading caption]"
-            else:
-                caption = "[No caption file]"
-            
-            dataset_info.append({
-                "image_path": str(img_path),
-                "caption": caption
-            })
-        
+                    with open(caption_path, 'r', encoding='utf-8') as f: caption = f.read().strip()
+                except: caption = "[Error reading caption]"
+            else: caption = "[No caption file]"
+            dataset_info.append({"image_path": str(img_path), "caption": caption})
         return dataset_info
-    
-    def _cache_exists(self, path):
-        """Check if cache directory exists."""
-        cache_dir = Path(path) / ".precomputed_embeddings_cache"
-        return cache_dir.exists() and cache_dir.is_dir()
-    
+    def _cache_exists(self, path): cache_dir = Path(path) / ".precomputed_embeddings_cache"; return cache_dir.exists() and cache_dir.is_dir()
     def load_datasets_from_config(self, datasets_config):
         self.datasets = []
         for d in datasets_config:
@@ -2227,329 +2031,87 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             if path and os.path.exists(path):
                 images_data = self._load_dataset_images(path)
                 if images_data:
-                    self.datasets.append({
-                        "path": path,
-                        "images_data": images_data,
-                        "image_count": len(images_data),
-                        "current_preview_idx": 0,
-                        "repeats": d.get("repeats", 1),
-                    })
-        self.repopulate_dataset_grid()
-        self.update_dataset_totals()
-    
+                    self.datasets.append({"path": path, "images_data": images_data, "image_count": len(images_data), "current_preview_idx": 0, "repeats": d.get("repeats", 1)})
+        self.repopulate_dataset_grid(); self.update_dataset_totals()
     def add_dataset_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", "")
         if not path: return
-        
         images_data = self._load_dataset_images(path)
-        if not images_data:
-            QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder.")
-            return
-        
-        self.datasets.append({
-            "path": path,
-            "images_data": images_data,
-            "image_count": len(images_data),
-            "current_preview_idx": 0,
-            "repeats": 1,
-        })
-        self.repopulate_dataset_grid()
-        self.update_dataset_totals()
-    
+        if not images_data: QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder."); return
+        self.datasets.append({"path": path, "images_data": images_data, "image_count": len(images_data), "current_preview_idx": 0, "repeats": 1})
+        self.repopulate_dataset_grid(); self.update_dataset_totals()
     def _cycle_preview(self, idx, direction):
-        """Cycle through preview images. Direction: 1 for next, -1 for previous."""
-        ds = self.datasets[idx]
-        ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"])
-        self._update_preview_for_card(idx)
-    
+        ds = self.datasets[idx]; ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"]); self._update_preview_for_card(idx)
     def _update_preview_for_card(self, idx):
-        """Update just the preview and caption for a specific card."""
-        if idx >= len(self.dataset_widgets):
-            return
-        
-        ds = self.datasets[idx]
-        widgets = self.dataset_widgets[idx]
-        
-        current_data = ds["images_data"][ds["current_preview_idx"]]
-        
-        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
-            183, 183, 
-            QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
-            QtCore.Qt.TransformationMode.SmoothTransformation
-        )
-        widgets["preview_label"].setPixmap(pixmap)
-        
-        caption_text = current_data["caption"]
-        if len(caption_text) > 200:
-            caption_text = caption_text[:200] + "..."
-        widgets["caption_label"].setText(caption_text)
-        
-        widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
-    
+        if idx >= len(self.dataset_widgets): return
+        ds = self.datasets[idx]; widgets = self.dataset_widgets[idx]; current_data = ds["images_data"][ds["current_preview_idx"]]
+        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+        widgets["preview_label"].setPixmap(pixmap); caption_text = current_data["caption"]
+        if len(caption_text) > 200: caption_text = caption_text[:200] + "..."
+        widgets["caption_label"].setText(caption_text); widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
     def repopulate_dataset_grid(self):
         while self.dataset_grid.count():
             item = self.dataset_grid.takeAt(0)
-            if item.widget():
-                item.widget().deleteLater()
-        
-        self.dataset_widgets = []
-        
-        dataset_count = len(self.datasets)
-        if dataset_count == 1:
-            COLUMNS = 1
-        elif dataset_count == 2:
-            COLUMNS = 2
-        else:
-            COLUMNS = 3
-        
+            if item.widget(): item.widget().deleteLater()
+        self.dataset_widgets = []; dataset_count = len(self.datasets)
+        COLUMNS = 1 if dataset_count == 1 else (2 if dataset_count == 2 else 3)
         for idx, ds in enumerate(self.datasets):
-            row = idx // COLUMNS
-            col = idx % COLUMNS
-            
-            card = QtWidgets.QGroupBox()
-            card.setStyleSheet("""
-                QGroupBox {
-                    border: 2px solid #4a4668;
-                    border-radius: 8px;
-                    margin-top: 5px;
-                    padding: 12px;
-                    background-color: #383552;
-                }
-            """)
-            
-            card_layout = QtWidgets.QVBoxLayout(card)
-            card_layout.setSpacing(10)
-            
-            top_section = QtWidgets.QHBoxLayout()
-            top_section.setSpacing(12)
-            
-            preview_section = QtWidgets.QVBoxLayout()
-            preview_section.setSpacing(5)
-            
-            image_container = QtWidgets.QHBoxLayout()
-            image_container.addStretch()
-            
-            preview_label = QtWidgets.QLabel()
-            preview_label.setFixedSize(183, 183)
-            preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #2c2a3e;")
-            preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            preview_label.setScaledContents(False)
-            
-            current_data = ds["images_data"][ds["current_preview_idx"]]
-            pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(
-                183, 183, 
-                QtCore.Qt.AspectRatioMode.KeepAspectRatio, 
-                QtCore.Qt.TransformationMode.SmoothTransformation
-            )
-            preview_label.setPixmap(pixmap)
-            image_container.addWidget(preview_label)
-            image_container.addStretch()
-            
-            preview_section.addLayout(image_container)
-            
-            counter_nav_layout = QtWidgets.QHBoxLayout()
-            counter_nav_layout.setSpacing(8)
-            
-            left_arrow = QtWidgets.QPushButton("◄")
-            left_arrow.setFixedHeight(22)
-            left_arrow.setMinimumWidth(35)
-            left_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, -1))
-            left_arrow.setStyleSheet("""
-                QPushButton {
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 0px;
-                }
-            """)
-            counter_nav_layout.addWidget(left_arrow)
-            
-            counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
-            counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;")
-            counter_nav_layout.addWidget(counter_label, 1)
-            
-            right_arrow = QtWidgets.QPushButton("►")
-            right_arrow.setFixedHeight(22)
-            right_arrow.setMinimumWidth(35)
-            right_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1))
-            right_arrow.setStyleSheet("""
-                QPushButton {
-                    font-size: 16px;
-                    font-weight: bold;
-                    padding: 0px;
-                }
-            """)
-            counter_nav_layout.addWidget(right_arrow)
-            
-            preview_section.addLayout(counter_nav_layout)
-            
-            top_section.addLayout(preview_section)
-            
-            caption_container = QtWidgets.QWidget()
-            caption_container.setStyleSheet("""
-                QWidget {
-                    background-color: #2c2a3e;
-                    border: 1px solid #4a4668;
-                    border-radius: 4px;
-                }
-            """)
-            caption_layout = QtWidgets.QVBoxLayout(caption_container)
-            caption_layout.setContentsMargins(8, 8, 8, 8)
-            
-            caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>")
-            caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;")
-            caption_layout.addWidget(caption_title)
-            
-            caption_label = QtWidgets.QLabel()
-            caption_text = current_data["caption"]
-            if len(caption_text) > 200:
-                caption_text = caption_text[:200] + "..."
-            caption_label.setText(caption_text)
-            caption_label.setWordWrap(True)
-            caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;")
-            caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-            caption_layout.addWidget(caption_label, 1)
-            
-            top_section.addWidget(caption_container, 1)
-            card_layout.addLayout(top_section)
-            
-            separator = QtWidgets.QFrame()
-            separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
-            separator.setStyleSheet("border: 1px solid #4a4668;")
-            card_layout.addWidget(separator)
-            
-            path_label = QtWidgets.QLabel()
-            path_short = Path(ds['path']).name
-            if len(path_short) > 30:
-                path_short = path_short[:27] + "..."
-            path_label.setText(f"<b>Folder:</b> {path_short}")
-            path_label.setToolTip(ds['path'])
-            path_label.setStyleSheet("color: #e0e0e0;")
-            card_layout.addWidget(path_label)
-            
-            count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}")
-            count_label.setStyleSheet("color: #e0e0e0;")
-            card_layout.addWidget(count_label)
-            
-            repeats_total_label = QtWidgets.QLabel(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}")
-            repeats_total_label.setStyleSheet("color: #ab97e6;")
-            card_layout.addWidget(repeats_total_label)
-            
-            repeats_container = QtWidgets.QWidget()
-            repeats_layout = QtWidgets.QHBoxLayout(repeats_container)
-            repeats_layout.setContentsMargins(0, 5, 0, 0)
-            repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
-            
-            repeats_spin = NoScrollSpinBox()
-            repeats_spin.setMinimum(1)
-            repeats_spin.setMaximum(10000)
-            repeats_spin.setValue(ds["repeats"])
-            repeats_spin.setStyleSheet("""
-                QSpinBox::up-button, QSpinBox::down-button {
-                    width: 20px;
-                }
-            """)
-            repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
-            repeats_layout.addWidget(repeats_spin, 1)
-            card_layout.addWidget(repeats_container)
-            
-            btn_layout = QtWidgets.QHBoxLayout()
-            btn_layout.setSpacing(5)
-
-            remove_btn = QtWidgets.QPushButton("Remove")
-            remove_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
-            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
-            btn_layout.addWidget(remove_btn)
-
-            clear_btn = QtWidgets.QPushButton("Clear Cache")
-            clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
-            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
-
-            cache_exists = self._cache_exists(ds["path"])
-            clear_btn.setEnabled(cache_exists)
-            if not cache_exists:
-                clear_btn.setToolTip("No cache found")
-                clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
-
-            btn_layout.addWidget(clear_btn)
-            card_layout.addLayout(btn_layout)
-            
-            self.dataset_grid.addWidget(card, row, col)
-            
-            self.dataset_widgets.append({
-                "preview_label": preview_label,
-                "caption_label": caption_label,
-                "counter_label": counter_label,
-                "repeats_total_label": repeats_total_label,
-                "clear_btn": clear_btn
-            })
-        
+            row, col = idx // COLUMNS, idx % COLUMNS
+            card = QtWidgets.QGroupBox(); card.setStyleSheet("QGroupBox { border: 2px solid #4a4668; border-radius: 8px; margin-top: 5px; padding: 12px; background-color: #383552; }")
+            card_layout = QtWidgets.QVBoxLayout(card); card_layout.setSpacing(10); top_section = QtWidgets.QHBoxLayout(); top_section.setSpacing(12)
+            preview_section = QtWidgets.QVBoxLayout(); preview_section.setSpacing(5); image_container = QtWidgets.QHBoxLayout(); image_container.addStretch()
+            preview_label = QtWidgets.QLabel(); preview_label.setFixedSize(183, 183); preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #2c2a3e;"); preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter); preview_label.setScaledContents(False)
+            current_data = ds["images_data"][ds["current_preview_idx"]]; pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+            preview_label.setPixmap(pixmap); image_container.addWidget(preview_label); image_container.addStretch(); preview_section.addLayout(image_container)
+            counter_nav_layout = QtWidgets.QHBoxLayout(); counter_nav_layout.setSpacing(8); left_arrow = QtWidgets.QPushButton("◄"); left_arrow.setFixedHeight(22); left_arrow.setMinimumWidth(35); left_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, -1)); left_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }"); counter_nav_layout.addWidget(left_arrow)
+            counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}"); counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter); counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;"); counter_nav_layout.addWidget(counter_label, 1)
+            right_arrow = QtWidgets.QPushButton("►"); right_arrow.setFixedHeight(22); right_arrow.setMinimumWidth(35); right_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1)); right_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }"); counter_nav_layout.addWidget(right_arrow); preview_section.addLayout(counter_nav_layout); top_section.addLayout(preview_section)
+            caption_container = QtWidgets.QWidget(); caption_container.setStyleSheet("QWidget { background-color: #2c2a3e; border: 1px solid #4a4668; border-radius: 4px; }"); caption_layout = QtWidgets.QVBoxLayout(caption_container); caption_layout.setContentsMargins(8, 8, 8, 8); caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>"); caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;"); caption_layout.addWidget(caption_title)
+            caption_label = QtWidgets.QLabel(); caption_text = current_data["caption"];
+            if len(caption_text) > 200: caption_text = caption_text[:200] + "...";
+            caption_label.setText(caption_text); caption_label.setWordWrap(True); caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;"); caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop); caption_layout.addWidget(caption_label, 1); top_section.addWidget(caption_container, 1); card_layout.addLayout(top_section)
+            separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668;"); card_layout.addWidget(separator)
+            path_label = QtWidgets.QLabel(); path_short = Path(ds['path']).name;
+            if len(path_short) > 30: path_short = path_short[:27] + "...";
+            path_label.setText(f"<b>Folder:</b> {path_short}"); path_label.setToolTip(ds['path']); path_label.setStyleSheet("color: #e0e0e0;"); card_layout.addWidget(path_label)
+            count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}"); count_label.setStyleSheet("color: #e0e0e0;"); card_layout.addWidget(count_label)
+            repeats_total_label = QtWidgets.QLabel(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}"); repeats_total_label.setStyleSheet("color: #ab97e6;"); card_layout.addWidget(repeats_total_label)
+            repeats_container = QtWidgets.QWidget(); repeats_layout = QtWidgets.QHBoxLayout(repeats_container); repeats_layout.setContentsMargins(0, 5, 0, 0); repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
+            repeats_spin = NoScrollSpinBox(); repeats_spin.setMinimum(1); repeats_spin.setMaximum(10000); repeats_spin.setValue(ds["repeats"]); repeats_spin.setStyleSheet("QSpinBox::up-button, QSpinBox::down-button { width: 20px; }"); repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v)); repeats_layout.addWidget(repeats_spin, 1); card_layout.addWidget(repeats_container)
+            btn_layout = QtWidgets.QHBoxLayout(); btn_layout.setSpacing(5); remove_btn = QtWidgets.QPushButton("Remove"); remove_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;"); remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i)); btn_layout.addWidget(remove_btn)
+            clear_btn = QtWidgets.QPushButton("Clear Cache"); clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;"); clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p)); cache_exists = self._cache_exists(ds["path"]); clear_btn.setEnabled(cache_exists)
+            if not cache_exists: clear_btn.setToolTip("No cache found");
+            btn_layout.addWidget(clear_btn); card_layout.addLayout(btn_layout); self.dataset_grid.addWidget(card, row, col)
+            self.dataset_widgets.append({"preview_label": preview_label, "caption_label": caption_label, "counter_label": counter_label, "repeats_total_label": repeats_total_label, "clear_btn": clear_btn})
         if dataset_count % COLUMNS != 0:
-            for empty_col in range((dataset_count % COLUMNS), COLUMNS):
-                self.dataset_grid.setColumnStretch(empty_col, 1)
-
+            for empty_col in range((dataset_count % COLUMNS), COLUMNS): self.dataset_grid.setColumnStretch(empty_col, 1)
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
-        
         if idx < len(self.dataset_widgets):
-            ds = self.datasets[idx]
-            total = ds['image_count'] * ds['repeats']
-            self.dataset_widgets[idx]["repeats_total_label"].setText(
-                f"<b>Total (with repeats):</b> {total}"
-            )
-        
+            ds = self.datasets[idx]; total = ds['image_count'] * ds['repeats']; self.dataset_widgets[idx]["repeats_total_label"].setText(f"<b>Total (with repeats):</b> {total}")
         self.update_dataset_totals()
-
     def remove_dataset(self, idx):
-        del self.datasets[idx]
-        self.repopulate_dataset_grid()
-        self.update_dataset_totals()
-
+        del self.datasets[idx]; self.repopulate_dataset_grid(); self.update_dataset_totals()
     def update_dataset_totals(self):
-        total = sum(ds["image_count"] for ds in self.datasets)
-        total_rep = self.get_total_repeats()
-        self.total_label.setText(str(total))
-        self.total_repeats_label.setText(str(total_rep))
-        self.datasetsChanged.emit()
-
+        total = sum(ds["image_count"] for ds in self.datasets); total_rep = self.get_total_repeats()
+        self.total_label.setText(str(total)); self.total_repeats_label.setText(str(total_rep)); self.datasetsChanged.emit()
     def confirm_clear_cache(self, path):
-        reply = QtWidgets.QMessageBox.question(
-            self, "Confirm", 
-            "Delete all cached latents in this dataset?", 
-            QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
-        )
-        if reply == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.clear_cached_latents(path)
-
+        reply = QtWidgets.QMessageBox.question(self, "Confirm", "Delete all cached latents in this dataset?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
+        if reply == QtWidgets.QMessageBox.StandardButton.Yes: self.clear_cached_latents(path)
     def clear_cached_latents(self, path):
-        root = Path(path)
-        deleted = False
+        root = Path(path); deleted = False
         for cache_dir in list(root.rglob(".precomputed_embeddings_cache")):
             if cache_dir.is_dir():
-                try:
-                    shutil.rmtree(cache_dir)
-                    self.parent_gui.log(f"Deleted cache directory: {cache_dir}")
-                    deleted = True
-                except Exception as e:
-                    self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
-        
-        if deleted:
-            self.refresh_cache_buttons()
-        
-        if not deleted:
-            self.parent_gui.log("No cached latent directories found to delete.")
-    
+                try: shutil.rmtree(cache_dir); self.parent_gui.log(f"Deleted cache directory: {cache_dir}"); deleted = True
+                except Exception as e: self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
+        if deleted: self.refresh_cache_buttons()
+        if not deleted: self.parent_gui.log("No cached latent directories found to delete.")
     def refresh_cache_buttons(self):
-        """Refresh the enabled state of all Clear Cache buttons."""
         for idx, ds in enumerate(self.datasets):
             if idx < len(self.dataset_widgets):
-                cache_exists = self._cache_exists(ds["path"])
-                clear_btn = self.dataset_widgets[idx]["clear_btn"]
-                clear_btn.setEnabled(cache_exists)
-                if not cache_exists:
-                    clear_btn.setToolTip("No cache found")
-                else:
-                    clear_btn.setToolTip("")
+                cache_exists = self._cache_exists(ds["path"]); clear_btn = self.dataset_widgets[idx]["clear_btn"]; clear_btn.setEnabled(cache_exists)
+                if not cache_exists: clear_btn.setToolTip("No cache found")
+                else: clear_btn.setToolTip("")
 
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
