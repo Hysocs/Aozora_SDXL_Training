@@ -62,12 +62,25 @@ def generate_character_map(pil_image):
     saliency_a = np.abs(a_channel.astype(np.float32) - mean_a)
     saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
     color_saliency = saliency_a + saliency_b
+    
+    # Normalize to 0-1, then convert to uint8 for morphological ops
     if color_saliency.max() > 0:
-        color_saliency = (color_saliency / color_saliency.max() * 255).astype(np.uint8)
+        color_saliency_norm = color_saliency / color_saliency.max()
+    else:
+        color_saliency_norm = np.zeros_like(color_saliency, dtype=np.float32)
+    
+    color_saliency_uint8 = (color_saliency_norm * 255).astype(np.uint8)
+    
+    # Morphological operations require uint8
     kernel = np.ones((11, 11), np.uint8)
-    dilated = cv2.dilate(color_saliency, kernel, iterations=2)
+    dilated = cv2.dilate(color_saliency_uint8, kernel, iterations=2)
     eroded = cv2.erode(dilated, kernel, iterations=2)
-    final_map = cv2.GaussianBlur(eroded, (11, 11), 0)
+    
+    # Convert back to float32 and apply final Gaussian blur
+    eroded_float = eroded.astype(np.float32) / 255.0
+    final_map = cv2.GaussianBlur(eroded_float, (11, 11), 0)
+    
+    # Return as mode 'F' PIL Image (32-bit float)
     return Image.fromarray(final_map)
 
 def generate_detail_map(pil_image):
@@ -76,21 +89,30 @@ def generate_detail_map(pil_image):
     sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=5)
     sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=5)
     magnitude = np.sqrt(sobelx**2 + sobely**2)
+    
+    # Normalize directly to 0-1
     if magnitude.max() > 0:
-        magnitude = (magnitude / magnitude.max() * 255).astype(np.uint8)
+        magnitude_norm = magnitude / magnitude.max()
     else:
-        magnitude = np.zeros_like(magnitude, dtype=np.uint8)
-    final_map = cv2.GaussianBlur(magnitude, (1, 1), 0)
+        magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
+    
+    # Apply Gaussian blur
+    final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (1, 1), 0)
+    
+    # Return as mode 'F' PIL Image
     return Image.fromarray(final_map)
 
-def _generate_semantic_noise_map_for_batch(images, char_weight, detail_weight, target_size, device, dtype, num_channels, normalize=True):
+def _generate_semantic_noise_map_for_batch(images, blend_factor, global_strength, target_size, device, dtype, num_channels, normalize=True):
     """
-    Internal function to process a batch of images and create a combined saliency map tensor.
-    (This function is UNCHANGED from your original and works correctly).
+    Generates semantic noise maps with intuitive blend and strength controls.
+    - blend_factor: 0.0 = 100% character map, 1.0 = 100% detail map
+    - global_strength: Overall modulation multiplier
+    - normalize: If True, normalizes by theoretical max (cancels strength in weight map, re-applies in modulation)
     """
     batch_maps = []
+    
     for img in images:
-        if img is None: # Handle cases where an image failed to load
+        if img is None:
             salience_tensor = torch.zeros(target_size, dtype=dtype)
             batch_maps.append(salience_tensor)
             continue
@@ -101,31 +123,34 @@ def _generate_semantic_noise_map_for_batch(images, char_weight, detail_weight, t
         char_map_np = np.array(char_map_pil).astype(np.float32)
         detail_map_np = np.array(detail_map_pil).astype(np.float32)
 
-        combined_map_np = (char_weight * char_map_np) + (detail_weight * detail_map_np)
+        # Calculate weights WITH strength (for raw combination)
+        char_weight = (1.0 - blend_factor) * global_strength
+        detail_weight = blend_factor * global_strength
         
-        # This logic is CRITICAL and CORRECT. It handles the two modes.
+        # Raw weighted combination (range: 0.0 to global_strength)
+        combined_raw = (char_weight * char_map_np) + (detail_weight * detail_map_np)
+        
+        # Apply normalization or clipping based on flag
         if normalize:
-            # Rescale mode: find the max value and scale the map down
-            if combined_map_np.max() > 0:
-                combined_map_np = (combined_map_np / combined_map_np.max() * 255)
+            # Normalize by theoretical max to get 0-1 weight map (cancels out strength)
+            theoretical_max = global_strength if global_strength > 0 else 1.0
+            weight_map = combined_raw / theoretical_max
         else:
-            # Clipping mode: just cap values at 255
-            combined_map_np = np.clip(combined_map_np, 0, 255)
+            # Without normalization, clip to 0-1 range (keeps strength information)
+            weight_map = np.clip(combined_raw, 0, 1)
         
-        combined_map_pil = Image.fromarray(combined_map_np.astype(np.uint8)).resize(target_size, Image.Resampling.LANCZOS)
+        # Apply gamma correction for smoother falloff
+        weight_map = np.power(weight_map, 0.8)
         
-        # The final tensor is correctly scaled to a 0.0-1.0 range for modulation
-        salience_tensor = torch.from_numpy(np.array(combined_map_pil)).float() / 255.0
+        # Resize and convert to tensor
+        combined_map_pil = Image.fromarray(weight_map, mode='F').resize(target_size, Image.Resampling.LANCZOS)
+        salience_tensor = torch.from_numpy(np.array(combined_map_pil)).float()
         batch_maps.append(salience_tensor)
 
     salience_tensor_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
     return salience_tensor_batch.expand(-1, num_channels, -1, -1)
 
 def generate_train_noise(latents, config, original_images=None):
-    """
-    Generates noise for training based on the strategy defined in the config.
-    MODIFIED: SEMANTIC_NOISE_GLOBAL_STRENGTH has been removed.
-    """
     base_noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
 
     if config.NOISE_TYPE == "Semantic":
@@ -134,26 +159,29 @@ def generate_train_noise(latents, config, original_images=None):
             return base_noise
 
         b, c, h, w = latents.shape
+        
+        # Generate weight map (0-1 range) with optional normalization
         salience_tensor = _generate_semantic_noise_map_for_batch(
             original_images,
-            config.SEMANTIC_NOISE_CHAR_WEIGHT,
-            config.SEMANTIC_NOISE_DETAIL_WEIGHT,
+            config.SEMANTIC_NOISE_BLEND,
+            config.SEMANTIC_NOISE_GLOBAL_STRENGTH,
             target_size=(w, h),
             device=latents.device,
             dtype=latents.dtype,
             num_channels=c,
-            normalize=config.SEMANTIC_NOISE_NORMALIZE 
+            normalize=config.SEMANTIC_NOISE_NORMALIZE  # Now respected!
         )
         
-        modulation = 1.0 + salience_tensor
-
-        structured_noise = base_noise * modulation
+        # Apply strength in modulation step (only if normalized, otherwise already in map)
+        if config.SEMANTIC_NOISE_NORMALIZE:
+            # Strength was normalized out, so apply it now
+            modulation = 1.0 + salience_tensor * config.SEMANTIC_NOISE_GLOBAL_STRENGTH
+        else:
+            # Strength is already in the weight map, just add base
+            modulation = 1.0 + salience_tensor
         
-
-        std_structured = torch.std(structured_noise, dim=(1, 2, 3), keepdim=True)
-        std_original = torch.std(base_noise, dim=(1, 2, 3), keepdim=True)
-        final_noise = structured_noise * (std_original / (std_structured + 1e-9))
-        return final_noise
+        structured_noise = base_noise * modulation
+        return structured_noise
 
     elif config.NOISE_TYPE == "Offset":
         strength = float(getattr(config, "NOISE_OFFSET", 0.1))
@@ -165,7 +193,7 @@ def generate_train_noise(latents, config, original_images=None):
     
     else: # "Default"
         return base_noise
-
+    
 class TrainingConfig:
     def __init__(self):
         for key, value in default_config.__dict__.items():
@@ -613,7 +641,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             if not images: continue
             image_batch_tensor = torch.stack(images).to(device, dtype=torch.float32)
             with torch.no_grad():
-                latents = vae.encode(image_batch_tensor).latent_dist.mean * vae.config.scaling_factor
+                latents = vae.encode(image_batch_tensor).latent_dist.sample() * vae.config.scaling_factor
             for j, m in enumerate(valid_meta):
                 cache_path = cache_dir / f"{m['ip'].stem}.pt"
                 torch.save({
@@ -911,9 +939,16 @@ def save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable
     training_state = {
         'global_step': global_step,
         'optimizer_state': optimizer.save_cpu_state(),
-        'scaler_state_dict': scaler.state_dict(),
         'sampler_seed': sampler.seed,
     }
+
+    # --- FIX ---
+    # Only save the scaler state if a scaler is actually being used.
+    if scaler is not None:
+        training_state['scaler_state_dict'] = scaler.state_dict()
+    else:
+        training_state['scaler_state_dict'] = None # Save a placeholder
+
     torch.save(training_state, output_dir / state_filename)
     print(f"Successfully saved training state: {state_filename}")
 
@@ -928,7 +963,6 @@ def main():
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed = config.SEED
     optimizer_state = None
-    scaler_state_dict = None
 
     if config.RESUME_TRAINING:
         print("\n" + "="*50); print("--- RESUMING TRAINING SESSION ---")
@@ -938,7 +972,6 @@ def main():
         global_step = training_state['global_step']
         initial_sampler_seed = training_state['sampler_seed']
         optimizer_state = training_state['optimizer_state']
-        scaler_state_dict = training_state['scaler_state_dict']
         model_to_load = Path(config.RESUME_MODEL_PATH)
         
         print(f"INFO: Resuming from global step: {global_step}")
@@ -1015,17 +1048,12 @@ def main():
     
     optimizer = create_optimizer(config, params_to_optimize)
     lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, max_train_steps=config.MAX_TRAIN_STEPS)
-    use_grad_scaler = next(unet.parameters()).dtype == torch.float32 and config.MIXED_PRECISION in ["float16", "fp16"]
-    scaler = torch.amp.GradScaler('cuda', enabled=use_grad_scaler)
 
     if config.RESUME_TRAINING:
         print("\n--- Restoring Training States ---")
         if optimizer_state:
             optimizer.load_cpu_state(optimizer_state)
             print("INFO: Optimizer state loaded successfully using custom CPU method.")
-        if scaler_state_dict:
-            scaler.load_state_dict(scaler_state_dict)
-            print("INFO: GradScaler state loaded.")
         lr_scheduler.step(global_step)
         print(f"INFO: LR scheduler stepped to {global_step}. Current LR: {lr_scheduler.get_last_lr()[0]:.2e}")
         print("--- Resume setup complete. Starting training loop. ---")
@@ -1059,13 +1087,20 @@ def main():
             if not batch: continue
 
             if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
+            
+            # ✅ CRITICAL DTYPE FIX FOR BFLOAT16
             latents = batch["latents"].to(device, non_blocking=True)
-            embeds = batch["embeds"].to(device, non_blocking=True)
-            pooled = batch["pooled"].to(device, non_blocking=True)
+            embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
+            pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             original_images = batch.get("original_image")
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
-                time_ids = torch.cat([torch.tensor(list(s1) + [0,0] + list(s2)).unsqueeze(0) for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"])], dim=0).to(device, dtype=embeds.dtype)
+                # ✅ CRITICAL DTYPE FIX FOR TIME_IDS
+                time_ids_list = []
+                for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"]):
+                    time_id = torch.tensor(list(s1) + [0,0] + list(s2), dtype=torch.float32)
+                    time_ids_list.append(time_id.unsqueeze(0).to(device, dtype=config.compute_dtype))
+                time_ids = torch.cat(time_ids_list, dim=0)
                 
                 noise = generate_train_noise(latents, config, original_images=original_images)
                 
@@ -1083,35 +1118,47 @@ def main():
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
             diagnostics.step(loss.item())
-            scaler.scale(loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
+            loss.backward()  # ✅ Direct backward for bfloat16
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 test_param = dict(unet.named_parameters())[test_param_name]
                 before_val = test_param.data.clone()
-                scaler.unscale_(optimizer)
                 
+                # ✅ Calculate grad norm on raw gradients
                 raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
-                
                 timestep_sampler.update(raw_grad_norm)
                 
-                if config.CLIP_GRAD_NORM > 0: torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
+                if config.CLIP_GRAD_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
                 clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
 
-                scaler.step(optimizer); scaler.update()
+                optimizer.step()  # ✅ Direct step for bfloat16
                 lr_scheduler.step(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
 
                 update_delta = torch.abs(test_param.data - before_val).max().item()
-                optim_step_time = time.time() - last_optim_step_log_time; optim_step_times.append(optim_step_time); last_optim_step_log_time = time.time()
+                optim_step_time = time.time() - last_optim_step_log_time
+                optim_step_times.append(optim_step_time)
+                last_optim_step_log_time = time.time()
+                
                 diag_data_to_log = {
-                    'optim_step': (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS, 'avg_loss': diagnostics.get_average_loss(),
-                    'current_lr': optimizer.param_groups[0]['lr'], 'raw_grad_norm': raw_grad_norm, 'clipped_grad_norm': clipped_grad_norm,
-                    'update_delta': update_delta, 'optim_step_time': optim_step_time, 'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)}
+                    'optim_step': (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS,
+                    'avg_loss': diagnostics.get_average_loss(),
+                    'current_lr': optimizer.param_groups[0]['lr'],
+                    'raw_grad_norm': raw_grad_norm,
+                    'clipped_grad_norm': clipped_grad_norm,
+                    'update_delta': update_delta,
+                    'optim_step_time': optim_step_time,
+                    'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)
+                }
                 reporter.check_and_report_anomaly(global_step + 1, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
-                diagnostics.reset(); accumulated_latent_paths.clear()
+                diagnostics.reset()
+                accumulated_latent_paths.clear()
 
-            step_duration = time.time() - last_step_time; global_step_times.append(step_duration); last_step_time = time.time()
+            step_duration = time.time() - last_step_time
+            global_step_times.append(step_duration)
+            last_step_time = time.time()
             elapsed_time = time.time() - training_start_time
             eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * (sum(global_step_times) / len(global_step_times))
             
@@ -1130,7 +1177,7 @@ def main():
                  print(f"\n--- Saving checkpoint at step {global_step} ---")
                  save_checkpoint(
                     global_step, unet, base_model_state_dict, key_map, trainable_layer_names,
-                    optimizer, lr_scheduler, scaler, sampler, config
+                    optimizer, lr_scheduler, None, sampler, config  # ✅ Pass None for scaler
                 )
 
     print("\nTraining complete.")
@@ -1138,7 +1185,6 @@ def main():
     output_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_final.safetensors"
     save_model(output_path, unet, base_model_state_dict, key_map, trainable_layer_names)
     print("All tasks complete. Final model saved.")
-
 
 if __name__ == "__main__":
     try:

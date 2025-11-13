@@ -86,11 +86,12 @@ GRAD_SPIKE_THRESHOLD_LOW = 0.2
 
 # --- Noise Enhancements ---
 NOISE_TYPE = "Semantic"  # Options: "Default", "Offset", "Semantic"
-SEMANTIC_NOISE_NORMALIZE = True  # Add this to your default config
+SEMANTIC_NOISE_NORMALIZE = True
+
 # --- Parameters for "Offset" Noise ---
 NOISE_OFFSET = 0.05 # Only used if NOISE_TYPE is "Offset"
 
 # --- Parameters for "Semantic" Noise ---
 # These settings are only active when NOISE_TYPE is "Semantic"
-SEMANTIC_NOISE_CHAR_WEIGHT = 0.2     # Focus on overall character shape (blob).
-SEMANTIC_NOISE_DETAIL_WEIGHT = 0.5   # Focus on edges and lineart.
+SEMANTIC_NOISE_BLEND = 0.5     # 0.0 = 100% Character, 1.0 = 100% Detail, 0.5 = Equal mix
+SEMANTIC_NOISE_GLOBAL_STRENGTH = 0.8  # Overall modulation strength (1.0 = standard, 2.0 = strong)

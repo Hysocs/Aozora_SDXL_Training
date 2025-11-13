@@ -2,8 +2,8 @@
     "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_127.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_127.pt",
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_2002.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_2002.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
     "SHOULD_UPSCALE": true,
@@ -11,56 +11,56 @@
     "MAX_AREA_TOLERANCE": 1.0,
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 1500,
+    "MAX_TRAIN_STEPS": 3500,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 1,
+    "GRADIENT_ACCUMULATION_STEPS": 8,
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": 1.0,
-    "SEED": 69,
+    "CLIP_GRAD_NORM": 5.0,
+    "SEED": 42,
     "SAVE_EVERY_N_STEPS": 1001,
-    "UNET_EXCLUDE_TARGETS": "conv1, conv2",
+    "UNET_EXCLUDE_TARGETS": "time_embed, label_emb, conv_in, conv_out, down_blocks.2,",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            9e-07
+            0.0
         ],
         [
             0.05,
-            9e-06
+            6.5e-06
         ],
         [
             0.9,
-            9e-06
+            6.5e-06
         ],
         [
             1.0,
-            9e-07
+            0.0
         ]
     ],
-    "LR_GRAPH_MIN": 9e-07,
-    "LR_GRAPH_MAX": 9e-06,
-    "TIMESTEP_SAMPLING_METHOD": "Uniform Continuous (Flow)",
+    "LR_GRAPH_MIN": 0.0,
+    "LR_GRAPH_MAX": 6.5e-06,
+    "TIMESTEP_SAMPLING_METHOD": "Random Integer (Default)",
     "TIMESTEP_SAMPLING_MIN": 0,
-    "TIMESTEP_SAMPLING_MAX": 153,
+    "TIMESTEP_SAMPLING_MAX": 999,
     "TIMESTEP_SAMPLING_GRAD_MIN": 0.5,
-    "TIMESTEP_SAMPLING_GRAD_MAX": 1.5,
+    "TIMESTEP_SAMPLING_GRAD_MAX": 10.0,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_ZERO_TERMINAL_SNR": true,
-    "GRAD_SPIKE_THRESHOLD_HIGH": 5.0,
-    "GRAD_SPIKE_THRESHOLD_LOW": 0.01,
+    "USE_ZERO_TERMINAL_SNR": false,
+    "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
+    "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Artists/by sAviOr",
-            "repeats": 1
+            "path": "C:/Users/Administrator/Pictures/GameCG/from Forestia ~Chiisana Machi no Bokujou Life~",
+            "repeats": 3
         }
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_SCHEDULER": "DDPMScheduler",
-    "NOISE_TYPE": "Semantic",
+    "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "SEMANTIC_NOISE_CHAR_WEIGHT": 2.7755575615628914e-17,
-    "SEMANTIC_NOISE_DETAIL_WEIGHT": 5.0,
+    "SEMANTIC_NOISE_BLEND": 0.5,
+    "SEMANTIC_NOISE_GLOBAL_STRENGTH": 1.0,
     "SEMANTIC_NOISE_NORMALIZE": true,
     "RAVEN_PARAMS": {
         "betas": [
@@ -68,9 +68,9 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.001,
-        "debias_strength": 0.15,
-        "use_grad_centralization": true,
+        "weight_decay": 0.018,
+        "debias_strength": 1.0,
+        "use_grad_centralization": false,
         "gc_alpha": 0.5
     }
 }

@@ -1141,8 +1141,8 @@ class TrainingGUI(QtWidgets.QWidget):
         # --- [MODIFIED] Noise widget definitions ---
         "NOISE_OFFSET": {"label": "Noise Offset Strength:", "tooltip": "Improves learning of dark/bright images. Try 0.05.", "widget": "QDoubleSpinBox", "range": (0.0, 0.5), "step": 0.01, "decimals": 3},
         "SEMANTIC_NOISE_NORMALIZE": {"label": "Normalize Semantic Map (recommended)", "tooltip": "Normalize the combined semantic map to 0-1 range. Disable for raw weight scaling.", "widget": "QCheckBox"},
-        "SEMANTIC_NOISE_CHAR_WEIGHT": {"label": "Character Focus:", "tooltip": "Weight for the overall character shape noise map.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
-        "SEMANTIC_NOISE_DETAIL_WEIGHT": {"label": "Detail Focus:", "tooltip": "Weight for the lineart/edge noise map.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
+        "SEMANTIC_NOISE_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
+        "SEMANTIC_NOISE_GLOBAL_STRENGTH": {"label": "Overall Strength:", "tooltip": "Total modulation strength. 0.5 = subtle, 1.0 = standard, 2.0 = strong. Higher values can wash out color.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
     }
     def __init__(self):
         super().__init__()
@@ -1355,8 +1355,8 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["NOISE_SCHEDULER"] = self.widgets["NOISE_SCHEDULER"].currentText()
         config_to_save["NOISE_TYPE"] = self.widgets["NOISE_TYPE"].currentText()
         config_to_save["NOISE_OFFSET"] = self.widgets["NOISE_OFFSET"].value()
-        config_to_save["SEMANTIC_NOISE_CHAR_WEIGHT"] = self.widgets["SEMANTIC_NOISE_CHAR_WEIGHT"].value()
-        config_to_save["SEMANTIC_NOISE_DETAIL_WEIGHT"] = self.widgets["SEMANTIC_NOISE_DETAIL_WEIGHT"].value()
+        config_to_save["SEMANTIC_NOISE_BLEND"] = self.widgets["SEMANTIC_NOISE_BLEND"].value()
+        config_to_save["SEMANTIC_NOISE_GLOBAL_STRENGTH"] = self.widgets["SEMANTIC_NOISE_GLOBAL_STRENGTH"].value()
         config_to_save["SEMANTIC_NOISE_NORMALIZE"] = self.widgets["SEMANTIC_NOISE_NORMALIZE"].isChecked()
         # --- End of new block ---
         
@@ -1689,9 +1689,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.semantic_noise_container = QtWidgets.QWidget()
         semantic_layout = QtWidgets.QFormLayout(self.semantic_noise_container)
         semantic_layout.setContentsMargins(0, 0, 0, 0)
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_CHAR_WEIGHT")
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_DETAIL_WEIGHT")
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_NORMALIZE")  # Add this line
+        # FIXED: Use the correct keys that exist in UI_DEFINITIONS
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_BLEND")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_GLOBAL_STRENGTH")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_NORMALIZE")
         layout.addWidget(self.semantic_noise_container)
 
         # Zero-Terminal SNR checkbox
@@ -1829,9 +1830,10 @@ class TrainingGUI(QtWidgets.QWidget):
                 
                 # --- General Widgets (excluding special cases) ---
                 special_keys = [
-                    "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE"
-                ] + [k for k in self.widgets.keys() if k.startswith("RAVEN_") or k.startswith("TIMESTEP") or k.startswith("SEMANTIC_") or k.startswith("NOISE_OFFSET")]
-                
+                    "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE",
+                    "SEMANTIC_NOISE_BLEND", "SEMANTIC_NOISE_GLOBAL_STRENGTH"  # Add both
+                ] + [k for k in self.widgets.keys() if k.startswith("RAVEN_") or k.startswith("TIMESTEP") or k.startswith("NOISE_OFFSET") or k.startswith("SEMANTIC_")]
+                                
                 for key, widget in self.widgets.items():
                     if key in special_keys: continue
                     value = self.current_config.get(key)
@@ -1866,8 +1868,8 @@ class TrainingGUI(QtWidgets.QWidget):
                 noise_type = self.current_config.get("NOISE_TYPE", "Default")
                 self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
                 self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
-                self.widgets["SEMANTIC_NOISE_CHAR_WEIGHT"].setValue(self.current_config.get("SEMANTIC_NOISE_CHAR_WEIGHT", 1.0))
-                self.widgets["SEMANTIC_NOISE_DETAIL_WEIGHT"].setValue(self.current_config.get("SEMANTIC_NOISE_DETAIL_WEIGHT", 0.5))
+                self.widgets["SEMANTIC_NOISE_BLEND"].setValue(self.current_config.get("SEMANTIC_NOISE_BLEND", 0.5))
+                self.widgets["SEMANTIC_NOISE_GLOBAL_STRENGTH"].setValue(self.current_config.get("SEMANTIC_NOISE_GLOBAL_STRENGTH", 0.8))
                 self.widgets["SEMANTIC_NOISE_NORMALIZE"].setChecked(self.current_config.get("SEMANTIC_NOISE_NORMALIZE", True))
                 self._toggle_noise_widgets()
                 # --- End of new block ---
