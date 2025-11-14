@@ -11,7 +11,7 @@
     "MAX_AREA_TOLERANCE": 1.0,
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 3500,
+    "MAX_TRAIN_STEPS": 2000,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 8,
     "MIXED_PRECISION": "bfloat16",
@@ -57,10 +57,10 @@
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_SCHEDULER": "DDPMScheduler",
-    "NOISE_TYPE": "Default",
+    "NOISE_TYPE": "Semantic",
     "NOISE_OFFSET": 0.025,
-    "SEMANTIC_NOISE_BLEND": 0.5,
-    "SEMANTIC_NOISE_GLOBAL_STRENGTH": 1.0,
+    "SEMANTIC_NOISE_BLEND": 0.7,
+    "SEMANTIC_NOISE_GLOBAL_STRENGTH": 0.12,
     "SEMANTIC_NOISE_NORMALIZE": true,
     "RAVEN_PARAMS": {
         "betas": [

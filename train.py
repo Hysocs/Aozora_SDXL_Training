@@ -150,6 +150,8 @@ def _generate_semantic_noise_map_for_batch(images, blend_factor, global_strength
     salience_tensor_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
     return salience_tensor_batch.expand(-1, num_channels, -1, -1)
 
+SEMANTIC_NOISE_INVERT = False
+
 def generate_train_noise(latents, config, original_images=None):
     base_noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
 
@@ -160,7 +162,7 @@ def generate_train_noise(latents, config, original_images=None):
 
         b, c, h, w = latents.shape
         
-        # Generate weight map (0-1 range) with optional normalization
+        # Generate weight map (0-1 range) - YOUR EXISTING CODE
         salience_tensor = _generate_semantic_noise_map_for_batch(
             original_images,
             config.SEMANTIC_NOISE_BLEND,
@@ -169,15 +171,21 @@ def generate_train_noise(latents, config, original_images=None):
             device=latents.device,
             dtype=latents.dtype,
             num_channels=c,
-            normalize=config.SEMANTIC_NOISE_NORMALIZE  # Now respected!
+            normalize=config.SEMANTIC_NOISE_NORMALIZE
         )
         
-        # Apply strength in modulation step (only if normalized, otherwise already in map)
+        # ✅ FIX: Zero-mean salience map (range becomes [-0.5, +0.5])
+        salience_tensor = salience_tensor - 0.5
+        
+        # ✅ FIX: Invert semantic mapping if enabled
+        if SEMANTIC_NOISE_INVERT:
+            salience_tensor = -salience_tensor
+        
+        # ✅ FIX: Direct strength scaling (no *2.0 multiplier)
+        # strength now directly controls max deviation from 1.0
         if config.SEMANTIC_NOISE_NORMALIZE:
-            # Strength was normalized out, so apply it now
             modulation = 1.0 + salience_tensor * config.SEMANTIC_NOISE_GLOBAL_STRENGTH
         else:
-            # Strength is already in the weight map, just add base
             modulation = 1.0 + salience_tensor
         
         structured_noise = base_noise * modulation
@@ -1094,6 +1102,9 @@ def main():
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             original_images = batch.get("original_image")
 
+            # ✅ FIX: Ensure target is in compute_dtype BEFORE loss
+            target = None
+            
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 # ✅ CRITICAL DTYPE FIX FOR TIME_IDS
                 time_ids_list = []
@@ -1109,13 +1120,16 @@ def main():
 
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
-                target = noise
                 if config.PREDICTION_TYPE == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
+                else:  # epsilon
+                    target = noise
                 
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
-                
-                loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+
+            # ✅ FIX: Calculate loss OUTSIDE autocast to prevent precision saturation
+            loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="mean")
+            loss = loss.to(dtype=config.compute_dtype)  # Cast back for bfloat16 backprop
 
             diagnostics.step(loss.item())
             loss.backward()  # ✅ Direct backward for bfloat16
