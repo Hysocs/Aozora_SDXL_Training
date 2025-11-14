@@ -1140,9 +1140,11 @@ class TrainingGUI(QtWidgets.QWidget):
         
         # --- [MODIFIED] Noise widget definitions ---
         "NOISE_OFFSET": {"label": "Noise Offset Strength:", "tooltip": "Improves learning of dark/bright images. Try 0.05.", "widget": "QDoubleSpinBox", "range": (0.0, 0.5), "step": 0.01, "decimals": 3},
-        "SEMANTIC_NOISE_NORMALIZE": {"label": "Normalize Semantic Map (recommended)", "tooltip": "Normalize the combined semantic map to 0-1 range. Disable for raw weight scaling.", "widget": "QCheckBox"},
-        "SEMANTIC_NOISE_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
-        "SEMANTIC_NOISE_GLOBAL_STRENGTH": {"label": "Overall Strength:", "tooltip": "Total modulation strength. 0.5 = subtle, 1.0 = standard, 2.0 = strong. Higher values can wash out color.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
+        
+        # --- [NEW] Loss widget definitions ---
+        "LOSS_TYPE": {"label": "Loss Type:", "tooltip": "Use default MSE loss or weighted Semantic loss.", "widget": "QComboBox", "options": ["Default", "Semantic"]},
+        "SEMANTIC_LOSS_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
+        "SEMANTIC_LOSS_STRENGTH": {"label": "Overall Strength:", "tooltip": "How much to increase loss in important areas. 0.5 = subtle, 1.0 = standard, 2.0 = strong.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
     }
     def __init__(self):
         super().__init__()
@@ -1310,14 +1312,11 @@ class TrainingGUI(QtWidgets.QWidget):
     def _prepare_config_to_save(self):
         config_to_save = {}
         for key in self.default_config.keys():
-            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS"]:
+            # Skip keys that are handled by special widgets
+            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS",
+                       "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH"]:
                 continue
             
-            # --- [MODIFIED] Noise config saving ---
-            if key.startswith("NOISE_") or key.startswith("SEMANTIC_NOISE_"):
-                continue # Skip old and new keys here, handle them specifically below
-            # --- End of modification ---
-
             live_val = self.current_config.get(key)
             if live_val is None:
                 continue
@@ -1328,6 +1327,7 @@ class TrainingGUI(QtWidgets.QWidget):
                     rounded_curve = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
                     config_to_save[key] = rounded_curve
                     continue
+                
                 converted_val = None
                 if isinstance(live_val, (bool, list)):
                     converted_val = live_val
@@ -1347,19 +1347,21 @@ class TrainingGUI(QtWidgets.QWidget):
             except (ValueError, TypeError) as e:
                 self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
 
+        # --- Handle special widgets ---
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
         
-        # --- [NEW] Noise config saving ---
+        # [MODIFIED] Save noise and loss types
         config_to_save["NOISE_SCHEDULER"] = self.widgets["NOISE_SCHEDULER"].currentText()
         config_to_save["NOISE_TYPE"] = self.widgets["NOISE_TYPE"].currentText()
         config_to_save["NOISE_OFFSET"] = self.widgets["NOISE_OFFSET"].value()
-        config_to_save["SEMANTIC_NOISE_BLEND"] = self.widgets["SEMANTIC_NOISE_BLEND"].value()
-        config_to_save["SEMANTIC_NOISE_GLOBAL_STRENGTH"] = self.widgets["SEMANTIC_NOISE_GLOBAL_STRENGTH"].value()
-        config_to_save["SEMANTIC_NOISE_NORMALIZE"] = self.widgets["SEMANTIC_NOISE_NORMALIZE"].isChecked()
-        # --- End of new block ---
         
+        config_to_save["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
+        config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
+        config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
+        
+        # Timestep Sampling
         ts_method = self.widgets["TIMESTEP_SAMPLING_METHOD"].currentText()
         config_to_save["TIMESTEP_SAMPLING_METHOD"] = ts_method
         config_to_save["TIMESTEP_SAMPLING_MIN"] = self.widgets["TIMESTEP_SAMPLING_MIN"].value()
@@ -1367,6 +1369,7 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["TIMESTEP_SAMPLING_GRAD_MIN"] = self.widgets["TIMESTEP_SAMPLING_GRAD_MIN"].value()
         config_to_save["TIMESTEP_SAMPLING_GRAD_MAX"] = self.widgets["TIMESTEP_SAMPLING_GRAD_MAX"].value()
         
+        # Raven Optimizer
         raven_params = {}
         try:
             betas_str = self.widgets['RAVEN_betas'].text().strip()
@@ -1382,7 +1385,6 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_params["use_grad_centralization"] = self.widgets['RAVEN_use_grad_centralization'].isChecked()
         raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
         config_to_save["RAVEN_PARAMS"] = raven_params
-
 
         return config_to_save
 
@@ -1526,10 +1528,12 @@ class TrainingGUI(QtWidgets.QWidget):
         right_grid.addWidget(self._create_core_training_group(), 0, 0)
         right_grid.addWidget(self._create_optimizer_group(), 0, 1)
         right_grid.addWidget(self._create_scheduler_config_group(), 1, 0)
-        right_grid.addWidget(self._create_timestep_sampling_group(), 1, 1)
-        right_grid.addWidget(self._create_noise_enhancements_group(), 2, 0)
-        right_grid.addWidget(self._create_unet_group(), 2, 1)
-        right_grid.addWidget(self._create_advanced_group(), 3, 0, 1, 2)
+        right_grid.addWidget(self._create_loss_group(), 1, 1) # <-- [NEW] Loss group added
+        right_grid.addWidget(self._create_timestep_sampling_group(), 2, 0)
+        right_grid.addWidget(self._create_noise_enhancements_group(), 2, 1) # <-- [MODIFIED] Noise group
+        right_grid.addWidget(self._create_unet_group(), 3, 0)
+        right_grid.addWidget(self._create_advanced_group(), 3, 1)
+        
         spacer = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding)
         right_grid.addItem(spacer, 4, 0, 1, 2)
         right_grid.setColumnStretch(0, 1)
@@ -1663,42 +1667,29 @@ class TrainingGUI(QtWidgets.QWidget):
         self._add_widget_to_form(layout, "NOISE_SCHEDULER")
         self._add_widget_to_form(layout, "PREDICTION_TYPE")
         self._add_widget_to_form(layout, "BETA_SCHEDULE")
+        _label, snr_checkbox = self._create_widget("USE_ZERO_TERMINAL_SNR")
+        if snr_checkbox:
+            layout.addRow(snr_checkbox)
         return group
 
+    # --- [MODIFIED] Simplified noise group ---
     def _create_noise_enhancements_group(self):
-        group = QtWidgets.QGroupBox("Noise Enhancements")
+        group = QtWidgets.QGroupBox("Noise Configuration")
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
 
-        # Main dropdown
         form_layout = QtWidgets.QFormLayout()
         self.widgets["NOISE_TYPE"] = QtWidgets.QComboBox()
-        self.widgets["NOISE_TYPE"].addItems(["Default", "Offset", "Semantic"])
+        self.widgets["NOISE_TYPE"].addItems(["Default", "Offset"])
         self.widgets["NOISE_TYPE"].currentTextChanged.connect(self._toggle_noise_widgets)
         form_layout.addRow("Noise Type:", self.widgets["NOISE_TYPE"])
         layout.addLayout(form_layout)
 
-        # Container for Offset settings
         self.offset_noise_container = QtWidgets.QWidget()
         offset_layout = QtWidgets.QFormLayout(self.offset_noise_container)
         offset_layout.setContentsMargins(0, 0, 0, 0)
         self._add_widget_to_form(offset_layout, "NOISE_OFFSET")
         layout.addWidget(self.offset_noise_container)
-
-        # Container for Semantic settings
-        self.semantic_noise_container = QtWidgets.QWidget()
-        semantic_layout = QtWidgets.QFormLayout(self.semantic_noise_container)
-        semantic_layout.setContentsMargins(0, 0, 0, 0)
-        # FIXED: Use the correct keys that exist in UI_DEFINITIONS
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_BLEND")
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_GLOBAL_STRENGTH")
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_NOISE_NORMALIZE")
-        layout.addWidget(self.semantic_noise_container)
-
-        # Zero-Terminal SNR checkbox
-        _label, snr_checkbox = self._create_widget("USE_ZERO_TERMINAL_SNR")
-        if snr_checkbox:
-            layout.addWidget(snr_checkbox)
 
         layout.addStretch(1)
         return group
@@ -1706,11 +1697,34 @@ class TrainingGUI(QtWidgets.QWidget):
     def _toggle_noise_widgets(self):
         noise_type = self.widgets["NOISE_TYPE"].currentText()
         self.offset_noise_container.setVisible(noise_type == "Offset")
-        self.semantic_noise_container.setVisible(noise_type == "Semantic")
-        # Also toggle the normalize checkbox visibility
-        if "SEMANTIC_NOISE_NORMALIZE" in self.widgets:
-            self.widgets["SEMANTIC_NOISE_NORMALIZE"].setVisible(noise_type == "Semantic")
 
+    # --- [NEW] Loss configuration group ---
+    def _create_loss_group(self):
+        group = QtWidgets.QGroupBox("Loss Configuration")
+        layout = QtWidgets.QVBoxLayout(group)
+        layout.setSpacing(10)
+
+        form_layout = QtWidgets.QFormLayout()
+        self.widgets["LOSS_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["LOSS_TYPE"].addItems(["Default", "Semantic"])
+        self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
+        form_layout.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
+        layout.addLayout(form_layout)
+
+        self.semantic_loss_container = QtWidgets.QWidget()
+        semantic_layout = QtWidgets.QFormLayout(self.semantic_loss_container)
+        semantic_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_LOSS_BLEND")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_LOSS_STRENGTH")
+        layout.addWidget(self.semantic_loss_container)
+
+        layout.addStretch(1)
+        return group
+
+    def _toggle_loss_widgets(self):
+        loss_type = self.widgets["LOSS_TYPE"].currentText()
+        self.semantic_loss_container.setVisible(loss_type == "Semantic")
+        
     def _create_timestep_sampling_group(self):
         group = QtWidgets.QGroupBox("Timestep Sampling")
         layout = QtWidgets.QFormLayout(group)
@@ -1830,9 +1844,8 @@ class TrainingGUI(QtWidgets.QWidget):
                 
                 # --- General Widgets (excluding special cases) ---
                 special_keys = [
-                    "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE",
-                    "SEMANTIC_NOISE_BLEND", "SEMANTIC_NOISE_GLOBAL_STRENGTH"  # Add both
-                ] + [k for k in self.widgets.keys() if k.startswith("RAVEN_") or k.startswith("TIMESTEP") or k.startswith("NOISE_OFFSET") or k.startswith("SEMANTIC_")]
+                    "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE"
+                ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TIMESTEP_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
                                 
                 for key, widget in self.widgets.items():
                     if key in special_keys: continue
@@ -1864,15 +1877,17 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc); self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha); self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
                 self._toggle_optimizer_widgets()
 
-
+                # [MODIFIED] Noise and Loss widgets
                 noise_type = self.current_config.get("NOISE_TYPE", "Default")
                 self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
                 self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
-                self.widgets["SEMANTIC_NOISE_BLEND"].setValue(self.current_config.get("SEMANTIC_NOISE_BLEND", 0.5))
-                self.widgets["SEMANTIC_NOISE_GLOBAL_STRENGTH"].setValue(self.current_config.get("SEMANTIC_NOISE_GLOBAL_STRENGTH", 0.8))
-                self.widgets["SEMANTIC_NOISE_NORMALIZE"].setChecked(self.current_config.get("SEMANTIC_NOISE_NORMALIZE", True))
                 self._toggle_noise_widgets()
-                # --- End of new block ---
+                
+                loss_type = self.current_config.get("LOSS_TYPE", "Default")
+                self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
+                self.widgets["SEMANTIC_LOSS_BLEND"].setValue(self.current_config.get("SEMANTIC_LOSS_BLEND", 0.5))
+                self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
+                self._toggle_loss_widgets()
 
                 if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                     self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))

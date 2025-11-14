@@ -50,7 +50,8 @@ def set_seed(seed):
         torch.cuda.manual_seed_all(seed)
     print(f"INFO: Set random seed to {seed}")
 
-# --- Semantic Noise Functions ---
+# --- Semantic Map Functions ---
+# --- MODIFICATION: These functions are now used for loss weighting, not noise modulation. ---
 
 def generate_character_map(pil_image):
     """Generates a map focusing on the overall character/object region using color and structure."""
@@ -63,7 +64,6 @@ def generate_character_map(pil_image):
     saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
     color_saliency = saliency_a + saliency_b
     
-    # Normalize to 0-1, then convert to uint8 for morphological ops
     if color_saliency.max() > 0:
         color_saliency_norm = color_saliency / color_saliency.max()
     else:
@@ -71,16 +71,13 @@ def generate_character_map(pil_image):
     
     color_saliency_uint8 = (color_saliency_norm * 255).astype(np.uint8)
     
-    # Morphological operations require uint8
     kernel = np.ones((11, 11), np.uint8)
     dilated = cv2.dilate(color_saliency_uint8, kernel, iterations=2)
     eroded = cv2.erode(dilated, kernel, iterations=2)
     
-    # Convert back to float32 and apply final Gaussian blur
     eroded_float = eroded.astype(np.float32) / 255.0
     final_map = cv2.GaussianBlur(eroded_float, (11, 11), 0)
     
-    # Return as mode 'F' PIL Image (32-bit float)
     return Image.fromarray(final_map)
 
 def generate_detail_map(pil_image):
@@ -90,31 +87,29 @@ def generate_detail_map(pil_image):
     sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=5)
     magnitude = np.sqrt(sobelx**2 + sobely**2)
     
-    # Normalize directly to 0-1
     if magnitude.max() > 0:
         magnitude_norm = magnitude / magnitude.max()
     else:
         magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
     
-    # Apply Gaussian blur
     final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (1, 1), 0)
     
-    # Return as mode 'F' PIL Image
     return Image.fromarray(final_map)
 
-def _generate_semantic_noise_map_for_batch(images, blend_factor, global_strength, target_size, device, dtype, num_channels, normalize=True):
+# --- MODIFICATION: Renamed from _generate_semantic_noise_map_for_batch ---
+def _generate_semantic_map_for_batch(images, blend_factor, strength, target_size, device, dtype, num_channels):
     """
-    Generates semantic noise maps with intuitive blend and strength controls.
+    Generates semantic maps for loss weighting.
     - blend_factor: 0.0 = 100% character map, 1.0 = 100% detail map
-    - global_strength: Overall modulation multiplier
-    - normalize: If True, normalizes by theoretical max (cancels strength in weight map, re-applies in modulation)
+    - strength: Overall multiplier for the map. The final map is NOT multiplied by this, it's just used for weighting.
     """
     batch_maps = []
     
     for img in images:
         if img is None:
-            salience_tensor = torch.zeros(target_size, dtype=dtype)
-            batch_maps.append(salience_tensor)
+            # If an image is missing, create a zero map which will result in a weight of 1.0 later
+            weight_map_tensor = torch.zeros(target_size, dtype=dtype)
+            batch_maps.append(weight_map_tensor)
             continue
             
         char_map_pil = generate_character_map(img)
@@ -123,87 +118,47 @@ def _generate_semantic_noise_map_for_batch(images, blend_factor, global_strength
         char_map_np = np.array(char_map_pil).astype(np.float32)
         detail_map_np = np.array(detail_map_pil).astype(np.float32)
 
-        # Calculate weights WITH strength (for raw combination)
-        char_weight = (1.0 - blend_factor) * global_strength
-        detail_weight = blend_factor * global_strength
+        # Raw weighted combination
+        combined_map = ((1.0 - blend_factor) * char_map_np) + (blend_factor * detail_map_np)
         
-        # Raw weighted combination (range: 0.0 to global_strength)
-        combined_raw = (char_weight * char_map_np) + (detail_weight * detail_map_np)
-        
-        # Apply normalization or clipping based on flag
-        if normalize:
-            # Normalize by theoretical max to get 0-1 weight map (cancels out strength)
-            theoretical_max = global_strength if global_strength > 0 else 1.0
-            weight_map = combined_raw / theoretical_max
-        else:
-            # Without normalization, clip to 0-1 range (keeps strength information)
-            weight_map = np.clip(combined_raw, 0, 1)
+        # Normalize by theoretical max to ensure a clean 0-1 range
+        if combined_map.max() > 0:
+            combined_map = combined_map / combined_map.max()
         
         # Apply gamma correction for smoother falloff
-        weight_map = np.power(weight_map, 0.8)
+        weight_map = np.power(combined_map, 0.8)
         
         # Resize and convert to tensor
         combined_map_pil = Image.fromarray(weight_map, mode='F').resize(target_size, Image.Resampling.LANCZOS)
-        salience_tensor = torch.from_numpy(np.array(combined_map_pil)).float()
-        batch_maps.append(salience_tensor)
+        weight_map_tensor = torch.from_numpy(np.array(combined_map_pil)).float()
+        batch_maps.append(weight_map_tensor)
 
-    salience_tensor_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
-    return salience_tensor_batch.expand(-1, num_channels, -1, -1)
+    # Stack, add channel dimension, move to device, and expand for all channels
+    final_map_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
+    return final_map_batch.expand(-1, num_channels, -1, -1)
 
-SEMANTIC_NOISE_INVERT = False
-
-def generate_train_noise(latents, config, original_images=None):
+# --- MODIFICATION: Simplified noise generation ---
+def generate_train_noise(latents, config):
+    """
+    Generates training noise. 'Semantic' noise is no longer handled here.
+    """
     base_noise = torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
 
-    if config.NOISE_TYPE == "Semantic":
-        if original_images is None:
-            print("WARNING: NOISE_TYPE is 'Semantic' but no original images were provided. Falling back to default noise.")
-            return base_noise
-
-        b, c, h, w = latents.shape
-        
-        # Generate weight map (0-1 range) - YOUR EXISTING CODE
-        salience_tensor = _generate_semantic_noise_map_for_batch(
-            original_images,
-            config.SEMANTIC_NOISE_BLEND,
-            config.SEMANTIC_NOISE_GLOBAL_STRENGTH,
-            target_size=(w, h),
-            device=latents.device,
-            dtype=latents.dtype,
-            num_channels=c,
-            normalize=config.SEMANTIC_NOISE_NORMALIZE
-        )
-        
-        # ✅ FIX: Zero-mean salience map (range becomes [-0.5, +0.5])
-        salience_tensor = salience_tensor - 0.5
-        
-        # ✅ FIX: Invert semantic mapping if enabled
-        if SEMANTIC_NOISE_INVERT:
-            salience_tensor = -salience_tensor
-        
-        # ✅ FIX: Direct strength scaling (no *2.0 multiplier)
-        # strength now directly controls max deviation from 1.0
-        if config.SEMANTIC_NOISE_NORMALIZE:
-            modulation = 1.0 + salience_tensor * config.SEMANTIC_NOISE_GLOBAL_STRENGTH
-        else:
-            modulation = 1.0 + salience_tensor
-        
-        structured_noise = base_noise * modulation
-        return structured_noise
-
-    elif config.NOISE_TYPE == "Offset":
+    if config.NOISE_TYPE == "Offset":
         strength = float(getattr(config, "NOISE_OFFSET", 0.1))
         if strength <= 0:
             return base_noise
         b, c, h, w = base_noise.shape
+        # Create a single offset value for all pixels in each batch item
         offset = torch.randn(b, 1, 1, 1, device=base_noise.device, dtype=base_noise.dtype)
         return base_noise + strength * offset
     
     else: # "Default"
         return base_noise
-    
+
 class TrainingConfig:
     def __init__(self):
+        # --- MODIFICATION: Assumes new config values like LOSS_TYPE will be in default_config ---
         for key, value in default_config.__dict__.items():
             if not key.startswith('__'):
                 setattr(self, key, value)
@@ -666,7 +621,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.latent_files = []
-        self.use_semantic_noise = (config.NOISE_TYPE == "Semantic")
+        # --- MODIFICATION: Check for semantic loss, not semantic noise ---
+        self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
         
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
@@ -688,8 +644,8 @@ class ImageTextLatentDataset(Dataset):
             key = all_meta.get(f.stem)
             self.bucket_keys.append(tuple(key) if key else None)
         print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
-        if self.use_semantic_noise:
-             print("INFO: Semantic noise is ENABLED. Original images will be loaded during training.")
+        if self.use_semantic_loss:
+             print("INFO: Semantic loss is ENABLED. Original images will be loaded during training.")
 
     def __len__(self): return len(self.latent_files)
 
@@ -718,12 +674,13 @@ class ImageTextLatentDataset(Dataset):
                 "latent_path": str(latent_path)
             }
             
-            if self.use_semantic_noise:
+            # --- MODIFICATION: Load original image if semantic loss is enabled ---
+            if self.use_semantic_loss:
                 original_image_path = self._find_original_image_path(latent_path)
                 if original_image_path:
                     item_data["original_image"] = Image.open(original_image_path).convert("RGB")
                 else:
-                    print(f"WARNING: Could not find original image for {latent_path.stem}. Semantic noise will use a zero map for this item.")
+                    print(f"WARNING: Could not find original image for {latent_path.stem}. Semantic loss will be skipped for this item.")
                     item_data["original_image"] = None
 
             return item_data
@@ -950,12 +907,10 @@ def save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable
         'sampler_seed': sampler.seed,
     }
 
-    # --- FIX ---
-    # Only save the scaler state if a scaler is actually being used.
     if scaler is not None:
         training_state['scaler_state_dict'] = scaler.state_dict()
     else:
-        training_state['scaler_state_dict'] = None # Save a placeholder
+        training_state['scaler_state_dict'] = None
 
     torch.save(training_state, output_dir / state_filename)
     print(f"Successfully saved training state: {state_filename}")
@@ -1076,8 +1031,9 @@ def main():
     
     timestep_sampler = TimestepSampler(config, noise_scheduler, device)
     print(f"\n--- Using Timestep Sampling Method: {timestep_sampler.method} ---")
-    print(f"--- Using Noise Generation Method: {config.NOISE_TYPE} ---\n")
-
+    print(f"--- Using Noise Generation Method: {config.NOISE_TYPE} ---")
+    # --- NEW: Announce the loss type being used ---
+    print(f"--- Using Loss Calculation Method: {getattr(config, 'LOSS_TYPE', 'Default')} ---\n")
 
     accumulated_latent_paths = []
     training_start_time = time.time()
@@ -1096,24 +1052,22 @@ def main():
 
             if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
             
-            # ✅ CRITICAL DTYPE FIX FOR BFLOAT16
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             original_images = batch.get("original_image")
 
-            # ✅ FIX: Ensure target is in compute_dtype BEFORE loss
             target = None
             
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
-                # ✅ CRITICAL DTYPE FIX FOR TIME_IDS
                 time_ids_list = []
                 for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"]):
                     time_id = torch.tensor(list(s1) + [0,0] + list(s2), dtype=torch.float32)
                     time_ids_list.append(time_id.unsqueeze(0).to(device, dtype=config.compute_dtype))
                 time_ids = torch.cat(time_ids_list, dim=0)
                 
-                noise = generate_train_noise(latents, config, original_images=original_images)
+                # --- MODIFICATION: Simplified noise generation call ---
+                noise = generate_train_noise(latents, config)
                 
                 timesteps = timestep_sampler.sample(latents.shape[0])
                 timestep_sampler.record_timesteps(timesteps)
@@ -1127,19 +1081,55 @@ def main():
                 
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-            # ✅ FIX: Calculate loss OUTSIDE autocast to prevent precision saturation
-            loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="mean")
-            loss = loss.to(dtype=config.compute_dtype)  # Cast back for bfloat16 backprop
+            # --- MODIFICATION: New loss calculation logic ---
+            # Calculate base per-pixel loss outside autocast for precision
+            per_pixel_loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="none")
+
+            if getattr(config, 'LOSS_TYPE', 'Default') == "Semantic":
+                # Only apply semantic loss if original images were successfully loaded
+                if original_images and None not in original_images:
+                    b, c, h, w = latents.shape
+
+                    # Generate the 0-1 semantic map for the batch
+                    semantic_map = _generate_semantic_map_for_batch(
+                        original_images,
+                        config.SEMANTIC_LOSS_BLEND,
+                        config.SEMANTIC_LOSS_STRENGTH,
+                        target_size=(w, h),
+                        device=latents.device,
+                        dtype=torch.float32, # Process map in float32 for precision
+                        num_channels=c,
+                    )
+
+                    # Create a modulation map. Base weight is 1.0.
+                    # Important areas (map > 0) get their loss increased.
+                    # A strength of 1.0 means important areas have up to 2x the loss.
+                    modulation = 1.0 + (semantic_map * config.SEMANTIC_LOSS_STRENGTH)
+                    
+                    # Apply the weights to the per-pixel loss
+                    modulated_loss = per_pixel_loss * modulation
+
+                    # Reduce to a single value
+                    loss = modulated_loss.mean()
+                else:
+                    if global_step % 100 == 0: # Avoid spamming the console
+                        print("\nWARNING: LOSS_TYPE is 'Semantic' but no original images were provided for this batch. Falling back to default loss.")
+                    loss = per_pixel_loss.mean()
+            else:
+                # Default behavior: just take the mean
+                loss = per_pixel_loss.mean()
+
+            # Cast back to compute_dtype for backward pass
+            loss = loss.to(dtype=config.compute_dtype)
 
             diagnostics.step(loss.item())
-            loss.backward()  # ✅ Direct backward for bfloat16
+            loss.backward()
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 test_param = dict(unet.named_parameters())[test_param_name]
                 before_val = test_param.data.clone()
                 
-                # ✅ Calculate grad norm on raw gradients
                 raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
                 timestep_sampler.update(raw_grad_norm)
                 
@@ -1147,7 +1137,7 @@ def main():
                     torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
                 clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
 
-                optimizer.step()  # ✅ Direct step for bfloat16
+                optimizer.step()
                 lr_scheduler.step(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
 
@@ -1191,7 +1181,7 @@ def main():
                  print(f"\n--- Saving checkpoint at step {global_step} ---")
                  save_checkpoint(
                     global_step, unet, base_model_state_dict, key_map, trainable_layer_names,
-                    optimizer, lr_scheduler, None, sampler, config  # ✅ Pass None for scaler
+                    optimizer, lr_scheduler, None, sampler, config
                 )
 
     print("\nTraining complete.")

@@ -9,6 +9,7 @@
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": 1048576,
     "MAX_AREA_TOLERANCE": 1.0,
+    "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
     "MAX_TRAIN_STEPS": 2000,
@@ -56,12 +57,11 @@
         }
     ],
     "OPTIMIZER_TYPE": "raven",
-    "NOISE_SCHEDULER": "DDPMScheduler",
-    "NOISE_TYPE": "Semantic",
+    "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "SEMANTIC_NOISE_BLEND": 0.7,
-    "SEMANTIC_NOISE_GLOBAL_STRENGTH": 0.12,
-    "SEMANTIC_NOISE_NORMALIZE": true,
+    "LOSS_TYPE": "Semantic",
+    "SEMANTIC_LOSS_BLEND": 0.5,
+    "SEMANTIC_LOSS_STRENGTH": 0.8,
     "RAVEN_PARAMS": {
         "betas": [
             0.9,

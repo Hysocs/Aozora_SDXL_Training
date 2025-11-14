@@ -1,6 +1,6 @@
-# ==================================================================================== 
-# DEFAULT CONFIGURATION 
-# Simplified configuration matching the refactored training script
+# ====================================================================================
+# DEFAULT CONFIGURATION
+# Updated to separate Semantic Loss from Noise Type
 # ====================================================================================
 
 # --- Paths ---
@@ -24,8 +24,9 @@ INSTANCE_DATASETS = [
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
-SHOULD_UPSCALE = False
+
 # --- Aspect Ratio Bucketing ---
+SHOULD_UPSCALE = False
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
 MAX_AREA_TOLERANCE = 1.1
 
@@ -56,21 +57,15 @@ LR_CUSTOM_CURVE = [
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 
+# --- Timestep Sampling ---
 TIMESTEP_SAMPLING_METHOD = "Random Integer (Default)"
-
 TIMESTEP_SAMPLING_MIN = 0
 TIMESTEP_SAMPLING_MAX = 999
 TIMESTEP_SAMPLING_GRAD_MIN = 0.1
 TIMESTEP_SAMPLING_GRAD_MAX = 0.9
 
-# --- Advanced ---
-MEMORY_EFFICIENT_ATTENTION = "xformers"
-USE_ZERO_TERMINAL_SNR = True
-
 # --- Optimizer Configuration ---
-OPTIMIZER_TYPE = "raven"  # "raven" or "adafactor"
-
-# Raven Optimizer Parameters
+OPTIMIZER_TYPE = "raven"
 RAVEN_PARAMS = {
     "betas": [0.9, 0.999],
     "eps": 1e-8,
@@ -80,18 +75,18 @@ RAVEN_PARAMS = {
     "gc_alpha": 1.0
 }
 
-# --- Gradient Spike Detection ---
+# --- Noise Configuration ---
+NOISE_TYPE = "Default"  # Options: "Default", "Offset"
+NOISE_OFFSET = 0.05     # Only used if NOISE_TYPE is "Offset"
+
+# --- Loss Configuration ---
+LOSS_TYPE = "Default"  # Options: "Default", "Semantic"
+# These settings are only active when LOSS_TYPE is "Semantic"
+SEMANTIC_LOSS_BLEND = 0.5     # 0.0 = Character, 1.0 = Detail, 0.5 = Mix
+SEMANTIC_LOSS_STRENGTH = 0.8  # How much to boost loss in important areas (0.0 to ~2.0)
+
+# --- Advanced & Miscellaneous ---
+MEMORY_EFFICIENT_ATTENTION = "xformers"
+USE_ZERO_TERMINAL_SNR = True
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
-
-# --- Noise Enhancements ---
-NOISE_TYPE = "Semantic"  # Options: "Default", "Offset", "Semantic"
-SEMANTIC_NOISE_NORMALIZE = True
-
-# --- Parameters for "Offset" Noise ---
-NOISE_OFFSET = 0.05 # Only used if NOISE_TYPE is "Offset"
-
-# --- Parameters for "Semantic" Noise ---
-# These settings are only active when NOISE_TYPE is "Semantic"
-SEMANTIC_NOISE_BLEND = 0.5     # 0.0 = 100% Character, 1.0 = 100% Detail, 0.5 = Equal mix
-SEMANTIC_NOISE_GLOBAL_STRENGTH = 0.8  # Overall modulation strength (1.0 = standard, 2.0 = strong)
