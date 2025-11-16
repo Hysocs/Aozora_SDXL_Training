@@ -1120,10 +1120,23 @@ def main():
                 loss = per_pixel_loss.mean()
 
             # Cast back to compute_dtype for backward pass
+            #old
+            #loss = loss.to(dtype=config.compute_dtype)
+
+            #diagnostics.step(loss.item())
+            #loss.backward()
+            accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
+            raw_loss_value = loss.detach().item()  # Save for logging
+            loss = loss / accumulation_steps       # Scale before backward
+
+            # Cast for backward pass
             loss = loss.to(dtype=config.compute_dtype)
 
-            diagnostics.step(loss.item())
+            # Backward pass
             loss.backward()
+
+            # Use raw loss for diagnostics
+            diagnostics.step(raw_loss_value)
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
