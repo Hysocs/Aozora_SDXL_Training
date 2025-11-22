@@ -109,6 +109,20 @@ QTextEdit {
     border-radius: 4px;
     padding: 5px;
 }
+QPlainTextEdit {
+    background-color: #1a1926;
+    border: 1px solid #4a4668;
+    color: #e0e0e0;
+    font-family: 'Consolas', 'Courier New', monospace;
+    border-radius: 4px;
+    padding: 5px;
+}
+QPlainTextEdit:focus { border: 1px solid #ab97e6; }
+QPlainTextEdit:disabled {
+    background-color: #242233;
+    color: #7a788c;
+    border: 1px solid #383552;
+}
 QCheckBox {
     spacing: 8px;
 }
@@ -1129,7 +1143,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "SEED": {"label": "Seed:", "tooltip": "Ensures reproducible training.", "widget": "QLineEdit"},
         "RESUME_MODEL_PATH": {"label": "Resume Model:", "tooltip": "The .safetensors checkpoint file.", "widget": "Path", "file_type": "file_safetensors"},
         "RESUME_STATE_PATH": {"label": "Resume State:", "tooltip": "The .pt optimizer state file.", "widget": "Path", "file_type": "file_pt"},
-        "UNET_EXCLUDE_TARGETS": {"label": "Exclude Layers (Keywords):", "tooltip": "Comma-separated keywords for layers to exclude from training (e.g., 'conv1, conv2, norm').", "widget": "QLineEdit"},
+        "UNET_EXCLUDE_TARGETS": {"label": "Exclude Layers (Keywords):", "tooltip": "Keywords for layers to exclude from training (comma-separated).", "widget": "QPlainTextEdit", "height": 260},
         "LR_GRAPH_MIN": {"label": "Graph Min LR:", "tooltip": "The minimum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "NOISE_SCHEDULER": {"label": "Noise Scheduler:", "tooltip": "The noise scheduler to use for training. EulerDiscrete is experimental.", "widget": "QComboBox", "options": ["DDPMScheduler", "DDIMScheduler", "EulerDiscreteScheduler (Experimental)"]},
@@ -1443,6 +1457,10 @@ class TrainingGUI(QtWidgets.QWidget):
         if widget_type == "QLineEdit":
             widget = QtWidgets.QLineEdit()
             widget.textChanged.connect(lambda text, k=key: self._update_config_from_widget(k, widget))
+        elif widget_type == "QPlainTextEdit":
+            widget = QtWidgets.QPlainTextEdit()
+            if "height" in definition: widget.setFixedHeight(definition["height"])
+            widget.textChanged.connect(lambda: self._update_config_from_widget(key, widget))
         elif widget_type == "QSpinBox":
             widget = QtWidgets.QSpinBox()
             if "range" in definition: widget.setRange(*definition["range"])
@@ -1827,11 +1845,18 @@ class TrainingGUI(QtWidgets.QWidget):
             entry_widget.setText(path.replace('\\', '/'))
     
     def _update_config_from_widget(self, key, widget):
-        if isinstance(widget, QtWidgets.QLineEdit): self.current_config[key] = widget.text().strip()
-        elif isinstance(widget, QtWidgets.QCheckBox): self.current_config[key] = widget.isChecked()
-        elif isinstance(widget, QtWidgets.QComboBox): self.current_config[key] = widget.currentText()
-        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = widget.value()
-        elif isinstance(widget, LRCurveWidget): self.current_config[key] = widget.get_points()
+        if isinstance(widget, QtWidgets.QLineEdit):
+            self.current_config[key] = widget.text().strip()
+        elif isinstance(widget, QtWidgets.QPlainTextEdit):
+            self.current_config[key] = widget.toPlainText().strip()
+        elif isinstance(widget, QtWidgets.QCheckBox):
+            self.current_config[key] = widget.isChecked()
+        elif isinstance(widget, QtWidgets.QComboBox):
+            self.current_config[key] = widget.currentText()
+        elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+            self.current_config[key] = widget.value()
+        elif isinstance(widget, LRCurveWidget):
+            self.current_config[key] = widget.get_points()
     
     def _apply_config_to_widgets(self):
             for widget in self.widgets.values():
@@ -1851,11 +1876,16 @@ class TrainingGUI(QtWidgets.QWidget):
                     if key in special_keys: continue
                     value = self.current_config.get(key)
                     if value is None: continue
-                    if isinstance(widget, QtWidgets.QLineEdit): widget.setText(str(value))
-                    elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
-                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-
+                    if isinstance(widget, QtWidgets.QLineEdit):
+                        widget.setText(str(value))
+                    elif isinstance(widget, QtWidgets.QPlainTextEdit):
+                        widget.setPlainText(str(value))
+                    elif isinstance(widget, QtWidgets.QCheckBox):
+                        widget.setChecked(bool(value))
+                    elif isinstance(widget, QtWidgets.QComboBox):
+                        widget.setCurrentText(str(value))
+                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)):
+                        widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
                 # --- Special Cases ---
                 optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
                 self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())

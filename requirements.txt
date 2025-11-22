@@ -34,3 +34,5 @@ pandas
 matplotlib
 xformers
 ultralytics
+tomesd
+peft

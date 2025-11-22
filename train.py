@@ -29,6 +29,7 @@ from multiprocessing import Pool, cpu_count
 import config as default_config
 import threading
 import queue
+import tomesd
 
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
@@ -375,28 +376,67 @@ class AsyncReporter:
         print("Async reporter shut down.")
 
 class BucketBatchSampler(Sampler):
-    def __init__(self, dataset, batch_size, seed, shuffle=True, drop_last=False):
-        self.batch_size, self.shuffle, self.drop_last, self.seed, self.dataset = batch_size, shuffle, drop_last, seed, dataset
-        self.epoch_indices = list(range(len(self.dataset.latent_files)))
+    def __init__(self, dataset, batch_size, seed, shuffle=True):
+        self.dataset = dataset
+        self.batch_size = batch_size
+        self.seed = seed
+        self.shuffle = shuffle
+        self.epoch = 0
+        self.total_images = len(self.dataset)
 
     def __iter__(self):
-        g = torch.Generator(); g.manual_seed(self.seed)
-        indices = torch.randperm(len(self.epoch_indices), generator=g).tolist() if self.shuffle else self.epoch_indices
-        buckets = defaultdict(list)
-        for i in indices:
-            if (key := self.dataset.bucket_keys[i]): buckets[key].append(i)
-        all_batches = []
-        for key in sorted(buckets.keys()):
-            for i in range(0, len(buckets[key]), self.batch_size):
-                batch = buckets[key][i:i + self.batch_size]
-                if not self.drop_last or len(batch) == self.batch_size: all_batches.append(batch)
-        if self.shuffle: all_batches = [all_batches[i] for i in torch.randperm(len(all_batches), generator=g).tolist()]
-        yield from all_batches
-        self.seed += 1
+        g = torch.Generator()
+        # SEED + EPOCH: Ensures every epoch has a unique, random order,
+        # preventing the model from memorizing the sequence.
+        g.manual_seed(self.seed + self.epoch)
+        
+        indices = list(range(self.total_images))
+        
+        # --- MODE A: BATCH SIZE 1 (Total Aspect Ratio Mixing) ---
+        # If batch size is 1, we ignore buckets completely.
+        # We shuffle the entire list of images globally.
+        # This results in [Tall, Wide, Square, Wide, Tall] sequences.
+        if self.batch_size == 1:
+            if self.shuffle:
+                indices = torch.randperm(len(indices), generator=g).tolist()
+            
+            # Wrap each index in a list to create a "batch" of 1
+            batches = [[i] for i in indices]
+
+        # --- MODE B: BATCH SIZE > 1 (Bucketed Mixing) ---
+        # If batch size > 1, we MUST group by resolution to allow tensor stacking.
+        # However, we Shuffle the Batches at the end so we don't process
+        # all tall batches at once.
+        else:
+            # 1. Shuffle indices so buckets fill up randomly
+            if self.shuffle:
+                indices = torch.randperm(len(indices), generator=g).tolist()
+
+            # 2. Group into buckets (Tall, Wide, Square)
+            buckets = defaultdict(list)
+            for idx in indices:
+                key = self.dataset.bucket_keys[idx]
+                buckets[key].append(idx)
+
+            # 3. Create Batches
+            batches = []
+            for key in buckets:
+                bucket_indices = buckets[key]
+                for i in range(0, len(bucket_indices), self.batch_size):
+                    batch = bucket_indices[i : i + self.batch_size]
+                    batches.append(batch)
+            
+            # 4. Shuffle the Batches (Aspect Ratio Mixing for Batches)
+            # This ensures: Batch_1(Tall) -> Batch_2(Wide) -> Batch_3(Square)
+            if self.shuffle:
+                batch_indices = torch.randperm(len(batches), generator=g).tolist()
+                batches = [batches[i] for i in batch_indices]
+
+        self.epoch += 1
+        yield from batches
 
     def __len__(self):
-        return (len(self.epoch_indices) // self.batch_size if self.drop_last
-                else (len(self.epoch_indices) + self.batch_size - 1) // self.batch_size)
+        return (self.total_images + self.batch_size - 1) // self.batch_size
 
 class ResolutionCalculator:
     def __init__(self, target_area, stride=64, should_upscale=False, max_area_tolerance=1.1):
@@ -921,7 +961,11 @@ def main():
     if config.SEED: set_seed(config.SEED)
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
+    
+    # Optimized matmul settings
+    torch.backends.cuda.matmul.allow_tf32 = True
+    torch.backends.cudnn.allow_tf32 = True
+    
     global_step = 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed = config.SEED
@@ -970,7 +1014,7 @@ def main():
         'beta_schedule': config.BETA_SCHEDULE
     }
     noise_scheduler = scheduler_class.from_config(filter_scheduler_config(training_scheduler_config, scheduler_class))
-    print(f"INFO: Training with {type(noise_scheduler).__name__}, prediction type '{noise_scheduler.config.prediction_type}', and beta schedule '{noise_scheduler.config.beta_schedule}'")
+    print(f"INFO: Training with {type(noise_scheduler).__name__}")
 
     if getattr(config, 'USE_ZERO_TERMINAL_SNR', False):
         print("INFO: Applying Zero Terminal SNR rescaling to scheduler betas.")
@@ -981,34 +1025,42 @@ def main():
     print("\n--- Initializing Dataset ---")
     dataset = ImageTextLatentDataset(config)
     print(f"INFO: Initializing BucketBatchSampler with seed: {initial_sampler_seed}")
-    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True, drop_last=True)
+    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
     dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
     unet.to(device).enable_gradient_checkpointing()
     unet.enable_xformers_memory_efficient_attention() if config.MEMORY_EFFICIENT_ATTENTION == "xformers" else unet.set_attn_processor(AttnProcessor2_0())
     
+
     print("\n--- UNet Layer Selection Report ---")
-    total_params = sum(p.numel() for p in unet.parameters())
-    
     exclusion_keywords = config.UNET_EXCLUDE_TARGETS
-    trainable_layer_names = [name for name, param in unet.named_parameters() if not any(k in name for k in exclusion_keywords)]
+    
+    trainable_layer_names = []
+    frozen_layer_names = []
     
     for name, param in unet.named_parameters():
-        param.requires_grad = (name in trainable_layer_names)
-        
+        should_exclude = any(k in name for k in exclusion_keywords)
+        if should_exclude:
+            param.requires_grad = False
+            frozen_layer_names.append(name)
+        else:
+            param.requires_grad = True
+            trainable_layer_names.append(name)
+
     params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
+    total_params = sum(p.numel() for p in unet.parameters())
     trainable_params = sum(p.numel() for p in params_to_optimize)
     frozen_params = total_params - trainable_params
     percentage_trainable = (trainable_params / total_params) * 100 if total_params > 0 else 0
 
-    print(f"  - Exclusion Keywords Used: {exclusion_keywords if exclusion_keywords else 'None'}")
-    print(f"  - Total UNet Parameters: {total_params / 1e6:.3f}M")
-    print(f"  - Trainable Parameters:  {trainable_params / 1e6:.3f}M")
-    print(f"  - Frozen Parameters:     {frozen_params / 1e6:.3f}M")
-    print(f"  - Percentage Being Trained: {percentage_trainable:.2f}%")
+    print(f"  - Exclusion Keywords: {exclusion_keywords}")
+    print(f"  - Trainable: {trainable_params / 1e6:.2f}M params ({percentage_trainable:.2f}%)")
+    print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
+    
+
     
     print(f"GUI_PARAM_INFO::{trainable_params / 1e6:.2f}M ({percentage_trainable:.2f}%) of {total_params / 1e6:.2f}M total")
-    
+
     optimizer = create_optimizer(config, params_to_optimize)
     lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, max_train_steps=config.MAX_TRAIN_STEPS)
 
@@ -1016,24 +1068,20 @@ def main():
         print("\n--- Restoring Training States ---")
         if optimizer_state:
             optimizer.load_cpu_state(optimizer_state)
-            print("INFO: Optimizer state loaded successfully using custom CPU method.")
         lr_scheduler.step(global_step)
-        print(f"INFO: LR scheduler stepped to {global_step}. Current LR: {lr_scheduler.get_last_lr()[0]:.2e}")
         print("--- Resume setup complete. Starting training loop. ---")
     else:
         print("\n--- Fresh start setup complete. Starting training loop. ---")
 
     unet.train()
     key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
-    test_param_name = trainable_layer_names[0] if trainable_layer_names else "N/A"
-    diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
-    reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name=test_param_name)
     
+    diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
+    # Passed "Gradient Check" as the name so the reporter knows we aren't tracking a specific layer anymore
+    reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="Gradient Check") 
     timestep_sampler = TimestepSampler(config, noise_scheduler, device)
-    print(f"\n--- Using Timestep Sampling Method: {timestep_sampler.method} ---")
-    print(f"--- Using Noise Generation Method: {config.NOISE_TYPE} ---")
-    # --- NEW: Announce the loss type being used ---
-    print(f"--- Using Loss Calculation Method: {getattr(config, 'LOSS_TYPE', 'Default')} ---\n")
+
+    print(f"\n--- Using Loss Calculation Method: {getattr(config, 'LOSS_TYPE', 'Default')} ---\n")
 
     accumulated_latent_paths = []
     training_start_time = time.time()
@@ -1066,9 +1114,7 @@ def main():
                     time_ids_list.append(time_id.unsqueeze(0).to(device, dtype=config.compute_dtype))
                 time_ids = torch.cat(time_ids_list, dim=0)
                 
-                # --- MODIFICATION: Simplified noise generation call ---
                 noise = generate_train_noise(latents, config)
-                
                 timesteps = timestep_sampler.sample(latents.shape[0])
                 timestep_sampler.record_timesteps(timesteps)
 
@@ -1076,72 +1122,40 @@ def main():
                 
                 if config.PREDICTION_TYPE == "v_prediction":
                     target = noise_scheduler.get_velocity(latents, noise, timesteps)
-                else:  # epsilon
+                else:
                     target = noise
                 
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-            # --- MODIFICATION: New loss calculation logic ---
-            # Calculate base per-pixel loss outside autocast for precision
+            # Loss Calculation
             per_pixel_loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="none")
 
             if getattr(config, 'LOSS_TYPE', 'Default') == "Semantic":
-                # Only apply semantic loss if original images were successfully loaded
                 if original_images and None not in original_images:
                     b, c, h, w = latents.shape
-
-                    # Generate the 0-1 semantic map for the batch
                     semantic_map = _generate_semantic_map_for_batch(
-                        original_images,
-                        config.SEMANTIC_LOSS_BLEND,
-                        config.SEMANTIC_LOSS_STRENGTH,
-                        target_size=(w, h),
-                        device=latents.device,
-                        dtype=torch.float32, # Process map in float32 for precision
-                        num_channels=c,
+                        original_images, config.SEMANTIC_LOSS_BLEND, config.SEMANTIC_LOSS_STRENGTH,
+                        target_size=(w, h), device=latents.device, dtype=torch.float32, num_channels=c
                     )
-
-                    # Create a modulation map. Base weight is 1.0.
-                    # Important areas (map > 0) get their loss increased.
-                    # A strength of 1.0 means important areas have up to 2x the loss.
                     modulation = 1.0 + (semantic_map * config.SEMANTIC_LOSS_STRENGTH)
-                    
-                    # Apply the weights to the per-pixel loss
-                    modulated_loss = per_pixel_loss * modulation
-
-                    # Reduce to a single value
-                    loss = modulated_loss.mean()
+                    loss = (per_pixel_loss * modulation).mean()
                 else:
-                    if global_step % 100 == 0: # Avoid spamming the console
-                        print("\nWARNING: LOSS_TYPE is 'Semantic' but no original images were provided for this batch. Falling back to default loss.")
                     loss = per_pixel_loss.mean()
             else:
-                # Default behavior: just take the mean
                 loss = per_pixel_loss.mean()
 
-            # Cast back to compute_dtype for backward pass
-            #old
-            #loss = loss.to(dtype=config.compute_dtype)
-
-            #diagnostics.step(loss.item())
-            #loss.backward()
             accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
-            raw_loss_value = loss.detach().item()  # Save for logging
-            loss = loss / accumulation_steps       # Scale before backward
-
-            # Cast for backward pass
+            raw_loss_value = loss.detach().item()
+            loss = loss / accumulation_steps
             loss = loss.to(dtype=config.compute_dtype)
-
-            # Backward pass
             loss.backward()
 
-            # Use raw loss for diagnostics
             diagnostics.step(raw_loss_value)
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-                test_param = dict(unet.named_parameters())[test_param_name]
-                before_val = test_param.data.clone()
+                
+                # --- SIMPLIFIED: No parameter clone/check logic here ---
                 
                 raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
                 timestep_sampler.update(raw_grad_norm)
@@ -1154,18 +1168,20 @@ def main():
                 lr_scheduler.step(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
 
-                update_delta = torch.abs(test_param.data - before_val).max().item()
                 optim_step_time = time.time() - last_optim_step_log_time
                 optim_step_times.append(optim_step_time)
                 last_optim_step_log_time = time.time()
                 
+
+                update_status = 1.0 if raw_grad_norm > 0 else 0.0
+
                 diag_data_to_log = {
                     'optim_step': (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS,
                     'avg_loss': diagnostics.get_average_loss(),
                     'current_lr': optimizer.param_groups[0]['lr'],
                     'raw_grad_norm': raw_grad_norm,
                     'clipped_grad_norm': clipped_grad_norm,
-                    'update_delta': update_delta,
+                    'update_delta': update_status, # Pseudo-value for reporter
                     'optim_step_time': optim_step_time,
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)
                 }
@@ -1180,11 +1196,8 @@ def main():
             eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * (sum(global_step_times) / len(global_step_times))
             
             timing_data = {
-                'raw_step_time': step_duration, 
-                'elapsed_time': elapsed_time, 
-                'eta': eta_seconds,
-                'loss': loss.item(),
-                'timestep': timesteps[0].item()
+                'raw_step_time': step_duration, 'elapsed_time': elapsed_time, 'eta': eta_seconds,
+                'loss': loss.item(), 'timestep': timesteps[0].item()
             }
             
             reporter.log_step(global_step, timing_data=timing_data, diag_data=diag_data_to_log)

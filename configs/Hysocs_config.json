@@ -1,9 +1,9 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/experimentalNoobaiWith_rectifiedFlowV01.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_8008.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_8008.pt",
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_4509.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
     "SHOULD_UPSCALE": true,
@@ -11,66 +11,66 @@
     "MAX_AREA_TOLERANCE": 1.0,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
-    "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 1500,
+    "BETA_SCHEDULE": "squaredcos_cap_v2",
+    "MAX_TRAIN_STEPS": 2500,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 8,
+    "GRADIENT_ACCUMULATION_STEPS": 5,
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": 12.0,
-    "SEED": 42,
-    "SAVE_EVERY_N_STEPS": 1001,
-    "UNET_EXCLUDE_TARGETS": "down_blocks.0, down_blocks.2, down_blocks.1.attentions, mid_block.attentions.1",
+    "CLIP_GRAD_NORM": 20.0,
+    "SEED": 64,
+    "SAVE_EVERY_N_STEPS": 1501,
+    "UNET_EXCLUDE_TARGETS": "conv1,conv2,conv_shortcut",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            0.0
+            9.9e-07
         ],
         [
             0.05,
-            2e-05
+            4.9e-05
         ],
         [
             0.9,
-            2e-05
+            4.9e-05
         ],
         [
             1.0,
-            0.0
+            9.9e-07
         ]
     ],
-    "LR_GRAPH_MIN": 0.0,
-    "LR_GRAPH_MAX": 2e-05,
+    "LR_GRAPH_MIN": 9.9e-07,
+    "LR_GRAPH_MAX": 4.9e-05,
     "TIMESTEP_SAMPLING_METHOD": "Random Integer (Default)",
-    "TIMESTEP_SAMPLING_MIN": 0,
-    "TIMESTEP_SAMPLING_MAX": 999,
+    "TIMESTEP_SAMPLING_MIN": 101,
+    "TIMESTEP_SAMPLING_MAX": 953,
     "TIMESTEP_SAMPLING_GRAD_MIN": 0.5,
     "TIMESTEP_SAMPLING_GRAD_MAX": 10.0,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
-    "USE_ZERO_TERMINAL_SNR": false,
+    "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/AI_Training_data/Artists/by you yue yue",
+            "path": "C:/Users/Administrator/Pictures/AI_Training_data/Artists/by anmo too",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "LOSS_TYPE": "Semantic",
+    "LOSS_TYPE": "Default",
     "SEMANTIC_LOSS_BLEND": 0.5,
-    "SEMANTIC_LOSS_STRENGTH": 2.0,
+    "SEMANTIC_LOSS_STRENGTH": 1.8,
     "RAVEN_PARAMS": {
         "betas": [
             0.9,
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.018,
+        "weight_decay": 0.01,
         "debias_strength": 1.0,
-        "use_grad_centralization": false,
+        "use_grad_centralization": true,
         "gc_alpha": 0.5
     }
 }
