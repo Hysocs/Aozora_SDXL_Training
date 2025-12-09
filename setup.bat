@@ -1,229 +1,178 @@
 @ECHO OFF
-CLS
-SETLOCAL ENABLEDELAYEDEXPANSION
+SETLOCAL
 
-chcp 65001 >nul 2>&1
-
-:: Setup for ANSI colors in the console.
-FOR /F "tokens=1,2 delims=#" %%a IN ('"PROMPT #$E# & FOR %%b IN (1) DO REM"') DO SET "ESC=%%a"
-
-:: Define color variables for easier use.
-SET "COLOR_RESET=!ESC![0m"
-SET "COLOR_RED=!ESC![91m"
-SET "COLOR_GREEN=!ESC![92m"
-SET "COLOR_YELLOW=!ESC![93m"
-SET "COLOR_CYAN=!ESC![96m"
-SET "COLOR_WHITE=!ESC![97m"
-SET "COLOR_BLUE=!ESC![94m"
+:: Keep window open by relaunching
+IF "%~1"=="" (
+    cmd /k "%~f0" KEEPALIVE
+    EXIT /b
+)
 
 :: =================================================================================
-::              SDXL Training Environment Setup Script (Fully Automated)
+::              SDXL Training Environment Setup Script (Fixed)
 :: =================================================================================
 
-:: --- ( STEP 1: CONFIGURE YOUR PATHS AND URLS HERE ) ---
+:: --- CONFIGURATION ---
 SET VENV_DIR=portable_Venv
-SET PYTHON_EXE=py -3.11
-SET VENV_PATH=.\!VENV_DIR!\Scripts
-SET WHEELS_DIR=.\!VENV_DIR!\Wheels
+SET PYTHON_EXE=py -3.12
+SET WHEELS_DIR=%VENV_DIR%\Wheels
 
-:: PyTorch 2.8.0 + CUDA 12.8 Wheels
-SET FLASH_ATTN_URL=https://github.com/kingbri1/flash-attention/releases/download/v2.8.2/flash_attn-2.8.2+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl
-SET FLASH_ATTN_FILENAME=flash_attn-2.8.2+cu128torch2.8.0cxx11abiFALSE-cp311-cp311-win_amd64.whl
+:: PyTorch 2.9.1 + CUDA 12.8 Stack
+SET TORCH_VERSION=2.9.1
+SET TORCHVISION_VERSION=0.24.1
+SET TORCHAUDIO_VERSION=2.9.1
+SET XFORMERS_VERSION=0.0.33.post2
 
-SET FLASH_ATTN_WHL_PATH=!WHEELS_DIR!\!FLASH_ATTN_FILENAME!
+:: Flash Attention Wheel (for PyTorch 2.9.1 + CUDA 12.8 + Python 3.12)
+SET FLASH_ATTN_FILENAME=flash_attn-2.8.2+cu128torch2.9.1-cp312-none-win_amd64.whl
+SET FLASH_ATTN_URL=https://github.com/kingbri1/flash-attention/releases/download/v2.8.2/%FLASH_ATTN_FILENAME%
 
-:: --- ( END OF CONFIGURATION ) ---
-
+:: --- MENU ---
 :MENU
 CLS
-ECHO !COLOR_CYAN!====================================================!COLOR_RESET!
-ECHO !COLOR_CYAN!        SDXL Training Environment Installer         !COLOR_RESET!
-ECHO !COLOR_CYAN!====================================================!COLOR_RESET!
 ECHO.
-ECHO !COLOR_WHITE!Please choose your installation type:!COLOR_RESET!
+ECHO === SDXL Training Environment Installer ===
+ECHO [1] Install WITH Flash Attention (RTX 30xx/40xx)
+ECHO [2] Install WITHOUT Flash Attention (AMD/Older NVIDIA)
 ECHO.
-ECHO   !COLOR_CYAN![1]!COLOR_RESET! Install !COLOR_YELLOW!WITH!COLOR_RESET! Flash Attention (Recommended for NVIDIA RTX cards)
-ECHO   !COLOR_CYAN![2]!COLOR_RESET! Install !COLOR_YELLOW!WITHOUT!COLOR_RESET! Flash Attention (For AMD or older NVIDIA cards)
+ECHO Python 3.12, PyTorch %TORCH_VERSION%, CUDA 12.8
 ECHO.
-ECHO !COLOR_YELLOW!Note: The installation process downloads many files and may take a while.!COLOR_RESET!
-ECHO.
+CHOICE /C 12 /N /M "Enter choice [1 or 2]: "
 
-CHOICE /C 12 /N /M "Enter your choice [1 or 2]: "
-
-IF ERRORLEVEL 2 GOTO InstallWithoutFlash
-IF ERRORLEVEL 1 GOTO InstallWithFlash
-GOTO MENU
-
-:InstallWithFlash
-ECHO.
-ECHO !COLOR_GREEN![INFO] Proceeding with Flash Attention installation.!COLOR_RESET!
-SET "INSTALL_MODE=FLASH"
-GOTO:START_CHECKS
-
-:InstallWithoutFlash
-ECHO.
-ECHO !COLOR_GREEN![INFO] Proceeding without Flash Attention installation.!COLOR_RESET!
-SET "INSTALL_MODE=NO_FLASH"
-GOTO:START_CHECKS
+IF ERRORLEVEL 2 SET INSTALL_MODE=NO_FLASH & GOTO START_CHECKS
+IF ERRORLEVEL 1 SET INSTALL_MODE=FLASH & GOTO START_CHECKS
 
 :START_CHECKS
 ECHO.
-ECHO !COLOR_CYAN!===================================================!COLOR_RESET!
-ECHO !COLOR_CYAN!  Starting Automated Environment Setup             !COLOR_RESET!
-ECHO !COLOR_CYAN!===================================================!COLOR_RESET!
+ECHO === Starting Setup ===
 ECHO.
 
-:: --- CUDA Detection ---
-ECHO !COLOR_WHITE![INFO] Checking for NVIDIA CUDA...!COLOR_RESET!
-where nvidia-smi >nul 2>nul
+:: --- CUDA Check ---
+where nvidia-smi >nul 2>&1
 IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] CUDA not detected! nvidia-smi not found.!COLOR_RESET!
-    ECHO !COLOR_YELLOW![WARNING] This installer requires an NVIDIA GPU with CUDA support.!COLOR_RESET!
-    ECHO !COLOR_YELLOW!          Please install NVIDIA drivers and CUDA toolkit.!COLOR_RESET!
-    GOTO:FATAL_ERROR
+    ECHO [ERROR] nvidia-smi not found. Install NVIDIA drivers from nvidia.com/drivers
+    GOTO FATAL_ERROR
 )
-
-nvidia-smi >nul 2>nul
-IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] CUDA check failed! No NVIDIA GPU detected.!COLOR_RESET!
-    GOTO:FATAL_ERROR
-)
-
-ECHO !COLOR_GREEN![SUCCESS] CUDA detected successfully.!COLOR_RESET!
+ECHO [OK] CUDA detected.
 ECHO.
 
-:: --- Pre-flight Checks ---
-IF NOT EXIST "requirements.txt" (
-    ECHO !COLOR_RED![ERROR] requirements.txt not found!COLOR_RESET!
-    GOTO:FATAL_ERROR
-)
-
-where %PYTHON_EXE% >nul 2>nul
+:: --- Python Check ---
+where %PYTHON_EXE% >nul 2>&1
 IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] Python 3.11 not found!COLOR_RESET!
-    ECHO !COLOR_YELLOW!        Please install Python 3.11 and ensure it's in your PATH.!COLOR_RESET!
-    GOTO:FATAL_ERROR
+    ECHO [ERROR] Python 3.12 not found. Install from python.org/downloads/
+    GOTO FATAL_ERROR
 )
+%PYTHON_EXE% --version
+ECHO [OK] Python 3.12+ found.
+ECHO.
 
-:: --- Virtual Environment Setup ---
-IF NOT EXIST "!VENV_PATH!\activate.bat" (
-    ECHO !COLOR_WHITE![INFO] Creating virtual environment...!COLOR_RESET!
-    %PYTHON_EXE% -m venv %VENV_DIR% >nul 2>nul
-    IF ERRORLEVEL 1 (
-        ECHO !COLOR_RED![ERROR] Failed to create virtual environment.!COLOR_RESET!
-        GOTO:FATAL_ERROR
-    )
-    ECHO !COLOR_GREEN![SUCCESS] Virtual environment created.!COLOR_RESET!
+:: --- Requirements.txt Check ---
+IF NOT EXIST requirements.txt (
+    ECHO [ERROR] requirements.txt not found in: %CD%
+    GOTO FATAL_ERROR
+)
+ECHO [OK] requirements.txt found.
+ECHO.
+
+:: --- Virtual Environment ---
+IF NOT EXIST "%VENV_DIR%\Scripts\activate.bat" (
+    ECHO [INFO] Creating virtual environment...
+    %PYTHON_EXE% -m venv %VENV_DIR%
+    IF ERRORLEVEL 1 GOTO FATAL_ERROR
+    ECHO [OK] venv created.
 ) ELSE (
-    ECHO !COLOR_GREEN![INFO] Virtual environment found.!COLOR_RESET!
+    ECHO [OK] venv exists.
 )
 ECHO.
 
-ECHO !COLOR_WHITE![INFO] Activating virtual environment...!COLOR_RESET!
-CALL "!VENV_PATH!\activate.bat"
-IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] Failed to activate virtual environment.!COLOR_RESET!
-    GOTO:FATAL_ERROR
-)
-ECHO !COLOR_GREEN![SUCCESS] Virtual environment activated.!COLOR_RESET!
+:: --- Activate venv ---
+CALL "%VENV_DIR%\Scripts\activate.bat"
+IF ERRORLEVEL 1 GOTO FATAL_ERROR
+ECHO [OK] venv activated.
 ECHO.
 
+:: --- Set Encoding ---
 SET PYTHONIOENCODING=utf-8
 
-:: --- Pip Upgrade ---
-ECHO !COLOR_WHITE![INFO] Upgrading pip...!COLOR_RESET!
-python -m pip install --upgrade pip --quiet --no-warn-script-location 2>nul
-ECHO !COLOR_GREEN![SUCCESS] Pip upgraded.!COLOR_RESET!
-ECHO.
-
-:: --- PyTorch Installation ---
-ECHO !COLOR_WHITE![INFO] Installing PyTorch 2.8.0 + CUDA 12.8...!COLOR_RESET!
-ECHO !COLOR_BLUE!       This may take several minutes, please wait...!COLOR_RESET!
-python -m pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128 --quiet --no-warn-script-location 2>nul
+:: --- Core ML Stack (PyTorch + Vision + Audio + Xformers) ---
+ECHO [INFO] Installing PyTorch %TORCH_VERSION% stack...
+ECHO [INFO] This may take 10-20 minutes depending on your internet speed...
+python -m pip install --upgrade pip
+python -m pip install torch==%TORCH_VERSION% torchvision==%TORCHVISION_VERSION% torchaudio==%TORCHAUDIO_VERSION% xformers==%XFORMERS_VERSION% --index-url https://download.pytorch.org/whl/cu128
 IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] PyTorch installation failed.!COLOR_RESET!
-    ECHO !COLOR_YELLOW![INFO] Opening detailed output in new window...!COLOR_RESET!
-    START "PyTorch Installation - Details" cmd /k "python -m pip install torch==2.8.0 torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128"
-    GOTO:FATAL_ERROR
+    ECHO [ERROR] PyTorch installation failed. Check your internet/PyPI access.
+    GOTO FATAL_ERROR
 )
-ECHO !COLOR_GREEN![SUCCESS] PyTorch stack installed.!COLOR_RESET!
+ECHO [OK] PyTorch + Xformers installed.
 ECHO.
 
-:: --- Xformers Installation ---
-ECHO !COLOR_WHITE![INFO] Installing Xformers for PyTorch 2.8.0 + CUDA 12.8...!COLOR_RESET!
-ECHO !COLOR_BLUE!       This may take several minutes, please wait...!COLOR_RESET!
-python -m pip install -U xformers --index-url https://download.pytorch.org/whl/cu128 --quiet --no-warn-script-location 2>nul
-IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] Xformers installation failed.!COLOR_RESET!
-    ECHO !COLOR_YELLOW![INFO] Opening detailed output in new window...!COLOR_RESET!
-    START "Xformers Installation - Details" cmd /k "python -m pip install -U xformers --index-url https://download.pytorch.org/whl/cu128"
-    GOTO:FATAL_ERROR
-)
-ECHO !COLOR_GREEN![SUCCESS] Xformers installed.!COLOR_RESET!
-ECHO.
-
-:: --- Flash Attention Installation (Optional) ---
-IF "!INSTALL_MODE!"=="FLASH" (
-    ECHO !COLOR_WHITE![INFO] Installing Flash Attention...!COLOR_RESET!
+:: --- Flash Attention ---
+IF "%INSTALL_MODE%"=="FLASH" (
+    ECHO [INFO] Installing Flash Attention v2.8.2...
+    IF NOT EXIST "%WHEELS_DIR%" MKDIR "%WHEELS_DIR%"
     
-    IF NOT EXIST "!WHEELS_DIR!" MKDIR "!WHEELS_DIR!" >nul 2>nul
-    
-    IF NOT EXIST "!FLASH_ATTN_WHL_PATH!" (
-        ECHO !COLOR_BLUE!       Downloading flash-attention wheel...!COLOR_RESET!
-        curl -L --progress-bar -o "!FLASH_ATTN_WHL_PATH!" !FLASH_ATTN_URL! 2>nul
+    SET FLASH_PATH=%WHEELS_DIR%\%FLASH_ATTN_FILENAME%
+    IF NOT EXIST "%FLASH_PATH%" (
+        ECHO [INFO] Downloading from GitHub...
+        curl -L --progress-bar -o "%FLASH_PATH%" %FLASH_ATTN_URL%
         IF ERRORLEVEL 1 (
-            ECHO !COLOR_RED![ERROR] Flash Attention download failed.!COLOR_RESET!
-            DEL "!FLASH_ATTN_WHL_PATH!" >nul 2>nul
-            GOTO:FATAL_ERROR
+            ECHO [ERROR] Download failed. Check URL or internet.
+            GOTO FATAL_ERROR
         )
-        ECHO !COLOR_GREEN![SUCCESS] Flash Attention downloaded.!COLOR_RESET!
+        ECHO [OK] Downloaded.
     ) ELSE (
-        ECHO !COLOR_GREEN![INFO] Flash Attention wheel found locally.!COLOR_RESET!
+        ECHO [INFO] Using cached wheel.
     )
     
-    python -m pip install "!FLASH_ATTN_WHL_PATH!" --quiet --no-warn-script-location 2>nul
-    IF ERRORLEVEL 1 (
-        ECHO !COLOR_RED![ERROR] Flash Attention installation failed.!COLOR_RESET!
-        ECHO !COLOR_YELLOW![INFO] Opening detailed output in new window...!COLOR_RESET!
-        START "Flash Attention Installation - Details" cmd /k "python -m pip install "!FLASH_ATTN_WHL_PATH!""
-        GOTO:FATAL_ERROR
-    )
-    ECHO !COLOR_GREEN![SUCCESS] Flash Attention installed.!COLOR_RESET!
+    ECHO [INFO] Installing wheel...
+    python -m pip install "%FLASH_PATH%"
+    IF ERRORLEVEL 1 GOTO FATAL_ERROR
+    ECHO [OK] Flash Attention installed.
     ECHO.
 )
 
-:: --- Requirements.txt Installation ---
-ECHO !COLOR_WHITE![INFO] Installing remaining dependencies...!COLOR_RESET!
-ECHO !COLOR_BLUE!       This may take several minutes, please wait...!COLOR_RESET!
-python -m pip install -r requirements.txt --quiet --no-warn-script-location 2>nul
+:: --- Dependencies ---
+ECHO [INFO] Installing remaining packages from requirements.txt...
+python -m pip install -r requirements.txt
 IF ERRORLEVEL 1 (
-    ECHO !COLOR_RED![ERROR] Failed to install dependencies from requirements.txt!COLOR_RESET!
-    ECHO !COLOR_YELLOW![INFO] Opening detailed output in new window...!COLOR_RESET!
-    START "Requirements Installation - Details" cmd /k "python -m pip install -r requirements.txt"
-    GOTO:FATAL_ERROR
+    ECHO [ERROR] Package installation failed. Check requirements.txt
+    GOTO FATAL_ERROR
 )
-ECHO !COLOR_GREEN![SUCCESS] All dependencies installed.!COLOR_RESET!
+ECHO [OK] All packages installed.
+ECHO.
+
+:: --- Final Verification ---
+ECHO [INFO] Verifying installation...
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}'); import torchvision; print(f'Vision: {torchvision.__version__}'); import xformers; print(f'Xformers: {xformers.__version__}')"
+IF "%INSTALL_MODE%"=="FLASH" (
+    python -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')" 2>nul || ECHO [WARN] Flash import test failed.
+)
+ECHO [OK] Verification complete.
 ECHO.
 
 :: --- Success ---
 ECHO.
-ECHO !COLOR_GREEN!============================================================!COLOR_RESET!
-ECHO !COLOR_GREEN!      INSTALLATION COMPLETE!                                !COLOR_RESET!
-ECHO !COLOR_GREEN!============================================================!COLOR_RESET!
+ECHO ========================================
+ECHO    INSTALLATION COMPLETE!
+ECHO ========================================
 ECHO.
-ECHO !COLOR_CYAN!Your SDXL training environment is ready to use.!COLOR_RESET!
-ECHO.
-GOTO:END
+ECHO To activate manually: CALL "%VENV_DIR%\Scripts\activate.bat"
+PAUSE
+GOTO END
 
 :FATAL_ERROR
 ECHO.
-ECHO !COLOR_RED!============================================================!COLOR_RESET!
-ECHO !COLOR_RED!      INSTALLATION FAILED                                   !COLOR_RESET!
-ECHO !COLOR_RED!============================================================!COLOR_RESET!
+ECHO ========================================
+ECHO    INSTALLATION FAILED
+ECHO ========================================
 ECHO.
-ECHO !COLOR_YELLOW!Please check the error messages above and try again.!COLOR_RESET!
+ECHO Common issues:
+ECHO 1. Python 3.12 not installed or 'py' launcher not in PATH
+ECHO 2. No internet connection to PyPI
+ECHO 3. requirements.txt contains invalid packages
+ECHO 4. Insufficient disk space
+ECHO 5. Antivirus blocking pip/curl
 ECHO.
+PAUSE
 
 :END
-PAUSE
-EXIT
+EXIT /b

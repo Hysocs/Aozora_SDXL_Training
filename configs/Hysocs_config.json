@@ -11,8 +11,8 @@
     "MAX_AREA_TOLERANCE": 1.0,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
-    "BETA_SCHEDULE": "squaredcos_cap_v2",
-    "MAX_TRAIN_STEPS": 2500,
+    "BETA_SCHEDULE": "scaled_linear",
+    "MAX_TRAIN_STEPS": 1800,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 5,
     "MIXED_PRECISION": "bfloat16",
@@ -23,23 +23,23 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            9.9e-07
+            4.9e-09
         ],
         [
             0.05,
-            4.9e-05
+            4.9e-06
         ],
         [
             0.9,
-            4.9e-05
+            4.9e-06
         ],
         [
             1.0,
-            9.9e-07
+            4.9e-09
         ]
     ],
-    "LR_GRAPH_MIN": 9.9e-07,
-    "LR_GRAPH_MAX": 4.9e-05,
+    "LR_GRAPH_MIN": 4.9e-09,
+    "LR_GRAPH_MAX": 4.9e-06,
     "TIMESTEP_SAMPLING_METHOD": "Random Integer (Default)",
     "TIMESTEP_SAMPLING_MIN": 101,
     "TIMESTEP_SAMPLING_MAX": 953,
@@ -52,7 +52,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/AI_Training_data/Artists/by anmo too",
+            "path": "C:/Users/Administrator/Pictures/Seishoriyou Yuusha -ver1.5-",
             "repeats": 1
         }
     ],
@@ -70,7 +70,7 @@
         "eps": 1e-08,
         "weight_decay": 0.01,
         "debias_strength": 1.0,
-        "use_grad_centralization": true,
+        "use_grad_centralization": false,
         "gc_alpha": 0.5
     }
 }
