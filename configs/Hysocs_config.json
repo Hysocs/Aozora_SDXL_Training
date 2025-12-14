@@ -12,34 +12,66 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 1800,
+    "MAX_TRAIN_STEPS": 2000,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 5,
+    "GRADIENT_ACCUMULATION_STEPS": 10,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 20.0,
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": 1501,
+    "SAVE_EVERY_N_STEPS": 5002,
     "UNET_EXCLUDE_TARGETS": "conv1,conv2,conv_shortcut",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            4.9e-09
+            4e-07
         ],
         [
-            0.05,
-            4.9e-06
+            0.1,
+            4e-05
         ],
         [
-            0.9,
-            4.9e-06
+            0.19,
+            3.90309e-05
+        ],
+        [
+            0.28,
+            3.62185e-05
+        ],
+        [
+            0.37,
+            3.18381e-05
+        ],
+        [
+            0.46,
+            2.63185e-05
+        ],
+        [
+            0.55,
+            2.02e-05
+        ],
+        [
+            0.64,
+            1.40815e-05
+        ],
+        [
+            0.73,
+            8.5619e-06
+        ],
+        [
+            0.82,
+            4.1815e-06
+        ],
+        [
+            0.91,
+            1.3691e-06
         ],
         [
             1.0,
-            4.9e-09
+            4e-07
         ]
     ],
-    "LR_GRAPH_MIN": 4.9e-09,
-    "LR_GRAPH_MAX": 4.9e-06,
+    "LR_GRAPH_MIN": 4e-07,
+    "LR_GRAPH_MAX": 4e-05,
     "TIMESTEP_SAMPLING_METHOD": "Random Integer (Default)",
     "TIMESTEP_SAMPLING_MIN": 101,
     "TIMESTEP_SAMPLING_MAX": 953,
@@ -52,7 +84,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Seishoriyou Yuusha -ver1.5-",
+            "path": "C:/Users/Administrator/Pictures/GameCG/Sisters' Compass ~Lovey-Dovey Slow Life on Uninhabited island with Younger Sisters~",
             "repeats": 1
         }
     ],
