@@ -1,10 +1,11 @@
 
+
 import json
 import os
 import re
 from PyQt6 import QtWidgets, QtCore, QtGui
 import subprocess
-from PyQt6.QtCore import QThread, pyqtSignal, QPropertyAnimation, QEasingCurve
+from PyQt6.QtCore import QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QObject
 import copy
 import sys
 from pathlib import Path
@@ -12,22 +13,31 @@ import random
 import shutil
 import ctypes
 import math
-import config as default_config
 from collections import deque
 from matplotlib.backends.backend_qt5agg import FigureCanvasQTAgg as FigureCanvas
-from matplotlib.figure import Figure
+# Note: config import assumes a file named config.py exists in the same directory
+try:
+    import config as default_config
+except ImportError:
+    # Fallback if config.py is missing, just to ensure code runs for testing
+    class default_config:
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0}
+        OPTIMIZER_TYPE = "AdamW"
 
 def prevent_sleep(enable=True):
     ES_CONTINUOUS = 0x80000000
     ES_SYSTEM_REQUIRED = 0x00000001
     ES_DISPLAY_REQUIRED = 0x00000002
-    kernel32 = ctypes.windll.kernel32
-    if enable:
-        kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
-        print("Sleep prevention enabled.")
-    else:
-        kernel32.SetThreadExecutionState(ES_CONTINUOUS)
-        print("Sleep prevention disabled.")
+    try:
+        kernel32 = ctypes.windll.kernel32
+        if enable:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED)
+            print("Sleep prevention enabled.")
+        else:
+            kernel32.SetThreadExecutionState(ES_CONTINUOUS)
+            print("Sleep prevention disabled.")
+    except Exception:
+        pass # Not on Windows or ctypes failed
 
 STYLESHEET = """
 QWidget {
@@ -994,65 +1004,98 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.set_points(points)
         self.pointsChanged.emit(points)
     
-    def set_cosine_preset(self):
+    def set_generated_preset(self, mode, num_restarts, initial_warmup_pct, restart_rampup_pct):
+        # Validation
+        num_restarts = max(1, int(num_restarts))
+        initial_warmup_pct = max(0.0, min(1.0, float(initial_warmup_pct)))
+        restart_rampup_pct = max(0.0, min(1.0, float(restart_rampup_pct)))
+
+
+        epsilon = 1e-5 
+
         min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        warmup_portion = 0.10
-        num_decay_points = 10
-        points = [[0.0, min_lr], [warmup_portion, max_lr]]
-        decay_duration = 1.0 - warmup_portion
-        for i in range(num_decay_points + 1):
-            decay_progress = i / num_decay_points
-            norm_x = warmup_portion + decay_progress * decay_duration
-            cosine_val = 0.5 * (1 + math.cos(math.pi * decay_progress))
-            lr_val = min_lr + (max_lr - min_lr) * cosine_val
-            points.append([norm_x, lr_val])
-        unique_points = sorted(list(set(tuple(p) for p in points)), key=lambda x: x[0])
+        points = []
+        segment_length = 1.0 / num_restarts
+        points_per_segment = 20 # Resolution for cosine curves
+
+        for i in range(num_restarts):
+            segment_start = i * segment_length
+            segment_end = (i + 1) * segment_length
+            
+            # Determine which warmup percentage to use
+            current_warmup_pct = initial_warmup_pct if i == 0 else restart_rampup_pct
+            
+            # Calculate lengths
+            warmup_len = segment_length * current_warmup_pct
+            
+            # Apply the fix: ensure warmup_len is at least epsilon so X coordinates differ
+            if warmup_len < epsilon:
+                warmup_len = epsilon
+            
+            # Safety clamp so warmup doesn't exceed the segment itself
+            if warmup_len > segment_length:
+                warmup_len = segment_length
+
+            decay_len = segment_length - warmup_len
+            
+            # 1. Start of segment (Bottom)
+            points.append([segment_start, min_lr])
+
+            # 2. Peak point (Top)
+            peak_x = segment_start + warmup_len
+            # Clamp peak_x to ensure it doesn't float-drift past segment end
+            peak_x = min(peak_x, segment_end)
+            
+            points.append([peak_x, max_lr])
+
+            # 3. Decay phase
+            if decay_len > epsilon:
+                if mode == "Cosine":
+                    for j in range(1, points_per_segment + 1):
+                        progress = j / points_per_segment
+                        x = peak_x + (progress * decay_len)
+                        # Standard cosine decay from 1.0 down to 0.0
+                        factor = 0.5 * (1 + math.cos(math.pi * progress))
+                        y = min_lr + (max_lr - min_lr) * factor
+                        points.append([x, y])
+                else: # Linear
+                    points.append([segment_end, min_lr])
+            else:
+                # If 100% warmup (no decay room), we end high
+                # Check if this isn't the absolute end of training to avoid hanging high
+                if i < num_restarts - 1:
+                    points.append([segment_end, max_lr])
+                else:
+                    # If it's the very last point, user usually expects it to drop or stay?
+                    # Generally with 100% warmup it stays high.
+                    points.append([segment_end, max_lr])
+        
+        # Cleanup / format points
+        final_points = []
+        for p in points:
+            x = max(0.0, min(1.0, p[0]))
+            y = max(min_lr, min(max_lr, p[1]))
+            final_points.append([x, y])
+        
+        # Ensure start point exists
+        if not final_points or final_points[0][0] != 0.0:
+            final_points.insert(0, [0.0, min_lr])
+        
+        # Ensure end point exists
+        if final_points[-1][0] < 1.0:
+             final_points.append([1.0, final_points[-1][1]])
+
+        # Filter duplicates (x collision)
+        unique_points = []
+        last_x = -1.0
+        for p in final_points:
+            # We check against last_x + tiny threshold. 
+            # Since we forced warmup_len >= epsilon (1e-5), this passes.
+            if p[0] > last_x + 1e-9:
+                unique_points.append(p)
+                last_x = p[0]
+        
         self.apply_preset(unique_points)
-    
-    def set_linear_preset(self):
-        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        warmup_portion = 0.05
-        points = [[0.0, min_lr], [warmup_portion, max_lr], [1.0, min_lr]]
-        self.apply_preset(points)
-    
-    def set_constant_preset(self):
-        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        warmup_portion = 0.05
-        cooldown_start = 1.0 - 0.10
-        points = [[0.0, min_lr], [warmup_portion, max_lr], [cooldown_start, max_lr], [1.0, min_lr]]
-        self.apply_preset(points)
-    
-    def set_step_preset(self):
-        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        points = [[0.0, min_lr], [0.05, max_lr], [0.60, max_lr], [0.65, max_lr / 40], [1.0, min_lr]]
-        self.apply_preset(points)
-    
-    def set_cyclical_dip_preset(self):
-        min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        warmup_end_portion = 0.05
-        cooldown_start_portion = 0.60
-        num_dips = 2
-        dip_factor = 0.25
-        dip_bottom_duration = 0.035
-        dip_transition_duration = 0.025
-        points = [[0.0, min_lr], [warmup_end_portion, max_lr]]
-        plateau_duration = cooldown_start_portion - warmup_end_portion
-        single_dip_total_duration = (dip_transition_duration * 2) + dip_bottom_duration
-        flat_part_duration = (plateau_duration - (num_dips * single_dip_total_duration)) / (num_dips + 1)
-        if flat_part_duration < 0: return
-        current_pos = warmup_end_portion
-        dip_lr = max(max_lr * dip_factor, min_lr)
-        for _ in range(num_dips):
-            current_pos += flat_part_duration
-            points.append([current_pos, max_lr])
-            current_pos += dip_transition_duration
-            points.append([current_pos, dip_lr])
-            current_pos += dip_bottom_duration
-            points.append([current_pos, dip_lr])
-            current_pos += dip_transition_duration
-            points.append([current_pos, max_lr])
-        points.extend([[cooldown_start_portion, max_lr], [0.65, max_lr / 40], [1.0, min_lr]])
-        self.apply_preset(points)
 
 class ProcessRunner(QThread):
     logSignal = pyqtSignal(str)
@@ -1659,18 +1702,70 @@ class TrainingGUI(QtWidgets.QWidget):
         self.lr_curve_widget.pointsChanged.connect(lambda pts: self._update_config_from_widget("LR_CUSTOM_CURVE", self.lr_curve_widget))
         self.lr_curve_widget.selectionChanged.connect(self._update_lr_button_states)
         lr_layout.addWidget(self.lr_curve_widget)
+        
         lr_controls_layout = QtWidgets.QHBoxLayout()
         self.add_point_btn = QtWidgets.QPushButton("Add Point"); self.add_point_btn.clicked.connect(self.lr_curve_widget.add_point)
         self.remove_point_btn = QtWidgets.QPushButton("Remove Selected"); self.remove_point_btn.clicked.connect(self.lr_curve_widget.remove_selected_point)
         lr_controls_layout.addWidget(self.add_point_btn); lr_controls_layout.addWidget(self.remove_point_btn); lr_controls_layout.addStretch()
         lr_layout.addLayout(lr_controls_layout)
-        preset_layout = QtWidgets.QHBoxLayout()
-        preset_layout.addWidget(QtWidgets.QLabel("<b>Presets:</b>"))
-        presets = {"Cosine": self.lr_curve_widget.set_cosine_preset, "Linear": self.lr_curve_widget.set_linear_preset, "Constant": self.lr_curve_widget.set_constant_preset, "Step": self.lr_curve_widget.set_step_preset, "Cyclical Dip": self.lr_curve_widget.set_cyclical_dip_preset}
-        for name, func in presets.items():
-            btn = QtWidgets.QPushButton(name); btn.clicked.connect(func); preset_layout.addWidget(btn)
-        preset_layout.addStretch()
-        lr_layout.addLayout(preset_layout)
+        
+        # --- [NEW] Updated Preset Controls ---
+        # Using a QGridLayout for cleaner alignment
+        presets_group = QtWidgets.QWidget()
+        presets_grid = QtWidgets.QGridLayout(presets_group)
+        presets_grid.setContentsMargins(0, 0, 0, 0)
+        presets_grid.setSpacing(10)
+
+        # Row 0: Restarts
+        presets_grid.addWidget(QtWidgets.QLabel("Restarts:"), 0, 0)
+        restarts_spin = QtWidgets.QSpinBox()
+        restarts_spin.setRange(1, 50)
+        restarts_spin.setValue(1)
+        restarts_spin.setToolTip("Number of restart cycles (1 = standard single cycle)")
+        presets_grid.addWidget(restarts_spin, 0, 1)
+
+        # Row 1: Initial Warmup
+        presets_grid.addWidget(QtWidgets.QLabel("Initial Warmup %:"), 1, 0)
+        initial_warmup_spin = QtWidgets.QDoubleSpinBox()
+        initial_warmup_spin.setRange(0.0, 100.0)
+        initial_warmup_spin.setSingleStep(1.0)
+        initial_warmup_spin.setValue(5.0) # Default 5%
+        initial_warmup_spin.setSuffix("%")
+        initial_warmup_spin.setToolTip("Percentage of the first cycle spent warming up")
+        presets_grid.addWidget(initial_warmup_spin, 1, 1)
+
+        # Row 2: Restart Rampup
+        presets_grid.addWidget(QtWidgets.QLabel("Restart Rampup %:"), 2, 0)
+        restart_rampup_spin = QtWidgets.QDoubleSpinBox()
+        restart_rampup_spin.setRange(0.0, 100.0)
+        restart_rampup_spin.setSingleStep(1.0)
+        restart_rampup_spin.setValue(0.0) # Default 0% (hard restart)
+        restart_rampup_spin.setSuffix("%")
+        restart_rampup_spin.setToolTip("Percentage of subsequent cycles spent ramping up")
+        presets_grid.addWidget(restart_rampup_spin, 2, 1)
+
+        # Row 3: Buttons
+        apply_cosine_btn = QtWidgets.QPushButton("Apply Cosine")
+        apply_cosine_btn.clicked.connect(lambda: self.lr_curve_widget.set_generated_preset(
+            "Cosine", 
+            restarts_spin.value(), 
+            initial_warmup_spin.value() / 100.0,
+            restart_rampup_spin.value() / 100.0
+        ))
+        presets_grid.addWidget(apply_cosine_btn, 3, 0)
+
+        apply_linear_btn = QtWidgets.QPushButton("Apply Linear")
+        apply_linear_btn.clicked.connect(lambda: self.lr_curve_widget.set_generated_preset(
+            "Linear", 
+            restarts_spin.value(), 
+            initial_warmup_spin.value() / 100.0,
+            restart_rampup_spin.value() / 100.0
+        ))
+        presets_grid.addWidget(apply_linear_btn, 3, 1)
+
+        lr_layout.addWidget(presets_group)
+        # -------------------------------------
+
         graph_bounds_layout = QtWidgets.QFormLayout()
         self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MIN")
         self._add_widget_to_form(graph_bounds_layout, "LR_GRAPH_MAX")
@@ -1922,7 +2017,11 @@ class TrainingGUI(QtWidgets.QWidget):
                 if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                     self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
                 if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
-                if hasattr(self, "dataset_manager"): self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
+                
+                # Load datasets using threaded loader
+                if hasattr(self, "dataset_manager"): 
+                    self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
+                    
                 self._update_training_calculations()
             finally:
                 for widget in self.widgets.values():
@@ -2045,118 +2144,364 @@ class TrainingGUI(QtWidgets.QWidget):
 class NoScrollSpinBox(QtWidgets.QSpinBox):
     def wheelEvent(self, event): event.ignore()
 
+class DatasetLoaderThread(QThread):
+    finished = pyqtSignal(list, str)  # returns list of dicts, path
+    
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        images_data = []
+        exts = {'.jpg', '.jpeg', '.png', '.webp', '.bmp'}
+        try:
+            # Use os.walk or scandir for better performance on large directories
+            # pathlib.rglob is also fine if avoiding content reads
+            path_obj = Path(self.path)
+            for file_path in path_obj.rglob("*"):
+                if file_path.suffix.lower() in exts:
+                    # IMPORTANT: We do NOT read the text file here.
+                    # We just store the path where the caption *should* be.
+                    caption_path = file_path.with_suffix('.txt')
+                    images_data.append({
+                        "image_path": str(file_path),
+                        "caption_path": str(caption_path) if caption_path.exists() else None,
+                        "caption_loaded": False,
+                        "caption": ""
+                    })
+        except Exception as e:
+            print(f"Error scanning {self.path}: {e}")
+            
+        self.finished.emit(images_data, self.path)
+
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()
+    
     def __init__(self, parent_gui):
-        super().__init__(); self.parent_gui = parent_gui; self.datasets = []; self.dataset_widgets = []; self._init_ui()
-    def _init_ui(self):
-        layout = QtWidgets.QVBoxLayout(self); layout.setContentsMargins(0,0,0,0)
-        add_button = QtWidgets.QPushButton("Add Dataset Folder"); add_button.clicked.connect(self.add_dataset_folder); layout.addWidget(add_button)
-        scroll_area = QtWidgets.QScrollArea(); scroll_area.setWidgetResizable(True); scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
-        self.grid_container = QtWidgets.QWidget(); self.dataset_grid = QtWidgets.QGridLayout(self.grid_container); self.dataset_grid.setSpacing(15); self.dataset_grid.setContentsMargins(5, 5, 5, 5)
-        scroll_area.setWidget(self.grid_container); layout.addWidget(scroll_area)
-        bottom_hbox = QtWidgets.QHBoxLayout(); bottom_hbox.addStretch(1); bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:")); self.total_label = QtWidgets.QLabel("0"); bottom_hbox.addWidget(self.total_label)
-        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:")); self.total_repeats_label = QtWidgets.QLabel("0"); bottom_hbox.addWidget(self.total_repeats_label); bottom_hbox.addStretch(); layout.addLayout(bottom_hbox)
-    def get_total_repeats(self): return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
-    def get_datasets_config(self): return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-    def _load_dataset_images(self, path):
-        exts = ['.jpg', '.jpeg', '.png', '.webp', '.bmp']; images = [p for ext in exts for p in Path(path).rglob(f"*{ext}")]; dataset_info = []
-        for img_path in images:
-            caption_path = img_path.with_suffix('.txt'); caption = "";
-            if caption_path.exists():
-                try:
-                    with open(caption_path, 'r', encoding='utf-8') as f: caption = f.read().strip()
-                except: caption = "[Error reading caption]"
-            else: caption = "[No caption file]"
-            dataset_info.append({"image_path": str(img_path), "caption": caption})
-        return dataset_info
-    def _cache_exists(self, path): cache_dir = Path(path) / ".precomputed_embeddings_cache"; return cache_dir.exists() and cache_dir.is_dir()
-    def load_datasets_from_config(self, datasets_config):
+        super().__init__()
+        self.parent_gui = parent_gui
         self.datasets = []
+        self.dataset_widgets = []
+        self.loader_threads = [] 
+        self._init_ui()
+        
+    def _init_ui(self):
+        layout = QtWidgets.QVBoxLayout(self)
+        layout.setContentsMargins(0,0,0,0)
+        
+        top_bar = QtWidgets.QHBoxLayout()
+        add_button = QtWidgets.QPushButton("Add Dataset Folder")
+        add_button.clicked.connect(self.add_dataset_folder)
+        top_bar.addWidget(add_button)
+        
+        self.loading_label = QtWidgets.QLabel("")
+        self.loading_label.setStyleSheet("color: #ffdd57; font-weight: bold;")
+        top_bar.addWidget(self.loading_label)
+        top_bar.addStretch()
+        
+        layout.addLayout(top_bar)
+        
+        scroll_area = QtWidgets.QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        self.grid_container = QtWidgets.QWidget()
+        self.dataset_grid = QtWidgets.QGridLayout(self.grid_container)
+        self.dataset_grid.setSpacing(15)
+        self.dataset_grid.setContentsMargins(5, 5, 5, 5)
+        scroll_area.setWidget(self.grid_container)
+        layout.addWidget(scroll_area)
+        
+        bottom_hbox = QtWidgets.QHBoxLayout()
+        bottom_hbox.addStretch(1)
+        bottom_hbox.addWidget(QtWidgets.QLabel("Total Images:"))
+        self.total_label = QtWidgets.QLabel("0")
+        bottom_hbox.addWidget(self.total_label)
+        bottom_hbox.addWidget(QtWidgets.QLabel("With Repeats:"))
+        self.total_repeats_label = QtWidgets.QLabel("0")
+        bottom_hbox.addWidget(self.total_repeats_label)
+        bottom_hbox.addStretch()
+        layout.addLayout(bottom_hbox)
+
+    def get_total_repeats(self): 
+        return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
+        
+    def get_datasets_config(self): 
+        return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
+
+    def _start_loading_path(self, path, repeats=1):
+        self.loading_label.setText(f"Scanning: {Path(path).name}...")
+        loader = DatasetLoaderThread(path)
+        # Store repeats in the thread object temporarily to pass it through
+        loader.repeats = repeats 
+        loader.finished.connect(self._on_loader_finished)
+        self.loader_threads.append(loader)
+        loader.start()
+
+    def _on_loader_finished(self, images_data, path):
+        sender = self.sender()
+        repeats = getattr(sender, 'repeats', 1)
+        
+        if sender in self.loader_threads:
+            self.loader_threads.remove(sender)
+            
+        if not self.loader_threads:
+            self.loading_label.setText("")
+            
+        if not images_data:
+            if self.isVisible(): # Only warn if adding manually, not quite perfect but reduces startup spam
+                QtWidgets.QMessageBox.warning(self, "No Images", f"No valid images found in {path}.")
+            return
+
+        self.datasets.append({
+            "path": path, 
+            "images_data": images_data, 
+            "image_count": len(images_data), 
+            "current_preview_idx": 0, 
+            "repeats": repeats
+        })
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+
+    def load_datasets_from_config(self, datasets_config):
+        # Clear existing datasets first
+        self.datasets = []
+        # Clear any running threads
+        for t in self.loader_threads:
+            t.quit()
+        self.loader_threads = []
+        
+        self.repopulate_dataset_grid()
+        
         for d in datasets_config:
             path = d.get("path")
             if path and os.path.exists(path):
-                images_data = self._load_dataset_images(path)
-                if images_data:
-                    self.datasets.append({"path": path, "images_data": images_data, "image_count": len(images_data), "current_preview_idx": 0, "repeats": d.get("repeats", 1)})
-        self.repopulate_dataset_grid(); self.update_dataset_totals()
+                self._start_loading_path(path, d.get("repeats", 1))
+
     def add_dataset_folder(self):
         path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", "")
         if not path: return
-        images_data = self._load_dataset_images(path)
-        if not images_data: QtWidgets.QMessageBox.warning(self, "No Images", "No valid images found in the folder."); return
-        self.datasets.append({"path": path, "images_data": images_data, "image_count": len(images_data), "current_preview_idx": 0, "repeats": 1})
-        self.repopulate_dataset_grid(); self.update_dataset_totals()
+        self._start_loading_path(path, 1)
+
     def _cycle_preview(self, idx, direction):
-        ds = self.datasets[idx]; ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"]); self._update_preview_for_card(idx)
+        ds = self.datasets[idx]
+        ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"])
+        self._update_preview_for_card(idx)
+        
     def _update_preview_for_card(self, idx):
         if idx >= len(self.dataset_widgets): return
-        ds = self.datasets[idx]; widgets = self.dataset_widgets[idx]; current_data = ds["images_data"][ds["current_preview_idx"]]
-        pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
-        widgets["preview_label"].setPixmap(pixmap); caption_text = current_data["caption"]
+        
+        ds = self.datasets[idx]
+        widgets = self.dataset_widgets[idx]
+        current_data = ds["images_data"][ds["current_preview_idx"]]
+        
+        # Load caption lazily
+        if not current_data["caption_loaded"]:
+            if current_data["caption_path"]:
+                try:
+                    with open(current_data["caption_path"], 'r', encoding='utf-8') as f:
+                        current_data["caption"] = f.read().strip()
+                except Exception:
+                    current_data["caption"] = "[Error reading caption]"
+            else:
+                current_data["caption"] = "[No caption file]"
+            current_data["caption_loaded"] = True
+
+        # Load pixmap
+        pixmap = QtGui.QPixmap(current_data["image_path"])
+        if not pixmap.isNull():
+             pixmap = pixmap.scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+        
+        widgets["preview_label"].setPixmap(pixmap)
+        
+        caption_text = current_data["caption"]
         if len(caption_text) > 200: caption_text = caption_text[:200] + "..."
-        widgets["caption_label"].setText(caption_text); widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+        widgets["caption_label"].setText(caption_text)
+        widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+        
     def repopulate_dataset_grid(self):
         while self.dataset_grid.count():
             item = self.dataset_grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
-        self.dataset_widgets = []; dataset_count = len(self.datasets)
+            
+        self.dataset_widgets = []
+        dataset_count = len(self.datasets)
         COLUMNS = 1 if dataset_count == 1 else (2 if dataset_count == 2 else 3)
+        
         for idx, ds in enumerate(self.datasets):
             row, col = idx // COLUMNS, idx % COLUMNS
-            card = QtWidgets.QGroupBox(); card.setStyleSheet("QGroupBox { border: 2px solid #4a4668; border-radius: 8px; margin-top: 5px; padding: 12px; background-color: #383552; }")
-            card_layout = QtWidgets.QVBoxLayout(card); card_layout.setSpacing(10); top_section = QtWidgets.QHBoxLayout(); top_section.setSpacing(12)
-            preview_section = QtWidgets.QVBoxLayout(); preview_section.setSpacing(5); image_container = QtWidgets.QHBoxLayout(); image_container.addStretch()
-            preview_label = QtWidgets.QLabel(); preview_label.setFixedSize(183, 183); preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #2c2a3e;"); preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter); preview_label.setScaledContents(False)
-            current_data = ds["images_data"][ds["current_preview_idx"]]; pixmap = QtGui.QPixmap(current_data["image_path"]).scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
-            preview_label.setPixmap(pixmap); image_container.addWidget(preview_label); image_container.addStretch(); preview_section.addLayout(image_container)
-            counter_nav_layout = QtWidgets.QHBoxLayout(); counter_nav_layout.setSpacing(8); left_arrow = QtWidgets.QPushButton("◄"); left_arrow.setFixedHeight(22); left_arrow.setMinimumWidth(35); left_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, -1)); left_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }"); counter_nav_layout.addWidget(left_arrow)
-            counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}"); counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter); counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;"); counter_nav_layout.addWidget(counter_label, 1)
-            right_arrow = QtWidgets.QPushButton("►"); right_arrow.setFixedHeight(22); right_arrow.setMinimumWidth(35); right_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1)); right_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }"); counter_nav_layout.addWidget(right_arrow); preview_section.addLayout(counter_nav_layout); top_section.addLayout(preview_section)
-            caption_container = QtWidgets.QWidget(); caption_container.setStyleSheet("QWidget { background-color: #2c2a3e; border: 1px solid #4a4668; border-radius: 4px; }"); caption_layout = QtWidgets.QVBoxLayout(caption_container); caption_layout.setContentsMargins(8, 8, 8, 8); caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>"); caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;"); caption_layout.addWidget(caption_title)
-            caption_label = QtWidgets.QLabel(); caption_text = current_data["caption"];
-            if len(caption_text) > 200: caption_text = caption_text[:200] + "...";
-            caption_label.setText(caption_text); caption_label.setWordWrap(True); caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;"); caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop); caption_layout.addWidget(caption_label, 1); top_section.addWidget(caption_container, 1); card_layout.addLayout(top_section)
-            separator = QtWidgets.QFrame(); separator.setFrameShape(QtWidgets.QFrame.Shape.HLine); separator.setStyleSheet("border: 1px solid #4a4668;"); card_layout.addWidget(separator)
-            path_label = QtWidgets.QLabel(); path_short = Path(ds['path']).name;
-            if len(path_short) > 30: path_short = path_short[:27] + "...";
-            path_label.setText(f"<b>Folder:</b> {path_short}"); path_label.setToolTip(ds['path']); path_label.setStyleSheet("color: #e0e0e0;"); card_layout.addWidget(path_label)
-            count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}"); count_label.setStyleSheet("color: #e0e0e0;"); card_layout.addWidget(count_label)
-            repeats_total_label = QtWidgets.QLabel(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}"); repeats_total_label.setStyleSheet("color: #ab97e6;"); card_layout.addWidget(repeats_total_label)
-            repeats_container = QtWidgets.QWidget(); repeats_layout = QtWidgets.QHBoxLayout(repeats_container); repeats_layout.setContentsMargins(0, 5, 0, 0); repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
-            repeats_spin = NoScrollSpinBox(); repeats_spin.setMinimum(1); repeats_spin.setMaximum(10000); repeats_spin.setValue(ds["repeats"]); repeats_spin.setStyleSheet("QSpinBox::up-button, QSpinBox::down-button { width: 20px; }"); repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v)); repeats_layout.addWidget(repeats_spin, 1); card_layout.addWidget(repeats_container)
-            btn_layout = QtWidgets.QHBoxLayout(); btn_layout.setSpacing(5); remove_btn = QtWidgets.QPushButton("Remove"); remove_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;"); remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i)); btn_layout.addWidget(remove_btn)
-            clear_btn = QtWidgets.QPushButton("Clear Cache"); clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;"); clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p)); cache_exists = self._cache_exists(ds["path"]); clear_btn.setEnabled(cache_exists)
-            if not cache_exists: clear_btn.setToolTip("No cache found");
-            btn_layout.addWidget(clear_btn); card_layout.addLayout(btn_layout); self.dataset_grid.addWidget(card, row, col)
-            self.dataset_widgets.append({"preview_label": preview_label, "caption_label": caption_label, "counter_label": counter_label, "repeats_total_label": repeats_total_label, "clear_btn": clear_btn})
+            card = QtWidgets.QGroupBox()
+            card.setStyleSheet("QGroupBox { border: 2px solid #4a4668; border-radius: 8px; margin-top: 5px; padding: 12px; background-color: #383552; }")
+            card_layout = QtWidgets.QVBoxLayout(card)
+            card_layout.setSpacing(10)
+            
+            top_section = QtWidgets.QHBoxLayout()
+            top_section.setSpacing(12)
+            
+            preview_section = QtWidgets.QVBoxLayout()
+            preview_section.setSpacing(5)
+            image_container = QtWidgets.QHBoxLayout()
+            image_container.addStretch()
+            preview_label = QtWidgets.QLabel()
+            preview_label.setFixedSize(183, 183)
+            preview_label.setStyleSheet("border: 1px solid #4a4668; background-color: #2c2a3e;")
+            preview_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            preview_label.setScaledContents(False)
+            image_container.addWidget(preview_label)
+            image_container.addStretch()
+            preview_section.addLayout(image_container)
+            
+            counter_nav_layout = QtWidgets.QHBoxLayout()
+            counter_nav_layout.setSpacing(8)
+            left_arrow = QtWidgets.QPushButton("◄")
+            left_arrow.setFixedHeight(22)
+            left_arrow.setMinimumWidth(35)
+            left_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, -1))
+            left_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }")
+            counter_nav_layout.addWidget(left_arrow)
+            
+            counter_label = QtWidgets.QLabel(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+            counter_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            counter_label.setStyleSheet("color: #ab97e6; font-size: 12px; font-weight: bold;")
+            counter_nav_layout.addWidget(counter_label, 1)
+            
+            right_arrow = QtWidgets.QPushButton("►")
+            right_arrow.setFixedHeight(22)
+            right_arrow.setMinimumWidth(35)
+            right_arrow.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1))
+            right_arrow.setStyleSheet("QPushButton { font-size: 16px; font-weight: bold; padding: 0px; }")
+            counter_nav_layout.addWidget(right_arrow)
+            preview_section.addLayout(counter_nav_layout)
+            top_section.addLayout(preview_section)
+            
+            caption_container = QtWidgets.QWidget()
+            caption_container.setStyleSheet("QWidget { background-color: #2c2a3e; border: 1px solid #4a4668; border-radius: 4px; }")
+            caption_layout = QtWidgets.QVBoxLayout(caption_container)
+            caption_layout.setContentsMargins(8, 8, 8, 8)
+            caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>")
+            caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;")
+            caption_layout.addWidget(caption_title)
+            caption_label = QtWidgets.QLabel("Loading...")
+            caption_label.setWordWrap(True)
+            caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;")
+            caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
+            caption_layout.addWidget(caption_label, 1)
+            top_section.addWidget(caption_container, 1)
+            card_layout.addLayout(top_section)
+            
+            separator = QtWidgets.QFrame()
+            separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+            separator.setStyleSheet("border: 1px solid #4a4668;")
+            card_layout.addWidget(separator)
+            
+            path_label = QtWidgets.QLabel()
+            path_short = Path(ds['path']).name
+            if len(path_short) > 30: path_short = path_short[:27] + "..."
+            path_label.setText(f"<b>Folder:</b> {path_short}")
+            path_label.setToolTip(ds['path'])
+            path_label.setStyleSheet("color: #e0e0e0;")
+            card_layout.addWidget(path_label)
+            
+            count_label = QtWidgets.QLabel(f"<b>Images:</b> {ds['image_count']}")
+            count_label.setStyleSheet("color: #e0e0e0;")
+            card_layout.addWidget(count_label)
+            
+            repeats_total_label = QtWidgets.QLabel(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}")
+            repeats_total_label.setStyleSheet("color: #ab97e6;")
+            card_layout.addWidget(repeats_total_label)
+            
+            repeats_container = QtWidgets.QWidget()
+            repeats_layout = QtWidgets.QHBoxLayout(repeats_container)
+            repeats_layout.setContentsMargins(0, 5, 0, 0)
+            repeats_layout.addWidget(QtWidgets.QLabel("Repeats:"))
+            repeats_spin = NoScrollSpinBox()
+            repeats_spin.setMinimum(1)
+            repeats_spin.setMaximum(10000)
+            repeats_spin.setValue(ds["repeats"])
+            repeats_spin.setStyleSheet("QSpinBox::up-button, QSpinBox::down-button { width: 20px; }")
+            repeats_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
+            repeats_layout.addWidget(repeats_spin, 1)
+            card_layout.addWidget(repeats_container)
+            
+            btn_layout = QtWidgets.QHBoxLayout()
+            btn_layout.setSpacing(5)
+            remove_btn = QtWidgets.QPushButton("Remove")
+            remove_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+            remove_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
+            btn_layout.addWidget(remove_btn)
+            
+            clear_btn = QtWidgets.QPushButton("Clear Cache")
+            clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+            clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
+            # Cache check is disk intensive, might want to move this too, but usually fast enough
+            cache_exists = self._cache_exists(ds["path"]) 
+            clear_btn.setEnabled(cache_exists)
+            if not cache_exists: clear_btn.setToolTip("No cache found")
+            btn_layout.addWidget(clear_btn)
+            card_layout.addLayout(btn_layout)
+            
+            self.dataset_grid.addWidget(card, row, col)
+            self.dataset_widgets.append({
+                "preview_label": preview_label, 
+                "caption_label": caption_label, 
+                "counter_label": counter_label, 
+                "repeats_total_label": repeats_total_label, 
+                "clear_btn": clear_btn
+            })
+            
+            # Initial load for the first image
+            self._update_preview_for_card(idx)
+            
         if dataset_count % COLUMNS != 0:
-            for empty_col in range((dataset_count % COLUMNS), COLUMNS): self.dataset_grid.setColumnStretch(empty_col, 1)
+            for empty_col in range((dataset_count % COLUMNS), COLUMNS): 
+                self.dataset_grid.setColumnStretch(empty_col, 1)
+                
+    def _cache_exists(self, path):
+        cache_dir = Path(path) / ".precomputed_embeddings_cache"
+        return cache_dir.exists() and cache_dir.is_dir()
+
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
         if idx < len(self.dataset_widgets):
-            ds = self.datasets[idx]; total = ds['image_count'] * ds['repeats']; self.dataset_widgets[idx]["repeats_total_label"].setText(f"<b>Total (with repeats):</b> {total}")
+            ds = self.datasets[idx]
+            total = ds['image_count'] * ds['repeats']
+            self.dataset_widgets[idx]["repeats_total_label"].setText(f"<b>Total (with repeats):</b> {total}")
         self.update_dataset_totals()
+        
     def remove_dataset(self, idx):
-        del self.datasets[idx]; self.repopulate_dataset_grid(); self.update_dataset_totals()
+        del self.datasets[idx]
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+        
     def update_dataset_totals(self):
-        total = sum(ds["image_count"] for ds in self.datasets); total_rep = self.get_total_repeats()
-        self.total_label.setText(str(total)); self.total_repeats_label.setText(str(total_rep)); self.datasetsChanged.emit()
+        total = sum(ds["image_count"] for ds in self.datasets)
+        total_rep = self.get_total_repeats()
+        self.total_label.setText(str(total))
+        self.total_repeats_label.setText(str(total_rep))
+        self.datasetsChanged.emit()
+        
     def confirm_clear_cache(self, path):
         reply = QtWidgets.QMessageBox.question(self, "Confirm", "Delete all cached latents in this dataset?", QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No)
         if reply == QtWidgets.QMessageBox.StandardButton.Yes: self.clear_cached_latents(path)
+        
     def clear_cached_latents(self, path):
         root = Path(path); deleted = False
         for cache_dir in list(root.rglob(".precomputed_embeddings_cache")):
             if cache_dir.is_dir():
-                try: shutil.rmtree(cache_dir); self.parent_gui.log(f"Deleted cache directory: {cache_dir}"); deleted = True
-                except Exception as e: self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
+                try: 
+                    shutil.rmtree(cache_dir)
+                    self.parent_gui.log(f"Deleted cache directory: {cache_dir}")
+                    deleted = True
+                except Exception as e: 
+                    self.parent_gui.log(f"Error deleting {cache_dir}: {e}")
         if deleted: self.refresh_cache_buttons()
         if not deleted: self.parent_gui.log("No cached latent directories found to delete.")
+        
     def refresh_cache_buttons(self):
         for idx, ds in enumerate(self.datasets):
             if idx < len(self.dataset_widgets):
-                cache_exists = self._cache_exists(ds["path"]); clear_btn = self.dataset_widgets[idx]["clear_btn"]; clear_btn.setEnabled(cache_exists)
+                cache_exists = self._cache_exists(ds["path"])
+                clear_btn = self.dataset_widgets[idx]["clear_btn"]
+                clear_btn.setEnabled(cache_exists)
                 if not cache_exists: clear_btn.setToolTip("No cache found")
                 else: clear_btn.setToolTip("")
 
