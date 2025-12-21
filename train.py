@@ -30,7 +30,9 @@ import config as default_config
 import threading
 import queue
 import tomesd
-
+import numpy as np
+import torch
+from scipy.interpolate import PchipInterpolator
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
 
@@ -115,7 +117,7 @@ def generate_detail_map(pil_image):
     
     return Image.fromarray(final_map)
 
-# --- MODIFICATION: Renamed from _generate_semantic_noise_map_for_batch ---
+
 def _generate_semantic_map_for_batch(images, blend_factor, strength, target_size, device, dtype, num_channels):
     """
     Generates semantic maps for loss weighting.
@@ -858,110 +860,121 @@ class ImageTextLatentDataset(Dataset):
 
 class TimestepSampler:
     """
-    Handles different timestep sampling strategies, including a robust, goal-seeking mode 
-    that differentiates between single outliers and genuine instability trends.
+    Smooth timestep sampling using PCHIP-interpolated CDF for graph-based probability control.
+    Compatible with any noise_scheduler (DDPM, Euler, etc.).
     """
     def __init__(self, config, noise_scheduler, device):
-        self.method = config.TIMESTEP_SAMPLING_METHOD
         self.config = config
         self.noise_scheduler = noise_scheduler
         self.device = device
         self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+        
+        # 1. Load curve points from config
+        self.curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [])
+        if not self.curve_points:
+            print("WARNING: TIMESTEP_WEIGHTING_CURVE empty. Defaulting to uniform.")
+            self.curve_points = [[0.0, 1.0], [1.0, 1.0]]
+            
+        self.curve_points.sort(key=lambda p: p[0])
+        
+        # Ensure full range coverage
+        if self.curve_points[0][0] > 0.0: 
+            self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
+        if self.curve_points[-1][0] < 1.0: 
+            self.curve_points.append([1.0, self.curve_points[-1][1]])
 
-        if "Dynamic" in self.method:
-            self.target_min_grad = self.config.TIMESTEP_SAMPLING_GRAD_MIN
-            self.target_max_grad = self.config.TIMESTEP_SAMPLING_GRAD_MAX
+        # 2. Build PCHIP interpolator for smooth PDF
+        x_points = np.array([p[0] for p in self.curve_points], dtype=np.float64)
+        y_points = np.array([max(0.0, p[1]) for p in self.curve_points], dtype=np.float64)
+        self.interpolator = PchipInterpolator(x_points, y_points)
+        
+        # 3. Precompute high-resolution CDF
+        self.resolution = 100000
+        self.cdf = self._precompute_cdf()
+        
+        # Debug distribution
+        self._print_sampling_distribution()
+        
+        print(f"INFO: Initialized Graph-Based Timestep Sampler (Scheduler: {type(noise_scheduler).__name__})")
+        print(f"      Resolution: {self.resolution}, Control Points: {len(self.curve_points)}")
+
+    def _interpolate_weight(self, x):
+        """Evaluate PDF at point x using PCHIP"""
+        return float(self.interpolator(x))
+
+    def _precompute_cdf(self):
+        """Numerical integration to build CDF from PDF"""
+        x_vals = np.linspace(0, 1, self.resolution, dtype=np.float64)
+        pdf = np.array([self._interpolate_weight(x) for x in x_vals], dtype=np.float64)
+        
+        # Trapezoidal integration
+        dx = 1.0 / (self.resolution - 1)
+        cdf = np.cumsum((pdf[:-1] + pdf[1:]) * dx * 0.5)
+        cdf = np.insert(cdf, 0, 0.0)
+        
+        # Normalize
+        if cdf[-1] > 0:
+            cdf = cdf / cdf[-1]
+        else:
+            print("WARNING: All weights zero. Using uniform CDF.")
+            cdf = np.linspace(0, 1, self.resolution, dtype=np.float64)
             
-            self.current_min_ts = float(self.config.TIMESTEP_SAMPLING_MIN)
-            self.current_max_ts = float(self.config.TIMESTEP_SAMPLING_MAX)
-            
-            self.global_min_ts = 0.0
-            self.global_max_ts = float(self.num_train_timesteps - 1)
-            
-            self.adjustment_strength = 0.05
-            self.smoothing_factor = 0.9
-            self.max_shift_per_step = 50.0
-            
-            self.smoothed_grad_norm = (self.target_min_grad + self.target_max_grad) / 2.0
-            self.last_timestep_avg = self.num_train_timesteps / 2.0
-            self.consecutive_spike_count = 0
-            
-            print("INFO: Initialized Trend-Aware Dynamic Sampler.")
-            print(f"      Target Grad Norm Range: [{self.target_min_grad:.3f}, {self.target_max_grad:.3f}]")
-            print(f"      Adjustment Strength: {self.adjustment_strength}, Max Shift: {int(self.max_shift_per_step)}")
+        return torch.tensor(cdf, dtype=torch.float32, device=self.device)
+
+    def _print_sampling_distribution(self):
+        """Visual verification of sampling bias"""
+        print("\n" + "="*60)
+        print(f"TIMESTEP SAMPLING DISTRIBUTION (10K samples, {type(self.noise_scheduler).__name__})")
+        print("="*60)
+        
+        test_samples = 10000
+        _, t_continuous = self.sample(test_samples)
+        timesteps = (t_continuous * self.num_train_timesteps).long()
+        
+        ranges = [
+            (0, 100, "0-100 (Early)"),
+            (100, 300, "100-300"),
+            (300, 500, "300-500"),
+            (500, 700, "500-700"),
+            (700, 900, "700-900"),
+            (900, self.num_train_timesteps, f"900-{self.num_train_timesteps} (Late)")
+        ]
+        
+        print("\nRange            | Count  | Percentage")
+        print("-" * 40)
+        for start, end, label in ranges:
+            count = ((timesteps >= start) & (timesteps < end)).sum().item()
+            percentage = (count / test_samples) * 100
+            bar = "#" * int(percentage / 2)
+            print(f"{label:<15} | {count:>4} | {percentage:>5.1f}% {bar}")
+        
+        print(f"\nMean timestep: {timesteps.float().mean():.1f} / {self.num_train_timesteps - 1}")
+        print("="*60 + "\n")
 
     def sample(self, batch_size):
-        """Public method to get a batch of timesteps based on the current strategy."""
-        if "Uniform Continuous" in self.method:
-            t_continuous = torch.rand(batch_size, device=self.device)
-            return (t_continuous * (self.num_train_timesteps - 1)).long()
+        """Inverse transform sampling from CDF"""
+        # Sample uniform [0,1]
+        u = torch.rand(batch_size, device=self.device)
         
-        elif "Dynamic" in self.method:
-            min_ts = int(self.current_min_ts)
-            max_ts = int(self.current_max_ts)
-            if min_ts >= max_ts:
-                min_ts = max(0, max_ts - 1)
-            
-            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device, dtype=torch.long)
+        # Find indices in CDF
+        indices = torch.searchsorted(self.cdf, u)
         
-        else: # Default: Random Integer
-            min_ts = self.config.TIMESTEP_SAMPLING_MIN
-            max_ts = self.config.TIMESTEP_SAMPLING_MAX
-            return torch.randint(min_ts, max_ts + 1, (batch_size,), device=self.device, dtype=torch.long)
-            
+        # Convert to continuous timesteps [0,1]
+        t_continuous = indices.float() / self.resolution
+        t_continuous = torch.clamp(t_continuous, 0.0001, 0.9999)
+        
+        # Convert to discrete timesteps [0, num_train_timesteps-1]
+        timesteps = (t_continuous * self.num_train_timesteps).long()
+        
+        return timesteps, t_continuous
+
     def update(self, raw_grad_norm):
-        """Update the dynamic range based on the raw gradient norm, handling outliers intelligently."""
-        if "Dynamic" not in self.method:
-            return
-
-        is_spike = raw_grad_norm > self.target_max_grad
-        if is_spike:
-            self.consecutive_spike_count += 1
-        else:
-            self.consecutive_spike_count = 0
-            
-        self.smoothed_grad_norm = (self.smoothing_factor * self.smoothed_grad_norm) + \
-                                  ((1 - self.smoothing_factor) * raw_grad_norm)
-        
-        base_shift = self.adjustment_strength * self.num_train_timesteps
-        shift_direction = 0.0
-
-        if self.consecutive_spike_count > 1:
-            shift_direction = -1.5
-        elif self.consecutive_spike_count == 1:
-            shift_direction = -0.5
-        else:
-            if self.smoothed_grad_norm < self.target_min_grad:
-                shift_direction = 1.0
-            elif self.smoothed_grad_norm > self.target_max_grad:
-                shift_direction = -1.0
-        
-        if shift_direction != 0.0:
-            final_shift = min(base_shift * abs(shift_direction), self.max_shift_per_step)
-            final_shift *= (shift_direction / abs(shift_direction))
-
-            self.current_min_ts += final_shift
-            self.current_max_ts += final_shift
-
-        self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
-        self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
-        
-        min_range_size = 50.0
-        current_range_size = self.current_max_ts - self.current_min_ts
-        if current_range_size < min_range_size:
-            center = (self.current_min_ts + self.current_max_ts) / 2.0
-            self.current_min_ts = center - (min_range_size / 2.0)
-            self.current_max_ts = center + (min_range_size / 2.0)
-        
-        self.current_min_ts = max(self.global_min_ts, self.current_min_ts)
-        self.current_max_ts = min(self.global_max_ts, self.current_max_ts)
-        if self.current_min_ts >= self.current_max_ts:
-            self.current_min_ts = self.current_max_ts - 1.0
-
+        """No-op for graph-based sampling (kept for compatibility)"""
+        pass
+    
     def record_timesteps(self, timesteps):
-        """Records the timesteps used in a batch for the next dynamic update."""
-        if "Dynamic" in self.method:
-            self.last_timestep_avg = timesteps.float().mean().item()
+        """No-op for graph-based sampling (kept for compatibility)"""
+        pass
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
@@ -1278,7 +1291,7 @@ def main():
                 time_ids = torch.cat(time_ids_list, dim=0)
                 
                 noise = generate_train_noise(latents, config)
-                timesteps = timestep_sampler.sample(latents.shape[0])
+                timesteps, _ = timestep_sampler.sample(latents.shape[0])
                 timestep_sampler.record_timesteps(timesteps)
 
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)

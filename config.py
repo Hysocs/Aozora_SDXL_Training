@@ -1,11 +1,11 @@
 # ====================================================================================
 # DEFAULT CONFIGURATION
-# Updated to separate Semantic Loss from Noise Type
+# Updated for Custom Timestep Probability Curve
 # ====================================================================================
 
 # --- Paths ---
 SINGLE_FILE_CHECKPOINT_PATH = "./model.safetensors"
-VAE_PATH = ""  # Optional separate VAE path, leave empty to use VAE from model
+VAE_PATH = ""
 OUTPUT_DIR = "./output"
 
 # --- Resume Training ---
@@ -45,7 +45,7 @@ SEED = 42
 SAVE_EVERY_N_STEPS = 1000
 
 # --- UNet Layer Exclusion (Blacklist) ---
-UNET_EXCLUDE_TARGETS = "conv1, conv2"  # Comma-separated keywords to exclude from training
+UNET_EXCLUDE_TARGETS = "conv1, conv2"
 
 # --- Learning Rate Scheduler ---
 LR_CUSTOM_CURVE = [
@@ -57,12 +57,14 @@ LR_CUSTOM_CURVE = [
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 
-# --- Timestep Sampling ---
-TIMESTEP_SAMPLING_METHOD = "Random Integer (Default)"
-TIMESTEP_SAMPLING_MIN = 0
-TIMESTEP_SAMPLING_MAX = 999
-TIMESTEP_SAMPLING_GRAD_MIN = 0.1
-TIMESTEP_SAMPLING_GRAD_MAX = 0.9
+# --- Timestep Weighting Curve ---
+# X: Timestep (0.0=Data, 1.0=Noise)
+# Y: Relative Frequency (1.0 = Standard Uniform)
+TIMESTEP_WEIGHTING_CURVE = [
+    [0.0, 1.0],
+    [0.5, 1.0],
+    [1.0, 1.0]
+]
 
 # --- Optimizer Configuration ---
 OPTIMIZER_TYPE = "raven"
@@ -76,17 +78,20 @@ RAVEN_PARAMS = {
 }
 
 # --- Noise Configuration ---
-NOISE_TYPE = "Default"  # Options: "Default", "Offset"
-NOISE_OFFSET = 0.05     # Only used if NOISE_TYPE is "Offset"
+NOISE_TYPE = "Default"
+NOISE_OFFSET = 0.05
 
 # --- Loss Configuration ---
-LOSS_TYPE = "Default"  # Options: "Default", "Semantic"
-# These settings are only active when LOSS_TYPE is "Semantic"
-SEMANTIC_LOSS_BLEND = 0.5     # 0.0 = Character, 1.0 = Detail, 0.5 = Mix
-SEMANTIC_LOSS_STRENGTH = 0.8  # How much to boost loss in important areas (0.0 to ~2.0)
+LOSS_TYPE = "Default"
+SEMANTIC_LOSS_BLEND = 0.5
+SEMANTIC_LOSS_STRENGTH = 0.8
 
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "xformers"
 USE_ZERO_TERMINAL_SNR = True
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
+
+RF_MU = -0.2
+RF_SIGMA = 1.5
+RF_SHIFT = 2.5
