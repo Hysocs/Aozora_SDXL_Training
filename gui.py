@@ -1193,7 +1193,7 @@ class TimestepCurveWidget(QtWidgets.QWidget):
         self._points = [[0.0, 1.0], [1.0, 1.0]]
         self._visual_points = []
         self.min_weight = 0.0
-        self.max_weight = 10.0
+        self.max_weight = 5.0
         self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
         self.point_radius = 8
         self._dragging_point_index = -1
@@ -1413,7 +1413,18 @@ class TimestepCurveWidget(QtWidgets.QWidget):
                 [0.8, 1.5],
                 [1.0, 0.5]
             ])
-        
+
+        elif name == "Structure & Detail (Ends Focus)":
+            self.set_points([
+                [0.0, 3.0],   # High focus on details/hands
+                [0.15, 2.0],
+                [0.3, 0.5],   # Start ignoring the middle
+                [0.5, 0.1],   # Almost zero focus on the "blur" phase
+                [0.7, 0.5],   # Start caring about structure again
+                [0.85, 2.0],
+                [1.0, 3.0]    # High focus on composition
+            ])
+
         elif name == "Bias Early (Detail Focus)":
             self.set_points([
                 [0.0, 3.0],
@@ -1435,7 +1446,34 @@ class TimestepCurveWidget(QtWidgets.QWidget):
                 [0.85, 2.5],
                 [1.0, 1.5]
             ])
-        
+        elif name == "Logit-Normal (Inspired)":
+            self.set_points([
+                [0.0, 0.0],
+                [0.01, 0.0],
+                [0.05, 0.05],
+                [0.1, 0.14],
+                [0.2, 0.42],
+                [0.3, 0.85],
+                [0.4, 1.35],
+                [0.5, 1.60], 
+                [0.6, 1.35],
+                [0.7, 0.85],
+                [0.8, 0.42],
+                [0.9, 0.14],
+                [0.95, 0.05],
+                [0.99, 0.0],
+                [1.0, 0.0]
+            ])
+        elif name == "Trapezoid (Broad Plateau)":
+            self.set_points([
+                [0.0, 0.2],   # Start with some weight (don't ignore the very end)
+                [0.1, 1.0],   # Ramp up quickly to Full Weight for details
+                [0.2, 1.0],   # Full weight
+                [0.5, 1.0],   # Full weight (Bridge)
+                [0.8, 1.0],   # Full weight (Structure/Concepts)
+                [0.9, 1.0],   # Keep structure learning high
+                [1.0, 0.2]    # Drop off slightly at pure noise to prevent instability
+            ])
         self.pointsChanged.emit(self._points)
 
 class ProcessRunner(QThread):
@@ -1535,10 +1573,6 @@ class TrainingGUI(QtWidgets.QWidget):
         "LOSS_TYPE": {"label": "Loss Type:", "tooltip": "Use default MSE loss or weighted Semantic loss.", "widget": "QComboBox", "options": ["Default", "Semantic"]},
         "SEMANTIC_LOSS_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
         "SEMANTIC_LOSS_STRENGTH": {"label": "Overall Strength:", "tooltip": "How much to increase loss in important areas. 0.5 = subtle, 1.0 = standard, 2.0 = strong.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
-        # --- Rectified Flow Parameters ---
-        "RF_MU": {"label": "RF Mean (Mu):", "tooltip": "Logit-Normal Mean (Default: -0.2). Controls center of timestep distribution.", "widget": "QDoubleSpinBox", "range": (-5.0, 5.0), "step": 0.1, "decimals": 2},
-        "RF_SIGMA": {"label": "RF Sigma:", "tooltip": "Logit-Normal Deviation (Default: 1.5). Controls spread of timesteps.", "widget": "QDoubleSpinBox", "range": (0.01, 10.0), "step": 0.1, "decimals": 2},
-        "RF_SHIFT": {"label": "RF Shift:", "tooltip": "Weighting Shift (Default: 2.5). Higher values concentrate training on noise/structure.", "widget": "QDoubleSpinBox", "range": (1.0, 20.0), "step": 0.1, "decimals": 2},
     }
 
     def __init__(self):
@@ -1739,10 +1773,7 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
         config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
         
-        # Save RF Params
-        config_to_save["RF_MU"] = self.widgets["RF_MU"].value()
-        config_to_save["RF_SIGMA"] = self.widgets["RF_SIGMA"].value()
-        config_to_save["RF_SHIFT"] = self.widgets["RF_SHIFT"].value()
+        # RF PARAMS SAVING REMOVED
         
         val = self.current_config.get("TIMESTEP_WEIGHTING_CURVE")
         if val:
@@ -1901,19 +1932,10 @@ class TrainingGUI(QtWidgets.QWidget):
         right_grid.addWidget(self.scheduler_group, 1, 0)
         right_grid.addWidget(self._create_loss_group(), 1, 1)
         
-        # --- Timestep / RF Stack ---
-        self.timestep_stack = QtWidgets.QStackedWidget()
-        
-        # Page 0: Standard Timestep Curve
+        # --- MODIFIED: Always show Timestep Curve ---
         self.timestep_group = self._create_timestep_sampling_group()
-        self.timestep_stack.addWidget(self.timestep_group)
-        
-        # Page 1: RF Sampling
-        self.rf_group = self._create_rf_sampling_group()
-        self.timestep_stack.addWidget(self.rf_group)
-        
-        right_grid.addWidget(self.timestep_stack, 2, 0)
-        # ---------------------------
+        right_grid.addWidget(self.timestep_group, 2, 0)
+        # --------------------------------------------
         
         self.noise_group = self._create_noise_enhancements_group()
         right_grid.addWidget(self.noise_group, 2, 1)
@@ -1937,17 +1959,18 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'scheduler_group'): self.scheduler_group.setEnabled(not is_rf)
         if hasattr(self, 'noise_group'): self.noise_group.setEnabled(not is_rf)
         
-        # Switch stack page: 0 for Standard, 1 for RF
-        if hasattr(self, 'timestep_stack'):
-            self.timestep_stack.setCurrentIndex(1 if is_rf else 0)
+        # NOTE: Stack switching logic removed because we always use the Curve now.
         
         disabled_tooltip = "This configuration is hardcoded for Rectified Flow training."
         if is_rf:
             if hasattr(self, 'scheduler_group'): self.scheduler_group.setToolTip(disabled_tooltip)
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip(disabled_tooltip)
+            # Update the title of the curve group to reflect RF context if desired
+            if hasattr(self, 'timestep_group'): self.timestep_group.setTitle("Timestep Probability Curve")
         else:
             if hasattr(self, 'scheduler_group'): self.scheduler_group.setToolTip("")
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip("")
+            if hasattr(self, 'timestep_group'): self.timestep_group.setTitle("Timestep Probability Curve")
         
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
 
@@ -2150,8 +2173,11 @@ class TrainingGUI(QtWidgets.QWidget):
         ts_preset_combo.addItems([
             "Uniform (recommended)", 
             "Bell Curve (Balanced)", 
+            "Structure & Detail (Ends Focus)",
             "Bias Early (Detail Focus)", 
-            "Bias Late (Concept Focus)"
+            "Bias Late (Concept Focus)",
+            "Logit-Normal (Inspired)",
+            "Trapezoid (Broad Plateau)"
         ])
         ts_preset_combo.currentIndexChanged.connect(lambda: self.timestep_curve_widget.apply_preset(ts_preset_combo.currentText()))
         preset_layout.addWidget(ts_preset_combo, 1)
@@ -2269,10 +2295,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
                 self._toggle_loss_widgets()
 
-                # RF Values
-                self.widgets["RF_MU"].setValue(self.current_config.get("RF_MU", -0.2))
-                self.widgets["RF_SIGMA"].setValue(self.current_config.get("RF_SIGMA", 1.5))
-                self.widgets["RF_SHIFT"].setValue(self.current_config.get("RF_SHIFT", 2.5))
+                # RF VALUES LOADING REMOVED
 
                 if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                     self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))

@@ -1,5 +1,5 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/rouwei_v080Vpred.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/NoobAI-RF-0.2-Slight-Aesthetic.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_4509.safetensors",
@@ -14,7 +14,7 @@
     "BETA_SCHEDULE": "scaled_linear",
     "MAX_TRAIN_STEPS": 2500,
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": 6,
+    "GRADIENT_ACCUMULATION_STEPS": 10,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 50.0,
     "SEED": 64,
@@ -23,107 +23,32 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            4e-06
+            2e-06
         ],
         [
             0.05,
-            5e-05
+            2e-05
         ],
         [
-            0.0975,
-            4.97168e-05
-        ],
-        [
-            0.145,
-            4.88743e-05
-        ],
-        [
-            0.1925,
-            4.74932e-05
-        ],
-        [
-            0.24,
-            4.56074e-05
-        ],
-        [
-            0.2875,
-            4.32635e-05
-        ],
-        [
-            0.335,
-            4.05191e-05
-        ],
-        [
-            0.3825,
-            3.74418e-05
-        ],
-        [
-            0.43,
-            3.41074e-05
-        ],
-        [
-            0.4775,
-            3.0598e-05
-        ],
-        [
-            0.525,
-            2.7e-05
-        ],
-        [
-            0.5725,
-            2.3402e-05
-        ],
-        [
-            0.62,
-            1.98926e-05
-        ],
-        [
-            0.6675,
-            1.65582e-05
-        ],
-        [
-            0.715,
-            1.34809e-05
-        ],
-        [
-            0.7625,
-            1.07365e-05
-        ],
-        [
-            0.81,
-            8.3926e-06
-        ],
-        [
-            0.8575,
-            6.5068e-06
-        ],
-        [
-            0.905,
-            5.1257e-06
-        ],
-        [
-            0.9525,
-            4.2832e-06
+            0.95305164,
+            2e-05
         ],
         [
             1.0,
-            4e-06
+            2e-06
         ]
     ],
-    "LR_GRAPH_MIN": 4e-06,
-    "LR_GRAPH_MAX": 5e-05,
+    "LR_GRAPH_MIN": 2e-06,
+    "LR_GRAPH_MAX": 2e-05,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
-    "RF_MU": -0.2,
-    "RF_SIGMA": 1.5,
-    "RF_SHIFT": 2.5,
     "TRAINING_MODE": "Rectified Flow (Experimental)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\CG\\Forestia ~Chiisana Machi no Bokujou Life~",
+            "path": "C:/Users/Administrator/Pictures\\umamusume",
             "repeats": 1
         }
     ],
@@ -136,31 +61,31 @@
     "TIMESTEP_WEIGHTING_CURVE": [
         [
             0.0,
-            0.5
+            0.2
+        ],
+        [
+            0.0502,
+            1.225
         ],
         [
             0.2,
-            1.5
+            1.0
         ],
         [
-            0.4,
-            2.0
-        ],
-        [
-            0.5,
-            2.5
-        ],
-        [
-            0.6,
-            2.0
+            0.4984,
+            1.125
         ],
         [
             0.8,
-            1.5
+            1.0
+        ],
+        [
+            0.9624,
+            1.225
         ],
         [
             1.0,
-            0.5
+            0.2
         ]
     ],
     "RAVEN_PARAMS": {

@@ -30,7 +30,7 @@ import config as default_config
 import threading
 import queue
 import tomesd
-
+from scipy.interpolate import PchipInterpolator
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
 
@@ -621,57 +621,132 @@ class ImageTextLatentDataset(Dataset):
 
 class TimestepSampler:
     """
-    Replicates base model training: Logit-Normal with Shift.
-    Defaults match SDXL-RF/NoobAI training: mu=-0.2, sigma=1.5, Shift=2.5
+    Smooth timestep sampling using PCHIP-interpolated CDF for graph-based probability control.
+    Adapted for Rectified Flow (no noise_scheduler object needed).
     """
     def __init__(self, config, device):
-        # Load values from config, defaulting to original hardcoded values if missing
-        self.mu = getattr(config, 'RF_MU', -0.2)
-        self.sigma = getattr(config, 'RF_SIGMA', 1.5)
-        self.shift = getattr(config, 'RF_SHIFT', 2.5)
-        
+        self.config = config
         self.device = device
-        self.num_train_timesteps = 1000
+        self.num_train_timesteps = 1000 # Standard for RF
         
-        print(f"\n{'='*60}")
-        print(f"TIMESTEP SAMPLING CONFIGURATION (Rectified Flow)")
-        print(f"{'='*60}")
-        print(f"Method: Logit-Normal with Shift")
-        print(f"  Mean (mu)   = {self.mu}")
-        print(f"  Sigma       = {self.sigma}")
-        print(f"  Shift       = {self.shift}")
-        print(f"{'='*60}\n")
+        # 1. Load curve points from config
+        self.curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [])
+        if not self.curve_points:
+            print("WARNING: TIMESTEP_WEIGHTING_CURVE empty. Defaulting to uniform.")
+            self.curve_points = [[0.0, 1.0], [1.0, 1.0]]
+            
+        self.curve_points.sort(key=lambda p: p[0])
         
+        # Ensure full range coverage
+        if self.curve_points[0][0] > 0.0: 
+            self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
+        if self.curve_points[-1][0] < 1.0: 
+            self.curve_points.append([1.0, self.curve_points[-1][1]])
+
+        # 2. Build PCHIP interpolator for smooth PDF
+        x_points = np.array([p[0] for p in self.curve_points], dtype=np.float64)
+        y_points = np.array([max(0.0, p[1]) for p in self.curve_points], dtype=np.float64)
+        self.interpolator = PchipInterpolator(x_points, y_points)
+        
+        # 3. Precompute high-resolution CDF
+        self.resolution = 100000
+        self.cdf = self._precompute_cdf()
+        
+        # Debug distribution
+        self._print_sampling_distribution()
+        
+        print(f"INFO: Initialized Graph-Based Timestep Sampler (Rectified Flow)")
+        print(f"      Resolution: {self.resolution}, Control Points: {len(self.curve_points)}")
+
+    def _interpolate_weight(self, x):
+        """Evaluate PDF at point x using PCHIP"""
+        return float(self.interpolator(x))
+
+    def _precompute_cdf(self):
+        """Numerical integration to build CDF from PDF"""
+        x_vals = np.linspace(0, 1, self.resolution, dtype=np.float64)
+        pdf = np.array([self._interpolate_weight(x) for x in x_vals], dtype=np.float64)
+        
+        # Trapezoidal integration
+        dx = 1.0 / (self.resolution - 1)
+        cdf = np.cumsum((pdf[:-1] + pdf[1:]) * dx * 0.5)
+        cdf = np.insert(cdf, 0, 0.0)
+        
+        # Normalize
+        if cdf[-1] > 0:
+            cdf = cdf / cdf[-1]
+        else:
+            print("WARNING: All weights zero. Using uniform CDF.")
+            cdf = np.linspace(0, 1, self.resolution, dtype=np.float64)
+            
+        return torch.tensor(cdf, dtype=torch.float32, device=self.device)
+
+    def _print_sampling_distribution(self):
+        """Visual verification of sampling bias"""
+        print("\n" + "="*60)
+        print(f"TIMESTEP SAMPLING DISTRIBUTION (10K samples, Rectified Flow)")
+        print("="*60)
+        
+        test_samples = 10000
+        _, t_continuous = self.sample(test_samples)
+        # Move to CPU for counting
+        t_continuous = t_continuous.cpu()
+        timesteps = (t_continuous * self.num_train_timesteps).long()
+        
+        # RF LABELS: 0 is Clean, 1000 is Noise
+        ranges = [
+            (0, 100,   "0-100   (Details/Refine)"),
+            (100, 300, "100-300 (Low Noise)"),
+            (300, 500, "300-500 (Mid Range)"),
+            (500, 700, "500-700 (High Noise)"),
+            (700, 900, "700-900 (Structure)"),
+            (900, 1001,"900-1000 (Pure Noise)") 
+        ]
+        
+        print("\nRange            | Count  | Percentage")
+        print("-" * 40)
+        for start, end, label in ranges:
+            count = ((timesteps >= start) & (timesteps < end)).sum().item()
+            percentage = (count / test_samples) * 100
+            bar = "#" * int(percentage / 2)
+            print(f"{label:<25} | {count:>4} | {percentage:>5.1f}% {bar}")
+        
+        print(f"\nMean timestep: {timesteps.float().mean():.1f} / {self.num_train_timesteps - 1}")
+        print("="*60 + "\n")
+
     def sample(self, batch_size):
-        """
-        Sample timesteps using Logit-Normal distribution with shift transformation.
-        Returns discrete timesteps and continuous t values in [0,1].
-        """
-        # 1. Sample from normal distribution
-        z = torch.randn(batch_size, device=self.device) * self.sigma + self.mu
+        """Inverse transform sampling from CDF"""
+        # Sample uniform [0,1]
+        u = torch.rand(batch_size, device=self.device)
         
-        # 2. Apply sigmoid to get logit-normal distribution in [0,1]
-        t_raw = torch.sigmoid(z)
+        # Find indices in CDF
+        indices = torch.searchsorted(self.cdf, u)
         
-        # 3. Apply shift transformation (concentrates distribution toward t=1 for shift>1)
-        # Formula: t_shifted = shift * t_raw / (1 + (shift - 1) * t_raw)
-        t_continuous = self.shift * t_raw / (1.0 + (self.shift - 1.0) * t_raw)
-        
-        # 4. Clamp to avoid numerical instability
+        # Convert to continuous timesteps [0,1]
+        t_continuous = indices.float() / self.resolution
         t_continuous = torch.clamp(t_continuous, 0.0001, 0.9999)
         
-        # 5. Convert to discrete timesteps [0, 999]
+        # Convert to discrete timesteps [0, num_train_timesteps-1]
         timesteps = (t_continuous * self.num_train_timesteps).long()
         
         return timesteps, t_continuous
 
-    def update(self, raw_grad_norm): 
-        """No-op for this sampler"""
+    def update(self, raw_grad_norm):
         pass
     
-    def record_timesteps(self, timesteps): 
-        """No-op for this sampler"""
+    def record_timesteps(self, timesteps):
         pass
+
+def apply_flow_matching_shift(t, shift_factor):
+    """
+    Applies the SD3/Flux "Shift" formula to the timestep.
+    This warps the linear 0-1 time scale to better suit high-resolution images.
+    
+    Formula: t_shifted = (shift * t) / (1 + (shift - 1) * t)
+    """
+    if shift_factor == 1.0:
+        return t
+    return (shift_factor * t) / (1.0 + (shift_factor - 1.0) * t)
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
@@ -766,7 +841,6 @@ def save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable
 
 def main():
     config = TrainingConfig()
-    config.TIMESTEP_SAMPLING_METHOD = "Logit-Normal"  # Force the method
     
     if config.SEED: set_seed(config.SEED)
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
@@ -904,20 +978,29 @@ def main():
                 # 1. Sample Noise
                 noise = generate_train_noise(latents, config)
                 
-                # 2. Sample "t" using Logit-Normal with Shift
-                # Returns timesteps [0, 999] and t_continuous [0, 1]
-                timesteps, t_continuous = timestep_sampler.sample(latents.shape[0])
+                # 2. Sample "t" Probability (From your Curve Widget)
+                # t_raw comes from your GUI curve. It decides WHICH steps we train on.
+                _, t_raw = timestep_sampler.sample(latents.shape[0])
+                
+                # 3. Apply Hardcoded Shift Physics (2.5)
+                # This ensures the noise level matches high-res expectations (SD3 logic).
+                rf_shift = 2.5 
+                t_shifted = apply_flow_matching_shift(t_raw, rf_shift)
+                
+                # 4. Convert to Discrete Timesteps for the UNet Conditioning
+                # We condition the UNet on the SHIFTED time (the actual noise physics level).
+                timesteps = (t_shifted * 1000).long()
                 timestep_sampler.record_timesteps(timesteps)
 
-                # 3. Create Noisy Latents (Linear Interpolation)
-                # X_t = (1-t) * X_data + t * X_noise
-                t_expanded = t_continuous.view(-1, 1, 1, 1)
+                # 5. Create Noisy Latents using the SHIFTED time
+                # X_t = (1 - t_shifted) * X_data + t_shifted * X_noise
+                t_expanded = t_shifted.view(-1, 1, 1, 1)
                 noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
                 
-                # 4. Define Target (Velocity)
+                # 6. Define Target (Velocity)
                 target = noise - latents
                 
-                # 5. Predict
+                # 7. Predict
                 pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
             per_pixel_loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="none")
