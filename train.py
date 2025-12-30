@@ -1361,8 +1361,9 @@ def main():
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     # Passed "Gradient Check" as the name so the reporter knows we aren't tracking a specific layer anymore
     reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="Gradient Check") 
-    timestep_sampler = TimestepSampler(config, noise_scheduler, device)
-
+    timestep_sampler = TimestepSampler(config, device)
+    if config.RESUME_TRAINING and global_step > 0:
+        timestep_sampler.set_current_step(global_step)
     print(f"\n--- Using Loss Calculation Method: {getattr(config, 'LOSS_TYPE', 'Default')} ---\n")
 
     accumulated_latent_paths = []
