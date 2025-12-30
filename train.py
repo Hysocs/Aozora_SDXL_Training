@@ -894,193 +894,166 @@ class ImageTextLatentDataset(Dataset):
 
 class TimestepSampler:
     """
-    Simple ticket-pool based timestep sampler.
-    Pre-generates all timesteps according to your curve, shuffles them, 
-    and deals them out one by one.
+    Ticket-pool based timestep sampler using explicit bin allocation.
+    Reads 'TIMESTEP_ALLOCATION' from config (set by GUI).
     """
     def __init__(self, config, device):
         self.config = config
         self.device = device
-        self.num_train_timesteps = 1000
         self.max_train_steps = config.MAX_TRAIN_STEPS
+        # Batch size is needed to calculate total individual image tickets required
+        self.total_tickets_needed = self.max_train_steps * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
         
-        # Get curve from config
-        curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [[0.0, 1.0], [1.0, 1.0]])
+        # Get allocation from config
+        # Expects: {"bin_size": int, "counts": [int, int, ...]}
+        allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         
         # Build the ticket pool
-        self.ticket_pool = self._build_ticket_pool(curve_points)
+        self.ticket_pool = self._build_ticket_pool(allocation)
+        
+        # Pointer for where we are in the pool
         self.pool_index = 0
         
         print(f"INFO: Initialized Ticket Pool Timestep Sampler")
         print(f"      Total tickets: {len(self.ticket_pool)}, Seed: {self.seed}")
-        
-        # Print distribution preview
         self._print_sampling_distribution()
 
-    def _build_ticket_pool(self, curve_points):
-        """
-        Build a pool of timesteps based on the curve weights.
-        Each timestep gets a number of tickets proportional to its weight.
-        """
-        # Sort curve points by position
-        curve_points = sorted(curve_points, key=lambda p: p[0])
-        
-        # Each training step needs batch_size timesteps (one per image in the batch)
-        total_tickets_needed = self.max_train_steps * self.config.BATCH_SIZE
-        
-        # Build weight array for each timestep (0-999)
-        weights = np.zeros(self.num_train_timesteps, dtype=np.float64)
-        
-        for t in range(self.num_train_timesteps):
-            # Normalize t to [0, 1]
-            t_norm = t / (self.num_train_timesteps - 1)
-            
-            # Find which curve segment this falls into
-            weight = self._get_weight_at_position(t_norm, curve_points)
-            weights[t] = weight
-        
-        # Normalize weights to sum to 1
-        weights_sum = weights.sum()
-        if weights_sum > 0:
-            weights = weights / weights_sum
-        else:
-            # Fallback to uniform
-            weights = np.ones(self.num_train_timesteps) / self.num_train_timesteps
-        
-        # Generate tickets: each timestep gets tickets proportional to its weight
-        tickets = []
-        for t in range(self.num_train_timesteps):
-            num_tickets = int(weights[t] * total_tickets_needed)
-            tickets.extend([t] * num_tickets)
-        
-        # Make sure we have enough tickets
-        while len(tickets) < total_tickets_needed:
-            # Add more from high-weight timesteps
-            t = np.random.choice(self.num_train_timesteps, p=weights)
-            tickets.append(t)
-        
-        # Shuffle with seed
-        random.seed(self.seed)
-        random.shuffle(tickets)
-        
-        return tickets
+    def _build_ticket_pool(self, allocation):
+        # --- 1. Validate Allocation ---
+        use_fallback = False
+        if not allocation or "counts" not in allocation or "bin_size" not in allocation:
+            print("WARNING: TIMESTEP_ALLOCATION missing. Fallback to Uniform.")
+            use_fallback = True
+        elif sum(allocation["counts"]) == 0:
+            print("WARNING: TIMESTEP_ALLOCATION sum is 0. Fallback to Uniform.")
+            use_fallback = True
 
-    def _get_weight_at_position(self, t_norm, curve_points):
-        """
-        Simple linear interpolation between curve points.
-        """
-        # Handle edge cases
-        if t_norm <= curve_points[0][0]:
-            return max(1e-10, curve_points[0][1])
-        if t_norm >= curve_points[-1][0]:
-            return max(1e-10, curve_points[-1][1])
+        # --- 2. Fallback Logic (Uniform) ---
+        if use_fallback:
+            self.bin_size = 100 # Store for printing
+            num_bins = 1000 // self.bin_size
+            # Create a uniform distribution summing to max_train_steps
+            base = self.max_train_steps // num_bins
+            counts = [base] * num_bins
+            # Distribute remainder
+            for i in range(self.max_train_steps % num_bins):
+                counts[i] += 1
+        else:
+            self.bin_size = allocation["bin_size"] # Store for printing
+            counts = allocation["counts"]
+
+        # --- 3. Build Pool ---
+        # The 'counts' represent training STEPS per bin. 
+        # We need (counts * batch_size) tickets.
+        multiplier = self.config.BATCH_SIZE
+        pool = []
         
-        # Find surrounding points
-        for i in range(len(curve_points) - 1):
-            x1, y1 = curve_points[i]
-            x2, y2 = curve_points[i + 1]
+        # Use numpy generator for efficient range sampling
+        rng = np.random.Generator(np.random.PCG64(self.seed))
+        
+        for i, count in enumerate(counts):
+            if count <= 0: continue
             
-            if x1 <= t_norm <= x2:
-                # Linear interpolation
-                if x2 - x1 == 0:
-                    return max(1e-10, y1)
-                
-                alpha = (t_norm - x1) / (x2 - x1)
-                weight = y1 + alpha * (y2 - y1)
-                return max(1e-10, weight)  # Never exactly zero
+            # Define range for this bin (e.g., 0-50)
+            start_t = i * self.bin_size
+            end_t = min(1000, (i + 1) * self.bin_size)
+            
+            # Sanity check if bin is out of bounds
+            if start_t >= 1000: break
+            
+            # Generate tickets
+            num_tickets = int(count * multiplier)
+            
+            # Random integers in [start_t, end_t)
+            # This ensures we get specific timesteps distributed uniformly WITHIN the bin
+            bin_samples = rng.integers(start_t, end_t, size=num_tickets).tolist()
+            pool.extend(bin_samples)
+            
+        # --- 4. Shuffle ---
+        # We shuffle deterministically based on seed so training is reproducible
+        random.seed(self.seed)
+        random.shuffle(pool)
         
-        return 1e-10
+        # --- 5. Safety Check (Resize to Exact Requirement) ---
+        # It is crucial the pool is exactly the size needed or larger to prevent index errors
+        
+        if len(pool) == 0:
+            # Emergency fallback if something went terribly wrong
+            print("CRITICAL: Pool generation failed. Using random pool.")
+            pool = [random.randint(0, 999) for _ in range(self.total_tickets_needed)]
+            
+        elif len(pool) < self.total_tickets_needed:
+            print(f"WARNING: Ticket pool ({len(pool)}) < Required ({self.total_tickets_needed}). Recycling tickets to fill.")
+            while len(pool) < self.total_tickets_needed:
+                # Append a copy of the pool to itself until big enough
+                needed = self.total_tickets_needed - len(pool)
+                pool.extend(pool[:needed])
+                
+        elif len(pool) > self.total_tickets_needed:
+            # Trim if we have too many
+            pool = pool[:self.total_tickets_needed]
+            
+        return pool
+
+    def set_current_step(self, step):
+        """
+        Call this when resuming training to ensure we pick up the 
+        ticket sequence where we left off.
+        """
+        # Calculate how many tickets have theoretically been consumed
+        consumed_tickets = step * self.config.BATCH_SIZE
+        self.pool_index = consumed_tickets % len(self.ticket_pool)
+        print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Step {step})")
 
     def sample(self, batch_size):
-        """
-        Pull the next batch_size tickets from the pool.
-        Returns discrete timesteps (0-999) for training.
-        """
-        # Pull tickets from the pool
-        timesteps_list = []
+        indices = []
         for _ in range(batch_size):
             if self.pool_index >= len(self.ticket_pool):
-                # Reshuffle and start over (shouldn't happen in normal training)
-                print("WARNING: Ticket pool exhausted, reshuffling...")
-                random.seed(self.seed + self.pool_index)
-                random.shuffle(self.ticket_pool)
-                self.pool_index = 0
+                # This usually shouldn't happen if max_train_steps is correct,
+                # but good for safety.
+                self.pool_index = 0 
             
-            timesteps_list.append(self.ticket_pool[self.pool_index])
+            indices.append(self.ticket_pool[self.pool_index])
             self.pool_index += 1
-        
-        # Return only discrete timesteps as a tensor
-        timesteps = torch.tensor(timesteps_list, dtype=torch.long, device=self.device)
-        return timesteps
+            
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def _print_sampling_distribution(self):
-        """Show actual ticket counts in the pool"""
         print("\n" + "="*80)
         print("TIMESTEP TICKET POOL DISTRIBUTION")
-        print(f"Total Tickets: {len(self.ticket_pool):,} | Training Steps: {self.max_train_steps:,}")
-        print(f"Seed: {self.seed}")
+        print(f"Total Pool Size: {len(self.ticket_pool):,} | Seed: {self.seed}")
         print("="*80)
         
-        # Count tickets in the entire pool (not sampling, just counting what exists)
         timesteps = torch.tensor(self.ticket_pool, dtype=torch.long)
         
-        # 50-step bins
-        bin_size = 50
-        num_bins = self.num_train_timesteps // bin_size
+        # Use the actual bin size configured so the print matches the user input
+        vis_bin_size = self.bin_size 
+        num_bins = math.ceil(1000 / vis_bin_size)
         
-        print("\nTimestep Range | Tickets in Pool")
+        print(f"\n{'Range':<10} | {'Count':<10} | {'%':<6} | Bar")
         print("-" * 80)
         
-        # Collect bin data
-        bin_data = []
         max_count = 0
-        total_tickets = len(self.ticket_pool)
-        
+        counts = []
         for i in range(num_bins):
-            start = i * bin_size
-            end = start + bin_size
-            count = ((timesteps >= start) & (timesteps < end)).sum().item()
-            percentage = (count / total_tickets) * 100
-            max_count = max(max_count, count)
+            start = i * vis_bin_size
+            end = min(1000, start + vis_bin_size)
+            c = ((timesteps >= start) & (timesteps < end)).sum().item()
+            counts.append((f"{start}-{end}", c))
+            if c > max_count: max_count = c
             
-            # Label
-            if start < 200:
-                label = "CLEAN"
-            elif start < 500:
-                label = "LOW"
-            elif start < 700:
-                label = "MID"
-            elif start < 900:
-                label = "HIGH"
-            else:
-                label = "NOISE"
-            
-            bin_data.append((f"{start}-{end-1}", label, count, percentage))
-        
-        # Print bins
-        for range_str, label, count, percentage in bin_data:
-            bar_length = int((count / max(max_count, 1)) * 50)
-            bar = "#" * bar_length
-            print(f"{range_str:8s} {label:5s} {count:7,d} {percentage:5.1f}% | {bar}")
-        
-        # Summary stats
-        print("-" * 80)
-        mean = timesteps.float().mean().item()
-        median = timesteps.float().median().item()
-        std = timesteps.float().std().item()
-        total_check = sum([bd[2] for bd in bin_data])
-        print(f"Mean: {mean:6.1f} | Median: {median:6.1f} | Std: {std:6.1f}")
-        print(f"Total Tickets Verified: {total_check:,} / {total_tickets:,}")
+        for label, count in counts:
+            pct = (count / len(self.ticket_pool)) * 100
+            # Scale bar to 40 chars
+            bar_len = int((count / max(1, max_count)) * 40)
+            print(f"{label:<10} | {count:<10,d} | {pct:<6.1f}% | {'#' * bar_len}")
         print("="*80 + "\n")
-
+        
     def update(self, raw_grad_norm):
-        """Kept for compatibility - does nothing"""
+        """Compatibility method for training loop calls"""
         pass
-    
-    def record_timesteps(self, timesteps):
-        """Kept for compatibility - does nothing"""
-        pass
+
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
