@@ -1371,9 +1371,7 @@ def main():
                 time_ids = torch.cat(time_ids_list, dim=0)
                 
                 noise = generate_train_noise(latents, config)
-                timesteps, _ = timestep_sampler.sample(latents.shape[0])
-                timestep_sampler.record_timesteps(timesteps)
-
+                timesteps = timestep_sampler.sample(latents.shape[0])
                 noisy_latents = noise_scheduler.add_noise(latents, noise, timesteps)
                 
                 if config.PREDICTION_TYPE == "v_prediction":
