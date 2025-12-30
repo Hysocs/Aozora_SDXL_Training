@@ -1,6 +1,6 @@
 # ====================================================================================
 # DEFAULT CONFIGURATION
-# Updated for Custom Timestep Probability Curve
+# Updated for Custom Timestep Ticket Allocation (Bar Chart)
 # ====================================================================================
 
 # --- Paths ---
@@ -57,14 +57,13 @@ LR_CUSTOM_CURVE = [
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 
-# --- Timestep Weighting Curve ---
-# X: Timestep (0.0=Data, 1.0=Noise)
-# Y: Relative Frequency (1.0 = Standard Uniform)
-TIMESTEP_WEIGHTING_CURVE = [
-    [0.0, 1.0],
-    [0.5, 1.0],
-    [1.0, 1.0]
-]
+# --- Timestep Allocation (Ticket System) ---
+# "bin_size": resolution of the bars (e.g., 50 means 0-50, 50-100...)
+# "counts": list of integers representing tickets per bin.
+TIMESTEP_ALLOCATION = {
+    "bin_size": 100,
+    "counts": [] # Populated by GUI based on MAX_TRAIN_STEPS
+}
 
 # --- Optimizer Configuration ---
 OPTIMIZER_TYPE = "raven"

@@ -4,7 +4,7 @@ import os
 import re
 from PyQt6 import QtWidgets, QtCore, QtGui
 import subprocess
-from PyQt6.QtCore import QThread, pyqtSignal, QPropertyAnimation, QEasingCurve, QObject
+from PyQt6.QtCore import QThread, pyqtSignal, QObject
 import copy
 import sys
 from pathlib import Path
@@ -25,7 +25,8 @@ except ImportError:
     class default_config:
         RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0}
         OPTIMIZER_TYPE = "AdamW"
-        TIMESTEP_WEIGHTING_CURVE = [[0.0, 1.0], [1.0, 1.0]]
+        # Default allocation for fallback
+        TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
 def prevent_sleep(enable=True):
     try:
@@ -206,7 +207,21 @@ QTableWidget { gridline-color: #4a4668; background-color: #1a1926; }
 QTableWidget::item:selected { background-color: #ab97e6; color: #1a1926; }
 """
 
-# --- Helper Classes for Sorting ---
+# --- Helper Classes ---
+
+class NoScrollSpinBox(QtWidgets.QSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+class NoScrollDoubleSpinBox(QtWidgets.QDoubleSpinBox):
+    def wheelEvent(self, event):
+        event.ignore()
+
+class NoScrollComboBox(QtWidgets.QComboBox):
+    def wheelEvent(self, event):
+        # Ignore the event so it propagates to the parent (scroll area)
+        event.ignore()
+
 class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
     """Sorts by numeric value instead of string."""
     def __lt__(self, other):
@@ -743,7 +758,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.pause_button.toggled.connect(self._on_pause_toggled)
         control_layout.addWidget(self.pause_button)
         control_layout.addWidget(QtWidgets.QLabel("Update Speed:"))
-        self.speed_combo = QtWidgets.QComboBox()
+        self.speed_combo = NoScrollComboBox()
         self.speed_combo.addItems(["Fast (100ms)", "Normal (500ms)", "Slow (1000ms)", "Very Slow (2000ms)"])
         self.speed_combo.setCurrentIndex(1)
         self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
@@ -871,7 +886,8 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.min_lr_bound = 0.0
         self.max_lr_bound = 1.0e-6
         self.epoch_data = []
-        self.padding = {'top': 40, 'bottom': 60, 'left': 80, 'right': 20}
+        # CHANGED: Left padding set to 60 as a compromise for better spacing.
+        self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
         self.point_radius = 8
         self._dragging_point_index = -1
         self._selected_point_index = -1
@@ -983,6 +999,8 @@ class LRCurveWidget(QtWidgets.QWidget):
         painter.setPen(self.text_color)
         log_max, log_min = self._get_log_range()
         log_range = log_max - log_min
+        
+        # Draw Grid Labels
         for i in range(5):
             normalized_y = 1.0 - (i / 4.0)
             if i == 0:
@@ -995,50 +1013,48 @@ class LRCurveWidget(QtWidgets.QWidget):
                 else:
                     lr_val = self.max_lr_bound
             label = f"{lr_val:.1e}"
+            
             y = rect.top() + (i / 4.0) * rect.height()
+            
+            # Y-Axis Labels (Aligned Right within the padding)
             painter.drawText(QtCore.QRect(0, int(y - 10), self.padding['left'] - 5, 20),
                              QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
+            
             step_val = int(self.max_steps * (i / 4.0))
             label_x = str(step_val)
             x = rect.left() + (i / 4.0) * rect.width()
+            
+            # X-Axis Labels (Straight line, no stagger)
             painter.drawText(QtCore.QRect(int(x - 50), rect.bottom() + 5, 100, 20),
                              QtCore.Qt.AlignmentFlag.AlignCenter, label_x)
+                             
         small_font = self.font()
         small_font.setPointSize(8)
         painter.setFont(small_font)
+        
+        # Epoch Labels (Dotted Lines) - These are distinct from grid labels
         for norm_x, step_count in self.epoch_data:
             x = rect.left() + norm_x * rect.width()
             label_rect = QtCore.QRect(int(x - 40), rect.bottom() + 25, 80, 15)
             painter.drawText(label_rect, QtCore.Qt.AlignmentFlag.AlignCenter, str(step_count))
+            
         painter.setFont(original_font)
         font.setBold(True); painter.setFont(font)
         painter.drawText(self.rect().adjusted(0, 5, 0, 0), QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop, "Learning Rate Schedule")
     
     def draw_curve(self, painter):
         if not self._visual_points: return
-        
-        # Generate points for the main line
         poly_points = [self._to_pixel_coords(p[0], p[1]) for p in self._visual_points]
         poly = QtGui.QPolygonF(poly_points)
-        
-        # Draw the line itself
         painter.setPen(QtGui.QPen(self.line_color, 2))
         painter.drawPolyline(poly)
-        
-        # Create the fill polygon
         fill_poly = QtGui.QPolygonF(poly)
-        
-        # Append point at Bottom-Right (Last X, Min Y)
         last_x_norm = self._visual_points[-1][0]
         fill_poly.append(self._to_pixel_coords(last_x_norm, self.min_lr_bound))
-        
-        # Append point at Bottom-Left (First X, Min Y)
         first_x_norm = self._visual_points[0][0]
         fill_poly.append(self._to_pixel_coords(first_x_norm, self.min_lr_bound))
-        
-        # Setup and draw the fill
         fill_color = QtGui.QColor(self.point_fill_color)
-        fill_color.setAlpha(50)  # Same transparency level as the Timestep graph
+        fill_color.setAlpha(50)  
         painter.setBrush(fill_color)
         painter.setPen(QtCore.Qt.PenStyle.NoPen)
         painter.drawPolygon(fill_poly)
@@ -1047,20 +1063,14 @@ class LRCurveWidget(QtWidgets.QWidget):
         for i, p in enumerate(self._visual_points):
             pixel_pos = self._to_pixel_coords(p[0], p[1])
             is_selected = (i == self._selected_point_index)
-            
-            # Draw the point circle
             painter.setBrush(self.selected_point_color if is_selected else self.point_fill_color)
             painter.setPen(self.point_color)
             painter.drawEllipse(pixel_pos, self.point_radius, self.point_radius)
-            
-            # Only draw the text label if the point is selected or being dragged
             if is_selected or i == self._dragging_point_index:
                 original_point = self._points[i]
                 step_val = int(original_point[0] * self.max_steps)
                 lr_val = original_point[1]
                 label = f"({step_val}, {lr_val:.1e})"
-                
-                # Draw text centered above the point
                 painter.drawText(QtCore.QRectF(pixel_pos.x() - 50, pixel_pos.y() - 30, 100, 20),
                                  QtCore.Qt.AlignmentFlag.AlignCenter, label)
     
@@ -1183,298 +1193,268 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.apply_preset(unique_points)
 
 
-class TimestepCurveWidget(QtWidgets.QWidget):
-    pointsChanged = QtCore.pyqtSignal(list)
-    selectionChanged = QtCore.pyqtSignal(int)
-    
+class TimestepHistogramWidget(QtWidgets.QWidget):
+    allocationChanged = QtCore.pyqtSignal(dict)  # Emits {"bin_size": int, "counts": [int]}
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(300)
-        self._points = [[0.0, 1.0], [1.0, 1.0]]
-        self._visual_points = []
-        self.min_weight = 0.0
-        self.max_weight = 5.0
-        self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
-        self.point_radius = 8
-        self._dragging_point_index = -1
-        self._selected_point_index = -1
+        # Left padding 35, Right padding 20
+        self.padding = {'top': 40, 'bottom': 50, 'left': 35, 'right': 20}
         
-        # Colors for enabled state
+        # Internal State
+        self.bin_size = 100
+        self.max_tickets = 1000  # Default budget
+        self.counts = []  # List of integers, one per bin
+        self._dragging_bin_index = -1
+
+        # Colors
         self.bg_color = QtGui.QColor("#1a1926")
         self.grid_color = QtGui.QColor("#4a4668")
-        self.line_color = QtGui.QColor("#00bcd4")
-        self.point_color = QtGui.QColor("#ffffff")
-        self.point_fill_color = QtGui.QColor("#0097a7")
-        self.selected_point_color = QtGui.QColor("#ffdd57")
+        
+        # --- THEME UPDATE: Purple Scheme ---
+        self.bar_color_even = QtGui.QColor("#6a48d7")  # Main Theme Purple
+        self.bar_color_odd = QtGui.QColor("#5839b0")   # Slightly Darker Purple for contrast
+        
+        self.bar_hover_color = QtGui.QColor("#ab97e6") # Light Accent Purple (Title color)
         self.text_color = QtGui.QColor("#e0e0e0")
+        self.alert_color = QtGui.QColor("#e53935")
         
-        # Colors for disabled state
-        self.disabled_line_color = QtGui.QColor("#5c5a70")
-        self.disabled_fill_color = QtGui.QColor("#5c5a70")
-        self.disabled_fill_color.setAlpha(20)
-        self.disabled_point_fill_color = QtGui.QColor("#383552")
-        self.disabled_point_color = QtGui.QColor("#5c5a70")
-        
+        # Disabled Colors
+        self.disabled_bar_color = QtGui.QColor("#383552")
+        self.disabled_text_color = QtGui.QColor("#5c5a70")
+
         self.setMouseTracking(True)
-        self.setToolTip("X-Axis: Timestep (0=Data, 1000=Noise)\nY-Axis: Sampling Probability (Higher = More Frequent)")
-    
-    def set_points(self, points):
-        self._points = sorted(points, key=lambda p: p[0])
-        self._visual_points = [
-            [p[0], max(self.min_weight, min(self.max_weight, p[1]))]
-            for p in self._points
-        ]
+        self.setToolTip("Click and drag bars to allocate timestep tickets.\nTotal tickets must equal Max Training Steps.")
+        
+        self._init_bins()
+
+    def set_total_steps(self, steps):
+        if steps <= 0: steps = 1
+        if self.max_tickets > 0 and sum(self.counts) > 0:
+            scale_factor = steps / self.max_tickets
+            new_counts = [int(c * scale_factor) for c in self.counts]
+            diff = steps - sum(new_counts)
+            if diff != 0:
+                new_counts[0] = max(0, new_counts[0] + diff)
+            self.counts = new_counts
+        else:
+            self.max_tickets = steps
+            self._init_bins()
+        self.max_tickets = steps
         self.update()
-    
-    def get_points(self):
-        return self._points
-    
-    def _to_pixel_coords(self, norm_x, weight_y):
-        graph_width = self.width() - self.padding['left'] - self.padding['right']
-        graph_height = self.height() - self.padding['top'] - self.padding['bottom']
-        px = self.padding['left'] + norm_x * graph_width
-        norm_y = (weight_y - self.min_weight) / (self.max_weight - self.min_weight)
-        py = self.padding['top'] + (1 - norm_y) * graph_height
-        return QtCore.QPointF(px, py)
-    
-    def _to_data_coords(self, px, py):
-        graph_width = self.width() - self.padding['left'] - self.padding['right']
-        graph_height = self.height() - self.padding['top'] - self.padding['bottom']
-        norm_x = (px - self.padding['left']) / graph_width
-        clamped_py = max(self.padding['top'], min(py, self.padding['top'] + graph_height))
-        norm_y = 1 - ((clamped_py - self.padding['top']) / graph_height)
-        weight_y = self.min_weight + (norm_y * (self.max_weight - self.min_weight))
-        return max(0.0, min(1.0, norm_x)), max(self.min_weight, min(self.max_weight, weight_y))
-    
+        self._emit_change()
+
+    def set_bin_size(self, size):
+        if size <= 0: return
+        self.bin_size = size
+        self._init_bins()
+        self.update()
+        self._emit_change()
+        
+    def set_allocation(self, allocation):
+        if not allocation or "bin_size" not in allocation or "counts" not in allocation:
+            self._init_bins()
+            return
+        self.bin_size = allocation["bin_size"]
+        loaded_counts = allocation["counts"]
+        expected_bins = math.ceil(1000 / self.bin_size)
+        if len(loaded_counts) != expected_bins:
+            self._init_bins()
+        else:
+            self.counts = loaded_counts
+            current_sum = sum(self.counts)
+            if current_sum > 0:
+                self.max_tickets = current_sum
+        self.update()
+
+    def get_allocation(self):
+        return {"bin_size": self.bin_size, "counts": self.counts}
+        
+    def apply_preset(self, name):
+        num_bins = len(self.counts)
+        if num_bins == 0: return
+        weights = []
+        if name == "Uniform": weights = [1.0] * num_bins
+        elif name == "Bias Early (Detail)": weights = [(num_bins - i) ** 1.5 for i in range(num_bins)]
+        elif name == "Bias Late (Structure)": weights = [(i + 1) ** 1.5 for i in range(num_bins)]
+        elif name == "Bell Curve":
+            center = (num_bins - 1) / 2.0
+            sigma = num_bins / 3.0
+            weights = [math.exp(-((i - center)**2) / (2 * sigma**2)) for i in range(num_bins)]
+        total_weight = sum(weights)
+        if total_weight == 0: total_weight = 1
+        raw_counts = [(w / total_weight) * self.max_tickets for w in weights]
+        new_counts = [int(c) for c in raw_counts]
+        diff = self.max_tickets - sum(new_counts)
+        remainders = sorted([(raw_counts[i] - new_counts[i], i) for i in range(num_bins)], key=lambda x: x[0], reverse=True)
+        for i in range(diff):
+            new_counts[remainders[i][1]] += 1
+        self.counts = new_counts
+        self.update()
+        self._emit_change()
+
+    def _init_bins(self):
+        num_bins = math.ceil(1000 / self.bin_size)
+        base_count = self.max_tickets // num_bins
+        remainder = self.max_tickets % num_bins
+        self.counts = [base_count + 1 if i < remainder else base_count for i in range(num_bins)]
+        self._emit_change()
+
+    def _emit_change(self):
+        self.allocationChanged.emit(self.get_allocation())
+
+    def _get_bin_rect(self, index, graph_rect):
+        num_bins = len(self.counts)
+        if num_bins == 0: return QtCore.QRectF()
+        bin_width = graph_rect.width() / num_bins
+        x = graph_rect.left() + (index * bin_width)
+        max_val = max(self.counts) if self.counts else 1
+        y_scale_max = max(max_val * 1.2, self.max_tickets * 0.2) 
+        bar_height_ratio = self.counts[index] / y_scale_max
+        bar_pixel_height = bar_height_ratio * graph_rect.height()
+        y = graph_rect.bottom() - bar_pixel_height
+        return QtCore.QRectF(x, y, bin_width, bar_pixel_height)
+
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), self.bg_color)
-        
         rect = QtCore.QRect(self.padding['left'], self.padding['top'],
                             self.width() - self.padding['left'] - self.padding['right'],
                             self.height() - self.padding['top'] - self.padding['bottom'])
-        
-        # Check if widget is disabled
         is_enabled = self.isEnabled()
+        self._draw_grid_and_axes(painter, rect, is_enabled) # CHANGED: Centralized axis drawing
+        self._draw_bars(painter, rect, is_enabled)
+        self._draw_labels(painter, rect, is_enabled)
+        self._draw_header(painter, rect, is_enabled)
+
+    def _draw_grid_and_axes(self, painter, rect, is_enabled):
+        grid_color = self.grid_color if is_enabled else self.disabled_text_color
+        text_color = self.text_color if is_enabled else self.disabled_text_color
+        painter.setPen(QtGui.QPen(grid_color, 1, QtCore.Qt.PenStyle.DashLine))
         
-        # Draw with conditional colors
-        self.draw_grid_and_labels(painter, rect, is_enabled)
-        self.draw_curve(painter, is_enabled)
-        self.draw_points_and_labels(painter, is_enabled)
-    
-    def draw_grid_and_labels(self, painter, rect, is_enabled):
-        grid_color = self.grid_color if is_enabled else self.disabled_line_color
-        text_color = self.text_color if is_enabled else self.disabled_line_color
-        
-        painter.setPen(grid_color)
+        # Horizontal lines
         for i in range(5):
-            y = rect.top() + (i / 4.0) * rect.height()
+            y = rect.bottom() - (i / 4.0) * rect.height()
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
-            val = self.max_weight - (i / 4.0) * (self.max_weight - self.min_weight)
-            label = f"{val:.1f}x"
-            painter.setPen(text_color)
-            painter.drawText(QtCore.QRect(0, int(y - 10), self.padding['left'] - 5, 20),
-                             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
-            painter.setPen(grid_color)
-
-        for i in range(5):
-            x = rect.left() + (i / 4.0) * rect.width()
-            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
-            t_val = int(1000 * (i / 4.0))
-            label = str(t_val)
-            painter.setPen(text_color)
-            painter.drawText(QtCore.QRect(int(x - 20), rect.bottom() + 5, 40, 20),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, label)
-            painter.setPen(grid_color)
+        
+        # Vertical lines and static X-Axis labels
+        num_labels = 6 # e.g., 0, 200, 400, 600, 800, 1000
+        for i in range(num_labels):
+            x = rect.left() + (i / (num_labels - 1)) * rect.width()
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom()) # Draw grid line
             
+            # Draw label text
+            value = int((i / (num_labels - 1)) * 1000)
+            painter.setPen(text_color)
+            label_rect = QtCore.QRectF(x - 30, rect.bottom() + 5, 60, 20)
+            painter.drawText(label_rect, QtCore.Qt.AlignmentFlag.AlignCenter, str(value))
+            painter.setPen(QtGui.QPen(grid_color, 1, QtCore.Qt.PenStyle.DashLine))
+
+    def _draw_bars(self, painter, rect, is_enabled):
+        original_font = painter.font()
         font = painter.font()
-        font.setBold(True)
+        font.setPointSize(9)
         painter.setFont(font)
-        painter.drawText(self.rect().adjusted(0, 5, 0, 0), 
-                         QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop, 
-                         "Timestep Probability Distribution")
 
-    def draw_curve(self, painter, is_enabled):
-        if not self._visual_points: return
-        
-        line_color = self.line_color if is_enabled else self.disabled_line_color
-        fill_color = self.line_color if is_enabled else self.disabled_fill_color
-        
-        painter.setPen(QtGui.QPen(line_color, 3))
-        poly = QtGui.QPolygonF([self._to_pixel_coords(p[0], p[1]) for p in self._visual_points])
-        painter.drawPolyline(poly)
-        
-        fill_poly = QtGui.QPolygonF(poly)
-        fill_poly.append(self._to_pixel_coords(self._visual_points[-1][0], 0.0))
-        fill_poly.append(self._to_pixel_coords(self._visual_points[0][0], 0.0))
-        
-        fill_color.setAlpha(50 if is_enabled else 20)
-        painter.setBrush(fill_color)
-        painter.setPen(QtCore.Qt.PenStyle.NoPen)
-        painter.drawPolygon(fill_poly)
-
-    def draw_points_and_labels(self, painter, is_enabled):
-        # Skip drawing points entirely when disabled
-        if not is_enabled: 
-            return
-        
-        # Only draw interactive points when enabled
-        for i, p in enumerate(self._visual_points):
-            pixel_pos = self._to_pixel_coords(p[0], p[1])
-            is_selected = (i == self._selected_point_index)
-            painter.setBrush(self.selected_point_color if is_selected else self.point_fill_color)
-            painter.setPen(self.point_color)
-            painter.drawEllipse(pixel_pos, self.point_radius, self.point_radius)
-            if i == self._dragging_point_index or is_selected:
-                t_val = int(p[0] * 1000)
-                w_val = p[1]
-                label = f"T:{t_val}, W:{w_val:.3f}"
-                text_width = 110
-                text_height = 20
-                x_pos = pixel_pos.x() - (text_width / 2)
-                y_pos = pixel_pos.y() - 30
-                if x_pos + text_width > self.width(): x_pos = self.width() - text_width - 5
-                if x_pos < 0: x_pos = 5
-                if y_pos < 0: y_pos = pixel_pos.y() + 20
+        for i in range(len(self.counts)):
+            bar_rect = self._get_bin_rect(i, rect)
+            is_odd = (i % 2 != 0)
+            
+            # Bar coloring
+            if is_enabled:
+                painter.setBrush(self.bar_hover_color if i == self._dragging_bin_index else (self.bar_color_odd if is_odd else self.bar_color_even))
+            else:
+                painter.setBrush(self.disabled_bar_color)
+                
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.drawRect(bar_rect)
+            
+            # Draw count text on top of bar (staggered)
+            if is_enabled:
                 painter.setPen(self.text_color)
-                painter.drawText(QtCore.QRectF(x_pos, y_pos, text_width, text_height),
-                                 QtCore.Qt.AlignmentFlag.AlignCenter, label)
+                offset_y = 15 if is_odd else 0
+                text_y = bar_rect.top() - 20 - offset_y
+                if text_y < rect.top():
+                    if bar_rect.height() > 40:
+                        text_y = bar_rect.top() + 5 + offset_y
+                        painter.setPen(QtCore.Qt.GlobalColor.black)
+                    else:
+                        text_y = rect.top() + 5
+                        painter.setPen(self.text_color)
+                text_rect = QtCore.QRectF(bar_rect.left(), text_y, bar_rect.width(), 20)
+                painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignCenter, str(self.counts[i]))
+        
+        painter.setFont(original_font) # Restore font
+
+    def _draw_labels(self, painter, rect, is_enabled):
+        painter.setPen(self.text_color if is_enabled else self.disabled_text_color)
+        painter.save()
+        painter.translate(12, self.height() / 2)
+        painter.rotate(-90)
+        painter.drawText(QtCore.QRect(-100, -10, 200, 20), QtCore.Qt.AlignmentFlag.AlignCenter, "Tickets Count")
+        painter.restore()
+        
+        painter.drawText(QtCore.QRect(0, self.height() - 20, self.width(), 20), 
+                         QtCore.Qt.AlignmentFlag.AlignCenter, "Timestep Range")
+
+    def _draw_header(self, painter, rect, is_enabled):
+        used = sum(self.counts)
+        total = self.max_tickets
+        font = painter.font()
+        font.setBold(True); font.setPointSize(11)
+        painter.setFont(font)
+        status_text = f"Tickets Used: {used} / {total}"
+        if used == total: painter.setPen(QtGui.QColor("#66bb6a"))
+        elif used > total: painter.setPen(self.alert_color)
+        else: painter.setPen(self.text_color)
+        painter.drawText(self.rect().adjusted(0, 5, 0, 0), QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop, status_text)
 
     def mousePressEvent(self, event):
-        if event.button() != QtCore.Qt.MouseButton.LeftButton or not self.isEnabled(): 
-            return
-        new_selection = -1
-        for i, p in enumerate(self._visual_points):
-            pixel_pos = self._to_pixel_coords(p[0], p[1])
-            if (QtCore.QPointF(event.pos()) - pixel_pos).manhattanLength() < self.point_radius * 2:
-                self._dragging_point_index = i
-                new_selection = i
-                break
-        if self._selected_point_index != new_selection:
-            self._selected_point_index = new_selection
-            self.selectionChanged.emit(self._selected_point_index)
-        self.update()
+        if not self.isEnabled() or event.button() != QtCore.Qt.MouseButton.LeftButton: return
+        rect = QtCore.QRect(self.padding['left'], self.padding['top'],
+                            self.width() - self.padding['left'] - self.padding['right'],
+                            self.height() - self.padding['top'] - self.padding['bottom'])
+        num_bins = len(self.counts)
+        if num_bins == 0: return
+        rel_x = event.pos().x() - rect.left()
+        if 0 <= rel_x <= rect.width():
+            self._dragging_bin_index = int(rel_x / (rect.width() / num_bins))
+            self.update()
 
     def mouseMoveEvent(self, event):
-        if self._dragging_point_index != -1 and self.isEnabled():
-            norm_x, weight = self._to_data_coords(event.pos().x(), event.pos().y())
-            is_endpoint = self._dragging_point_index == 0 or self._dragging_point_index == len(self._points) - 1
-            if is_endpoint:
-                norm_x = 0.0 if self._dragging_point_index == 0 else 1.0
-            else:
-                min_x = self._points[self._dragging_point_index - 1][0]
-                max_x = self._points[self._dragging_point_index + 1][0]
-                norm_x = max(min_x, min(max_x, norm_x))
-            self._points[self._dragging_point_index] = [norm_x, weight]
-            self.set_points(self._points) 
-            self.pointsChanged.emit(self._points)
-        else:
-            on_point = any((QtCore.QPointF(event.pos()) - self._to_pixel_coords(p[0], p[1])).manhattanLength() < self.point_radius * 2 for p in self._visual_points)
-            self.setCursor(QtGui.QCursor(QtCore.Qt.CursorShape.PointingHandCursor if on_point else QtCore.Qt.CursorShape.ArrowCursor))
+        if not self.isEnabled(): return
+        rect = QtCore.QRect(self.padding['left'], self.padding['top'],
+                            self.width() - self.padding['left'] - self.padding['right'],
+                            self.height() - self.padding['top'] - self.padding['bottom'])
+        rel_x = event.pos().x() - rect.left()
+        num_bins = len(self.counts)
+        if num_bins == 0: return
+        
+        if self._dragging_bin_index == -1:
+            self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor if 0 <= rel_x <= rect.width() and 0 <= event.pos().y() <= self.height() else QtCore.Qt.CursorShape.ArrowCursor)
+            return
+
+        idx = self._dragging_bin_index
+        if not (0 <= idx < num_bins): return
+        
+        max_val = max(self.counts) if self.counts else 1
+        y_scale_max = max(max_val * 1.2, self.max_tickets * 0.2)
+        target_val = int(((rect.bottom() - event.pos().y()) / rect.height()) * y_scale_max)
+        
+        current_val = self.counts[idx]
+        available = self.max_tickets - (sum(self.counts) - current_val)
+        new_val = max(0, min(target_val, available))
+        
+        if new_val != current_val:
+            self.counts[idx] = new_val
+            self._emit_change()
+            self.update()
 
     def mouseReleaseEvent(self, event):
-        if event.button() != QtCore.Qt.MouseButton.LeftButton: return
-        self._dragging_point_index = -1
-        self.pointsChanged.emit(self._points)
-
-    def add_point(self):
-        if len(self._points) < 2: return
-        max_gap = 0; insert_idx = -1
-        for i in range(len(self._points) - 1):
-            gap = self._points[i+1][0] - self._points[i][0]
-            if gap > max_gap: max_gap = gap; insert_idx = i + 1
-        if insert_idx != -1:
-            prev_p = self._points[insert_idx - 1]; next_p = self._points[insert_idx]
-            new_p = [(prev_p[0] + next_p[0]) / 2, (prev_p[1] + next_p[1]) / 2]
-            self._points.insert(insert_idx, new_p)
-            self.set_points(self._points)
-            self.pointsChanged.emit(self._points)
-
-    def remove_selected_point(self):
-        if self._selected_point_index > 0 and self._selected_point_index < len(self._points) - 1:
-            self._points.pop(self._selected_point_index)
-            self._selected_point_index = -1
-            self.set_points(self._points)
-            self.selectionChanged.emit(self._selected_point_index)
-            self.pointsChanged.emit(self._points)
-
-    def apply_preset(self, name):
-        if name == "Uniform (recommended)":
-            self.set_points([[0.0, 1.0], [1.0, 1.0]])
-        
-        elif name == "Bell Curve (Balanced)":
-            self.set_points([
-                [0.0, 0.5],
-                [0.2, 1.5],
-                [0.4, 2.0],
-                [0.5, 2.5],
-                [0.6, 2.0],
-                [0.8, 1.5],
-                [1.0, 0.5]
-            ])
-
-        elif name == "Structure & Detail (Ends Focus)":
-            self.set_points([
-                [0.0, 3.0],   # High focus on details/hands
-                [0.15, 2.0],
-                [0.3, 0.5],   # Start ignoring the middle
-                [0.5, 0.1],   # Almost zero focus on the "blur" phase
-                [0.7, 0.5],   # Start caring about structure again
-                [0.85, 2.0],
-                [1.0, 3.0]    # High focus on composition
-            ])
-
-        elif name == "Bias Early (Detail Focus)":
-            self.set_points([
-                [0.0, 3.0],
-                [0.1, 4.0],
-                [0.25, 2.5],
-                [0.4, 1.5],
-                [0.6, 1.0],
-                [0.8, 0.6],
-                [1.0, 0.4]
-            ])
-        
-        elif name == "Bias Late (Concept Focus)":
-            self.set_points([
-                [0.0, 0.4],
-                [0.3, 0.6],
-                [0.5, 1.0],
-                [0.65, 2.0],
-                [0.75, 3.5],
-                [0.85, 2.5],
-                [1.0, 1.5]
-            ])
-        elif name == "Logit-Normal (Inspired)":
-            self.set_points([
-                [0.0, 0.0],
-                [0.01, 0.0],
-                [0.05, 0.05],
-                [0.1, 0.14],
-                [0.2, 0.42],
-                [0.3, 0.85],
-                [0.4, 1.35],
-                [0.5, 1.60], 
-                [0.6, 1.35],
-                [0.7, 0.85],
-                [0.8, 0.42],
-                [0.9, 0.14],
-                [0.95, 0.05],
-                [0.99, 0.0],
-                [1.0, 0.0]
-            ])
-        elif name == "Trapezoid (Broad Plateau)":
-            self.set_points([
-                [0.0, 0.2],   # Start with some weight (don't ignore the very end)
-                [0.1, 1.0],   # Ramp up quickly to Full Weight for details
-                [0.2, 1.0],   # Full weight
-                [0.5, 1.0],   # Full weight (Bridge)
-                [0.8, 1.0],   # Full weight (Structure/Concepts)
-                [0.9, 1.0],   # Keep structure learning high
-                [1.0, 0.2]    # Drop off slightly at pure noise to prevent instability
-            ])
-        self.pointsChanged.emit(self._points)
+        self._dragging_bin_index = -1
+        self.update()
 
 class ProcessRunner(QThread):
     logSignal = pyqtSignal(str)
@@ -1561,7 +1541,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "SEED": {"label": "Seed:", "tooltip": "Ensures reproducible training.", "widget": "QLineEdit"},
         "RESUME_MODEL_PATH": {"label": "Resume Model:", "tooltip": "The .safetensors checkpoint file.", "widget": "Path", "file_type": "file_safetensors"},
         "RESUME_STATE_PATH": {"label": "Resume State:", "tooltip": "The .pt optimizer state file.", "widget": "Path", "file_type": "file_pt"},
-        "UNET_EXCLUDE_TARGETS": {"label": "Exclude Layers (Keywords):", "tooltip": "Keywords for layers to exclude from training (comma-separated).", "widget": "QPlainTextEdit", "height": 260},
+        "UNET_EXCLUDE_TARGETS": {"label": "Exclude Layers (Keywords):", "tooltip": "Keywords for layers to exclude from training (comma-separated).", "widget": "QPlainTextEdit", "height": 100},
         "LR_GRAPH_MIN": {"label": "Graph Min LR:", "tooltip": "The minimum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "NOISE_SCHEDULER": {"label": "Noise Scheduler:", "tooltip": "The noise scheduler to use for training. EulerDiscrete is experimental.", "widget": "QComboBox", "options": ["DDPMScheduler", "DDIMScheduler", "EulerDiscreteScheduler (Experimental)"]},
@@ -1664,7 +1644,7 @@ class TrainingGUI(QtWidgets.QWidget):
         corner_hbox = QtWidgets.QHBoxLayout()
         corner_hbox.setContentsMargins(10, 5, 10, 5)
         corner_hbox.setSpacing(10)
-        self.config_dropdown = QtWidgets.QComboBox()
+        self.config_dropdown = NoScrollComboBox()
         if not self.presets: self.log("CRITICAL: No presets loaded to populate dropdown.")
         else:
             for name in sorted(self.presets.keys()):
@@ -1736,7 +1716,8 @@ class TrainingGUI(QtWidgets.QWidget):
     def _prepare_config_to_save(self):
         config_to_save = {}
         for key in self.default_config.keys():
-            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", "TIMESTEP_WEIGHTING_CURVE"]:
+            # Skip keys handled manually
+            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"]:
                 continue
             live_val = self.current_config.get(key)
             if live_val is None: continue
@@ -1762,6 +1743,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 config_to_save[key] = converted_val
             except (ValueError, TypeError) as e:
                 self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
+        
         config_to_save["TRAINING_MODE"] = self.training_mode_combo.currentText()
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
@@ -1773,12 +1755,9 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
         config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
         
-        # RF PARAMS SAVING REMOVED
-        
-        val = self.current_config.get("TIMESTEP_WEIGHTING_CURVE")
-        if val:
-            rounded = [[round(p[0], 4), round(p[1], 4)] for p in val]
-            config_to_save["TIMESTEP_WEIGHTING_CURVE"] = rounded
+        # Save Histogram Data
+        if hasattr(self, 'timestep_histogram'):
+            config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
         raven_params = {}
         try:
@@ -1852,17 +1831,17 @@ class TrainingGUI(QtWidgets.QWidget):
             if "height" in definition: widget.setFixedHeight(definition["height"])
             widget.textChanged.connect(lambda: self._update_config_from_widget(key, widget))
         elif widget_type == "QSpinBox":
-            widget = QtWidgets.QSpinBox()
+            widget = NoScrollSpinBox()
             if "range" in definition: widget.setRange(*definition["range"])
             widget.valueChanged.connect(lambda value, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QDoubleSpinBox":
-            widget = QtWidgets.QDoubleSpinBox()
+            widget = NoScrollDoubleSpinBox()
             if "range" in definition: widget.setRange(*definition["range"])
             if "step" in definition: widget.setSingleStep(definition["step"])
             if "decimals" in definition: widget.setDecimals(definition["decimals"])
             widget.valueChanged.connect(lambda value, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QComboBox":
-            widget = QtWidgets.QComboBox()
+            widget = NoScrollComboBox()
             widget.addItems(definition["options"])
             widget.currentTextChanged.connect(lambda text, k=key: self._update_config_from_widget(k, widget))
         elif widget_type == "QCheckBox":
@@ -1889,6 +1868,30 @@ class TrainingGUI(QtWidgets.QWidget):
         if widget:
             if label: form_layout.addRow(label, widget)
             else: form_layout.addRow(widget)
+
+    def _add_stacked_path_widget(self, layout, key):
+        """Custom helper to create a stacked layout (Label -> Input -> Browse) for paths."""
+        definition = self.UI_DEFINITIONS[key]
+        container = QtWidgets.QWidget()
+        vbox = QtWidgets.QVBoxLayout(container)
+        vbox.setContentsMargins(0,0,0,0)
+        vbox.setSpacing(2)
+
+        label = QtWidgets.QLabel(definition["label"])
+        label.setToolTip(definition["tooltip"])
+        label.setStyleSheet("font-weight: bold; color: #ab97e6; margin-bottom: 2px;")
+        vbox.addWidget(label)
+
+        input_field = QtWidgets.QLineEdit()
+        input_field.textChanged.connect(lambda text, k=key: self._update_config_from_widget(k, input_field))
+        self.widgets[key] = input_field
+        vbox.addWidget(input_field)
+
+        browse_btn = QtWidgets.QPushButton("Browse...")
+        browse_btn.clicked.connect(lambda: self._browse_path(input_field, definition["file_type"]))
+        vbox.addWidget(browse_btn)
+
+        layout.addWidget(container)
     
     def _populate_dataset_tab(self, parent_widget):
         layout = QtWidgets.QVBoxLayout(parent_widget)
@@ -1909,44 +1912,59 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state)))
     
     def _populate_model_training_tab(self, parent_widget):
-        main_layout = QtWidgets.QHBoxLayout(parent_widget)
-        main_layout.setSpacing(20)
+        main_layout = QtWidgets.QVBoxLayout(parent_widget)
+        main_layout.setSpacing(15)
         main_layout.setContentsMargins(15, 5, 15, 15)
-        left_vbox = QtWidgets.QVBoxLayout()
+        
+        row1 = QtWidgets.QHBoxLayout()
+        row1.setSpacing(20)
+        
+        col1_container = QtWidgets.QWidget()
+        col1_layout = QtWidgets.QVBoxLayout(col1_container)
+        col1_layout.setContentsMargins(0,0,0,0)
+        col1_layout.setSpacing(10)
+        
         mode_group = QtWidgets.QGroupBox("Training Mode")
         mode_layout = QtWidgets.QHBoxLayout(mode_group)
-        self.training_mode_combo = QtWidgets.QComboBox()
+        self.training_mode_combo = NoScrollComboBox()
         self.training_mode_combo.addItems(["Standard (SDXL)", "Rectified Flow (Experimental)"])
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
         mode_layout.addWidget(self.training_mode_combo)
-        left_vbox.addWidget(mode_group)
-        left_vbox.addWidget(self._create_path_group())
-        left_vbox.addWidget(self._create_lr_scheduler_group())
-        left_vbox.addStretch(1)
-        right_container = QtWidgets.QWidget()
-        right_grid = QtWidgets.QGridLayout(right_container)
-        right_grid.setSpacing(20)
-        right_grid.addWidget(self._create_core_training_group(), 0, 0)
-        right_grid.addWidget(self._create_optimizer_group(), 0, 1)
-        self.scheduler_group = self._create_scheduler_config_group()
-        right_grid.addWidget(self.scheduler_group, 1, 0)
-        right_grid.addWidget(self._create_loss_group(), 1, 1)
+        col1_layout.addWidget(mode_group)
         
-        # --- MODIFIED: Always show Timestep Curve ---
+        col1_layout.addWidget(self._create_path_group())
+        col1_layout.addStretch()
+        
+        row1.addWidget(col1_container, 1)
+        row1.addWidget(self._create_lr_scheduler_group(), 2)
+        
         self.timestep_group = self._create_timestep_sampling_group()
-        right_grid.addWidget(self.timestep_group, 2, 0)
-        # --------------------------------------------
+        row1.addWidget(self.timestep_group, 2)
         
+        main_layout.addLayout(row1)
+
+        row2 = QtWidgets.QHBoxLayout()
+        row2.setSpacing(20)
+        row2.addWidget(self._create_core_training_group(), 1)
+        self.scheduler_group = self._create_scheduler_config_group()
+        row2.addWidget(self.scheduler_group, 1)
+        row2.addWidget(self._create_unet_group(), 1)
+        main_layout.addLayout(row2)
+
+        row3 = QtWidgets.QHBoxLayout()
+        row3.setSpacing(20)
+        row3.addWidget(self._create_optimizer_group(), 1)
+        row3.addWidget(self._create_loss_group(), 1)
         self.noise_group = self._create_noise_enhancements_group()
-        right_grid.addWidget(self.noise_group, 2, 1)
-        right_grid.addWidget(self._create_unet_group(), 3, 0)
-        right_grid.addWidget(self._create_advanced_group(), 3, 1)
-        spacer = QtWidgets.QSpacerItem(20, 40, QtWidgets.QSizePolicy.Policy.Minimum, QtWidgets.QSizePolicy.Policy.Expanding)
-        right_grid.addItem(spacer, 4, 0, 1, 2)
-        right_grid.setColumnStretch(0, 1)
-        right_grid.setColumnStretch(1, 1)
-        main_layout.addLayout(left_vbox, 2) 
-        main_layout.addWidget(right_container, 3)
+        row3.addWidget(self.noise_group, 1)
+        main_layout.addLayout(row3)
+
+        row4 = QtWidgets.QHBoxLayout()
+        row4.setSpacing(20)
+        row4.addWidget(self._create_advanced_group(), 1)
+        row4.addStretch(2)
+        main_layout.addLayout(row4)
+
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
@@ -1959,18 +1977,13 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'scheduler_group'): self.scheduler_group.setEnabled(not is_rf)
         if hasattr(self, 'noise_group'): self.noise_group.setEnabled(not is_rf)
         
-        # NOTE: Stack switching logic removed because we always use the Curve now.
-        
         disabled_tooltip = "This configuration is hardcoded for Rectified Flow training."
         if is_rf:
             if hasattr(self, 'scheduler_group'): self.scheduler_group.setToolTip(disabled_tooltip)
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip(disabled_tooltip)
-            # Update the title of the curve group to reflect RF context if desired
-            if hasattr(self, 'timestep_group'): self.timestep_group.setTitle("Timestep Probability Curve")
         else:
             if hasattr(self, 'scheduler_group'): self.scheduler_group.setToolTip("")
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip("")
-            if hasattr(self, 'timestep_group'): self.timestep_group.setTitle("Timestep Probability Curve")
         
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
 
@@ -1983,29 +1996,35 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_path_group(self):
         path_group = QtWidgets.QGroupBox("File & Directory Paths")
         path_layout = QtWidgets.QVBoxLayout(path_group)
+        
         form_layout = QtWidgets.QFormLayout()
-        self.model_load_strategy_combo = QtWidgets.QComboBox()
+        self.model_load_strategy_combo = NoScrollComboBox()
         self.model_load_strategy_combo.addItems(["Load Base Model", "Resume from Checkpoint"])
         form_layout.addRow("Mode:", self.model_load_strategy_combo)
         path_layout.addLayout(form_layout)
+        
         self.path_stacked_widget = QtWidgets.QStackedWidget()
+        
         base_model_widget = QtWidgets.QWidget()
-        base_layout = QtWidgets.QFormLayout(base_model_widget)
+        base_layout = QtWidgets.QVBoxLayout(base_model_widget)
         base_layout.setContentsMargins(0, 5, 0, 0)
-        self._add_widget_to_form(base_layout, "SINGLE_FILE_CHECKPOINT_PATH")
-        self._add_widget_to_form(base_layout, "VAE_PATH")
+        base_layout.setSpacing(10)
+        self._add_stacked_path_widget(base_layout, "SINGLE_FILE_CHECKPOINT_PATH")
+        self._add_stacked_path_widget(base_layout, "VAE_PATH")
         self.path_stacked_widget.addWidget(base_model_widget)
+        
         resume_widget = QtWidgets.QWidget()
-        resume_layout = QtWidgets.QFormLayout(resume_widget)
+        resume_layout = QtWidgets.QVBoxLayout(resume_widget)
         resume_layout.setContentsMargins(0, 5, 0, 0)
-        self._add_widget_to_form(resume_layout, "RESUME_MODEL_PATH")
-        self._add_widget_to_form(resume_layout, "RESUME_STATE_PATH")
+        resume_layout.setSpacing(10)
+        self._add_stacked_path_widget(resume_layout, "RESUME_MODEL_PATH")
+        self._add_stacked_path_widget(resume_layout, "RESUME_STATE_PATH")
         self.path_stacked_widget.addWidget(resume_widget)
+        
         path_layout.addWidget(self.path_stacked_widget)
-        output_form_layout = QtWidgets.QFormLayout()
-        output_form_layout.setContentsMargins(0, 5, 0, 0)
-        self._add_widget_to_form(output_form_layout, "OUTPUT_DIR")
-        path_layout.addLayout(output_form_layout)
+        
+        self._add_stacked_path_widget(path_layout, "OUTPUT_DIR")
+        
         self.model_load_strategy_combo.currentIndexChanged.connect(self.toggle_resume_widgets)
         return path_group
     
@@ -2021,7 +2040,7 @@ class TrainingGUI(QtWidgets.QWidget):
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
         selector_layout = QtWidgets.QHBoxLayout()
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
-        self.widgets["OPTIMIZER_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["OPTIMIZER_TYPE"] = NoScrollComboBox()
         self.widgets["OPTIMIZER_TYPE"].addItems(["Raven"])
         self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
@@ -2030,11 +2049,11 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
         self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
         self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
-        self.widgets['RAVEN_weight_decay'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
-        self.widgets['RAVEN_debias_strength'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
+        self.widgets['RAVEN_weight_decay'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
+        self.widgets['RAVEN_debias_strength'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
         self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
         self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization"); self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
-        self.widgets['RAVEN_gc_alpha'] = QtWidgets.QDoubleSpinBox(); self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
+        self.widgets['RAVEN_gc_alpha'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
         self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
         self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state)))
         raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
@@ -2069,15 +2088,15 @@ class TrainingGUI(QtWidgets.QWidget):
         presets_grid.setContentsMargins(0, 0, 0, 0)
         presets_grid.setSpacing(10)
         presets_grid.addWidget(QtWidgets.QLabel("Restarts:"), 0, 0)
-        restarts_spin = QtWidgets.QSpinBox()
+        restarts_spin = NoScrollSpinBox()
         restarts_spin.setRange(1, 50); restarts_spin.setValue(1); restarts_spin.setToolTip("Number of restart cycles (1 = standard single cycle)")
         presets_grid.addWidget(restarts_spin, 0, 1)
         presets_grid.addWidget(QtWidgets.QLabel("Initial Warmup %:"), 1, 0)
-        initial_warmup_spin = QtWidgets.QDoubleSpinBox()
+        initial_warmup_spin = NoScrollDoubleSpinBox()
         initial_warmup_spin.setRange(0.0, 100.0); initial_warmup_spin.setSingleStep(1.0); initial_warmup_spin.setValue(5.0); initial_warmup_spin.setSuffix("%"); initial_warmup_spin.setToolTip("Percentage of the first cycle spent warming up")
         presets_grid.addWidget(initial_warmup_spin, 1, 1)
         presets_grid.addWidget(QtWidgets.QLabel("Restart Rampup %:"), 2, 0)
-        restart_rampup_spin = QtWidgets.QDoubleSpinBox()
+        restart_rampup_spin = NoScrollDoubleSpinBox()
         restart_rampup_spin.setRange(0.0, 100.0); restart_rampup_spin.setSingleStep(1.0); restart_rampup_spin.setValue(0.0); restart_rampup_spin.setSuffix("%"); restart_rampup_spin.setToolTip("Percentage of subsequent cycles spent ramping up")
         presets_grid.addWidget(restart_rampup_spin, 2, 1)
         apply_cosine_btn = QtWidgets.QPushButton("Apply Cosine")
@@ -2110,7 +2129,7 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
         form_layout = QtWidgets.QFormLayout()
-        self.widgets["NOISE_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["NOISE_TYPE"] = NoScrollComboBox()
         self.widgets["NOISE_TYPE"].addItems(["Default", "Offset"])
         self.widgets["NOISE_TYPE"].currentTextChanged.connect(self._toggle_noise_widgets)
         form_layout.addRow("Noise Type:", self.widgets["NOISE_TYPE"])
@@ -2132,7 +2151,7 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
         form_layout = QtWidgets.QFormLayout()
-        self.widgets["LOSS_TYPE"] = QtWidgets.QComboBox()
+        self.widgets["LOSS_TYPE"] = NoScrollComboBox()
         self.widgets["LOSS_TYPE"].addItems(["Default", "Semantic"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form_layout.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
@@ -2151,54 +2170,42 @@ class TrainingGUI(QtWidgets.QWidget):
         self.semantic_loss_container.setVisible(loss_type == "Semantic")
         
     def _create_timestep_sampling_group(self):
-        group = QtWidgets.QGroupBox("Timestep Probability Curve")
+        group = QtWidgets.QGroupBox("Timestep Ticket Allocation")
         layout = QtWidgets.QVBoxLayout(group)
-        self.timestep_curve_widget = TimestepCurveWidget()
-        self.widgets["TIMESTEP_WEIGHTING_CURVE"] = self.timestep_curve_widget
-        self.timestep_curve_widget.pointsChanged.connect(lambda pts: self._update_config_from_widget("TIMESTEP_WEIGHTING_CURVE", self.timestep_curve_widget))
-        self.timestep_curve_widget.selectionChanged.connect(self._update_timestep_button_states)
-        layout.addWidget(self.timestep_curve_widget)
-        controls_layout = QtWidgets.QHBoxLayout()
-        self.add_ts_point_btn = QtWidgets.QPushButton("Add Point")
-        self.add_ts_point_btn.clicked.connect(self.timestep_curve_widget.add_point)
-        self.remove_ts_point_btn = QtWidgets.QPushButton("Remove Point")
-        self.remove_ts_point_btn.clicked.connect(self.timestep_curve_widget.remove_selected_point)
-        self.remove_ts_point_btn.setEnabled(False)
-        controls_layout.addWidget(self.add_ts_point_btn)
-        controls_layout.addWidget(self.remove_ts_point_btn)
-        layout.addLayout(controls_layout)
-        preset_layout = QtWidgets.QHBoxLayout()
-        preset_layout.addWidget(QtWidgets.QLabel("Presets:"))
-        ts_preset_combo = QtWidgets.QComboBox()
-        ts_preset_combo.addItems([
-            "Uniform (recommended)", 
-            "Bell Curve (Balanced)", 
-            "Structure & Detail (Ends Focus)",
-            "Bias Early (Detail Focus)", 
-            "Bias Late (Concept Focus)",
-            "Logit-Normal (Inspired)",
-            "Trapezoid (Broad Plateau)"
-        ])
-        ts_preset_combo.currentIndexChanged.connect(lambda: self.timestep_curve_widget.apply_preset(ts_preset_combo.currentText()))
-        preset_layout.addWidget(ts_preset_combo, 1)
-        layout.addLayout(preset_layout)
-        return group
-    
-    # NEW METHOD for RF Params Group
-    def _create_rf_sampling_group(self):
-        group = QtWidgets.QGroupBox("Rectified Flow Sampling")
-        layout = QtWidgets.QFormLayout(group)
-        self._add_widget_to_form(layout, "RF_MU")
-        self._add_widget_to_form(layout, "RF_SIGMA")
-        self._add_widget_to_form(layout, "RF_SHIFT")
-        return group
-    
-    def _update_timestep_button_states(self, selected_index):
-        if hasattr(self, 'remove_ts_point_btn'):
-            points = self.timestep_curve_widget.get_points()
-            is_removable = selected_index > 0 and selected_index < len(points) - 1
-            self.remove_ts_point_btn.setEnabled(is_removable)
+        layout.setSpacing(10)
         
+        self.timestep_histogram = TimestepHistogramWidget()
+        self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
+        layout.addWidget(self.timestep_histogram)
+
+        controls_layout = QtWidgets.QHBoxLayout()
+        
+        controls_layout.addWidget(QtWidgets.QLabel("Bin Size:"))
+        self.bin_size_combo = NoScrollComboBox()
+        self.bin_size_combo.addItems(["40", "50", "100", "200", "250", "500"])
+        self.bin_size_combo.setCurrentText("100")
+        controls_layout.addWidget(self.bin_size_combo)
+        
+        controls_layout.addSpacing(20)
+
+        controls_layout.addWidget(QtWidgets.QLabel("Presets:"))
+        ts_preset_combo = NoScrollComboBox()
+        ts_preset_combo.addItems([
+            "Uniform", 
+            "Bell Curve", 
+            "Bias Early (Detail)", 
+            "Bias Late (Structure)"
+        ])
+        controls_layout.addWidget(ts_preset_combo, 1)
+        
+        layout.addLayout(controls_layout)
+        
+        self.bin_size_combo.currentTextChanged.connect(lambda txt: self.timestep_histogram.set_bin_size(int(txt)))
+        self.timestep_histogram.allocationChanged.connect(lambda data: self._update_config_from_widget("TIMESTEP_ALLOCATION", self.timestep_histogram))
+        ts_preset_combo.currentIndexChanged.connect(lambda: self.timestep_histogram.apply_preset(ts_preset_combo.currentText()))
+        
+        return group
+    
     def _create_unet_group(self):
         unet_group = QtWidgets.QGroupBox("UNet Layer Exclusion")
         layout = QtWidgets.QFormLayout(unet_group)
@@ -2253,61 +2260,68 @@ class TrainingGUI(QtWidgets.QWidget):
         elif isinstance(widget, QtWidgets.QComboBox): self.current_config[key] = widget.currentText()
         elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = widget.value()
         elif isinstance(widget, LRCurveWidget): self.current_config[key] = widget.get_points()
-        elif isinstance(widget, TimestepCurveWidget): self.current_config[key] = widget.get_points()
+        elif isinstance(widget, TimestepHistogramWidget): self.current_config[key] = widget.get_allocation()
     
     def _apply_config_to_widgets(self):
-            for widget in self.widgets.values(): widget.blockSignals(True)
-            try:
-                mode = self.current_config.get("TRAINING_MODE", "Standard (SDXL)")
-                self.training_mode_combo.setCurrentText(mode)
-                self._on_training_mode_changed(mode) 
-                if hasattr(self, 'model_load_strategy_combo'):
-                    is_resuming = self.current_config.get("RESUME_TRAINING", False)
-                    self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
-                    self.toggle_resume_widgets(1 if is_resuming else 0)
-                special_keys = ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_WEIGHTING_CURVE"] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
-                for key, widget in self.widgets.items():
-                    if key in special_keys: continue
-                    value = self.current_config.get(key)
-                    if value is None: continue
-                    if isinstance(widget, QtWidgets.QLineEdit): widget.setText(str(value))
-                    elif isinstance(widget, QtWidgets.QPlainTextEdit): widget.setPlainText(str(value))
-                    elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
-                    elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
-                    elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-                optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
-                self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
+        for widget in self.widgets.values(): widget.blockSignals(True)
+        try:
+            mode = self.current_config.get("TRAINING_MODE", "Standard (SDXL)")
+            self.training_mode_combo.setCurrentText(mode)
+            self._on_training_mode_changed(mode) 
+            if hasattr(self, 'model_load_strategy_combo'):
+                is_resuming = self.current_config.get("RESUME_TRAINING", False)
+                self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
+                self.toggle_resume_widgets(1 if is_resuming else 0)
+            
+            # Special keys handling
+            special_keys = ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
+            for key, widget in self.widgets.items():
+                if key in special_keys: continue
+                value = self.current_config.get(key)
+                if value is None: continue
+                if isinstance(widget, QtWidgets.QLineEdit): widget.setText(str(value))
+                elif isinstance(widget, QtWidgets.QPlainTextEdit): widget.setPlainText(str(value))
+                elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
+                elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
+                elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
+            optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
+            self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
+            
+            user_raven_params = self.current_config.get("RAVEN_PARAMS", {}); full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
+            self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"]))); self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
+            self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"]); self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
+            use_gc = full_raven_params.get("use_grad_centralization", False); gc_alpha = full_raven_params.get("gc_alpha", 1.0)
+            self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc); self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha); self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
+            self._toggle_optimizer_widgets()
+
+            noise_type = self.current_config.get("NOISE_TYPE", "Default")
+            self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
+            self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
+            self._toggle_noise_widgets()
+            loss_type = self.current_config.get("LOSS_TYPE", "Default")
+            self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
+            self.widgets["SEMANTIC_LOSS_BLEND"].setValue(self.current_config.get("SEMANTIC_LOSS_BLEND", 0.5))
+            self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
+            self._toggle_loss_widgets()
+
+            if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
+                self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
+            if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
+            
+            if hasattr(self, 'timestep_histogram'):
+                allocation = self.current_config.get("TIMESTEP_ALLOCATION")
+                if allocation:
+                    if "bin_size" in allocation:
+                        self.bin_size_combo.blockSignals(True)
+                        self.bin_size_combo.setCurrentText(str(allocation["bin_size"]))
+                        self.bin_size_combo.blockSignals(False)
+                    self.timestep_histogram.set_allocation(allocation)
                 
-                user_raven_params = self.current_config.get("RAVEN_PARAMS", {}); full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
-                self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"]))); self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
-                self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"]); self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
-                use_gc = full_raven_params.get("use_grad_centralization", False); gc_alpha = full_raven_params.get("gc_alpha", 1.0)
-                self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc); self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha); self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
-                self._toggle_optimizer_widgets()
-
-                noise_type = self.current_config.get("NOISE_TYPE", "Default")
-                self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
-                self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
-                self._toggle_noise_widgets()
-                loss_type = self.current_config.get("LOSS_TYPE", "Default")
-                self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
-                self.widgets["SEMANTIC_LOSS_BLEND"].setValue(self.current_config.get("SEMANTIC_LOSS_BLEND", 0.5))
-                self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
-                self._toggle_loss_widgets()
-
-                # RF VALUES LOADING REMOVED
-
-                if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
-                    self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
-                if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
-                if hasattr(self, 'timestep_curve_widget'):
-                    curve_data = self.current_config.get("TIMESTEP_WEIGHTING_CURVE", [[0.0, 1.0], [1.0, 1.0]])
-                    self.timestep_curve_widget.set_points(curve_data)
-                if hasattr(self, "dataset_manager"): 
-                    self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
-                self._update_training_calculations()
-            finally:
-                for widget in self.widgets.values(): widget.blockSignals(False)
+            if hasattr(self, "dataset_manager"): 
+                self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
+            self._update_training_calculations()
+        finally:
+            for widget in self.widgets.values(): widget.blockSignals(False)
 
     def restore_defaults(self):
         index = self.config_dropdown.currentIndex()
@@ -2330,13 +2344,22 @@ class TrainingGUI(QtWidgets.QWidget):
     def _update_training_calculations(self):
         if not all(k in self.widgets for k in ["MAX_TRAIN_STEPS", "GRADIENT_ACCUMULATION_STEPS", "BATCH_SIZE"]) or not hasattr(self, 'dataset_manager'): return
         try:
-            max_train_steps = int(self.widgets["MAX_TRAIN_STEPS"].text()); grad_accum_steps = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
-            batch_size = self.widgets["BATCH_SIZE"].value(); total_images_with_repeats = self.dataset_manager.get_total_repeats()
+            max_train_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
+            grad_accum_steps = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
+            batch_size = self.widgets["BATCH_SIZE"].value()
+            total_images_with_repeats = self.dataset_manager.get_total_repeats()
+            
             optimizer_steps = max_train_steps // grad_accum_steps if grad_accum_steps > 0 else 0
             steps_per_epoch = total_images_with_repeats // batch_size if total_images_with_repeats > 0 and batch_size > 0 else 0
             total_epochs = max_train_steps / steps_per_epoch if steps_per_epoch > 0 else float('inf')
+            
             self.optimizer_steps_label.setText(f"{optimizer_steps:,}")
             self.epochs_label.setText("∞ (Not enough images for one batch)" if total_epochs == float('inf') else f"{total_epochs:.2f}")
+
+            # Update Histogram Budget
+            if hasattr(self, 'timestep_histogram'):
+                self.timestep_histogram.set_total_steps(max_train_steps)
+
         except (ValueError, KeyError):
             self.optimizer_steps_label.setText("Invalid Input"); self.epochs_label.setText("Invalid Input")
 
@@ -2441,9 +2464,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
         if os.name == 'nt': prevent_sleep(False)
 
-class NoScrollSpinBox(QtWidgets.QSpinBox):
-    def wheelEvent(self, event): event.ignore()
-
 class DatasetLoaderThread(QThread):
     finished = pyqtSignal(list, str) 
     def __init__(self, path):
@@ -2491,7 +2511,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         add_custom_btn.clicked.connect(self.add_dataset_folder_custom)
         top_bar.addWidget(add_custom_btn)
         top_bar.addWidget(QtWidgets.QLabel("Sort By:"))
-        self.sort_combo = QtWidgets.QComboBox()
+        self.sort_combo = NoScrollComboBox()
         self.sort_combo.addItems(["Default (Order Added)", "Name (A-Z)", "Name (Z-A)", "Image Count (High → Low)", "Image Count (Low → High)"])
         self.sort_combo.currentIndexChanged.connect(self.sort_datasets)
         top_bar.addWidget(self.sort_combo)

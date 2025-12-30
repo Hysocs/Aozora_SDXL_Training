@@ -32,7 +32,6 @@ import queue
 import tomesd
 import numpy as np
 import torch
-from scipy.interpolate import PchipInterpolator
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
 
@@ -672,13 +671,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     if not check_if_caching_needed(config):
         print("\n" + "="*60); print("INFO: Datasets already cached."); print("="*60 + "\n"); return
 
-    print("\n" + "="*60); print("STARTING HIGH-FIDELITY (FP32) CACHING"); print("="*60 + "\n")
+    print("\n" + "="*60); print("STARTING HIGH-FIDELITY (FP32) CACHING (Standard SDXL)"); print("="*60 + "\n")
     
     # Use the logic from the GUI (Resolution + Upscaling)
     calc = ResolutionCalculator(config.TARGET_PIXEL_AREA, stride=64, should_upscale=config.SHOULD_UPSCALE)
     
     # 1. Force VAE to Safe Mode (FP32 + Tiling)
-    # This prevents Black Screens and NaNs
     vae.to(device, dtype=torch.float32) 
     vae.enable_tiling()
     vae.enable_slicing()
@@ -700,10 +698,18 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         
         # Find images
         paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
-        stems = {p.stem for p in cache_dir.rglob("*.pt")}
-        to_process = [p for p in paths if p.stem not in stems]
         
-        if not to_process: continue
+        # Check which are already cached using the new UNIQUE naming scheme
+        to_process = []
+        for p in paths:
+            relative_path = p.relative_to(root)
+            safe_stem = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
+            if not (cache_dir / f"{safe_stem}.pt").exists():
+                to_process.append(p)
+        
+        if not to_process:
+            print(f"INFO: All images in {root.name} are already cached.")
+            continue
         
         # Validation Phase
         print(f"INFO: Validating and Bucketing {len(to_process)} images...")
@@ -724,10 +730,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         # Processing Loop
         for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc="Encoding (FP32)")):
             
-            # 1. Text Embeddings (Using Chunking for >75 tokens)
+            # 1. Text Embeddings
             captions = [m['caption'] for m in batch_meta]
             embeds, pooled = compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device)
-            # FORCE KEEP AS FLOAT32
             embeds = embeds.to(dtype=torch.float32)
             pooled = pooled.to(dtype=torch.float32)
 
@@ -739,7 +744,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 try:
                     with Image.open(m['ip']) as img:
                         img = fix_alpha_channel(img)
-                        # USE BICUBIC (Matches GUI "Safe" Mode - No Halos)
                         processed_img = transform(resize_to_fit(img, w, h))
                         images.append(processed_img)
                         valid_meta_final.append(m)
@@ -749,38 +753,38 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             if not images: continue
 
             # 3. VAE Encoding
-            # Stack as Float32
             pixel_values = torch.stack(images).to(device, dtype=torch.float32)
             
             with torch.no_grad():
-                # Encode (FP32)
                 dist = vae.encode(pixel_values).latent_dist
+                # Standard SDXL Scaling (No Shift)
                 latents = dist.sample() * vae.config.scaling_factor
                 
-                # Check for NaNs (Black Screen prevention)
                 if torch.isnan(latents).any():
-                    print(f"\n[CRITICAL WARNING] NaN detected in batch! Skipping batch to protect training.")
+                    print(f"\n[CRITICAL WARNING] NaN detected in batch! Skipping batch.")
                     continue
 
             # 4. Save to Disk
-            # REMOVED .half() -> Saving as full Float32
-            latents = latents.cpu() # Keep as Float32
-            
+            latents = latents.cpu()
             forced_orig_size = (w, h) 
 
             for j, m in enumerate(valid_meta_final):
-                cache_path = cache_dir / f"{m['ip'].stem}.pt"
+                # GENERATE UNIQUE FILENAME BASED ON SUBFOLDERS
+                relative_path = m['ip'].relative_to(root)
+                safe_filename = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
+                cache_path = cache_dir / f"{safe_filename}.pt"
 
                 torch.save({
-                    "original_size": forced_orig_size, # <--- LIE TO THE MODEL
+                    "original_stem": m['ip'].stem,         # Used for metadata/tag lookup
+                    "relative_path": str(relative_path),   # Used to find original image for Semantic Loss
+                    "original_size": forced_orig_size, 
                     "target_size": (w, h),
-                    "crop_coords_top_left": (0, 0),    # <--- Enforce 0,0 crop
+                    "crop_coords_top_left": (0, 0),
                     "embeds": embeds[j].cpu(),
                     "pooled": pooled[j].cpu(),
                     "latents": latents[j]
                 }, cache_path)
             
-            # Cleanup
             del pixel_values, latents, embeds, pooled
             if batch_idx % 20 == 0: torch.cuda.empty_cache()
 
@@ -790,69 +794,99 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.latent_files = []
-        # --- MODIFICATION: Check for semantic loss, not semantic noise ---
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
         
+        # Store roots to help find original images later
+        self.dataset_roots = {} 
+
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             cache_dir = root / ".precomputed_embeddings_cache"
             if not cache_dir.exists(): continue
+            
             files = list(cache_dir.glob("*.pt"))
+            # Map every cache file back to its dataset root
+            for f in files:
+                self.dataset_roots[str(f)] = root
+                
             self.latent_files.extend(files * int(ds.get("repeats", 1)))
+
         if not self.latent_files: raise ValueError("No cached files found.")
+        
         print("INFO: Shuffling the entire dataset order...")
         random.shuffle(self.latent_files)
         
-        self.bucket_keys = []
+        # Load Metadata (Tags)
         all_meta = {}
         for ds in config.INSTANCE_DATASETS:
             meta_path = Path(ds["path"]) / "metadata.json"
             if meta_path.exists():
-                with open(meta_path, 'r') as f: all_meta.update(json.load(f))
-        for f in self.latent_files:
-            key = all_meta.get(f.stem)
-            self.bucket_keys.append(tuple(key) if key else None)
+                try:
+                    with open(meta_path, 'r', encoding='utf-8') as f: 
+                        all_meta.update(json.load(f))
+                except Exception as e:
+                    print(f"ERROR loading metadata: {e}")
+
+        self.bucket_keys = []
+        
+        print("INFO: Building buckets and linking metadata...")
+        for f in tqdm(self.latent_files, desc="Loading Cache Headers"):
+            try:
+                # Load header (CPU)
+                header = torch.load(f, map_location='cpu')
+                
+                # 1. Get Resolution for Bucketing
+                res = header.get('target_size')
+                if res:
+                    self.bucket_keys.append(tuple(res))
+                else:
+                    self.bucket_keys.append(None)
+                
+                # 2. (Optional check) You could verify tags here if needed, 
+                # but currently we assume if the file exists, the latents are valid.
+                # The TrainingConfig doesn't usually require 'bucket_keys' to contain tags, just resolutions.
+                
+            except Exception as e:
+                print(f"Error reading cache header for {f}: {e}")
+                self.bucket_keys.append(None)
+                
         print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
-        if self.use_semantic_loss:
-             print("INFO: Semantic loss is ENABLED. Original images will be loaded during training.")
+        if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED.")
 
     def __len__(self): return len(self.latent_files)
-
-    def _find_original_image_path(self, latent_path):
-        """Finds the original image file corresponding to a latent file."""
-        latent_p = Path(latent_path)
-        stem = latent_p.stem
-        parent_dir = latent_p.parent.parent
-        
-        for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
-            image_path = parent_dir / (stem + ext)
-            if image_path.exists():
-                return image_path
-        return None
 
     def __getitem__(self, i):
         try:
             latent_path = self.latent_files[i]
             data = torch.load(latent_path, map_location="cpu")
-            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()):
-                return None
+            
+            if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()): return None
             
             item_data = {
-                "latents": data["latents"], "embeds": data["embeds"], "pooled": data["pooled"],
-                "original_sizes": data["original_size"], "target_sizes": data["target_size"],
+                "latents": data["latents"], 
+                "embeds": data["embeds"], 
+                "pooled": data["pooled"], 
+                "original_sizes": data["original_size"], 
+                "target_sizes": data["target_size"], 
                 "latent_path": str(latent_path)
             }
-            
-            # --- MODIFICATION: Load original image if semantic loss is enabled ---
+
             if self.use_semantic_loss:
-                original_image_path = self._find_original_image_path(latent_path)
-                if original_image_path:
-                    # Open and fix alpha immediately
-                    with Image.open(original_image_path) as raw_img:
-                        item_data["original_image"] = fix_alpha_channel(raw_img)
+                # Use the saved relative path to find the image in subfolders
+                root = self.dataset_roots.get(str(latent_path))
+                relative_path = data.get("relative_path")
+                
+                if root and relative_path:
+                    original_image_path = Path(root) / relative_path
+                    if original_image_path.exists():
+                        with Image.open(original_image_path) as raw_img: 
+                            item_data["original_image"] = fix_alpha_channel(raw_img)
+                    else:
+                        item_data["original_image"] = None
                 else:
-                    print(f"WARNING: Could not find original image for {latent_path.stem}...")
+                    # Fallback for old cache files or missing paths
                     item_data["original_image"] = None
+                    
             return item_data
         except Exception as e:
             print(f"WARNING: Skipping {self.latent_files[i]}: {e}")
@@ -860,120 +894,192 @@ class ImageTextLatentDataset(Dataset):
 
 class TimestepSampler:
     """
-    Smooth timestep sampling using PCHIP-interpolated CDF for graph-based probability control.
-    Compatible with any noise_scheduler (DDPM, Euler, etc.).
+    Simple ticket-pool based timestep sampler.
+    Pre-generates all timesteps according to your curve, shuffles them, 
+    and deals them out one by one.
     """
-    def __init__(self, config, noise_scheduler, device):
+    def __init__(self, config, device):
         self.config = config
-        self.noise_scheduler = noise_scheduler
         self.device = device
-        self.num_train_timesteps = noise_scheduler.config.num_train_timesteps
+        self.num_train_timesteps = 1000
+        self.max_train_steps = config.MAX_TRAIN_STEPS
+        self.seed = config.SEED if config.SEED else 42
         
-        # 1. Load curve points from config
-        self.curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [])
-        if not self.curve_points:
-            print("WARNING: TIMESTEP_WEIGHTING_CURVE empty. Defaulting to uniform.")
-            self.curve_points = [[0.0, 1.0], [1.0, 1.0]]
-            
-        self.curve_points.sort(key=lambda p: p[0])
+        # Get curve from config
+        curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [[0.0, 1.0], [1.0, 1.0]])
         
-        # Ensure full range coverage
-        if self.curve_points[0][0] > 0.0: 
-            self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
-        if self.curve_points[-1][0] < 1.0: 
-            self.curve_points.append([1.0, self.curve_points[-1][1]])
-
-        # 2. Build PCHIP interpolator for smooth PDF
-        x_points = np.array([p[0] for p in self.curve_points], dtype=np.float64)
-        y_points = np.array([max(0.0, p[1]) for p in self.curve_points], dtype=np.float64)
-        self.interpolator = PchipInterpolator(x_points, y_points)
+        # Build the ticket pool
+        self.ticket_pool = self._build_ticket_pool(curve_points)
+        self.pool_index = 0
         
-        # 3. Precompute high-resolution CDF
-        self.resolution = 100000
-        self.cdf = self._precompute_cdf()
+        print(f"INFO: Initialized Ticket Pool Timestep Sampler")
+        print(f"      Total tickets: {len(self.ticket_pool)}, Seed: {self.seed}")
         
-        # Debug distribution
+        # Print distribution preview
         self._print_sampling_distribution()
-        
-        print(f"INFO: Initialized Graph-Based Timestep Sampler (Scheduler: {type(noise_scheduler).__name__})")
-        print(f"      Resolution: {self.resolution}, Control Points: {len(self.curve_points)}")
 
-    def _interpolate_weight(self, x):
-        """Evaluate PDF at point x using PCHIP"""
-        return float(self.interpolator(x))
-
-    def _precompute_cdf(self):
-        """Numerical integration to build CDF from PDF"""
-        x_vals = np.linspace(0, 1, self.resolution, dtype=np.float64)
-        pdf = np.array([self._interpolate_weight(x) for x in x_vals], dtype=np.float64)
+    def _build_ticket_pool(self, curve_points):
+        """
+        Build a pool of timesteps based on the curve weights.
+        Each timestep gets a number of tickets proportional to its weight.
+        """
+        # Sort curve points by position
+        curve_points = sorted(curve_points, key=lambda p: p[0])
         
-        # Trapezoidal integration
-        dx = 1.0 / (self.resolution - 1)
-        cdf = np.cumsum((pdf[:-1] + pdf[1:]) * dx * 0.5)
-        cdf = np.insert(cdf, 0, 0.0)
+        # Each training step needs batch_size timesteps (one per image in the batch)
+        total_tickets_needed = self.max_train_steps * self.config.BATCH_SIZE
         
-        # Normalize
-        if cdf[-1] > 0:
-            cdf = cdf / cdf[-1]
-        else:
-            print("WARNING: All weights zero. Using uniform CDF.")
-            cdf = np.linspace(0, 1, self.resolution, dtype=np.float64)
+        # Build weight array for each timestep (0-999)
+        weights = np.zeros(self.num_train_timesteps, dtype=np.float64)
+        
+        for t in range(self.num_train_timesteps):
+            # Normalize t to [0, 1]
+            t_norm = t / (self.num_train_timesteps - 1)
             
-        return torch.tensor(cdf, dtype=torch.float32, device=self.device)
+            # Find which curve segment this falls into
+            weight = self._get_weight_at_position(t_norm, curve_points)
+            weights[t] = weight
+        
+        # Normalize weights to sum to 1
+        weights_sum = weights.sum()
+        if weights_sum > 0:
+            weights = weights / weights_sum
+        else:
+            # Fallback to uniform
+            weights = np.ones(self.num_train_timesteps) / self.num_train_timesteps
+        
+        # Generate tickets: each timestep gets tickets proportional to its weight
+        tickets = []
+        for t in range(self.num_train_timesteps):
+            num_tickets = int(weights[t] * total_tickets_needed)
+            tickets.extend([t] * num_tickets)
+        
+        # Make sure we have enough tickets
+        while len(tickets) < total_tickets_needed:
+            # Add more from high-weight timesteps
+            t = np.random.choice(self.num_train_timesteps, p=weights)
+            tickets.append(t)
+        
+        # Shuffle with seed
+        random.seed(self.seed)
+        random.shuffle(tickets)
+        
+        return tickets
 
-    def _print_sampling_distribution(self):
-        """Visual verification of sampling bias"""
-        print("\n" + "="*60)
-        print(f"TIMESTEP SAMPLING DISTRIBUTION (10K samples, {type(self.noise_scheduler).__name__})")
-        print("="*60)
+    def _get_weight_at_position(self, t_norm, curve_points):
+        """
+        Simple linear interpolation between curve points.
+        """
+        # Handle edge cases
+        if t_norm <= curve_points[0][0]:
+            return max(1e-10, curve_points[0][1])
+        if t_norm >= curve_points[-1][0]:
+            return max(1e-10, curve_points[-1][1])
         
-        test_samples = 10000
-        _, t_continuous = self.sample(test_samples)
-        timesteps = (t_continuous * self.num_train_timesteps).long()
+        # Find surrounding points
+        for i in range(len(curve_points) - 1):
+            x1, y1 = curve_points[i]
+            x2, y2 = curve_points[i + 1]
+            
+            if x1 <= t_norm <= x2:
+                # Linear interpolation
+                if x2 - x1 == 0:
+                    return max(1e-10, y1)
+                
+                alpha = (t_norm - x1) / (x2 - x1)
+                weight = y1 + alpha * (y2 - y1)
+                return max(1e-10, weight)  # Never exactly zero
         
-        ranges = [
-            (0, 100, "0-100 (Early)"),
-            (100, 300, "100-300"),
-            (300, 500, "300-500"),
-            (500, 700, "500-700"),
-            (700, 900, "700-900"),
-            (900, self.num_train_timesteps, f"900-{self.num_train_timesteps} (Late)")
-        ]
-        
-        print("\nRange            | Count  | Percentage")
-        print("-" * 40)
-        for start, end, label in ranges:
-            count = ((timesteps >= start) & (timesteps < end)).sum().item()
-            percentage = (count / test_samples) * 100
-            bar = "#" * int(percentage / 2)
-            print(f"{label:<15} | {count:>4} | {percentage:>5.1f}% {bar}")
-        
-        print(f"\nMean timestep: {timesteps.float().mean():.1f} / {self.num_train_timesteps - 1}")
-        print("="*60 + "\n")
+        return 1e-10
 
     def sample(self, batch_size):
-        """Inverse transform sampling from CDF"""
-        # Sample uniform [0,1]
-        u = torch.rand(batch_size, device=self.device)
+        """
+        Pull the next batch_size tickets from the pool.
+        Returns discrete timesteps (0-999) for training.
+        """
+        # Pull tickets from the pool
+        timesteps_list = []
+        for _ in range(batch_size):
+            if self.pool_index >= len(self.ticket_pool):
+                # Reshuffle and start over (shouldn't happen in normal training)
+                print("WARNING: Ticket pool exhausted, reshuffling...")
+                random.seed(self.seed + self.pool_index)
+                random.shuffle(self.ticket_pool)
+                self.pool_index = 0
+            
+            timesteps_list.append(self.ticket_pool[self.pool_index])
+            self.pool_index += 1
         
-        # Find indices in CDF
-        indices = torch.searchsorted(self.cdf, u)
+        # Return only discrete timesteps as a tensor
+        timesteps = torch.tensor(timesteps_list, dtype=torch.long, device=self.device)
+        return timesteps
+
+    def _print_sampling_distribution(self):
+        """Show actual ticket counts in the pool"""
+        print("\n" + "="*80)
+        print("TIMESTEP TICKET POOL DISTRIBUTION")
+        print(f"Total Tickets: {len(self.ticket_pool):,} | Training Steps: {self.max_train_steps:,}")
+        print(f"Seed: {self.seed}")
+        print("="*80)
         
-        # Convert to continuous timesteps [0,1]
-        t_continuous = indices.float() / self.resolution
-        t_continuous = torch.clamp(t_continuous, 0.0001, 0.9999)
+        # Count tickets in the entire pool (not sampling, just counting what exists)
+        timesteps = torch.tensor(self.ticket_pool, dtype=torch.long)
         
-        # Convert to discrete timesteps [0, num_train_timesteps-1]
-        timesteps = (t_continuous * self.num_train_timesteps).long()
+        # 50-step bins
+        bin_size = 50
+        num_bins = self.num_train_timesteps // bin_size
         
-        return timesteps, t_continuous
+        print("\nTimestep Range | Tickets in Pool")
+        print("-" * 80)
+        
+        # Collect bin data
+        bin_data = []
+        max_count = 0
+        total_tickets = len(self.ticket_pool)
+        
+        for i in range(num_bins):
+            start = i * bin_size
+            end = start + bin_size
+            count = ((timesteps >= start) & (timesteps < end)).sum().item()
+            percentage = (count / total_tickets) * 100
+            max_count = max(max_count, count)
+            
+            # Label
+            if start < 200:
+                label = "CLEAN"
+            elif start < 500:
+                label = "LOW"
+            elif start < 700:
+                label = "MID"
+            elif start < 900:
+                label = "HIGH"
+            else:
+                label = "NOISE"
+            
+            bin_data.append((f"{start}-{end-1}", label, count, percentage))
+        
+        # Print bins
+        for range_str, label, count, percentage in bin_data:
+            bar_length = int((count / max(max_count, 1)) * 50)
+            bar = "#" * bar_length
+            print(f"{range_str:8s} {label:5s} {count:7,d} {percentage:5.1f}% | {bar}")
+        
+        # Summary stats
+        print("-" * 80)
+        mean = timesteps.float().mean().item()
+        median = timesteps.float().median().item()
+        std = timesteps.float().std().item()
+        total_check = sum([bd[2] for bd in bin_data])
+        print(f"Mean: {mean:6.1f} | Median: {median:6.1f} | Std: {std:6.1f}")
+        print(f"Total Tickets Verified: {total_check:,} / {total_tickets:,}")
+        print("="*80 + "\n")
 
     def update(self, raw_grad_norm):
-        """No-op for graph-based sampling (kept for compatibility)"""
+        """Kept for compatibility - does nothing"""
         pass
     
     def record_timesteps(self, timesteps):
-        """No-op for graph-based sampling (kept for compatibility)"""
+        """Kept for compatibility - does nothing"""
         pass
 
 def custom_collate_fn(batch):

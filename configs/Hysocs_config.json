@@ -12,34 +12,34 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 2500,
+    "MAX_TRAIN_STEPS": 2000,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 10,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 50.0,
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": 5002,
+    "SAVE_EVERY_N_STEPS": 6001,
     "UNET_EXCLUDE_TARGETS": "conv1,conv2,conv_shortcut",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            2e-06
+            1e-07
         ],
         [
-            0.05,
-            2e-05
+            0.05868545,
+            1e-05
         ],
         [
-            0.95305164,
-            2e-05
+            0.91314554,
+            1e-05
         ],
         [
             1.0,
-            2e-06
+            1e-07
         ]
     ],
-    "LR_GRAPH_MIN": 2e-06,
-    "LR_GRAPH_MAX": 2e-05,
+    "LR_GRAPH_MIN": 1e-07,
+    "LR_GRAPH_MAX": 1e-05,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -48,46 +48,46 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\umamusume",
+            "path": "C:/Users/Administrator/Pictures\\CG\\Forestia ~Chiisana Machi no Bokujou Life~",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "LOSS_TYPE": "Default",
-    "SEMANTIC_LOSS_BLEND": 0.5,
+    "LOSS_TYPE": "Semantic",
+    "SEMANTIC_LOSS_BLEND": 0.3,
     "SEMANTIC_LOSS_STRENGTH": 1.8,
-    "TIMESTEP_WEIGHTING_CURVE": [
-        [
-            0.0,
-            0.2
-        ],
-        [
-            0.0502,
-            1.225
-        ],
-        [
-            0.2,
-            1.0
-        ],
-        [
-            0.4984,
-            1.125
-        ],
-        [
-            0.8,
-            1.0
-        ],
-        [
-            0.9624,
-            1.225
-        ],
-        [
-            1.0,
-            0.2
+    "TIMESTEP_ALLOCATION": {
+        "bin_size": 40,
+        "counts": [
+            39,
+            46,
+            54,
+            62,
+            70,
+            78,
+            85,
+            92,
+            98,
+            104,
+            107,
+            110,
+            110,
+            110,
+            107,
+            104,
+            98,
+            92,
+            85,
+            78,
+            70,
+            62,
+            54,
+            46,
+            39
         ]
-    ],
+    },
     "RAVEN_PARAMS": {
         "betas": [
             0.9,

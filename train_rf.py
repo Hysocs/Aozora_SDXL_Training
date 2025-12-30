@@ -30,7 +30,6 @@ import config as default_config
 import threading
 import queue
 import tomesd
-from scipy.interpolate import PchipInterpolator
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
 
@@ -488,58 +487,148 @@ def check_if_caching_needed(config):
     return needs_caching
 
 def load_vae_only(config, device):
+    """
+    Load VAE with proper EQB7 configuration for NoobAI RectFlow
+    """
     vae_path = config.VAE_PATH
-    if not vae_path or not Path(vae_path).exists(): return None
+    if not vae_path or not Path(vae_path).exists(): 
+        return None
+    
     print(f"INFO: Loading dedicated VAE from: {vae_path}")
+    
+    # Load VAE in float32 for high precision encoding
     vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=torch.float32)
-    print(f"INFO: VAE loaded in Float32 (High Precision) to prevent artifacts.")
-    vae.enable_tiling()
-    vae.enable_slicing()
+    
+    # CRITICAL: Set shift/scale BEFORE any operations
+    # These values are specific to EQB7 VAE used in NoobAI
     vae.config.shift_factor = 0.1726
     vae.config.scaling_factor = 0.1280
-    print(f"INFO: VAE Shift/Scale set to RF values: Shift={vae.config.shift_factor}, Scale={vae.config.scaling_factor}")
+    
+    print(f"INFO: VAE loaded in Float32 (High Precision)")
+    print(f"INFO: VAE configured with EQB7 parameters:")
+    print(f"      - Shift Factor: {vae.config.shift_factor}")
+    print(f"      - Scale Factor: {vae.config.scaling_factor}")
+    
+    # Enable optimizations after configuration
+    vae.enable_tiling()
+    vae.enable_slicing()
+    
     vae = vae.to(device)
     return vae
 
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
+    """
+    Cache latents with proper VAE configuration for NoobAI RectFlow
+    """
     if not check_if_caching_needed(config):
-        print("\n" + "="*60); print("INFO: Datasets already cached."); print("="*60 + "\n"); return
-    print("\n" + "="*60); print("STARTING HIGH-FIDELITY (FP32) CACHING FOR RECTIFIED FLOW"); print("="*60 + "\n")
-    calc = ResolutionCalculator(config.TARGET_PIXEL_AREA, stride=64, should_upscale=config.SHOULD_UPSCALE)
-    vae.to(device, dtype=torch.float32) 
+        print("\n" + "="*60)
+        print("INFO: Datasets already cached.")
+        print("="*60 + "\n")
+        return
+    
+    print("\n" + "="*60)
+    print("STARTING HIGH-FIDELITY (FP32) CACHING FOR RECTIFIED FLOW")
+    print("Using EQB7 VAE with NoobAI parameters")
+    print("="*60 + "\n")
+    
+    calc = ResolutionCalculator(
+        config.TARGET_PIXEL_AREA, 
+        stride=64, 
+        should_upscale=config.SHOULD_UPSCALE
+    )
+    
+    # --- CRITICAL VAE SETUP FOR EQB7 ---
+    vae.to(device, dtype=torch.float32)
+    
+    # Verify configuration is correct
+    assert abs(vae.config.shift_factor - 0.1726) < 1e-6, \
+        f"VAE shift_factor mismatch! Expected 0.1726, got {vae.config.shift_factor}"
+    assert abs(vae.config.scaling_factor - 0.1280) < 1e-6, \
+        f"VAE scaling_factor mismatch! Expected 0.1280, got {vae.config.scaling_factor}"
+    
+    print(f"INFO: VAE configuration verified:")
+    print(f"      Shift: {vae.config.shift_factor}, Scale: {vae.config.scaling_factor}")
+    
+    # Enable memory optimizations
     vae.enable_tiling()
     vae.enable_slicing()
-    vae.config.shift_factor = 0.1726
-    vae.config.scaling_factor = 0.1280
+    
     te1.to(device)
     te2.to(device)
-    transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
+    
+    transform = transforms.Compose([
+        transforms.ToTensor(),
+        transforms.Normalize([0.5], [0.5])
+    ])
+    
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
         cache_dir = root / ".precomputed_embeddings_cache_rf_noobai"
         cache_dir.mkdir(exist_ok=True)
-        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
-        stems = {p.stem for p in cache_dir.rglob("*.pt")}
-        to_process = [p for p in paths if p.stem not in stems]
-        if not to_process: continue
-        print(f"INFO: Validating and Bucketing {len(to_process)} images...")
+        
+        # Find all images
+        paths = [
+            p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+            for p in root.rglob(f"*{ext}")
+        ]
+        
+        # Check which need caching
+        to_process = []
+        for p in paths:
+            relative_path = p.relative_to(root)
+            safe_stem = str(relative_path.with_suffix('')).replace(
+                os.sep, '_'
+            ).replace('/', '_').replace('\\', '_')
+            if not (cache_dir / f"{safe_stem}.pt").exists():
+                to_process.append(p)
+
+        if not to_process:
+            print(f"INFO: All images in {root.name} are already cached.")
+            continue
+            
+        print(f"INFO: Validating and Bucketing {len(to_process)} images from {root.name}...")
+        
+        # Multiprocessing for resolution calculation
         with Pool(processes=min(cpu_count(), 8)) as pool:
-            results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, calc) for p in to_process]), total=len(to_process)))
+            results = list(tqdm(
+                pool.imap(
+                    validate_and_assign_resolution, 
+                    [(p, calc) for p in to_process]
+                ), 
+                total=len(to_process)
+            ))
+        
         metadata = [r for r in results if r]
+        
+        # Group by resolution
         grouped = defaultdict(list)
-        for m in metadata: grouped[m["target_resolution"]].append(m)
+        for m in metadata:
+            grouped[m["target_resolution"]].append(m)
+        
+        # Create batches
         batches = []
         for res in grouped:
             for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE):
                 batches.append((res, grouped[res][i:i + config.CACHING_BATCH_SIZE]))
+        
         random.shuffle(batches)
-        for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc="Encoding (FP32)")):
+        
+        for batch_idx, ((w, h), batch_meta) in enumerate(
+            tqdm(batches, desc=f"Encoding {root.name} (FP32)")
+        ):
             captions = [m['caption'] for m in batch_meta]
-            embeds, pooled = compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device)
+            
+            # Text Encoders
+            embeds, pooled = compute_chunked_text_embeddings(
+                captions, t1, t2, te1, te2, device
+            )
             embeds = embeds.to(dtype=torch.float32)
             pooled = pooled.to(dtype=torch.float32)
+            
+            # Image Processing
             images = []
             valid_meta_final = []
+            
             for m in batch_meta:
                 try:
                     with Image.open(m['ip']) as img:
@@ -549,192 +638,314 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         valid_meta_final.append(m)
                 except Exception as e:
                     print(f"Skipping {m['ip']}: {e}")
-            if not images: continue
+            
+            if not images:
+                continue
+            
             pixel_values = torch.stack(images).to(device, dtype=torch.float32)
+            
+            # --- CRITICAL VAE ENCODING STEP ---
             with torch.no_grad():
+                # Encode to latent distribution
                 dist = vae.encode(pixel_values).latent_dist
-                latents = dist.sample() * vae.config.scaling_factor
-                if torch.isnan(latents).any():
-                    print(f"\n[CRITICAL WARNING] NaN detected in batch! Skipping batch.")
+                
+                # Sample from distribution
+                latents = dist.sample()
+                
+                # Apply scaling factor (NOT shift - shift is for timestep warping)
+                latents = latents * vae.config.scaling_factor
+                
+                # Verify no NaN values
+                if torch.isnan(latents).any() or torch.isinf(latents).any():
+                    print(f"\n[CRITICAL] NaN/Inf in batch {batch_idx}! Skipping.")
+                    print(f"Latent stats: min={latents.min()}, max={latents.max()}")
                     continue
-            latents = latents.cpu() 
-            forced_orig_size = (w, h) 
+            
+            latents = latents.cpu()
+            forced_orig_size = (w, h)
+            
+            # Save to disk with unique filenames
             for j, m in enumerate(valid_meta_final):
-                cache_path = cache_dir / f"{m['ip'].stem}.pt"
-                torch.save({"original_size": forced_orig_size, "target_size": (w, h), "crop_coords_top_left": (0, 0), "embeds": embeds[j].cpu(), "pooled": pooled[j].cpu(), "latents": latents[j]}, cache_path)
+                relative_path = m['ip'].relative_to(root)
+                safe_filename = str(relative_path.with_suffix('')).replace(
+                    os.sep, '_'
+                ).replace('/', '_').replace('\\', '_')
+                cache_path = cache_dir / f"{safe_filename}.pt"
+                
+                torch.save({
+                    "original_stem": m['ip'].stem,
+                    "relative_path": str(relative_path),
+                    "original_size": forced_orig_size,
+                    "target_size": (w, h),
+                    "crop_coords_top_left": (0, 0),
+                    "embeds": embeds[j].cpu(),
+                    "pooled": pooled[j].cpu(),
+                    "latents": latents[j],
+                    # Store VAE config for verification
+                    "vae_shift": vae.config.shift_factor,
+                    "vae_scale": vae.config.scaling_factor
+                }, cache_path)
+            
             del pixel_values, latents, embeds, pooled
-            if batch_idx % 20 == 0: torch.cuda.empty_cache()
+            if batch_idx % 20 == 0:
+                torch.cuda.empty_cache()
+
     print("\nINFO: Caching Complete (High Precision). Cleaning up...")
-    te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
+    te1.cpu()
+    te2.cpu()
+    gc.collect()
+    torch.cuda.empty_cache()
 
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.latent_files = []
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
+        
+        # Store roots to help find original images later
+        self.dataset_roots = {} 
+
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             cache_dir = root / ".precomputed_embeddings_cache_rf_noobai"
             if not cache_dir.exists(): continue
+            
             files = list(cache_dir.glob("*.pt"))
+            # Map every cache file back to its dataset root
+            for f in files:
+                self.dataset_roots[str(f)] = root
+                
             self.latent_files.extend(files * int(ds.get("repeats", 1)))
+
         if not self.latent_files: raise ValueError("No cached files found.")
+        
         print("INFO: Shuffling the entire dataset order...")
         random.shuffle(self.latent_files)
+        
         self.bucket_keys = []
-        all_meta = {}
-        for ds in config.INSTANCE_DATASETS:
-            meta_path = Path(ds["path"]) / "metadata.json"
-            if meta_path.exists():
-                with open(meta_path, 'r') as f: all_meta.update(json.load(f))
-        for f in self.latent_files:
-            key = all_meta.get(f.stem)
-            self.bucket_keys.append(tuple(key) if key else None)
+        
+        # --- NEW LOGIC: Read Resolution directly from Cache Header ---
+        print("INFO: building buckets from cache headers...")
+        for f in tqdm(self.latent_files, desc="Loading Cache Headers"):
+            try:
+                # We peek at the file header (CPU only)
+                # This is fast and gets us everything we need
+                header = torch.load(f, map_location='cpu')
+                
+                # 1. Get the Resolution for Bucketing (Fixes the "No Metadata" issue)
+                # If target_size is missing, default to None (which disables bucketing for that image)
+                res = header.get('target_size')
+                if res:
+                    self.bucket_keys.append(tuple(res))
+                else:
+                    self.bucket_keys.append(None)
+
+            except Exception as e:
+                print(f"Error reading cache header for {f}: {e}")
+                self.bucket_keys.append(None)
+                
         print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
-        if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED. Original images will be loaded during training.")
+        if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED.")
 
     def __len__(self): return len(self.latent_files)
-
-    def _find_original_image_path(self, latent_path):
-        latent_p = Path(latent_path)
-        stem = latent_p.stem
-        parent_dir = latent_p.parent.parent
-        for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp']:
-            image_path = parent_dir / (stem + ext)
-            if image_path.exists(): return image_path
-        return None
 
     def __getitem__(self, i):
         try:
             latent_path = self.latent_files[i]
             data = torch.load(latent_path, map_location="cpu")
+            
             if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()): return None
-            item_data = {"latents": data["latents"], "embeds": data["embeds"], "pooled": data["pooled"], "original_sizes": data["original_size"], "target_sizes": data["target_size"], "latent_path": str(latent_path)}
+            
+            item_data = {
+                "latents": data["latents"], 
+                "embeds": data["embeds"], 
+                "pooled": data["pooled"], 
+                "original_sizes": data["original_size"], 
+                "target_sizes": data["target_size"], 
+                "latent_path": str(latent_path)
+            }
+
             if self.use_semantic_loss:
-                original_image_path = self._find_original_image_path(latent_path)
-                if original_image_path:
-                    with Image.open(original_image_path) as raw_img: item_data["original_image"] = fix_alpha_channel(raw_img)
-                else: item_data["original_image"] = None
+                # Use the saved relative path to find the image in subfolders
+                root = self.dataset_roots.get(str(latent_path))
+                relative_path = data.get("relative_path")
+                
+                if root and relative_path:
+                    original_image_path = Path(root) / relative_path
+                    if original_image_path.exists():
+                        with Image.open(original_image_path) as raw_img: 
+                            item_data["original_image"] = fix_alpha_channel(raw_img)
+                    else:
+                        item_data["original_image"] = None
+                else:
+                    item_data["original_image"] = None
+                    
             return item_data
         except Exception as e:
             print(f"WARNING: Skipping {self.latent_files[i]}: {e}")
             return None
 
+
+
 class TimestepSampler:
     """
-    Smooth timestep sampling using PCHIP-interpolated CDF for graph-based probability control.
-    Adapted for Rectified Flow (no noise_scheduler object needed).
+    Ticket-pool based timestep sampler using explicit bin allocation.
+    Reads 'TIMESTEP_ALLOCATION' from config (set by GUI).
     """
     def __init__(self, config, device):
         self.config = config
         self.device = device
-        self.num_train_timesteps = 1000 # Standard for RF
+        self.max_train_steps = config.MAX_TRAIN_STEPS
+        # Batch size is needed to calculate total individual image tickets required
+        self.total_tickets_needed = self.max_train_steps * config.BATCH_SIZE
+        self.seed = config.SEED if config.SEED else 42
         
-        # 1. Load curve points from config
-        self.curve_points = getattr(config, 'TIMESTEP_WEIGHTING_CURVE', [])
-        if not self.curve_points:
-            print("WARNING: TIMESTEP_WEIGHTING_CURVE empty. Defaulting to uniform.")
-            self.curve_points = [[0.0, 1.0], [1.0, 1.0]]
-            
-        self.curve_points.sort(key=lambda p: p[0])
+        # Get allocation from config
+        # Expects: {"bin_size": int, "counts": [int, int, ...]}
+        allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         
-        # Ensure full range coverage
-        if self.curve_points[0][0] > 0.0: 
-            self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
-        if self.curve_points[-1][0] < 1.0: 
-            self.curve_points.append([1.0, self.curve_points[-1][1]])
-
-        # 2. Build PCHIP interpolator for smooth PDF
-        x_points = np.array([p[0] for p in self.curve_points], dtype=np.float64)
-        y_points = np.array([max(0.0, p[1]) for p in self.curve_points], dtype=np.float64)
-        self.interpolator = PchipInterpolator(x_points, y_points)
+        # Build the ticket pool
+        self.ticket_pool = self._build_ticket_pool(allocation)
         
-        # 3. Precompute high-resolution CDF
-        self.resolution = 100000
-        self.cdf = self._precompute_cdf()
+        # Pointer for where we are in the pool
+        self.pool_index = 0
         
-        # Debug distribution
+        print(f"INFO: Initialized Ticket Pool Timestep Sampler")
+        print(f"      Total tickets: {len(self.ticket_pool)}, Seed: {self.seed}")
         self._print_sampling_distribution()
-        
-        print(f"INFO: Initialized Graph-Based Timestep Sampler (Rectified Flow)")
-        print(f"      Resolution: {self.resolution}, Control Points: {len(self.curve_points)}")
 
-    def _interpolate_weight(self, x):
-        """Evaluate PDF at point x using PCHIP"""
-        return float(self.interpolator(x))
+    def _build_ticket_pool(self, allocation):
+        # --- 1. Validate Allocation ---
+        use_fallback = False
+        if not allocation or "counts" not in allocation or "bin_size" not in allocation:
+            print("WARNING: TIMESTEP_ALLOCATION missing. Fallback to Uniform.")
+            use_fallback = True
+        elif sum(allocation["counts"]) == 0:
+            print("WARNING: TIMESTEP_ALLOCATION sum is 0. Fallback to Uniform.")
+            use_fallback = True
 
-    def _precompute_cdf(self):
-        """Numerical integration to build CDF from PDF"""
-        x_vals = np.linspace(0, 1, self.resolution, dtype=np.float64)
-        pdf = np.array([self._interpolate_weight(x) for x in x_vals], dtype=np.float64)
-        
-        # Trapezoidal integration
-        dx = 1.0 / (self.resolution - 1)
-        cdf = np.cumsum((pdf[:-1] + pdf[1:]) * dx * 0.5)
-        cdf = np.insert(cdf, 0, 0.0)
-        
-        # Normalize
-        if cdf[-1] > 0:
-            cdf = cdf / cdf[-1]
+        # --- 2. Fallback Logic (Uniform) ---
+        if use_fallback:
+            self.bin_size = 100 # Store for printing
+            num_bins = 1000 // self.bin_size
+            # Create a uniform distribution summing to max_train_steps
+            base = self.max_train_steps // num_bins
+            counts = [base] * num_bins
+            # Distribute remainder
+            for i in range(self.max_train_steps % num_bins):
+                counts[i] += 1
         else:
-            print("WARNING: All weights zero. Using uniform CDF.")
-            cdf = np.linspace(0, 1, self.resolution, dtype=np.float64)
-            
-        return torch.tensor(cdf, dtype=torch.float32, device=self.device)
+            self.bin_size = allocation["bin_size"] # Store for printing
+            counts = allocation["counts"]
 
-    def _print_sampling_distribution(self):
-        """Visual verification of sampling bias"""
-        print("\n" + "="*60)
-        print(f"TIMESTEP SAMPLING DISTRIBUTION (10K samples, Rectified Flow)")
-        print("="*60)
+        # --- 3. Build Pool ---
+        # The 'counts' represent training STEPS per bin. 
+        # We need (counts * batch_size) tickets.
+        multiplier = self.config.BATCH_SIZE
+        pool = []
         
-        test_samples = 10000
-        _, t_continuous = self.sample(test_samples)
-        # Move to CPU for counting
-        t_continuous = t_continuous.cpu()
-        timesteps = (t_continuous * self.num_train_timesteps).long()
+        # Use numpy generator for efficient range sampling
+        rng = np.random.Generator(np.random.PCG64(self.seed))
         
-        # RF LABELS: 0 is Clean, 1000 is Noise
-        ranges = [
-            (0, 100,   "0-100   (Details/Refine)"),
-            (100, 300, "100-300 (Low Noise)"),
-            (300, 500, "300-500 (Mid Range)"),
-            (500, 700, "500-700 (High Noise)"),
-            (700, 900, "700-900 (Structure)"),
-            (900, 1001,"900-1000 (Pure Noise)") 
-        ]
+        for i, count in enumerate(counts):
+            if count <= 0: continue
+            
+            # Define range for this bin (e.g., 0-50)
+            start_t = i * self.bin_size
+            end_t = min(1000, (i + 1) * self.bin_size)
+            
+            # Sanity check if bin is out of bounds
+            if start_t >= 1000: break
+            
+            # Generate tickets
+            num_tickets = int(count * multiplier)
+            
+            # Random integers in [start_t, end_t)
+            # This ensures we get specific timesteps distributed uniformly WITHIN the bin
+            bin_samples = rng.integers(start_t, end_t, size=num_tickets).tolist()
+            pool.extend(bin_samples)
+            
+        # --- 4. Shuffle ---
+        # We shuffle deterministically based on seed so training is reproducible
+        random.seed(self.seed)
+        random.shuffle(pool)
         
-        print("\nRange            | Count  | Percentage")
-        print("-" * 40)
-        for start, end, label in ranges:
-            count = ((timesteps >= start) & (timesteps < end)).sum().item()
-            percentage = (count / test_samples) * 100
-            bar = "#" * int(percentage / 2)
-            print(f"{label:<25} | {count:>4} | {percentage:>5.1f}% {bar}")
+        # --- 5. Safety Check (Resize to Exact Requirement) ---
+        # It is crucial the pool is exactly the size needed or larger to prevent index errors
         
-        print(f"\nMean timestep: {timesteps.float().mean():.1f} / {self.num_train_timesteps - 1}")
-        print("="*60 + "\n")
+        if len(pool) == 0:
+            # Emergency fallback if something went terribly wrong
+            print("CRITICAL: Pool generation failed. Using random pool.")
+            pool = [random.randint(0, 999) for _ in range(self.total_tickets_needed)]
+            
+        elif len(pool) < self.total_tickets_needed:
+            print(f"WARNING: Ticket pool ({len(pool)}) < Required ({self.total_tickets_needed}). Recycling tickets to fill.")
+            while len(pool) < self.total_tickets_needed:
+                # Append a copy of the pool to itself until big enough
+                needed = self.total_tickets_needed - len(pool)
+                pool.extend(pool[:needed])
+                
+        elif len(pool) > self.total_tickets_needed:
+            # Trim if we have too many
+            pool = pool[:self.total_tickets_needed]
+            
+        return pool
+
+    def set_current_step(self, step):
+        """
+        Call this when resuming training to ensure we pick up the 
+        ticket sequence where we left off.
+        """
+        # Calculate how many tickets have theoretically been consumed
+        consumed_tickets = step * self.config.BATCH_SIZE
+        self.pool_index = consumed_tickets % len(self.ticket_pool)
+        print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Step {step})")
 
     def sample(self, batch_size):
-        """Inverse transform sampling from CDF"""
-        # Sample uniform [0,1]
-        u = torch.rand(batch_size, device=self.device)
-        
-        # Find indices in CDF
-        indices = torch.searchsorted(self.cdf, u)
-        
-        # Convert to continuous timesteps [0,1]
-        t_continuous = indices.float() / self.resolution
-        t_continuous = torch.clamp(t_continuous, 0.0001, 0.9999)
-        
-        # Convert to discrete timesteps [0, num_train_timesteps-1]
-        timesteps = (t_continuous * self.num_train_timesteps).long()
-        
-        return timesteps, t_continuous
+        indices = []
+        for _ in range(batch_size):
+            if self.pool_index >= len(self.ticket_pool):
+                # This usually shouldn't happen if max_train_steps is correct,
+                # but good for safety.
+                self.pool_index = 0 
+            
+            indices.append(self.ticket_pool[self.pool_index])
+            self.pool_index += 1
+            
+        return torch.tensor(indices, dtype=torch.long, device=self.device)
 
+    def _print_sampling_distribution(self):
+        print("\n" + "="*80)
+        print("TIMESTEP TICKET POOL DISTRIBUTION")
+        print(f"Total Pool Size: {len(self.ticket_pool):,} | Seed: {self.seed}")
+        print("="*80)
+        
+        timesteps = torch.tensor(self.ticket_pool, dtype=torch.long)
+        
+        # Use the actual bin size configured so the print matches the user input
+        vis_bin_size = self.bin_size 
+        num_bins = math.ceil(1000 / vis_bin_size)
+        
+        print(f"\n{'Range':<10} | {'Count':<10} | {'%':<6} | Bar")
+        print("-" * 80)
+        
+        max_count = 0
+        counts = []
+        for i in range(num_bins):
+            start = i * vis_bin_size
+            end = min(1000, start + vis_bin_size)
+            c = ((timesteps >= start) & (timesteps < end)).sum().item()
+            counts.append((f"{start}-{end}", c))
+            if c > max_count: max_count = c
+            
+        for label, count in counts:
+            pct = (count / len(self.ticket_pool)) * 100
+            # Scale bar to 40 chars
+            bar_len = int((count / max(1, max_count)) * 40)
+            print(f"{label:<10} | {count:<10,d} | {pct:<6.1f}% | {'#' * bar_len}")
+        print("="*80 + "\n")
+        
     def update(self, raw_grad_norm):
-        pass
-    
-    def record_timesteps(self, timesteps):
+        """Compatibility method for training loop calls"""
         pass
 
 def apply_flow_matching_shift(t, shift_factor):
@@ -842,11 +1053,11 @@ def save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable
 def main():
     config = TrainingConfig()
     
-    if config.SEED: set_seed(config.SEED)
+    if config.SEED:
+        set_seed(config.SEED)
+    
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    torch.backends.cuda.matmul.allow_tf32 = True
-    torch.backends.cudnn.allow_tf32 = True
     
     global_step = 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
@@ -854,7 +1065,8 @@ def main():
     optimizer_state = None
 
     if config.RESUME_TRAINING:
-        print("\n" + "="*50); print("--- RESUMING TRAINING SESSION ---")
+        print("\n" + "="*50)
+        print("--- RESUMING TRAINING SESSION ---")
         state_path = Path(config.RESUME_STATE_PATH)
         training_state = torch.load(state_path, map_location="cpu", weights_only=False)
         global_step = training_state['global_step']
@@ -864,43 +1076,95 @@ def main():
         print(f"INFO: Resuming from global step: {global_step}")
         print("="*50 + "\n")
     else:
-        print("\n" + "="*50); print("--- STARTING RECTIFIED FLOW TRAINING SESSION ---"); print("="*50 + "\n")
+        print("\n" + "="*50)
+        print("--- STARTING RECTIFIED FLOW TRAINING SESSION ---")
+        print("="*50 + "\n")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
     
+    # --- CACHING PHASE WITH PROPER VAE ---
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
-        base_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, torch_dtype=torch.float32, low_cpu_mem_usage=True)
-        vae_for_caching = load_vae_only(config, device) or base_pipe.vae.to(device)
-        precompute_and_cache_latents(config, base_pipe.tokenizer, base_pipe.tokenizer_2, base_pipe.text_encoder, base_pipe.text_encoder_2, vae_for_caching, device)
-        del base_pipe, vae_for_caching; gc.collect(); torch.cuda.empty_cache()
+        
+        # Load base pipeline
+        base_pipe = StableDiffusionXLPipeline.from_single_file(
+            config.SINGLE_FILE_CHECKPOINT_PATH,
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=True
+        )
+        
+        # Load VAE with proper configuration
+        vae_for_caching = load_vae_only(config, device)
+        if vae_for_caching is None:
+            # Fallback to pipeline VAE but configure it properly
+            vae_for_caching = base_pipe.vae
+            vae_for_caching.config.shift_factor = 0.1726
+            vae_for_caching.config.scaling_factor = 0.1280
+            print("INFO: Using pipeline VAE with EQB7 configuration")
+            vae_for_caching = vae_for_caching.to(device)
+        
+        # Run caching
+        precompute_and_cache_latents(
+            config,
+            base_pipe.tokenizer,
+            base_pipe.tokenizer_2,
+            base_pipe.text_encoder,
+            base_pipe.text_encoder_2,
+            vae_for_caching,
+            device
+        )
+        
+        del base_pipe, vae_for_caching
+        gc.collect()
+        torch.cuda.empty_cache()
 
+    # --- TRAINING PHASE ---
     print(f"\n--- Loading Model ---")
     print(f"INFO: Loading UNet for training from: {model_to_load.name}")
+    
     base_model_state_dict = load_file(model_to_load, device="cpu")
-    pipe = StableDiffusionXLPipeline.from_single_file(model_to_load, torch_dtype=config.compute_dtype, low_cpu_mem_usage=True)
+    
+    pipe = StableDiffusionXLPipeline.from_single_file(
+        model_to_load,
+        torch_dtype=config.compute_dtype,
+        low_cpu_mem_usage=True
+    )
+    
     unet = pipe.unet
     
-    # [REMOVED] Scheduler is not used during training
-    # print("\n--- Configuring Rectified Flow Scheduler ---")
-    # noise_scheduler = FlowMatchEulerDiscreteScheduler(num_train_timesteps=1000)
-    # print(f"INFO: Training with FlowMatchEulerDiscreteScheduler (Rectified Flow)")
-
-    del pipe; gc.collect(); torch.cuda.empty_cache()
+    # Clean up pipeline (we only need UNet for training)
+    del pipe
+    gc.collect()
+    torch.cuda.empty_cache()
 
     print("\n--- Initializing Dataset ---")
     dataset = ImageTextLatentDataset(config)
     print(f"INFO: Initializing BucketBatchSampler with seed: {initial_sampler_seed}")
-    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
-    dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
+    sampler = BucketBatchSampler(
+        dataset,
+        config.BATCH_SIZE,
+        initial_sampler_seed,
+        shuffle=True
+    )
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=sampler,
+        collate_fn=custom_collate_fn,
+        num_workers=config.NUM_WORKERS
+    )
 
     unet.to(device).enable_gradient_checkpointing()
-    unet.enable_xformers_memory_efficient_attention() if config.MEMORY_EFFICIENT_ATTENTION == "xformers" else unet.set_attn_processor(AttnProcessor2_0())
+    
+    if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
+        unet.enable_xformers_memory_efficient_attention()
+    else:
+        unet.set_attn_processor(AttnProcessor2_0())
     
     print("\n--- UNet Layer Selection Report ---")
     exclusion_keywords = config.UNET_EXCLUDE_TARGETS
     trainable_layer_names = []
     frozen_layer_names = []
+    
     for name, param in unet.named_parameters():
         should_exclude = any(k in name for k in exclusion_keywords)
         if should_exclude:
@@ -921,11 +1185,16 @@ def main():
     print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
     
     optimizer = create_optimizer(config, params_to_optimize)
-    lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, max_train_steps=config.MAX_TRAIN_STEPS)
+    lr_scheduler = CustomCurveLRScheduler(
+        optimizer=optimizer,
+        curve_points=config.LR_CUSTOM_CURVE,
+        max_train_steps=config.MAX_TRAIN_STEPS
+    )
 
     if config.RESUME_TRAINING:
         print("\n--- Restoring Training States ---")
-        if optimizer_state: optimizer.load_cpu_state(optimizer_state)
+        if optimizer_state:
+            optimizer.load_cpu_state(optimizer_state)
         lr_scheduler.step(global_step)
         print("--- Resume setup complete. Starting training loop. ---")
     else:
@@ -935,12 +1204,18 @@ def main():
     key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
-    reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="Gradient Check") 
+    reporter = AsyncReporter(
+        total_steps=config.MAX_TRAIN_STEPS,
+        test_param_name="Gradient Check"
+    )
     
-    # [MODIFIED] Initialize sampler without noise_scheduler parameter
     timestep_sampler = TimestepSampler(config, device)
 
-    print(f"\n--- Using Loss Calculation Method: Rectified Flow (Velocity Matching) ---\n")
+    if config.RESUME_TRAINING and global_step > 0:
+        timestep_sampler.set_current_step(global_step)
+
+    print(f"\n--- Using Loss: Rectified Flow (Velocity Matching) ---")
+    print(f"--- VAE: EQB7 (Shift: 0.1726, Scale: 0.1280) ---\n")
 
     accumulated_latent_paths = []
     training_start_time = time.time()
@@ -955,67 +1230,91 @@ def main():
             if global_step >= config.MAX_TRAIN_STEPS:
                 done = True
                 break
-            if not batch: continue
+            if not batch:
+                continue
 
-            if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
+            if "latent_path" in batch:
+                accumulated_latent_paths.extend(batch["latent_path"])
             
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             original_images = batch.get("original_image")
 
-            target = None
-            
-            with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
+            with torch.autocast(
+                device_type=device.type,
+                dtype=config.compute_dtype,
+                enabled=True
+            ):
                 time_ids_list = []
                 for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"]):
-                    time_id = torch.tensor(list(s1) + [0,0] + list(s2), dtype=torch.float32)
-                    time_ids_list.append(time_id.unsqueeze(0).to(device, dtype=config.compute_dtype))
+                    time_id = torch.tensor(
+                        list(s1) + [0, 0] + list(s2),
+                        dtype=torch.float32
+                    )
+                    time_ids_list.append(
+                        time_id.unsqueeze(0).to(device, dtype=config.compute_dtype)
+                    )
                 time_ids = torch.cat(time_ids_list, dim=0)
                 
-                # --- RF TRAINING STEP ---
-                
-                # 1. Sample Noise
-                noise = generate_train_noise(latents, config)
-                
-                # 2. Sample "t" Probability (From your Curve Widget)
-                # t_raw comes from your GUI curve. It decides WHICH steps we train on.
-                _, t_raw = timestep_sampler.sample(latents.shape[0])
-                
-                # 3. Apply Hardcoded Shift Physics (2.5)
-                # This ensures the noise level matches high-res expectations (SD3 logic).
-                rf_shift = 2.5 
-                t_shifted = apply_flow_matching_shift(t_raw, rf_shift)
-                
-                # 4. Convert to Discrete Timesteps for the UNet Conditioning
-                # We condition the UNet on the SHIFTED time (the actual noise physics level).
-                timesteps = (t_shifted * 1000).long()
-                timestep_sampler.record_timesteps(timesteps)
 
-                # 5. Create Noisy Latents using the SHIFTED time
-                # X_t = (1 - t_shifted) * X_data + t_shifted * X_noise
+                # --- RECTIFIED FLOW TRAINING ---
+                # --- RECTIFIED FLOW TRAINING ---
+                noise = generate_train_noise(latents, config)
+
+                # Sample timestep from ticket pool (discrete 0-999)
+                timesteps = timestep_sampler.sample(latents.shape[0])
+
+                # Convert to continuous [0, 1]
+                t_continuous = timesteps.float() / 1000.0
+
+                # Apply shift to control noise amount (not timestep label)
+                rf_shift = 2.5 # SD3 uses 3.0, AuraFlow uses 1.73. Noobai converted uses 2.5.
+                t_shifted = apply_flow_matching_shift(t_continuous, rf_shift)
+
+                # Create noisy latents using SHIFTED noise amount
                 t_expanded = t_shifted.view(-1, 1, 1, 1)
                 noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                
-                # 6. Define Target (Velocity)
-                target = noise - latents
-                
-                # 7. Predict
-                pred = unet(noisy_latents, timesteps, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-            per_pixel_loss = F.mse_loss(pred.float(), target.to(pred.dtype).float(), reduction="none")
+                # Target is velocity
+                target = noise - latents
+
+                timesteps_conditioning = (t_shifted * 1000.0).long()
+
+                pred = unet(
+                    noisy_latents,
+                    timesteps_conditioning,  # <--- CHANGED THIS (was 'timesteps')
+                    embeds,
+                    added_cond_kwargs={
+                        "text_embeds": pooled,
+                        "time_ids": time_ids
+                    }
+                ).sample
+
+            per_pixel_loss = F.mse_loss(
+                pred.float(),
+                target.to(pred.dtype).float(),
+                reduction="none"
+            )
 
             if getattr(config, 'LOSS_TYPE', 'Default') == "Semantic":
                 if original_images and None not in original_images:
                     b, c, h, w = latents.shape
                     semantic_map = _generate_semantic_map_for_batch(
-                        original_images, config.SEMANTIC_LOSS_BLEND, config.SEMANTIC_LOSS_STRENGTH,
-                        target_size=(w, h), device=latents.device, dtype=torch.float32, num_channels=c
+                        original_images,
+                        config.SEMANTIC_LOSS_BLEND,
+                        config.SEMANTIC_LOSS_STRENGTH,
+                        target_size=(w, h),
+                        device=latents.device,
+                        dtype=torch.float32,
+                        num_channels=c
                     )
                     modulation = 1.0 + (semantic_map * config.SEMANTIC_LOSS_STRENGTH)
                     loss = (per_pixel_loss * modulation).mean()
-                else: loss = per_pixel_loss.mean()
-            else: loss = per_pixel_loss.mean()
+                else:
+                    loss = per_pixel_loss.mean()
+            else:
+                loss = per_pixel_loss.mean()
 
             accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
             raw_loss_value = loss.detach().item()
@@ -1027,10 +1326,19 @@ def main():
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-                raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, float('inf')).item()
+                raw_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    params_to_optimize,
+                    float('inf')
+                ).item()
                 timestep_sampler.update(raw_grad_norm)
-                if config.CLIP_GRAD_NORM > 0: torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM)
-                clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
+                
+                if config.CLIP_GRAD_NORM > 0:
+                    torch.nn.utils.clip_grad_norm_(
+                        params_to_optimize,
+                        config.CLIP_GRAD_NORM
+                    )
+                clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) \
+                    if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
 
                 optimizer.step()
                 lr_scheduler.step(global_step + 1)
@@ -1047,11 +1355,18 @@ def main():
                     'current_lr': optimizer.param_groups[0]['lr'],
                     'raw_grad_norm': raw_grad_norm,
                     'clipped_grad_norm': clipped_grad_norm,
-                    'update_delta': update_status, 
+                    'update_delta': update_status,
                     'optim_step_time': optim_step_time,
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)
                 }
-                reporter.check_and_report_anomaly(global_step + 1, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
+                
+                reporter.check_and_report_anomaly(
+                    global_step + 1,
+                    raw_grad_norm,
+                    clipped_grad_norm,
+                    config,
+                    accumulated_latent_paths
+                )
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
@@ -1059,20 +1374,52 @@ def main():
             global_step_times.append(step_duration)
             last_step_time = time.time()
             elapsed_time = time.time() - training_start_time
-            eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * (sum(global_step_times) / len(global_step_times))
-            timing_data = {'raw_step_time': step_duration, 'elapsed_time': elapsed_time, 'eta': eta_seconds, 'loss': loss.item(), 'timestep': timesteps[0].item()}
+            eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * \
+                (sum(global_step_times) / len(global_step_times))
             
-            reporter.log_step(global_step, timing_data=timing_data, diag_data=diag_data_to_log)
+            timing_data = {
+                'raw_step_time': step_duration,
+                'elapsed_time': elapsed_time,
+                'eta': eta_seconds,
+                'loss': loss.item(),
+                'timestep': timesteps[0].item()
+            }
+            
+            reporter.log_step(
+                global_step,
+                timing_data=timing_data,
+                diag_data=diag_data_to_log
+            )
             global_step += 1
             
-            if config.SAVE_EVERY_N_STEPS > 0 and global_step % config.SAVE_EVERY_N_STEPS == 0:
-                 print(f"\n--- Saving checkpoint at step {global_step} ---")
-                 save_checkpoint(global_step, unet, base_model_state_dict, key_map, trainable_layer_names, optimizer, lr_scheduler, None, sampler, config)
+            if config.SAVE_EVERY_N_STEPS > 0 and \
+               global_step % config.SAVE_EVERY_N_STEPS == 0:
+                print(f"\n--- Saving checkpoint at step {global_step} ---")
+                save_checkpoint(
+                    global_step,
+                    unet,
+                    base_model_state_dict,
+                    key_map,
+                    trainable_layer_names,
+                    optimizer,
+                    lr_scheduler,
+                    None,
+                    sampler,
+                    config
+                )
 
     print("\nTraining complete.")
     reporter.shutdown()
-    output_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_rf.safetensors"
-    save_model(output_path, unet, base_model_state_dict, key_map, trainable_layer_names)
+    
+    output_path = OUTPUT_DIR / \
+        f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_rf.safetensors"
+    save_model(
+        output_path,
+        unet,
+        base_model_state_dict,
+        key_map,
+        trainable_layer_names
+    )
     print("All tasks complete. Final model saved.")
 
 if __name__ == "__main__":
