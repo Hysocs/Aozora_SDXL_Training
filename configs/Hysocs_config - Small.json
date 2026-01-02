@@ -12,34 +12,34 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": 10000,
+    "MAX_TRAIN_STEPS": 2500,
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": 10,
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": 50.0,
     "SEED": 64,
     "SAVE_EVERY_N_STEPS": 13000,
-    "UNET_EXCLUDE_TARGETS": "conv1,conv2,conv_shortcut",
+    "UNET_EXCLUDE_TARGETS": "conv_shortcut,conv1,conv2",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            1e-07
+            2.5e-06
         ],
         [
-            0.11034483,
-            5.5e-05
+            0.03,
+            2.5e-05
         ],
         [
-            0.85287356,
-            5.5e-05
+            0.96321839,
+            2.5e-05
         ],
         [
             1.0,
-            1e-07
+            2.5e-06
         ]
     ],
-    "LR_GRAPH_MIN": 1e-07,
-    "LR_GRAPH_MAX": 5.5e-05,
+    "LR_GRAPH_MIN": 2.5e-06,
+    "LR_GRAPH_MAX": 2.5e-05,
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -48,72 +48,44 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by sena",
-            "repeats": 1
-        },
-        {
-            "path": "C:\\Users\\Administrator\\Pictures\\Artists\\by Selcky",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by rebunxx",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by akipeko",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by Bitseon",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\CG\\TwinkleStarKnights",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\CG\\Amakano",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\umamusume",
+            "path": "C:/Users/Administrator/Pictures/CG/Forestia ~Chiisana Machi no Bokujou Life~",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "LOSS_TYPE": "Semantic",
+    "LOSS_TYPE": "Default",
     "SEMANTIC_LOSS_BLEND": 0.3,
     "SEMANTIC_LOSS_STRENGTH": 1.8,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            196,
-            231,
-            269,
-            308,
-            349,
-            388,
-            426,
-            461,
-            492,
-            518,
-            537,
-            549,
-            552,
-            549,
-            537,
-            518,
-            492,
-            461,
-            426,
-            388,
-            349,
-            308,
-            269,
-            231,
-            196
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100
         ]
     },
     "RAVEN_PARAMS": {
@@ -122,7 +94,7 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
+        "weight_decay": 0.0,
         "debias_strength": 1.0,
         "use_grad_centralization": false,
         "gc_alpha": 1.0

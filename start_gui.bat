@@ -6,15 +6,18 @@ SET VENV_PATH=.\portable_Venv\Scripts
 
 ECHO [INFO] Activating virtual environment...
 CALL "%VENV_PATH%\activate.bat"
+
 IF ERRORLEVEL 1 (
     ECHO [ERROR] Failed to activate the virtual environment.
-    ECHO         Make sure you have run setup.bat first!
+    ECHO Make sure you have run setup.bat first!
     PAUSE
     EXIT /B
 )
 
 ECHO [INFO] Starting the Training GUI...
-python gui.py
 
-ECHO [INFO] GUI closed.
-PAUSE
+:: Start GUI without showing console (pythonw instead of python)
+START /B pythonw.exe gui.py
+
+:: Exit the batch file immediately
+EXIT

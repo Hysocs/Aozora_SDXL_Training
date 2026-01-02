@@ -1562,6 +1562,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.setMinimumSize(QtCore.QSize(1000, 800))
         self.resize(1500, 1000)
         self.config_dir = "configs"
+        self.state_file = os.path.join(self.config_dir, "gui_state.json")
         self.widgets = {}
         self.process_runner = None
         self.current_config = {}
@@ -1573,6 +1574,27 @@ class TrainingGUI(QtWidgets.QWidget):
         self.last_browsed_path = os.getcwd()
         self._initialize_configs()
         self._setup_ui()
+        
+        # CHANGED: Block signals during initial load to prevent double-loading
+        self.config_dropdown.blockSignals(True)
+        
+        # Load last selected config
+        last_config = self._load_gui_state()
+        if last_config and last_config in self.presets:
+            index = self.config_dropdown.findData(last_config)
+            if index != -1:
+                self.config_dropdown.setCurrentIndex(index)
+                self.load_selected_config(index)
+            else:
+                self._load_first_config()
+        else:
+            self._load_first_config()
+        
+        # CHANGED: Re-enable signals after initial load
+        self.config_dropdown.blockSignals(False)
+
+    def _load_first_config(self):
+        """Helper to load the first available config"""
         if self.config_dropdown.count() > 0:
             self.config_dropdown.setCurrentIndex(0)
             self.load_selected_config(0)
@@ -1580,6 +1602,82 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log("CRITICAL: No configs found or created. Using temporary defaults.")
             self.current_config = copy.deepcopy(self.default_config)
             self._apply_config_to_widgets()
+
+    def _load_gui_state(self):
+        """Load the last selected config from state file"""
+        try:
+            if os.path.exists(self.state_file):
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    return state.get("last_config")
+        except (json.JSONDecodeError, IOError) as e:
+            self.log(f"Warning: Could not load GUI state. Error: {e}")
+        return None
+
+    def _save_gui_state(self):
+        """Save the currently selected config to state file"""
+        try:
+            index = self.config_dropdown.currentIndex()
+            if index >= 0:
+                selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
+                state = {"last_config": selected_key}
+                # Ensure config directory exists
+                os.makedirs(self.config_dir, exist_ok=True)
+                with open(self.state_file, 'w') as f:
+                    json.dump(state, f, indent=4)
+        except Exception as e:
+            self.log(f"Warning: Could not save GUI state. Error: {e}")
+
+    def load_selected_config(self, index):
+        selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
+        if selected_key and selected_key in self.presets:
+            config = copy.deepcopy(self.default_config)
+            config.update(self.presets[selected_key])
+            self.current_config = config
+            self.log(f"Loaded config: '{selected_key}.json'")
+        else:
+            self.log(f"Warning: Could not find selected preset '{selected_key}'. Loading hardcoded defaults.")
+            self.current_config = copy.deepcopy(self.default_config)
+        self._apply_config_to_widgets()
+        self._save_gui_state()
+
+    def closeEvent(self, event):
+        """Handle window close - save state and clean up"""
+        self._save_gui_state()
+        
+        # Stop any running training process
+        if self.process_runner and self.process_runner.isRunning():
+            reply = QtWidgets.QMessageBox.question(
+                self, 
+                "Training in Progress",
+                "Training is currently running. Do you want to stop it and exit?",
+                QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No
+            )
+            if reply == QtWidgets.QMessageBox.StandardButton.Yes:
+                self.stop_training()
+                # Wait for process to finish
+                if self.process_runner:
+                    self.process_runner.quit()
+                    self.process_runner.wait(2000)  # Wait up to 2 seconds
+                if os.name == 'nt':
+                    prevent_sleep(False)
+                event.accept()
+            else:
+                event.ignore()
+                return
+        
+        # Clean up any remaining threads
+        if hasattr(self, 'dataset_manager'):
+            for thread in self.dataset_manager.loader_threads:
+                if thread.isRunning():
+                    thread.quit()
+                    thread.wait(1000)
+        
+        # Disable sleep prevention if it was enabled
+        if os.name == 'nt':
+            prevent_sleep(False)
+        
+        event.accept()
     
     def paintEvent(self, event: QtGui.QPaintEvent):
         opt = QtWidgets.QStyleOption()
@@ -1589,14 +1687,14 @@ class TrainingGUI(QtWidgets.QWidget):
     
     def _initialize_configs(self):
         os.makedirs(self.config_dir, exist_ok=True)
-        json_files = [f for f in os.listdir(self.config_dir) if f.endswith(".json")]
+        json_files = [f for f in os.listdir(self.config_dir) if f.endswith(".json") and f != "gui_state.json"]
         if not json_files:
             default_save_path = os.path.join(self.config_dir, "default.json")
             with open(default_save_path, 'w') as f: json.dump(self.default_config, f, indent=4)
             self.log("No configs found. Created 'default.json'.")
         self.presets = {}
         for filename in os.listdir(self.config_dir):
-            if filename.endswith(".json"):
+            if filename.endswith(".json") and filename != "gui_state.json":  # CHANGED: Exclude gui_state.json
                 name = os.path.splitext(filename)[0]
                 path = os.path.join(self.config_dir, filename)
                 try:
