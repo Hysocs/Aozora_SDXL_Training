@@ -23,7 +23,8 @@ try:
 except ImportError:
     # Fallback if config.py is missing
     class default_config:
-        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0}
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
+        TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
         OPTIMIZER_TYPE = "AdamW"
         # Default allocation for fallback
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
@@ -1230,20 +1231,59 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self._init_bins()
 
     def set_total_steps(self, steps):
+        try:
+            steps = int(steps)
+        except ValueError:
+            return
+
         if steps <= 0: steps = 1
-        if self.max_tickets > 0 and sum(self.counts) > 0:
-            scale_factor = steps / self.max_tickets
-            new_counts = [int(c * scale_factor) for c in self.counts]
-            diff = steps - sum(new_counts)
-            if diff != 0:
-                new_counts[0] = max(0, new_counts[0] + diff)
-            self.counts = new_counts
-        else:
-            self.max_tickets = steps
-            self._init_bins()
+        
+        # Save the new max
         self.max_tickets = steps
+        
+        # Get current state
+        current_sum = sum(self.counts)
+        num_bins = len(self.counts)
+
+        # If the graph is empty or has no tickets yet, just initialize a flat distribution
+        if num_bins == 0 or current_sum == 0:
+            self._init_bins()
+            return
+
+        # --- SMART SCALING ALGORITHM (Largest Remainder Method) ---
+        
+        # 1. Calculate the ideal float value for each bin based on previous weight
+        # Formula: (Current_Bin_Count / Old_Total) * New_Total
+        raw_new_counts = [(c / current_sum) * steps for c in self.counts]
+
+        # 2. Floor the values to get the base integer counts
+        new_counts = [int(x) for x in raw_new_counts]
+
+        # 3. Calculate how many tickets are left over due to flooring
+        current_new_sum = sum(new_counts)
+        deficit = steps - current_new_sum
+
+        # 4. Distribute the deficit (remainder) to the bins with the highest fractional parts
+        # This prevents the "first bin spike" and keeps the curve smooth.
+        if deficit > 0:
+            # Create a list of (fractional_part, index)
+            fractional_parts = []
+            for i, raw_val in enumerate(raw_new_counts):
+                frac = raw_val - new_counts[i]
+                fractional_parts.append((frac, i))
+
+            # Sort by fractional part descending (highest fractions get priority)
+            fractional_parts.sort(key=lambda x: x[0], reverse=True)
+
+            # Add 1 ticket to the top 'deficit' bins
+            for i in range(deficit):
+                idx_to_increment = fractional_parts[i][1]
+                new_counts[idx_to_increment] += 1
+
+        self.counts = new_counts
         self.update()
         self._emit_change()
+
 
     def set_bin_size(self, size):
         if size <= 0: return
@@ -1282,6 +1322,15 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             center = (num_bins - 1) / 2.0
             sigma = num_bins / 3.0
             weights = [math.exp(-((i - center)**2) / (2 * sigma**2)) for i in range(num_bins)]
+        # --- ADD THIS BLOCK ---
+        elif name == "Peak Ends & Middle":
+            # 1.0 (Base) + 0.5 (Amplitude)
+            # Peaks at 1.5, Dips at 0.5. 
+            # This creates a gentle wave (3:1 ratio) rather than sharp spikes.
+            denom = max(1, num_bins - 1)
+            weights = [1.0 + 0.5 * math.cos(4 * math.pi * i / denom) for i in range(num_bins)]
+        # ----------------------
+        
         total_weight = sum(weights)
         if total_weight == 0: total_weight = 1
         raw_counts = [(w / total_weight) * self.max_tickets for w in weights]
@@ -1295,9 +1344,17 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self._emit_change()
 
     def _init_bins(self):
+        # Re-initialize bins (Uniform distribution)
+        # We ensure self.bin_size is valid
+        if self.bin_size <= 0: self.bin_size = 100
+            
         num_bins = math.ceil(1000 / self.bin_size)
+        if num_bins <= 0: num_bins = 1
+            
         base_count = self.max_tickets // num_bins
         remainder = self.max_tickets % num_bins
+        
+        # Distribute base count + remainder uniformly across the first 'remainder' bins
         self.counts = [base_count + 1 if i < remainder else base_count for i in range(num_bins)]
         self._emit_change()
 
@@ -1527,6 +1584,9 @@ class TrainingGUI(QtWidgets.QWidget):
         "OUTPUT_DIR": {"label": "Output Directory", "tooltip": "Folder where checkpoints will be saved.", "widget": "Path", "file_type": "folder"},
         "CACHING_BATCH_SIZE": {"label": "Caching Batch Size", "tooltip": "Adjust based on VRAM (e.g., 2-8).", "widget": "QSpinBox", "range": (1, 64)},
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QSpinBox", "range": (0, 16)},
+        "VRAM_CHUNK_ENABLED": {"label": "Spatial Chunking", "tooltip": "Splits large latents into random crops during training to prevent overfitting (This can reduce vram usage at 1.0 chance).", "widget": "QCheckBox"},
+        "VRAM_CHUNK_SIZE": {"label": "Chunk Limit (Latent Dim)", "tooltip": "Max latent dimension before splitting. 96=768px, 128=1024px.", "widget": "QComboBox", "options": ["96", "104", "112", "120", "128"]},
+        "VRAM_CHUNK_CHANCE": {"label": "Chunk Probability (0-1)", "tooltip": "Chance to apply chunking per step. 1.0 = Always, 0.1 = 10% chance.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
         "SHOULD_UPSCALE": {"label": "Upscale Images", "tooltip": "If enabled, upscale small images closer to bucket limit while maintaining aspect ratio.", "widget": "QCheckBox"},
         "MAX_AREA_TOLERANCE": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
@@ -1810,42 +1870,36 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log(f"Warning: Could not find selected preset '{selected_key}'. Loading hardcoded defaults.")
             self.current_config = copy.deepcopy(self.default_config)
         self._apply_config_to_widgets()
-    
+        
     def _prepare_config_to_save(self):
         config_to_save = {}
+        # Skip keys handled manually
+        skip_keys = [
+            "RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", 
+            "RAVEN_PARAMS", "TITAN_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
+            "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", 
+            "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"
+        ]
+        
+        # 1. Standard Widget Loop
         for key in self.default_config.keys():
-            # Skip keys handled manually
-            if key in ["RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"]:
-                continue
+            if key in skip_keys: continue
             live_val = self.current_config.get(key)
             if live_val is None: continue
-            default_val = self.default_config.get(key)
+            
             try:
                 if key == "LR_CUSTOM_CURVE":
-                    rounded_curve = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
-                    config_to_save[key] = rounded_curve
+                    config_to_save[key] = [[round(p[0], 8), round(p[1], 10)] for p in live_val]
                     continue
-                converted_val = None
-                if isinstance(live_val, (bool, list)):
-                    converted_val = live_val
-                elif default_val is not None:
-                    default_type = type(default_val)
-                    if default_type == bool:
-                        converted_val = str(live_val).strip().lower() in ('true', '1', 't', 'y', 'yes')
-                    elif default_type == int:
-                        converted_val = int(str(live_val).strip()) if str(live_val).strip() else 0
-                    elif default_type == float:
-                        converted_val = float(str(live_val).strip()) if str(live_val).strip() else 0.0
-                    else: converted_val = str(live_val)
-                else: converted_val = str(live_val)
-                config_to_save[key] = converted_val
-            except (ValueError, TypeError) as e:
-                self.log(f"Warning: Could not convert value for '{key}'. Not saved. Error: {e}")
+                config_to_save[key] = live_val
+            except Exception as e:
+                self.log(f"Warning: Could not save '{key}': {e}")
         
+        # 2. Manual Fields
         config_to_save["TRAINING_MODE"] = self.training_mode_combo.currentText()
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
-        config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentText().lower()
+        config_to_save["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
         config_to_save["NOISE_SCHEDULER"] = self.widgets["NOISE_SCHEDULER"].currentText()
         config_to_save["NOISE_TYPE"] = self.widgets["NOISE_TYPE"].currentText()
         config_to_save["NOISE_OFFSET"] = self.widgets["NOISE_OFFSET"].value()
@@ -1853,25 +1907,37 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
         config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
         
-        # Save Histogram Data
         if hasattr(self, 'timestep_histogram'):
             config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
+        # 3. Save RAVEN Params (From RAVEN_ widgets)
         raven_params = {}
         try:
-            betas_str = self.widgets['RAVEN_betas'].text().strip()
-            raven_params["betas"] = [float(x.strip()) for x in betas_str.split(',')]
-        except (ValueError, IndexError):
-            raven_params["betas"] = default_config.RAVEN_PARAMS["betas"]
-        try:
-            raven_params["eps"] = float(self.widgets['RAVEN_eps'].text().strip())
-        except ValueError:
-            raven_params["eps"] = default_config.RAVEN_PARAMS["eps"]
+            r_betas = self.widgets['RAVEN_betas'].text().strip()
+            raven_params["betas"] = [float(x.strip()) for x in r_betas.split(',')]
+        except: raven_params["betas"] = [0.9, 0.999]
+        try: raven_params["eps"] = float(self.widgets['RAVEN_eps'].text().strip())
+        except: raven_params["eps"] = 1e-8
         raven_params["weight_decay"] = self.widgets['RAVEN_weight_decay'].value()
         raven_params["debias_strength"] = self.widgets['RAVEN_debias_strength'].value()
         raven_params["use_grad_centralization"] = self.widgets['RAVEN_use_grad_centralization'].isChecked()
         raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
         config_to_save["RAVEN_PARAMS"] = raven_params
+
+        # 4. Save TITAN Params (From TITAN_ widgets)
+        titan_params = {}
+        try:
+            t_betas = self.widgets['TITAN_betas'].text().strip()
+            titan_params["betas"] = [float(x.strip()) for x in t_betas.split(',')]
+        except: titan_params["betas"] = [0.9, 0.999]
+        try: titan_params["eps"] = float(self.widgets['TITAN_eps'].text().strip())
+        except: titan_params["eps"] = 1e-8
+        titan_params["weight_decay"] = self.widgets['TITAN_weight_decay'].value()
+        titan_params["debias_strength"] = self.widgets['TITAN_debias_strength'].value()
+        titan_params["use_grad_centralization"] = self.widgets['TITAN_use_grad_centralization'].isChecked()
+        titan_params["gc_alpha"] = self.widgets['TITAN_gc_alpha'].value()
+        config_to_save["TITAN_PARAMS"] = titan_params
+            
         return config_to_save
 
     def save_config(self):
@@ -1996,18 +2062,41 @@ class TrainingGUI(QtWidgets.QWidget):
         layout.setContentsMargins(15, 15, 15, 15)
         top_hbox = QtWidgets.QHBoxLayout()
         top_hbox.setSpacing(20)
+        
+        # Groups definition
         groups = {
             "Batching & DataLoaders": ["CACHING_BATCH_SIZE", "NUM_WORKERS"],
+            "Spatial Chunking": ["VRAM_CHUNK_ENABLED", "VRAM_CHUNK_CHANCE", "VRAM_CHUNK_SIZE"],
             "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]
         }
+        
         for title, keys in groups.items(): top_hbox.addWidget(self._create_form_group(title, keys))
         layout.addLayout(top_hbox)
         self.dataset_manager = DatasetManagerWidget(self)
         self.dataset_manager.datasetsChanged.connect(self._update_training_calculations)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
+        
+        # Connect Upscale Logic
         if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state)))
+
+        # Connect Spatial Chunking Logic
+        if "VRAM_CHUNK_ENABLED" in self.widgets:
+            chk = self.widgets["VRAM_CHUNK_ENABLED"]
+            
+            # Helper to update dependent widgets based on checkbox state
+            def update_chunk_widgets(state):
+                enabled = bool(state)
+                if "VRAM_CHUNK_SIZE" in self.widgets:
+                    self.widgets["VRAM_CHUNK_SIZE"].setEnabled(enabled)
+                if "VRAM_CHUNK_CHANCE" in self.widgets:
+                    self.widgets["VRAM_CHUNK_CHANCE"].setEnabled(enabled)
+
+            chk.stateChanged.connect(update_chunk_widgets)
+            
+            # Set initial state immediately
+            update_chunk_widgets(chk.isChecked())
     
     def _populate_model_training_tab(self, parent_widget):
         main_layout = QtWidgets.QVBoxLayout(parent_widget)
@@ -2133,40 +2222,96 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in core_keys: self._add_widget_to_form(layout, key)
         return core_group
 
+    def _build_optimizer_form(self, prefix):
+        """Helper to create a layout of widgets for a specific optimizer prefix."""
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(container)
+        layout.setContentsMargins(0, 5, 0, 0)
+        
+        # Create widgets with unique keys (e.g., RAVEN_betas vs TITAN_betas)
+        self.widgets[f'{prefix}_betas'] = QtWidgets.QLineEdit()
+        self.widgets[f'{prefix}_eps'] = QtWidgets.QLineEdit()
+        
+        wd = NoScrollDoubleSpinBox()
+        wd.setRange(0.0, 1.0)
+        wd.setSingleStep(0.00001)   # 1e-5 — small enough for 0.0001, 1e-4, etc.
+        wd.setDecimals(6)           # Shows up to 6 decimal places (plenty for weight decay)
+        self.widgets[f'{prefix}_weight_decay'] = wd
+        
+        debias = NoScrollDoubleSpinBox()
+        debias.setRange(0.0, 1.0); debias.setSingleStep(0.01); debias.setDecimals(3)
+        debias.setToolTip("Controls the strength of bias correction.")
+        self.widgets[f'{prefix}_debias_strength'] = debias
+        
+        use_gc = QtWidgets.QCheckBox("Enable Gradient Centralization")
+        use_gc.setToolTip("Improves convergence by centering gradients.")
+        self.widgets[f'{prefix}_use_grad_centralization'] = use_gc
+        
+        gc_alpha = NoScrollDoubleSpinBox()
+        gc_alpha.setRange(0.0, 1.0); gc_alpha.setSingleStep(0.1); gc_alpha.setDecimals(1)
+        gc_alpha.setToolTip("Strength of gradient centralization.")
+        self.widgets[f'{prefix}_gc_alpha'] = gc_alpha
+        
+        # Internal logic connection
+        use_gc.stateChanged.connect(lambda state: gc_alpha.setEnabled(bool(state)))
+        
+        layout.addRow("Betas (b1, b2):", self.widgets[f'{prefix}_betas'])
+        layout.addRow("Epsilon (eps):", self.widgets[f'{prefix}_eps'])
+        layout.addRow("Weight Decay:", self.widgets[f'{prefix}_weight_decay'])
+        layout.addRow("Debias Strength:", self.widgets[f'{prefix}_debias_strength'])
+        layout.addRow(use_gc)
+        layout.addRow("GC Alpha:", self.widgets[f'{prefix}_gc_alpha'])
+        
+        return container
+
     def _create_optimizer_group(self):
         optimizer_group = QtWidgets.QGroupBox("Optimizer")
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
+        
         selector_layout = QtWidgets.QHBoxLayout()
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
+        
         self.widgets["OPTIMIZER_TYPE"] = NoScrollComboBox()
-        self.widgets["OPTIMIZER_TYPE"].addItems(["Raven"])
-        self.widgets["OPTIMIZER_TYPE"].currentTextChanged.connect(self._toggle_optimizer_widgets)
+        # Clean naming with internal ID mapping
+        self.widgets["OPTIMIZER_TYPE"].addItem("Raven: Performance Priority (~12GB VRAM)", "raven")
+        self.widgets["OPTIMIZER_TYPE"].addItem("Titan: VRAM Priority (~6GB VRAM, Slower)", "titan")
+        
+        self.widgets["OPTIMIZER_TYPE"].currentIndexChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
         main_layout.addLayout(selector_layout)
-        self.raven_settings_group = QtWidgets.QGroupBox("Raven Settings")
-        raven_layout = QtWidgets.QFormLayout(self.raven_settings_group)
-        self.widgets['RAVEN_betas'] = QtWidgets.QLineEdit()
-        self.widgets['RAVEN_eps'] = QtWidgets.QLineEdit()
-        self.widgets['RAVEN_weight_decay'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_weight_decay'].setRange(0.0, 1.0); self.widgets['RAVEN_weight_decay'].setSingleStep(0.001); self.widgets['RAVEN_weight_decay'].setDecimals(3)
-        self.widgets['RAVEN_debias_strength'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_debias_strength'].setRange(0.0, 1.0); self.widgets['RAVEN_debias_strength'].setSingleStep(0.01); self.widgets['RAVEN_debias_strength'].setDecimals(3)
-        self.widgets['RAVEN_debias_strength'].setToolTip("Controls the strength of bias correction. 1.0 = full correction, 0.3 = 30% (softer start).")
-        self.widgets['RAVEN_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization"); self.widgets['RAVEN_use_grad_centralization'].setToolTip("Improves convergence by centering gradients. Recommended for better training stability.")
-        self.widgets['RAVEN_gc_alpha'] = NoScrollDoubleSpinBox(); self.widgets['RAVEN_gc_alpha'].setRange(0.0, 1.0); self.widgets['RAVEN_gc_alpha'].setSingleStep(0.1); self.widgets['RAVEN_gc_alpha'].setDecimals(1)
-        self.widgets['RAVEN_gc_alpha'].setToolTip("Strength of gradient centralization. 1.0 = full strength, 0.5 = half strength.")
-        self.widgets['RAVEN_use_grad_centralization'].stateChanged.connect(lambda state: self.widgets['RAVEN_gc_alpha'].setEnabled(bool(state)))
-        raven_layout.addRow("Betas (b1, b2):", self.widgets['RAVEN_betas'])
-        raven_layout.addRow("Epsilon (eps):", self.widgets['RAVEN_eps'])
-        raven_layout.addRow("Weight Decay:", self.widgets['RAVEN_weight_decay'])
-        raven_layout.addRow("Debias Strength:", self.widgets['RAVEN_debias_strength'])
-        raven_layout.addRow(self.widgets['RAVEN_use_grad_centralization'])
-        raven_layout.addRow("GC Alpha:", self.widgets['RAVEN_gc_alpha'])
-        main_layout.addWidget(self.raven_settings_group)
+        
+        # --- STACKED WIDGET IMPLEMENTATION ---
+        self.optimizer_settings_group = QtWidgets.QGroupBox("Optimizer Settings")
+        group_layout = QtWidgets.QVBoxLayout(self.optimizer_settings_group)
+        
+        self.optimizer_stack = QtWidgets.QStackedWidget()
+        
+        # Page 0: Raven
+        self.raven_page = self._build_optimizer_form("RAVEN")
+        self.optimizer_stack.addWidget(self.raven_page)
+        
+        # Page 1: Titan
+        self.titan_page = self._build_optimizer_form("TITAN")
+        self.optimizer_stack.addWidget(self.titan_page)
+        
+        group_layout.addWidget(self.optimizer_stack)
+        main_layout.addWidget(self.optimizer_settings_group)
+        
         return optimizer_group
     
     def _toggle_optimizer_widgets(self):
-        selected_optimizer = self.widgets["OPTIMIZER_TYPE"].currentText()
-        is_raven = (selected_optimizer == "Raven")
-        self.raven_settings_group.setVisible(is_raven)
+        # Use currentData() to get "raven" or "titan" safely
+        selected_id = self.widgets["OPTIMIZER_TYPE"].currentData()
+        
+        # Switch stack page
+        if selected_id == "titan":
+            self.optimizer_stack.setCurrentIndex(1)
+        else:
+            self.optimizer_stack.setCurrentIndex(0) # Raven is default
+            
+        # Ensure the group box is visible
+        if hasattr(self, 'optimizer_settings_group'):
+            self.optimizer_settings_group.setVisible(True)
 
     def _create_lr_scheduler_group(self):
         lr_group = QtWidgets.QGroupBox("Learning Rate Scheduler")
@@ -2288,12 +2433,15 @@ class TrainingGUI(QtWidgets.QWidget):
 
         controls_layout.addWidget(QtWidgets.QLabel("Presets:"))
         ts_preset_combo = NoScrollComboBox()
+        # --- UPDATE THIS LIST ---
         ts_preset_combo.addItems([
             "Uniform", 
             "Bell Curve", 
             "Bias Early (Detail)", 
-            "Bias Late (Structure)"
+            "Bias Late (Structure)",
+            "Peak Ends & Middle" 
         ])
+        # ------------------------
         controls_layout.addWidget(ts_preset_combo, 1)
         
         layout.addLayout(controls_layout)
@@ -2363,6 +2511,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _apply_config_to_widgets(self):
         for widget in self.widgets.values(): widget.blockSignals(True)
         try:
+            # ... (Standard Loading Logic) ...
             mode = self.current_config.get("TRAINING_MODE", "Standard (SDXL)")
             self.training_mode_combo.setCurrentText(mode)
             self._on_training_mode_changed(mode) 
@@ -2371,8 +2520,11 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
                 self.toggle_resume_widgets(1 if is_resuming else 0)
             
-            # Special keys handling
-            special_keys = ["OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
+            # Exclude special keys handled manually
+            special_keys = [
+                "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"
+            ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
+            
             for key, widget in self.widgets.items():
                 if key in special_keys: continue
                 value = self.current_config.get(key)
@@ -2382,28 +2534,60 @@ class TrainingGUI(QtWidgets.QWidget):
                 elif isinstance(widget, QtWidgets.QCheckBox): widget.setChecked(bool(value))
                 elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
                 elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
-            optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE)
-            self.widgets["OPTIMIZER_TYPE"].setCurrentText(optimizer_type.capitalize())
             
-            user_raven_params = self.current_config.get("RAVEN_PARAMS", {}); full_raven_params = {**default_config.RAVEN_PARAMS, **user_raven_params}
-            self.widgets["RAVEN_betas"].setText(', '.join(map(str, full_raven_params["betas"]))); self.widgets["RAVEN_eps"].setText(str(full_raven_params["eps"]))
-            self.widgets["RAVEN_weight_decay"].setValue(full_raven_params["weight_decay"]); self.widgets["RAVEN_debias_strength"].setValue(full_raven_params.get("debias_strength", 1.0))
-            use_gc = full_raven_params.get("use_grad_centralization", False); gc_alpha = full_raven_params.get("gc_alpha", 1.0)
-            self.widgets["RAVEN_use_grad_centralization"].setChecked(use_gc); self.widgets["RAVEN_gc_alpha"].setValue(gc_alpha); self.widgets["RAVEN_gc_alpha"].setEnabled(use_gc)
-            self._toggle_optimizer_widgets()
+            # --- OPTIMIZER LOADING ---
+            optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE).lower()
+            index = self.widgets["OPTIMIZER_TYPE"].findData(optimizer_type)
+            if index >= 0: self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(index)
+            else: self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(0)
+            
+            # Load RAVEN Params
+            r_params = {**default_config.RAVEN_PARAMS, **self.current_config.get("RAVEN_PARAMS", {})}
+            self.widgets["RAVEN_betas"].setText(', '.join(map(str, r_params.get("betas", [0.9, 0.999]))))
+            self.widgets["RAVEN_eps"].setText(str(r_params.get("eps", 1e-8)))
+            self.widgets["RAVEN_weight_decay"].setValue(r_params.get("weight_decay", 0.01))
+            self.widgets["RAVEN_debias_strength"].setValue(r_params.get("debias_strength", 1.0))
+            self.widgets["RAVEN_use_grad_centralization"].setChecked(r_params.get("use_grad_centralization", False))
+            self.widgets["RAVEN_gc_alpha"].setValue(r_params.get("gc_alpha", 1.0))
+            self.widgets["RAVEN_gc_alpha"].setEnabled(r_params.get("use_grad_centralization", False))
 
+            # Load TITAN Params
+            t_defaults = getattr(default_config, "TITAN_PARAMS", default_config.RAVEN_PARAMS)
+            t_params = {**t_defaults, **self.current_config.get("TITAN_PARAMS", {})}
+            self.widgets["TITAN_betas"].setText(', '.join(map(str, t_params.get("betas", [0.9, 0.999]))))
+            self.widgets["TITAN_eps"].setText(str(t_params.get("eps", 1e-8)))
+            self.widgets["TITAN_weight_decay"].setValue(t_params.get("weight_decay", 0.01))
+            self.widgets["TITAN_debias_strength"].setValue(t_params.get("debias_strength", 1.0))
+            self.widgets["TITAN_use_grad_centralization"].setChecked(t_params.get("use_grad_centralization", False))
+            self.widgets["TITAN_gc_alpha"].setValue(t_params.get("gc_alpha", 1.0))
+            self.widgets["TITAN_gc_alpha"].setEnabled(t_params.get("use_grad_centralization", False))
+            
+            self._toggle_optimizer_widgets()
+            
+            # --- MANUAL TOGGLE UPDATES (Fixes greyed out options) ---
             noise_type = self.current_config.get("NOISE_TYPE", "Default")
             self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
             self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
             self._toggle_noise_widgets()
+            
             loss_type = self.current_config.get("LOSS_TYPE", "Default")
             self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
             self.widgets["SEMANTIC_LOSS_BLEND"].setValue(self.current_config.get("SEMANTIC_LOSS_BLEND", 0.5))
             self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
             self._toggle_loss_widgets()
 
+            # Fix Upscale Toggle
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
+            
+            # Fix Spatial Chunking Toggle (This fixes the issue)
+            if "VRAM_CHUNK_ENABLED" in self.widgets:
+                is_chunking = self.widgets["VRAM_CHUNK_ENABLED"].isChecked()
+                if "VRAM_CHUNK_SIZE" in self.widgets:
+                    self.widgets["VRAM_CHUNK_SIZE"].setEnabled(is_chunking)
+                if "VRAM_CHUNK_CHANCE" in self.widgets:
+                    self.widgets["VRAM_CHUNK_CHANCE"].setEnabled(is_chunking)
+
             if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
             
             if hasattr(self, 'timestep_histogram'):
@@ -2521,12 +2705,8 @@ class TrainingGUI(QtWidgets.QWidget):
         script_dir = os.path.dirname(os.path.abspath(__file__))
         config_path = os.path.abspath(config_path)
         mode = self.training_mode_combo.currentText()
-        if "Rectified Flow" in mode:
-            script_name = "train_rf.py"
-            self.log("INFO: Mode is Rectified Flow. Executing train_rf.py")
-        else:
-            script_name = "train.py"
-            self.log("INFO: Mode is Standard SDXL. Executing train.py")
+        script_name = "train.py"
+        self.log("INFO: Training started. Executing train.py")
         train_py_path = os.path.abspath(script_name)
         if not os.path.exists(train_py_path):
              self.log(f"CRITICAL ERROR: Training script not found: {train_py_path}. Aborting.")

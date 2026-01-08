@@ -3,6 +3,9 @@ from torch.optim import Optimizer
 import math
 
 class RavenAdamW(Optimizer):
+    """
+    RavenAdamW: High-Performance Optimizer with CPU State Offloading
+    """
     def __init__(
         self,
         params,
@@ -36,24 +39,16 @@ class RavenAdamW(Optimizer):
         )
         super(RavenAdamW, self).__init__(params, defaults)
 
-        max_param_size = 0
+        # Store device for synchronization purposes
         self.param_device = None
         for group in self.param_groups:
             for p in group['params']:
                 if p.requires_grad:
                     if self.param_device is None: 
                         self.param_device = p.device
-                    max_param_size = max(max_param_size, p.numel())
-
-        if max_param_size > 0:
-            self.reusable_exp_avg_gpu = torch.zeros(
-                max_param_size, device=self.param_device, dtype=torch.float32
-            )
-            self.reusable_exp_avg_sq_gpu = torch.zeros(
-                max_param_size, device=self.param_device, dtype=torch.float32
-            )
-        else:
-            self.reusable_exp_avg_gpu, self.reusable_exp_avg_sq_gpu = None, None
+                    break
+            if self.param_device is not None:
+                break
 
     def save_cpu_state(self):
         """Returns a state dictionary containing only the essential, CPU-bound tensors."""
@@ -112,8 +107,8 @@ class RavenAdamW(Optimizer):
                     grad.sub_(grad_mean, alpha=gc_alpha)
                 
                 state = self.state[p]
-                num_param_elements = p.numel()
 
+                # Initialize state if needed
                 if len(state) == 0:
                     state["step"] = 0
                     state["exp_avg_cpu"] = torch.zeros_like(p, memory_format=torch.preserve_format, device='cpu', dtype=torch.float32)
@@ -122,31 +117,55 @@ class RavenAdamW(Optimizer):
                 state["step"] += 1
                 step, exp_avg_cpu, exp_avg_sq_cpu = state["step"], state["exp_avg_cpu"], state["exp_avg_sq_cpu"]
                 
-                exp_avg_gpu_view = self.reusable_exp_avg_gpu[:num_param_elements].view_as(p)
-                exp_avg_sq_gpu_view = self.reusable_exp_avg_sq_gpu[:num_param_elements].view_as(p)
-                exp_avg_gpu_view.copy_(exp_avg_cpu, non_blocking=True)
-                exp_avg_sq_gpu_view.copy_(exp_avg_sq_cpu, non_blocking=True)
+                # Create temporary GPU buffers for this parameter
+                exp_avg_gpu = torch.zeros_like(p, dtype=torch.float32)
+                exp_avg_sq_gpu = torch.zeros_like(p, dtype=torch.float32)
                 
-                if self.param_device.type == 'cuda': torch.cuda.synchronize()
+                # Copy momentum states from CPU to GPU
+                exp_avg_gpu.copy_(exp_avg_cpu, non_blocking=True)
+                exp_avg_sq_gpu.copy_(exp_avg_sq_cpu, non_blocking=True)
                 
+                # Synchronize to ensure copies complete before computation
+                if self.param_device.type == 'cuda': 
+                    torch.cuda.synchronize()
+                
+                # Convert parameter to FP32 for computation
                 p_fp32 = p.to(torch.float32)
                 
+                # Update momentum states
+                exp_avg_gpu.mul_(beta1).add_(grad, alpha=1.0 - beta1)
+                exp_avg_sq_gpu.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
+
+                # Compute bias corrections
+                bias_correction1 = 1.0 - math.pow(beta1, step)
+                bias_correction2 = 1.0 - math.pow(beta2, step)
+                
+                # Apply debias strength (scales the bias correction)
+                if debias_strength < 1.0:
+                    bias_correction1 = 1.0 - (1.0 - bias_correction1) * debias_strength
+                    bias_correction2 = 1.0 - (1.0 - bias_correction2) * debias_strength
+                
+                step_size = lr / bias_correction1 if bias_correction1 > 0 else lr
+                
+                # Compute denominator with bias correction
+                denom = (exp_avg_sq_gpu.sqrt() / math.sqrt(bias_correction2) if bias_correction2 > 0 else exp_avg_sq_gpu.sqrt()).add_(eps)
+                
+                # Apply AdamW update (gradient step)
+                p_fp32.addcdiv_(exp_avg_gpu, denom, value=-step_size)
+                
+                # Apply weight decay (decoupled, after gradient update)
                 if weight_decay != 0:
                     p_fp32.mul_(1.0 - lr * weight_decay)
                 
-                exp_avg_gpu_view.mul_(beta1).add_(grad, alpha=1.0 - beta1)
-                exp_avg_sq_gpu_view.mul_(beta2).addcmul_(grad, grad, value=1.0 - beta2)
-
-                bias_correction1 = 1.0 - math.pow(beta1, step) * debias_strength if debias_strength > 0 else 1.0
-                bias_correction2 = 1.0 - math.pow(beta2, step) * debias_strength if debias_strength > 0 else 1.0
-                step_size = lr / bias_correction1 if bias_correction1 != 0 else lr
-                
-                denom = (exp_avg_sq_gpu_view.sqrt() / (math.sqrt(bias_correction2) if bias_correction2 > 0 else 1.0)).add_(eps)
-                
-                p_fp32.addcdiv_(exp_avg_gpu_view, denom, value=-step_size)
+                # Copy updated parameter back
                 p.copy_(p_fp32)
-                exp_avg_cpu.copy_(exp_avg_gpu_view, non_blocking=True)
-                exp_avg_sq_cpu.copy_(exp_avg_sq_gpu_view, non_blocking=True)
+                
+                # Copy updated momentum states back to CPU
+                exp_avg_cpu.copy_(exp_avg_gpu, non_blocking=True)
+                exp_avg_sq_cpu.copy_(exp_avg_sq_gpu, non_blocking=True)
 
-        if self.param_device.type == 'cuda': torch.cuda.synchronize()
+        # Final synchronization to ensure all copies complete
+        if self.param_device is not None and self.param_device.type == 'cuda': 
+            torch.cuda.synchronize()
+            
         return loss

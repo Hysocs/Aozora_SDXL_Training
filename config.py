@@ -24,7 +24,9 @@ INSTANCE_DATASETS = [
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
-
+VRAM_CHUNK_ENABLED = True
+VRAM_CHUNK_SIZE = 96
+VRAM_CHUNK_CHANCE = 1.0
 # --- Aspect Ratio Bucketing ---
 SHOULD_UPSCALE = False
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
@@ -75,7 +77,14 @@ RAVEN_PARAMS = {
     "use_grad_centralization": False,
     "gc_alpha": 1.0
 }
-
+TITAN_PARAMS = {
+    "betas": [0.9, 0.999],
+    "eps": 1e-8,
+    "weight_decay": 0.01,
+    "debias_strength": 0.3,
+    "use_grad_centralization": False,
+    "gc_alpha": 1.0
+}
 # --- Noise Configuration ---
 NOISE_TYPE = "Default"
 NOISE_OFFSET = 0.05

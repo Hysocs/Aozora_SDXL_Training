@@ -1,4 +1,5 @@
 import inspect
+import fnmatch
 import re
 import os
 from pathlib import Path
@@ -12,7 +13,8 @@ import torch
 import torch.nn.functional as F
 from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader, Sampler
-from diffusers import StableDiffusionXLPipeline, AutoencoderKL, FlowMatchEulerDiscreteScheduler
+# OPTIMIZATION: Added UNet2DConditionModel to imports
+from diffusers import StableDiffusionXLPipeline, AutoencoderKL, FlowMatchEulerDiscreteScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile
@@ -32,6 +34,7 @@ import queue
 import tomesd
 # --- Import the custom optimizer ---
 from optimizer.raven import RavenAdamW
+from optimizer.titan import TitanAdamW
 
 # --- Global Settings ---
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -691,6 +694,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 torch.cuda.empty_cache()
 
     print("\nINFO: Caching Complete (High Precision). Cleaning up...")
+
+    # ADD THIS:
+    print("\n--- VAE Scaling Verification ---")
+    cache_files = list(cache_dir.glob("*.pt"))
+    if cache_files:
+        test_latent = torch.load(cache_files[0], map_location="cpu")["latents"]
+        print(f"Latent range: {test_latent.min():.4f} to {test_latent.max():.4f}")
+        print(f"Expected range: -3 to +3 (if properly scaled)")
+    print("---\n")
+
+    # Continue with existing cleanup:
     te1.cpu()
     te2.cpu()
     gc.collect()
@@ -701,6 +715,12 @@ class ImageTextLatentDataset(Dataset):
         self.latent_files = []
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
         
+        # Read from config with fallbacks
+        self.enable_chunking = getattr(config, "VRAM_CHUNK_ENABLED", True)
+        self.max_latent_dim = int(getattr(config, "VRAM_CHUNK_SIZE", 96))
+        # New: Probability chance (Default 1.0 = 100%)
+        self.chunk_chance = float(getattr(config, "VRAM_CHUNK_CHANCE", 1.0))
+
         # Store roots to help find original images later
         self.dataset_roots = {} 
 
@@ -723,16 +743,11 @@ class ImageTextLatentDataset(Dataset):
         
         self.bucket_keys = []
         
-        # --- NEW LOGIC: Read Resolution directly from Cache Header ---
         print("INFO: building buckets from cache headers...")
         for f in tqdm(self.latent_files, desc="Loading Cache Headers"):
             try:
                 # We peek at the file header (CPU only)
-                # This is fast and gets us everything we need
                 header = torch.load(f, map_location='cpu')
-                
-                # 1. Get the Resolution for Bucketing (Fixes the "No Metadata" issue)
-                # If target_size is missing, default to None (which disables bucketing for that image)
                 res = header.get('target_size')
                 if res:
                     self.bucket_keys.append(tuple(res))
@@ -744,6 +759,8 @@ class ImageTextLatentDataset(Dataset):
                 self.bucket_keys.append(None)
                 
         print(f"INFO: Dataset initialized with {len(self.latent_files)} samples.")
+        if self.enable_chunking:
+            print(f"INFO: Spatial Chunking Enabled. Max Latent Dim: {self.max_latent_dim}, Chance: {self.chunk_chance}")
         if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED.")
 
     def __len__(self): return len(self.latent_files)
@@ -755,25 +772,94 @@ class ImageTextLatentDataset(Dataset):
             
             if (torch.isnan(data["latents"]).any() or torch.isinf(data["latents"]).any()): return None
             
+            latents = data["latents"] # Shape: [4, H, W]
+            c, h, w = latents.shape # These are the FULL dimensions before any chunking
+            
+            # Default values (Full image)
+            crop_top, crop_left = 0, 0
+            target_h, target_w = h, w
+            
+            # --- SPATIAL CHUNKING (CROP) LOGIC ---
+            # 1. Must be enabled
+            # 2. Image must be larger than limit
+            # 3. Roll dice against chunk_chance
+            should_chunk = (
+                self.enable_chunking and 
+                (h > self.max_latent_dim or w > self.max_latent_dim) and 
+                random.random() < self.chunk_chance
+            )
+
+            if should_chunk:
+                # Determine new size (clamp to max)
+                new_h = min(h, self.max_latent_dim)
+                new_w = min(w, self.max_latent_dim)
+                
+                # Pick a random position for the chunk
+                # Since __getitem__ is called every step/epoch, this ensures
+                # different crops are seen over the course of training.
+                top_max = h - new_h
+                left_max = w - new_w
+                
+                crop_top = random.randint(0, top_max) if top_max > 0 else 0
+                crop_left = random.randint(0, left_max) if left_max > 0 else 0
+                
+                # Slice the tensor (The "Chunking")
+                latents = latents[:, crop_top:crop_top+new_h, crop_left:crop_left+new_w]
+                
+                # Update target size for conditioning
+                target_h, target_w = new_h, new_w
+
+            # Convert latent-space coords to pixel-space coords for SDXL (multiply by 8)
+            crop_coords = (crop_top * 8, crop_left * 8)
+            target_size_px = (target_w * 8, target_h * 8) # W, H
+            
             item_data = {
-                "latents": data["latents"], 
+                "latents": latents, 
                 "embeds": data["embeds"], 
                 "pooled": data["pooled"], 
                 "original_sizes": data["original_size"], 
-                "target_sizes": data["target_size"], 
+                "target_sizes": target_size_px, 
+                "crop_coords": crop_coords,
                 "latent_path": str(latent_path)
             }
 
             if self.use_semantic_loss:
-                # Use the saved relative path to find the image in subfolders
                 root = self.dataset_roots.get(str(latent_path))
                 relative_path = data.get("relative_path")
                 
                 if root and relative_path:
                     original_image_path = Path(root) / relative_path
                     if original_image_path.exists():
-                        with Image.open(original_image_path) as raw_img: 
-                            item_data["original_image"] = fix_alpha_channel(raw_img)
+                        try:
+                            with Image.open(original_image_path) as raw_img: 
+                                raw_img = fix_alpha_channel(raw_img)
+                                
+                                # 1. Reconstruct Full Bucket Dimensions (Pixel Space)
+                                # 'w' and 'h' are the latent dims from the top of the function
+                                full_bucket_w = w * 8
+                                full_bucket_h = h * 8
+                                
+                                # 2. Resize raw image to match what the VAE saw (Center Crop/Resize)
+                                bucket_img = resize_to_fit(raw_img, full_bucket_w, full_bucket_h)
+                                
+                                # 3. Apply the Spatial Chunking Crop
+                                # crop_coords = (top_px, left_px)
+                                crop_t_px, crop_l_px = crop_coords
+                                chunk_w_px = target_size_px[0]
+                                chunk_h_px = target_size_px[1]
+                                
+                                # Crop: (left, top, right, bottom)
+                                cropped_semantic_img = bucket_img.crop((
+                                    crop_l_px, 
+                                    crop_t_px, 
+                                    crop_l_px + chunk_w_px, 
+                                    crop_t_px + chunk_h_px
+                                ))
+                                
+                                item_data["original_image"] = cropped_semantic_img
+                        except Exception as e:
+                            print(f"Error processing semantic image {original_image_path}: {e}")
+                            item_data["original_image"] = None
                     else:
                         item_data["original_image"] = None
                 else:
@@ -978,8 +1064,11 @@ def custom_collate_fn(batch):
         output["embeds"] = torch.stack(padded_embeds)
     for k in batch[0]:
         if k == "embeds": continue
-        if isinstance(batch[0][k], torch.Tensor): output[k] = torch.stack([item[k] for item in batch])
-        else: output[k] = [item[k] for item in batch]
+        if isinstance(batch[0][k], torch.Tensor): 
+            output[k] = torch.stack([item[k] for item in batch])
+        # Handle simple lists (like crop_coords tuples)
+        else: 
+            output[k] = [item[k] for item in batch]
     return output
 
 def _generate_hf_to_sd_unet_key_mapping(hf_keys):
@@ -1013,14 +1102,40 @@ def filter_scheduler_config(config, scheduler_class):
 
 def create_optimizer(config, params_to_optimize):
     optimizer_type = config.OPTIMIZER_TYPE.lower()
-    if optimizer_type == "raven":
+    
+    if optimizer_type == "titan":
+        print("\n--- Initializing Titan Optimizer (Sync Offloading) ---")
+        curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
+        if curve_points: initial_lr = max(point[1] for point in curve_points)
+        else: initial_lr = config.LEARNING_RATE 
+        
+        # Load params from config
+        titan_params = getattr(config, 'TITAN_PARAMS', {})
+        # Merge with defaults in case config is partial
+        defaults = default_config.TITAN_PARAMS
+        final_params = {**defaults, **titan_params}
+
+        return TitanAdamW(
+            params_to_optimize, 
+            lr=initial_lr, 
+            betas=tuple(final_params.get('betas', [0.9, 0.999])), 
+            eps=final_params.get('eps', 1e-8), 
+            weight_decay=final_params.get('weight_decay', 0.01), 
+            debias_strength=final_params.get('debias_strength', 1.0), 
+            use_grad_centralization=final_params.get('use_grad_centralization', False), 
+            gc_alpha=final_params.get('gc_alpha', 1.0)
+        )
+
+    elif optimizer_type == "raven":
         print("\n--- Initializing Raven Optimizer ---")
         curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
         if curve_points: initial_lr = max(point[1] for point in curve_points)
         else: initial_lr = config.LEARNING_RATE 
         raven_params = getattr(config, 'RAVEN_PARAMS', {})
         return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(raven_params.get('betas', [0.9, 0.999])), eps=raven_params.get('eps', 1e-8), weight_decay=raven_params.get('weight_decay', 0.01), debias_strength=raven_params.get('debias_strength', 1.0), use_grad_centralization=raven_params.get('use_grad_centralization', False), gc_alpha=raven_params.get('gc_alpha', 1.0))
-    else: raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'. Only 'raven' supported.")
+    
+    else: 
+        raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
 def save_model(output_path, unet, base_model_state_dict, key_map, trainable_layer_names):
     output_path = Path(output_path)
@@ -1087,9 +1202,11 @@ def main():
         print("Loading base model components for caching...")
         
         # Load base pipeline
+        # OPTIMIZATION: unet=None prevents loading 5GB UNet during caching
         base_pipe = StableDiffusionXLPipeline.from_single_file(
             config.SINGLE_FILE_CHECKPOINT_PATH,
             torch_dtype=torch.float32,
+            unet=None, 
             low_cpu_mem_usage=True
         )
         
@@ -1124,16 +1241,14 @@ def main():
     
     base_model_state_dict = load_file(model_to_load, device="cpu")
     
-    pipe = StableDiffusionXLPipeline.from_single_file(
+    # OPTIMIZATION: Load ONLY the UNet directly.
+    # Prevents loading Text Encoders/VAE into RAM/VRAM during training startup.
+    unet = UNet2DConditionModel.from_single_file(
         model_to_load,
         torch_dtype=config.compute_dtype,
         low_cpu_mem_usage=True
     )
     
-    unet = pipe.unet
-    
-    # Clean up pipeline (we only need UNet for training)
-    del pipe
     gc.collect()
     torch.cuda.empty_cache()
 
@@ -1153,7 +1268,8 @@ def main():
         num_workers=config.NUM_WORKERS
     )
 
-    unet.to(device).enable_gradient_checkpointing()
+    unet.enable_gradient_checkpointing()  # Enable first
+    unet.to(device)  # Then move to device
     
     if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
         unet.enable_xformers_memory_efficient_attention()
@@ -1165,8 +1281,19 @@ def main():
     trainable_layer_names = []
     frozen_layer_names = []
     
+
+
     for name, param in unet.named_parameters():
-        should_exclude = any(k in name for k in exclusion_keywords)
+        should_exclude = False
+        for keyword in exclusion_keywords:
+            # If the keyword doesn't already have a wildcard, treat it as a substring search
+            # by wrapping it in asterisks. This restores the old 'in' behavior.
+            pattern = keyword if '*' in keyword else f"*{keyword}*"
+            
+            if fnmatch.fnmatch(name, pattern):
+                should_exclude = True
+                break # Found a match, no need to check other keywords for this layer
+                
         if should_exclude:
             param.requires_grad = False
             frozen_layer_names.append(name)
@@ -1240,25 +1367,30 @@ def main():
             embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             original_images = batch.get("original_image")
+            
+            # Retrieve crop coords (default to 0,0 if missing)
+            batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
 
             with torch.autocast(
                 device_type=device.type,
                 dtype=config.compute_dtype,
                 enabled=True
             ):
+                # OPTIMIZATION: Build Time IDs list on CPU to reduce VRAM fragmentation, 
+                # then move to GPU in one go.
                 time_ids_list = []
-                for s1, s2 in zip(batch["original_sizes"], batch["target_sizes"]):
+                for s1, crop, s2 in zip(batch["original_sizes"], batch_crop_coords, batch["target_sizes"]):
+                    # TimeID Format: [Original_H, Original_W, Crop_Top, Crop_Left, Target_H, Target_W]
                     time_id = torch.tensor(
-                        list(s1) + [0, 0] + list(s2),
+                        [s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]],
                         dtype=torch.float32
                     )
-                    time_ids_list.append(
-                        time_id.unsqueeze(0).to(device, dtype=config.compute_dtype)
-                    )
-                time_ids = torch.cat(time_ids_list, dim=0)
+                    time_ids_list.append(time_id.unsqueeze(0))
+                
+                # Stack on CPU, then move to GPU
+                time_ids = torch.cat(time_ids_list, dim=0).to(device, dtype=config.compute_dtype)
                 
 
-                # --- RECTIFIED FLOW TRAINING ---
                 # --- RECTIFIED FLOW TRAINING ---
                 noise = generate_train_noise(latents, config)
 
@@ -1326,19 +1458,35 @@ def main():
 
             diag_data_to_log = None
             if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
-                raw_grad_norm = torch.nn.utils.clip_grad_norm_(
-                    params_to_optimize,
-                    float('inf')
-                ).item()
-                timestep_sampler.update(raw_grad_norm)
                 
-                if config.CLIP_GRAD_NORM > 0:
-                    torch.nn.utils.clip_grad_norm_(
-                        params_to_optimize,
-                        config.CLIP_GRAD_NORM
+                if isinstance(optimizer, TitanAdamW):
+                    # Titan handles the hidden CPU gradients internally
+                    # Returns the raw norm before clipping
+                    raw_grad_norm = optimizer.clip_grad_norm(
+                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else 0.0
                     )
-                clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) \
-                    if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
+                else:
+                    # Standard behavior for Raven/AdamW
+                    raw_grad_norm = torch.nn.utils.clip_grad_norm_(
+                        params_to_optimize,
+                        float('inf')
+                    )
+                    timestep_sampler.update(raw_grad_norm.item())
+                    
+                    if config.CLIP_GRAD_NORM > 0:
+                        torch.nn.utils.clip_grad_norm_(
+                            params_to_optimize,
+                            config.CLIP_GRAD_NORM
+                        )
+                
+                # Ensure raw_grad_norm is a float for logging
+                if isinstance(raw_grad_norm, torch.Tensor):
+                    raw_grad_norm = raw_grad_norm.item()
+                
+                clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
+                
+                # Update timestep sampler with raw norm
+                timestep_sampler.update(raw_grad_norm)
 
                 optimizer.step()
                 lr_scheduler.step(global_step + 1)
