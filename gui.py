@@ -1584,9 +1584,8 @@ class TrainingGUI(QtWidgets.QWidget):
         "OUTPUT_DIR": {"label": "Output Directory", "tooltip": "Folder where checkpoints will be saved.", "widget": "Path", "file_type": "folder"},
         "CACHING_BATCH_SIZE": {"label": "Caching Batch Size", "tooltip": "Adjust based on VRAM (e.g., 2-8).", "widget": "QSpinBox", "range": (1, 64)},
         "NUM_WORKERS": {"label": "Dataloader Workers", "tooltip": "Set to 0 on Windows if you have issues.", "widget": "QSpinBox", "range": (0, 16)},
-        "VRAM_CHUNK_ENABLED": {"label": "Spatial Chunking", "tooltip": "Splits large latents into random crops during training to prevent overfitting (This can reduce vram usage at 1.0 chance).", "widget": "QCheckBox"},
-        "VRAM_CHUNK_SIZE": {"label": "Chunk Limit (Latent Dim)", "tooltip": "Max latent dimension before splitting. 96=768px, 128=1024px.", "widget": "QComboBox", "options": ["96", "104", "112", "120", "128"]},
-        "VRAM_CHUNK_CHANCE": {"label": "Chunk Probability (0-1)", "tooltip": "Chance to apply chunking per step. 1.0 = Always, 0.1 = 10% chance.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
+        "UNCONDITIONAL_DROPOUT": {"label": "Unconditional Dropout", "tooltip": "Randomly replace captions with empty strings to train unconditional generation (allows negative prompts).", "widget": "QCheckBox"},
+        "UNCONDITIONAL_DROPOUT_CHANCE": {"label": "Dropout Chance", "tooltip": "Probability (0.0-1.0) of dropping the caption. 0.1 is standard.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
         "TARGET_PIXEL_AREA": {"label": "Target Pixel Area", "tooltip": "e.g., 1024*1024=1048576. Buckets are resolutions near this total area.", "widget": "QLineEdit"},
         "SHOULD_UPSCALE": {"label": "Upscale Images", "tooltip": "If enabled, upscale small images closer to bucket limit while maintaining aspect ratio.", "widget": "QCheckBox"},
         "MAX_AREA_TOLERANCE": {"label": "Max Area Tolerance:", "tooltip": "When upscaling, allow up to this multiplier over target area (e.g., 1.1 = 10% over).", "widget": "QLineEdit"},
@@ -2063,15 +2062,17 @@ class TrainingGUI(QtWidgets.QWidget):
         top_hbox = QtWidgets.QHBoxLayout()
         top_hbox.setSpacing(20)
         
-        # Groups definition
+        # Groups definition - Updated to replace Spatial Chunking with Unconditional Dropout
         groups = {
             "Batching & DataLoaders": ["CACHING_BATCH_SIZE", "NUM_WORKERS"],
-            "Spatial Chunking": ["VRAM_CHUNK_ENABLED", "VRAM_CHUNK_CHANCE", "VRAM_CHUNK_SIZE"],
+            "Unconditional Dropout": ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE"],
             "Aspect Ratio Bucketing": ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]
         }
         
-        for title, keys in groups.items(): top_hbox.addWidget(self._create_form_group(title, keys))
+        for title, keys in groups.items(): 
+            top_hbox.addWidget(self._create_form_group(title, keys))
         layout.addLayout(top_hbox)
+        
         self.dataset_manager = DatasetManagerWidget(self)
         self.dataset_manager.datasetsChanged.connect(self._update_training_calculations)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
@@ -2081,22 +2082,20 @@ class TrainingGUI(QtWidgets.QWidget):
         if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state)))
 
-        # Connect Spatial Chunking Logic
-        if "VRAM_CHUNK_ENABLED" in self.widgets:
-            chk = self.widgets["VRAM_CHUNK_ENABLED"]
+        # Connect Unconditional Dropout Logic
+        if "UNCONDITIONAL_DROPOUT" in self.widgets:
+            chk = self.widgets["UNCONDITIONAL_DROPOUT"]
             
             # Helper to update dependent widgets based on checkbox state
-            def update_chunk_widgets(state):
+            def update_dropout_widgets(state):
                 enabled = bool(state)
-                if "VRAM_CHUNK_SIZE" in self.widgets:
-                    self.widgets["VRAM_CHUNK_SIZE"].setEnabled(enabled)
-                if "VRAM_CHUNK_CHANCE" in self.widgets:
-                    self.widgets["VRAM_CHUNK_CHANCE"].setEnabled(enabled)
+                if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
+                    self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(enabled)
 
-            chk.stateChanged.connect(update_chunk_widgets)
+            chk.stateChanged.connect(update_dropout_widgets)
             
             # Set initial state immediately
-            update_chunk_widgets(chk.isChecked())
+            update_dropout_widgets(chk.isChecked())
     
     def _populate_model_training_tab(self, parent_widget):
         main_layout = QtWidgets.QVBoxLayout(parent_widget)
@@ -2564,7 +2563,7 @@ class TrainingGUI(QtWidgets.QWidget):
             
             self._toggle_optimizer_widgets()
             
-            # --- MANUAL TOGGLE UPDATES (Fixes greyed out options) ---
+            # --- MANUAL TOGGLE UPDATES ---
             noise_type = self.current_config.get("NOISE_TYPE", "Default")
             self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
             self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
@@ -2580,13 +2579,11 @@ class TrainingGUI(QtWidgets.QWidget):
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
             
-            # Fix Spatial Chunking Toggle (This fixes the issue)
-            if "VRAM_CHUNK_ENABLED" in self.widgets:
-                is_chunking = self.widgets["VRAM_CHUNK_ENABLED"].isChecked()
-                if "VRAM_CHUNK_SIZE" in self.widgets:
-                    self.widgets["VRAM_CHUNK_SIZE"].setEnabled(is_chunking)
-                if "VRAM_CHUNK_CHANCE" in self.widgets:
-                    self.widgets["VRAM_CHUNK_CHANCE"].setEnabled(is_chunking)
+            # Fix Unconditional Dropout Toggle (Replaces VRAM Chunk logic)
+            if "UNCONDITIONAL_DROPOUT" in self.widgets:
+                is_dropout = self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
+                if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
+                    self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(is_dropout)
 
             if hasattr(self, 'lr_curve_widget'): self._update_and_clamp_lr_graph()
             

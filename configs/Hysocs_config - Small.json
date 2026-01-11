@@ -1,48 +1,47 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/NoobAI-RF-0.2-Slight-Aesthetic.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/noobaiFlux2vae_03Aesthetic.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_4509.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "VRAM_CHUNK_ENABLED": true,
-    "VRAM_CHUNK_SIZE": "128",
-    "VRAM_CHUNK_CHANCE": 0.15000000000000002,
+    "UNCONDITIONAL_DROPOUT": true,
+    "UNCONDITIONAL_DROPOUT_CHANCE": 0.09999999999999969,
     "SHOULD_UPSCALE": true,
-    "TARGET_PIXEL_AREA": 1048576,
+    "TARGET_PIXEL_AREA": "1048576",
     "MAX_AREA_TOLERANCE": "1.05",
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "6",
+    "MAX_TRAIN_STEPS": "2000",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "5",
+    "GRADIENT_ACCUMULATION_STEPS": "8",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "50.0",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": 13000,
+    "SAVE_EVERY_N_STEPS": "2008",
     "UNET_EXCLUDE_TARGETS": "down_blocks.2.attentions.*.ff.*,down_blocks.2.attentions.*.attn1.*,up_blocks.2.attentions.*.attn1.*",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            2.5e-06
+            1e-06
         ],
         [
-            0.04367816,
-            2.5e-05
+            0.07586207,
+            4.5e-05
         ],
         [
-            0.95172414,
-            2.5e-05
+            0.92643678,
+            4.5e-05
         ],
         [
             1.0,
-            2.5e-06
+            1e-06
         ]
     ],
-    "LR_GRAPH_MIN": "2.5e-06",
-    "LR_GRAPH_MAX": "2.5e-05",
+    "LR_GRAPH_MIN": "1e-06",
+    "LR_GRAPH_MAX": "4.5e-05",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -51,7 +50,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by 13172966",
+            "path": "C:/Users/Administrator/Pictures\\CG\\Megamin Quest Shouwaru Megami Wakarase Oudou RPG (decensored)_upscaled",
             "repeats": 1
         }
     ],
@@ -64,31 +63,31 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            2,
-            1,
-            1,
-            1,
-            1,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0,
-            0
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80,
+            80
         ]
     },
     "RAVEN_PARAMS": {

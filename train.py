@@ -16,7 +16,7 @@ from torch.utils.data import Dataset, DataLoader, Sampler
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL, FlowMatchEulerDiscreteScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
 from safetensors.torch import save_file, load_file
-from PIL import Image, TiffImagePlugin, ImageFile
+from PIL import Image, TiffImagePlugin, ImageFile, ImageOps
 from torchvision import transforms
 from tqdm.auto import tqdm
 import logging
@@ -365,39 +365,62 @@ class ResolutionCalculator:
         self.max_area = target_area * max_area_tolerance
 
     def calculate_resolution(self, width, height):
-        aspect_ratio = width / height
         current_area = width * height
         
-        if not self.should_upscale:
-            if current_area < self.target_area:
-                 w = int(width // self.stride) * self.stride
-                 h = int(height // self.stride) * self.stride
-                 return (max(w, self.stride), max(h, self.stride))
-            
-            h = int(math.sqrt(self.target_area / aspect_ratio) // self.stride) * self.stride
-            w = int(h * aspect_ratio // self.stride) * self.stride
-            return (w, h)
-        
-        if current_area > self.max_area: scale_factor = math.sqrt(self.target_area / current_area)
-        elif current_area < self.target_area: scale_factor = math.sqrt(self.target_area / current_area)
-        else: scale_factor = 1.0
-        new_w = int((width * scale_factor) // self.stride) * self.stride
-        new_h = int((height * scale_factor) // self.stride) * self.stride
-        new_w = max(new_w, self.stride)
-        new_h = max(new_h, self.stride)
-        if new_w * new_h > self.max_area:
-            scale_down = math.sqrt(self.max_area / (new_w * new_h))
-            new_w = int((new_w * scale_down) // self.stride) * self.stride
-            new_h = int((new_h * scale_down) // self.stride) * self.stride
-            new_w = max(new_w, self.stride)
-            new_h = max(new_h, self.stride)
-        return (new_w, new_h)
+        # If image is smaller than target and upscaling is disabled, just snap to a nearby grid
+        if not self.should_upscale and current_area < self.target_area:
+            w = int(width // self.stride) * self.stride
+            h = int(height // self.stride) * self.stride
+            return max(w, self.stride), max(h, self.stride)
 
-def resize_to_fit(image, target_w, target_h):
-    w, h = image.size
-    if w / target_w < h / target_h: w_new, h_new = target_w, int(h * target_w / w)
-    else: w_new, h_new = int(w * target_h / h), target_h
-    return image.resize((w_new, h_new), Image.Resampling.BICUBIC).crop(((w_new - target_w) // 2, (h_new - target_h) // 2, (w_new + target_w) // 2, (h_new + target_h) // 2))
+        # 1. Calculate the ideal scale to match the target pixel area
+        scale = math.sqrt(self.target_area / current_area)
+        
+        # 2. Determine the "ideal" floating-point dimensions
+        scaled_w = width * scale
+        scaled_h = height * scale
+        
+        # 3. Snap the ideal dimensions to the nearest grid multiple (e.g., 64px)
+        # This creates a bucket that is mathematically the closest possible to the target area
+        # while respecting the original aspect ratio and the grid constraint.
+        target_w = int(round(scaled_w / self.stride) * self.stride)
+        target_h = int(round(scaled_h / self.stride) * self.stride)
+        
+        return max(target_w, self.stride), max(target_h, self.stride)
+
+def smart_resize(image, target_w, target_h):
+    # This function uses a single-pass resampling method with a float-precision crop box
+    # to achieve the highest quality downscaling with zero aspect ratio distortion.
+    
+    src_w, src_h = image.size
+    
+    # 1. Calculate aspect ratios to determine crop direction
+    target_aspect = target_w / target_h
+    src_aspect = src_w / src_h
+    
+    # 2. Determine the precise crop box on the SOURCE image in float coordinates.
+    # This prevents any intermediate resizing or rounding errors.
+    if src_aspect > target_aspect:
+        # Source is wider than target -> Crop width, keep full height
+        crop_w = src_h * target_aspect
+        crop_h = src_h
+        x_offset = (src_w - crop_w) / 2.0
+        y_offset = 0.0
+    else:
+        # Source is taller than target -> Crop height, keep full width
+        crop_w = src_w
+        crop_h = src_w / target_aspect
+        x_offset = 0.0
+        y_offset = (src_h - crop_h) / 2.0
+        
+    # 3. Define the box (left, top, right, bottom)
+    box = (x_offset, y_offset, x_offset + crop_w, y_offset + crop_h)
+    
+    # 4. Resize in ONE operation.
+    # The `box` argument tells Pillow to take pixels from this precise region of the
+    # source image and map them to the new `(target_w, target_h)` dimensions.
+    # LANCZOS is the sharpest, highest-quality filter for downscaling.
+    return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS, box=box)
 
 def validate_and_assign_resolution(args):
     ip, calculator = args
@@ -474,6 +497,14 @@ def check_if_caching_needed(config):
     
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     
+    # Check for Null Embeddings if Dropout is ON
+    if getattr(config, "UNCONDITIONAL_DROPOUT", False):
+         if config.INSTANCE_DATASETS:
+             ds0 = config.INSTANCE_DATASETS[0]
+             if not (Path(ds0["path"]) / cache_folder_name / "null_embeds.pt").exists():
+                 print("INFO: Null embeddings for unconditional dropout missing. Caching needed.")
+                 needs_caching = True
+
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
         if not root.exists():
@@ -498,32 +529,78 @@ def check_if_caching_needed(config):
             
     return needs_caching
 
-def load_vae_only(config, device):
-    vae_path = config.VAE_PATH
-    if not vae_path or not Path(vae_path).exists(): 
-        return None
-    
-    print(f"INFO: Loading dedicated VAE from: {vae_path}")
-    
-    vae = AutoencoderKL.from_single_file(vae_path, torch_dtype=torch.float32)
-    
-    if config.is_rectified_flow:
-        vae.config.shift_factor = 0.1726
-        vae.config.scaling_factor = 0.1280
-        print(f"INFO: [RF MODE] VAE configured with EQB7 parameters:")
-        print(f"      - Shift Factor: {vae.config.shift_factor}")
-        print(f"      - Scale Factor: {vae.config.scaling_factor}")
-    else:
-        vae.config.shift_factor = None
-        vae.config.scaling_factor = 0.13025
-        print(f"INFO: [STANDARD MODE] VAE configured with SDXL parameters:")
-        print(f"      - Scale Factor: {vae.config.scaling_factor}")
-    
-    vae.enable_tiling()
-    vae.enable_slicing()
-    
-    vae = vae.to(device)
-    return vae
+def load_unet_robust(path, compute_dtype):
+    print(f"INFO: Loading UNet from: {Path(path).name}")
+    try:
+        # 1. Try loading as Standard SDXL (4 channels)
+        unet = UNet2DConditionModel.from_single_file(
+            path,
+            torch_dtype=compute_dtype,
+            low_cpu_mem_usage=True
+        )
+        print("INFO: Loaded Standard SDXL UNet (4 input/output channels).")
+        
+    except Exception as e:
+        # 2. Check for the 32-channel mismatch error (Input OR Output)
+        err_str = str(e)
+        
+        # We check for both "conv_in" (Input) and "conv_out" (Output) errors
+        is_channel_error = ("conv_in.weight" in err_str and "32" in err_str) or \
+                           ("conv_out.weight" in err_str and "32" in err_str)
+                           
+        if is_channel_error:
+            print("INFO: Detected Flux/NoobAI UNet (32 channels). Switching config...")
+            try:
+                # Force the UNet to use 32 channels for BOTH Input and Output
+                unet = UNet2DConditionModel.from_single_file(
+                    path,
+                    torch_dtype=compute_dtype,
+                    low_cpu_mem_usage=True,
+                    in_channels=32,   # Fixes conv_in mismatch
+                    out_channels=32,  # Fixes conv_out mismatch
+                    ignore_mismatched_sizes=True
+                )
+                print("INFO: Successfully loaded 32-channel UNet (in=32, out=32).")
+            except Exception as e2:
+                print(f"CRITICAL ERROR: Failed to load 32-channel UNet: {e2}")
+                raise e2
+        else:
+            # If it's a real error (corruption, etc), raise it
+            raise e
+            
+    return unet
+
+def load_vae_robust(path, device):
+    """
+    Safely loads a VAE, auto-detecting if it is a 32-channel (Flux/Reflow) variant.
+    """
+    print(f"INFO: Attempting to load VAE from: {path}")
+    try:
+        # 1. Try loading as a standard SDXL VAE first
+        vae = AutoencoderKL.from_single_file(path, torch_dtype=torch.float32)
+        print("INFO: Loaded standard SDXL VAE (4 channels).")
+        
+    except Exception as e:
+        # 2. Check for the specific shape mismatch error
+        err_str = str(e)
+        if "conv_out.weight" in err_str and "but got torch.Size([64" in err_str:
+            print("INFO: Detected Flux/SDXL-Modified VAE (32 channels). Switching configuration...")
+            try:
+                # Force 32 channels and ignore size mismatches
+                vae = AutoencoderKL.from_single_file(
+                    path, 
+                    torch_dtype=torch.float32,
+                    latent_channels=32,
+                    ignore_mismatched_sizes=True
+                )
+                print("INFO: Successfully loaded 32-channel VAE.")
+            except Exception as e2:
+                print(f"CRITICAL ERROR: Failed to load VAE with 32-channel config: {e2}")
+                raise e2
+        else:
+            raise e
+            
+    return vae.to(device)
 
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     if not check_if_caching_needed(config):
@@ -532,11 +609,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         print("="*60 + "\n")
         return
     
+    # Determine cache folder name
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     
     print("\n" + "="*60)
-    print(f"STARTING HIGH-FIDELITY (FP32) CACHING FOR: {config.TRAINING_MODE}")
+    print(f"STARTING VRAM-OPTIMIZED CACHING FOR: {config.TRAINING_MODE}")
     print(f"Using cache folder: {cache_folder_name}")
+    print(f"VAE Channels: {vae.config.latent_channels}")
     print("="*60 + "\n")
     
     calc = ResolutionCalculator(
@@ -546,22 +625,20 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     )
     
     vae.to(device, dtype=torch.float32)
-    
-    if config.is_rectified_flow:
-        assert abs(vae.config.shift_factor - 0.1726) < 1e-6, \
-            f"VAE shift_factor mismatch! Expected 0.1726, got {vae.config.shift_factor}"
-        assert abs(vae.config.scaling_factor - 0.1280) < 1e-6, \
-            f"VAE scaling_factor mismatch! Expected 0.1280, got {vae.config.scaling_factor}"
-    else:
-        expected_scale = 0.13025
-        assert abs(vae.config.scaling_factor - expected_scale) < 1e-6, \
-            f"VAE scaling_factor mismatch! Expected {expected_scale}, got {vae.config.scaling_factor}"
-    
     vae.enable_tiling()
     vae.enable_slicing()
     
     te1.to(device)
     te2.to(device)
+    
+    # --- Compute Null Embeddings for Unconditional Dropout ---
+    print("INFO: Computing Null Embeddings for Unconditional Dropout...")
+    with torch.no_grad():
+        null_embeds, null_pooled = compute_chunked_text_embeddings([""], t1, t2, te1, te2, device)
+    
+    null_embeds = null_embeds.cpu()
+    null_pooled = null_pooled.cpu()
+    # ---------------------------------------------------------
     
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -572,6 +649,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         root = Path(dataset["path"])
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
+        
+        # Save Null Embeddings to every dataset cache folder to be safe/accessible
+        torch.save({"embeds": null_embeds, "pooled": null_pooled}, cache_dir / "null_embeds.pt")
         
         paths = [
             p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
@@ -585,6 +665,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 os.sep, '_'
             ).replace('/', '_').replace('\\', '_')
             
+            # Check if headers exist
             if not (cache_dir / f"{safe_stem}_te.pt").exists():
                 to_process.append(p)
 
@@ -617,7 +698,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         random.shuffle(batches)
         
         for batch_idx, ((w, h), batch_meta) in enumerate(
-            tqdm(batches, desc=f"Encoding {root.name} (FP32)")
+            tqdm(batches, desc=f"Encoding {root.name}")
         ):
             captions = [m['caption'] for m in batch_meta]
             
@@ -628,25 +709,15 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             pooled = pooled.to(dtype=torch.float32)
             
             images_global = []
-            images_full = []
             valid_meta_final = []
             
             for m in batch_meta:
                 try:
                     with Image.open(m['ip']) as img:
                         img = fix_alpha_channel(img)
-                        
-                        img_resized = resize_to_fit(img, w, h)
+                        # Resize to the calculated bucket resolution
+                        img_resized = smart_resize(img, w, h)
                         images_global.append(transform(img_resized))
-                        
-                        raw_w, raw_h = img.size
-                        should_cache_full = (raw_w > w + 64) or (raw_h > h + 64)
-                        
-                        if should_cache_full:
-                            images_full.append(transform(img))
-                        else:
-                            images_full.append(None)
-                            
                         valid_meta_final.append(m)
                 except Exception as e:
                     print(f"Skipping {m['ip']}: {e}")
@@ -657,18 +728,16 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             pixel_values_global = torch.stack(images_global).to(device, dtype=torch.float32)
             
             with torch.no_grad():
+                # Encode Logic
                 dist = vae.encode(pixel_values_global).latent_dist
                 latents_global = dist.sample() * vae.config.scaling_factor
                 
-                latents_full_list = []
-                for img_t in images_full:
-                    if img_t is not None:
-                        img_t = img_t.unsqueeze(0).to(device, dtype=torch.float32)
-                        dist_full = vae.encode(img_t).latent_dist
-                        lat_full = dist_full.sample() * vae.config.scaling_factor
-                        latents_full_list.append(lat_full.squeeze(0).cpu())
-                    else:
-                        latents_full_list.append(None)
+                # --- AUTO DETECT CHANNELS FOR LOGGING ---
+                # We don't need to manually pack because the VAE weights loaded as 32 channels.
+                # It will naturally output [B, 32, H, W]
+                if batch_idx == 0:
+                    print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
+                # ----------------------------------------
                 
             latents_global = latents_global.cpu()
             
@@ -680,10 +749,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 
                 path_te = cache_dir / f"{safe_filename}_te.pt"
                 path_lat = cache_dir / f"{safe_filename}_lat.pt"
-                path_full = cache_dir / f"{safe_filename}_full.pt"
                 
-                has_full = latents_full_list[j] is not None
-                
+                # Save metadata
                 torch.save({
                     "original_stem": m['ip'].stem,
                     "relative_path": str(relative_path),
@@ -693,19 +760,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     "pooled": pooled[j].cpu(),
                     "vae_shift": vae.config.shift_factor,
                     "vae_scale": vae.config.scaling_factor,
-                    "has_full_res": has_full
+                    "has_full_res": False
                 }, path_te)
                 
+                # Save latents (32ch or 4ch, whatever the VAE output)
                 torch.save(latents_global[j], path_lat)
-                
-                if has_full:
-                    torch.save(latents_full_list[j], path_full)
             
             del pixel_values_global, latents_global, embeds, pooled
             if batch_idx % 20 == 0:
                 torch.cuda.empty_cache()
 
-    print("\nINFO: Caching Complete (Split Files). Cleaning up...")
+    print("\nINFO: Caching Complete. Cleaning up...")
     te1.cpu()
     te2.cpu()
     gc.collect()
@@ -715,13 +780,11 @@ class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.te_files = []
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
-        self.enable_chunking = getattr(config, "VRAM_CHUNK_ENABLED", True)
-        self.max_latent_dim = int(getattr(config, "VRAM_CHUNK_SIZE", 96))
-        self.chunk_chance = float(getattr(config, "VRAM_CHUNK_CHANCE", 1.0))
+        
         self.dataset_roots = {} 
         self.is_rectified_flow = config.is_rectified_flow
-        self.worker_rng = None
         self.seed = config.SEED if config.SEED else 42
+        self.worker_rng = None
         
         cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
 
@@ -756,10 +819,46 @@ class ImageTextLatentDataset(Dataset):
             except Exception as e:
                 print(f"Error reading cache header for {f}: {e}")
                 self.bucket_keys.append(None)
+        
+        # --- Unconditional Dropout Setup ---
+        self.dropout_prob = getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) if getattr(config, "UNCONDITIONAL_DROPOUT", False) else 0.0
+        self.null_embeds = None
+        self.null_pooled = None
+        
+        if self.dropout_prob > 0:
+            found_null = False
+            # Try to load null embeds from any valid dataset cache
+            for ds in config.INSTANCE_DATASETS:
+                root = Path(ds["path"])
+                cache_dir = root / cache_folder_name
+                null_path = cache_dir / "null_embeds.pt"
+                if null_path.exists():
+                    try:
+                        null_data = torch.load(null_path, map_location="cpu")
+                        
+                        # FIX: Ensure we remove the batch dimension [1, ...] -> [...]
+                        # Cached files typically store [1, Seq, Dim] for embeds and [1, Dim] for pooled
+                        # from the compute_chunked_text_embeddings function.
+                        self.null_embeds = null_data["embeds"]
+                        if self.null_embeds.dim() == 3:
+                            self.null_embeds = self.null_embeds.squeeze(0)
+                            
+                        self.null_pooled = null_data["pooled"]
+                        if self.null_pooled.dim() == 2:
+                            self.null_pooled = self.null_pooled.squeeze(0)
+                            
+                        found_null = True
+                        print(f"INFO: Loaded null embeddings for unconditional dropout (Chance: {self.dropout_prob})")
+                        break
+                    except Exception as e:
+                        print(f"WARNING: Failed to load null embeddings: {e}")
+            
+            if not found_null:
+                print("WARNING: Unconditional Dropout enabled but null_embeds.pt not found in cache. Disabling dropout.")
+                self.dropout_prob = 0.0
+        # -----------------------------------
                 
         print(f"INFO: Dataset initialized with {len(self.te_files)} samples.")
-        if self.enable_chunking:
-            print(f"INFO: Spatial Chunking Enabled. Max Latent Dim: {self.max_latent_dim}, Chance: {self.chunk_chance}")
         if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED.")
 
     def __len__(self): return len(self.te_files)
@@ -783,77 +882,26 @@ class ImageTextLatentDataset(Dataset):
             cached_scale = data_te.get("vae_scale", 0.0)
             
             if self.is_rectified_flow:
-                if abs(cached_shift - 0.1726) > 1e-4 or abs(cached_scale - 0.1280) > 1e-4:
-                     print(f"WARNING: Skipping {path_te}: VAE param mismatch for Rectified Flow.")
+                if abs(cached_shift - 0.0760) > 1e-4 or abs(cached_scale - 0.6043) > 1e-4:
+                     print(f"WARNING: Skipping {path_te}: Scale mismatch! Cache={cached_scale:.4f} vs Expected=0.6043")
                      return None
             else:
                 if abs(cached_scale - 0.13025) > 1e-4:
                      print(f"WARNING: Skipping {path_te}: VAE param mismatch for Standard SDXL.")
                      return None
             
-            should_chunk = (
-                self.enable_chunking and 
-                self.worker_rng.random() < self.chunk_chance
-            )
-            
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
             
-            latents_to_use = None
-            latents_full = None
+            # Load the pre-bucketed latent
+            latents = torch.load(path_lat, map_location="cpu")
             
-            if should_chunk and data_te.get("has_full_res", False):
-                path_full = Path(path_str.replace("_te.pt", "_full.pt"))
-                if path_full.exists():
-                    latents_full = torch.load(path_full, map_location="cpu")
-            
-            if latents_full is None:
-                latents_to_use = torch.load(path_lat, map_location="cpu")
-            else:
-                latents_to_use = latents_full
-                
-            if (torch.isnan(latents_to_use).any() or torch.isinf(latents_to_use).any()): return None
+            if (torch.isnan(latents).any() or torch.isinf(latents).any()): return None
 
-            final_latents = None
+            final_latents = latents
             crop_coords = (0, 0)
             target_size_px = data_te["target_size"] 
             
-            if should_chunk and latents_full is not None:
-                h_full = latents_to_use.shape[1]
-                w_full = latents_to_use.shape[2]
-                
-                new_h = min(h_full, self.max_latent_dim)
-                new_w = min(w_full, self.max_latent_dim)
-                
-                top_max = h_full - new_h
-                left_max = w_full - new_w
-                
-                crop_top = self.worker_rng.randint(0, top_max) if top_max > 0 else 0
-                crop_left = self.worker_rng.randint(0, left_max) if left_max > 0 else 0
-                
-                final_latents = latents_to_use[:, crop_top:crop_top+new_h, crop_left:crop_left+new_w]
-                
-                crop_coords = (crop_top * 8, crop_left * 8)
-                target_size_px = (new_w * 8, new_h * 8)
-            else:
-                final_latents = latents_to_use
-                crop_coords = (0, 0)
-                
-                if should_chunk and latents_full is None:
-                     h = final_latents.shape[1]
-                     w = final_latents.shape[2]
-                     if h > self.max_latent_dim or w > self.max_latent_dim:
-                        new_h = min(h, self.max_latent_dim)
-                        new_w = min(w, self.max_latent_dim)
-                        top_max = h - new_h
-                        left_max = w - new_w
-                        crop_top = self.worker_rng.randint(0, top_max) if top_max > 0 else 0
-                        crop_left = self.worker_rng.randint(0, left_max) if left_max > 0 else 0
-                        
-                        final_latents = final_latents[:, crop_top:crop_top+new_h, crop_left:crop_left+new_w]
-                        crop_coords = (crop_top * 8, crop_left * 8)
-                        target_size_px = (new_w * 8, new_h * 8)
-
             item_data = {
                 "latents": final_latents, 
                 "embeds": data_te["embeds"], 
@@ -863,6 +911,12 @@ class ImageTextLatentDataset(Dataset):
                 "crop_coords": crop_coords,
                 "latent_path": str(path_te)
             }
+            
+            # --- Apply Unconditional Dropout ---
+            if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
+                item_data["embeds"] = self.null_embeds
+                item_data["pooled"] = self.null_pooled
+            # -----------------------------------
 
             if self.use_semantic_loss:
                 root = self.dataset_roots.get(str(path_te))
@@ -874,30 +928,10 @@ class ImageTextLatentDataset(Dataset):
                         try:
                             with Image.open(original_image_path) as raw_img: 
                                 raw_img = fix_alpha_channel(raw_img)
-                                
-                                w_px_final = target_size_px[0]
-                                h_px_final = target_size_px[1]
-                                crop_t_px, crop_l_px = crop_coords
-                                
-                                if latents_full is not None and should_chunk:
-                                    cropped_semantic_img = raw_img.crop((
-                                        crop_l_px, 
-                                        crop_t_px, 
-                                        crop_l_px + w_px_final, 
-                                        crop_t_px + h_px_final
-                                    ))
-                                    item_data["original_image"] = cropped_semantic_img.resize((w_px_final, h_px_final))
-                                else:
-                                    w_global = latents_to_use.shape[2] * 8
-                                    h_global = latents_to_use.shape[1] * 8
-                                    bucket_img = resize_to_fit(raw_img, w_global, h_global)
-                                    cropped_semantic_img = bucket_img.crop((
-                                        crop_l_px, 
-                                        crop_t_px, 
-                                        crop_l_px + w_px_final, 
-                                        crop_t_px + h_px_final
-                                    ))
-                                    item_data["original_image"] = cropped_semantic_img
+                                w_global = latents.shape[2] * 8
+                                h_global = latents.shape[1] * 8
+                                bucket_img = smart_resize(raw_img, w_global, h_global)
+                                item_data["original_image"] = bucket_img
                         except Exception as e:
                             print(f"Error processing semantic image {original_image_path}: {e}")
                             item_data["original_image"] = None
@@ -1365,25 +1399,47 @@ def main():
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
         
+        # 1. Determine where we are getting the VAE from
+        # If the user provided a separate VAE, use it. Otherwise, use the base model checkpoint.
+        vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
+        
+        # 2. Load the VAE separately first (prevents the Pipeline crash)
+        vae_for_caching = load_vae_robust(vae_source, device)
+
+        # 3. Apply necessary scaling configurations
+        if config.is_rectified_flow:
+            # --- UPDATE THESE VALUES ---
+            # Old (EQB7/SD3):
+            # vae_for_caching.config.shift_factor = 0.1726
+            # vae_for_caching.config.scaling_factor = 0.1280
+            
+            # New (NoobAI/Flux2 Specific):
+            vae_for_caching.config.shift_factor = 0.0760
+            vae_for_caching.config.scaling_factor = 0.6043
+            # ---------------------------
+            
+            print(f"INFO: [RF MODE] VAE configured with NoobAI parameters:")
+            print(f"      - Shift Factor: {vae_for_caching.config.shift_factor}")
+            print(f"      - Scale Factor: {vae_for_caching.config.scaling_factor}")
+        else:
+            vae_for_caching.config.shift_factor = None
+            vae_for_caching.config.scaling_factor = 0.13025
+        
+        vae_for_caching.enable_tiling()
+        vae_for_caching.enable_slicing()
+
+        # 4. Load the Pipeline for Text Encoders, INJECTING our pre-loaded VAE
+        # passing vae=vae_for_caching stops Diffusers from trying to load the VAE from the file 
+        # using the wrong config, which fixes the crash.
         base_pipe = StableDiffusionXLPipeline.from_single_file(
             config.SINGLE_FILE_CHECKPOINT_PATH,
-            torch_dtype=torch.float32,
+            vae=vae_for_caching, 
             unet=None, 
+            torch_dtype=torch.float32,
             low_cpu_mem_usage=True
         )
         
-        vae_for_caching = load_vae_only(config, device)
-        if vae_for_caching is None:
-            vae_for_caching = base_pipe.vae
-            if config.is_rectified_flow:
-                vae_for_caching.config.shift_factor = 0.1726
-                vae_for_caching.config.scaling_factor = 0.1280
-            else:
-                vae_for_caching.config.scaling_factor = 0.13025
-            
-            print("INFO: Using pipeline VAE with mode-specific configuration")
-            vae_for_caching = vae_for_caching.to(device)
-        
+        # 5. Proceed with caching
         precompute_and_cache_latents(
             config,
             base_pipe.tokenizer,
@@ -1401,14 +1457,7 @@ def main():
     print(f"\n--- Loading Model ---")
     print(f"INFO: Loading UNet for training from: {model_to_load.name}")
     
-    # Removed incorrect base model loading
-    # base_model_state_dict = load_file(model_to_load, device="cpu") 
-    
-    unet = UNet2DConditionModel.from_single_file(
-        model_to_load,
-        torch_dtype=config.compute_dtype,
-        low_cpu_mem_usage=True
-    )
+    unet = load_unet_robust(model_to_load, config.compute_dtype)
     
     gc.collect()
     torch.cuda.empty_cache()
@@ -1500,11 +1549,9 @@ def main():
     scheduler = None
     if config.is_rectified_flow:
         print(f"\n--- Using Loss: Rectified Flow (Velocity Matching) ---")
-        print(f"--- VAE: EQB7 (Shift: 0.1726, Scale: 0.1280) ---\n")
     else:
         prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
         print(f"\n--- Using Loss: Standard SDXL ({prediction_type}) ---")
-        print(f"--- VAE: Standard SDXL (Scale: 0.13025) ---\n")
         
         scheduler = DDPMScheduler.from_pretrained(
             "stabilityai/stable-diffusion-xl-base-1.0", 
