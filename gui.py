@@ -2113,7 +2113,7 @@ class TrainingGUI(QtWidgets.QWidget):
         mode_group = QtWidgets.QGroupBox("Training Mode")
         mode_layout = QtWidgets.QHBoxLayout(mode_group)
         self.training_mode_combo = NoScrollComboBox()
-        self.training_mode_combo.addItems(["Standard (SDXL)", "Rectified Flow (Experimental, For the Noobai rect flow conversion only!)"])
+        self.training_mode_combo.addItems(["Standard (SDXL)", "Rectified Flow (Noob rf conversion only!)"])
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
         mode_layout.addWidget(self.training_mode_combo)
         col1_layout.addWidget(mode_group)

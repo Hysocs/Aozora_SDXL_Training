@@ -46,7 +46,7 @@
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
-    "TRAINING_MODE": "Rectified Flow (Experimental)",
+    "TRAINING_MODE": "Rectified Flow (Experimental, For the Noobai rect flow conversion only!)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
