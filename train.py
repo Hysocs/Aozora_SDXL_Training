@@ -124,7 +124,7 @@ class TrainingConfig:
         self._load_from_user_config()
         self._type_check_and_correct()
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
-        self.is_rectified_flow = getattr(self, "TRAINING_MODE", "Standard (SDXL)") == "Rectified Flow (Noob rf conversion only!)"
+        self.is_rectified_flow = getattr(self, "TRAINING_MODE", "Standard (SDXL)") == "Rectified Flow (NoobAI Variant)"
 
     def _load_from_user_config(self):
         parser = argparse.ArgumentParser(description="Load a specific training configuration.")
