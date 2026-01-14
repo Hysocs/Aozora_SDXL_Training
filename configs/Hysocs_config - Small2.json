@@ -6,7 +6,7 @@
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "UNCONDITIONAL_DROPOUT": false,
+    "UNCONDITIONAL_DROPOUT": true,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.03,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
@@ -14,26 +14,26 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "2000",
+    "MAX_TRAIN_STEPS": "1500",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "6",
+    "GRADIENT_ACCUMULATION_STEPS": "5",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "50.0",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "1001",
-    "UNET_EXCLUDE_TARGETS": "down_blocks.2.attentions.*.ff.*,down_blocks.2.attentions.*.attn1.*,up_blocks.2.attentions.*.attn1.*",
+    "SAVE_EVERY_N_STEPS": "4004",
+    "UNET_EXCLUDE_TARGETS": "down_blocks.0.attentions.*,\ndown_blocks.1.attentions.*,\nmid_block.resnets.*,\nmid_block.attentions.*.attn1.*,down_blocks.0.resnets.*,\ndown_blocks.1.resnets.*,\ndown_blocks.2.resnets.*,\ndown_blocks.2.attentions.*.attn1.*,\ndown_blocks.3.resnets.*,",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
             1e-07
         ],
         [
-            0.05,
-            3e-05
+            0.05057471,
+            5e-05
         ],
         [
-            0.94942529,
-            3e-05
+            0.95172414,
+            5e-05
         ],
         [
             1.0,
@@ -41,7 +41,7 @@
         ]
     ],
     "LR_GRAPH_MIN": "1e-07",
-    "LR_GRAPH_MAX": "3e-05",
+    "LR_GRAPH_MAX": "5e-05",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -50,7 +50,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/CG/Houshi Bukatsu Nyuubu Taiken Hen ~Seiyoku ga Karamiau Bukatsu Time~ Nijigenme (decensored) - light tags",
+            "path": "C:/Users/Administrator/Pictures\\CG\\Hiyake Ato",
             "repeats": 1
         }
     ],
@@ -63,31 +63,31 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            39,
-            46,
-            54,
-            62,
-            70,
-            78,
-            85,
-            92,
-            98,
-            104,
-            107,
-            110,
-            110,
-            110,
-            107,
-            104,
-            98,
-            92,
-            85,
-            78,
-            70,
-            62,
-            54,
-            46,
-            39
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60,
+            60
         ]
     },
     "RAVEN_PARAMS": {
@@ -96,7 +96,7 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
+        "weight_decay": 0.005,
         "debias_strength": 1.0,
         "use_grad_centralization": false,
         "gc_alpha": 1.0

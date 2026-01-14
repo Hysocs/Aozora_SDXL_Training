@@ -440,58 +440,56 @@ def validate_and_assign_resolution(args):
         print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
         return None
 
-def compute_chunked_text_embeddings(captions, t1, t2, te1, te2, device):
+def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
+    """
+    Standard SDXL text embedding computation.
+    Returns properly sized embeddings for SDXL UNet.
+    """
     prompt_embeds_list = []
-    pooled_prompt_embeds_list = [] 
-    max_len = t1.model_max_length 
+    pooled_prompt_embeds_list = []
+    
     for caption in captions:
         with torch.no_grad():
-            tokens_1 = t1(caption, return_tensors="pt", truncation=False).input_ids.to(device)
-            tokens_2 = t2(caption, return_tensors="pt", truncation=False).input_ids.to(device)
-            ids1 = tokens_1[0]
-            ids2 = tokens_2[0]
-            if len(ids1) > 2:
-                ids1 = ids1[1:-1]
-                ids2 = ids2[1:-1]
-            chunk_size = max_len - 2 
-            total_len = len(ids1)
-            num_chunks = (total_len + chunk_size - 1) // chunk_size
-            if num_chunks == 0: num_chunks = 1
-            hidden_states_list = []
-            for i in range(num_chunks):
-                start = i * chunk_size
-                end = min((i + 1) * chunk_size, total_len)
-                chunk_ids1 = ids1[start:end]
-                chunk_ids2 = ids2[start:end]
-                bos = torch.tensor([t1.bos_token_id], device=device)
-                eos = torch.tensor([t1.eos_token_id], device=device)
-                chunk_ids1 = torch.cat([bos, chunk_ids1, eos], dim=0).unsqueeze(0)
-                chunk_ids2 = torch.cat([bos, chunk_ids2, eos], dim=0).unsqueeze(0)
-                pad_len = max_len - chunk_ids1.shape[1]
-                if pad_len > 0:
-                    pad_token = t1.pad_token_id
-                    padding = torch.tensor([pad_token] * pad_len, device=device).unsqueeze(0)
-                    chunk_ids1 = torch.cat([chunk_ids1, padding], dim=1)
-                    chunk_ids2 = torch.cat([chunk_ids2, padding], dim=1)
-                out1 = te1(chunk_ids1, output_hidden_states=True)
-                out2 = te2(chunk_ids2, output_hidden_states=True)
-                h1 = out1.hidden_states[-2]
-                h2 = out2.hidden_states[-2]
-                chunk_embed = torch.cat((h1, h2), dim=-1)
-                hidden_states_list.append(chunk_embed)
-                if i == 0: pooled_prompt_embeds_list.append(out2[0])
-            final_prompt_embed = torch.cat(hidden_states_list, dim=1)
-            prompt_embeds_list.append(final_prompt_embed)
-    max_seq_len = max([pe.shape[1] for pe in prompt_embeds_list])
-    padded_embeds = []
-    for pe in prompt_embeds_list:
-        curr_len = pe.shape[1]
-        if curr_len < max_seq_len:
-            padding = torch.zeros((1, max_seq_len - curr_len, pe.shape[2]), device=device, dtype=pe.dtype)
-            pe = torch.cat([pe, padding], dim=1)
-        padded_embeds.append(pe)
-    return torch.cat(padded_embeds), torch.cat(pooled_prompt_embeds_list)
-
+            # Tokenize with proper truncation/padding to 77 tokens
+            tokens_1 = t1(
+                caption,
+                padding="max_length",
+                max_length=t1.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).input_ids.to(device)
+            
+            tokens_2 = t2(
+                caption,
+                padding="max_length",
+                max_length=t2.model_max_length,
+                truncation=True,
+                return_tensors="pt"
+            ).input_ids.to(device)
+            
+            # Get embeddings from text encoders
+            # Use penultimate layer for CLIP ViT-L
+            enc_1_output = te1(tokens_1, output_hidden_states=True)
+            prompt_embeds_1 = enc_1_output.hidden_states[-2]  # [1, 77, 768]
+            
+            # Use penultimate layer for OpenCLIP ViT-G  
+            enc_2_output = te2(tokens_2, output_hidden_states=True)
+            prompt_embeds_2 = enc_2_output.hidden_states[-2]  # [1, 77, 1280]
+            
+            # Concatenate along feature dimension
+            prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)  # [1, 77, 2048]
+            
+            # Pooled embeddings from second encoder (for time embeddings)
+            pooled_prompt_embeds = enc_2_output[0]  # [1, 1280]
+            
+            prompt_embeds_list.append(prompt_embeds)
+            pooled_prompt_embeds_list.append(pooled_prompt_embeds)
+    
+    # Stack batches
+    prompt_embeds = torch.cat(prompt_embeds_list, dim=0)  # [B, 77, 2048]
+    pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=0)  # [B, 1280]
+    
+    return prompt_embeds, pooled_prompt_embeds
 def check_if_caching_needed(config):
     needs_caching = False
     
@@ -634,7 +632,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     # --- Compute Null Embeddings for Unconditional Dropout ---
     print("INFO: Computing Null Embeddings for Unconditional Dropout...")
     with torch.no_grad():
-        null_embeds, null_pooled = compute_chunked_text_embeddings([""], t1, t2, te1, te2, device)
+        null_embeds, null_pooled = compute_text_embeddings_sdxl(
+    [""], t1, t2, te1, te2, device
+    )
     
     null_embeds = null_embeds.cpu()
     null_pooled = null_pooled.cpu()
@@ -702,7 +702,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         ):
             captions = [m['caption'] for m in batch_meta]
             
-            embeds, pooled = compute_chunked_text_embeddings(
+            embeds, pooled = compute_text_embeddings_sdxl(
                 captions, t1, t2, te1, te2, device
             )
             embeds = embeds.to(dtype=torch.float32)
@@ -730,13 +730,25 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             with torch.no_grad():
                 # Encode Logic
                 dist = vae.encode(pixel_values_global).latent_dist
-                latents_global = dist.sample() * vae.config.scaling_factor
+                latents_global = dist.mean
+                
+                # Apply Shift-Scale Normalization (Critical for Flux/NoobAI 32ch VAE)
+                if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
+                    # Flux/NoobAI style: shift then scale
+                    latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
+                else:
+                    # Standard SDXL: just scale
+                    latents_global = latents_global * vae.config.scaling_factor
                 
                 # --- AUTO DETECT CHANNELS FOR LOGGING ---
-                # We don't need to manually pack because the VAE weights loaded as 32 channels.
-                # It will naturally output [B, 32, H, W]
                 if batch_idx == 0:
                     print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
+                    print(f"DEBUG: Latent mean: {latents_global.mean().item():.4f}")
+                    print(f"DEBUG: Latent std: {latents_global.std().item():.4f}")
+
+                # Add this for every 10th batch
+                if batch_idx % 10 == 0:
+                    print(f"Batch {batch_idx}: mean={latents_global.mean().item():.4f}, std={latents_global.std().item():.4f}")
                 # ----------------------------------------
                 
             latents_global = latents_global.cpu()
@@ -883,12 +895,12 @@ class ImageTextLatentDataset(Dataset):
             
             if self.is_rectified_flow:
                 if abs(cached_shift - 0.0760) > 1e-4 or abs(cached_scale - 0.6043) > 1e-4:
-                     print(f"WARNING: Skipping {path_te}: Scale mismatch! Cache={cached_scale:.4f} vs Expected=0.6043")
-                     return None
+                    print(f"WARNING: Skipping {path_te}: Scale mismatch! Cache={cached_scale:.4f} vs Expected=0.6043")
+                    return None
             else:
                 if abs(cached_scale - 0.13025) > 1e-4:
-                     print(f"WARNING: Skipping {path_te}: VAE param mismatch for Standard SDXL.")
-                     return None
+                    print(f"WARNING: Skipping {path_te}: VAE param mismatch for Standard SDXL.")
+                    return None
             
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
@@ -896,26 +908,37 @@ class ImageTextLatentDataset(Dataset):
             # Load the pre-bucketed latent
             latents = torch.load(path_lat, map_location="cpu")
             
-            if (torch.isnan(latents).any() or torch.isinf(latents).any()): return None
+            if (torch.isnan(latents).any() or torch.isinf(latents).any()): 
+                return None
 
             final_latents = latents
             crop_coords = (0, 0)
-            target_size_px = data_te["target_size"] 
+            target_size_px = data_te["target_size"]
+            
+            # Load embeddings - they're already the correct shape [77, 2048]
+            embeds = data_te["embeds"]
+            pooled = data_te["pooled"]
+            
+            # Remove batch dimension if present (defensive check)
+            if embeds.dim() == 3 and embeds.shape[0] == 1:
+                embeds = embeds.squeeze(0)  # [1, 77, 2048] -> [77, 2048]
+            if pooled.dim() == 2 and pooled.shape[0] == 1:
+                pooled = pooled.squeeze(0)  # [1, 1280] -> [1280]
             
             item_data = {
-                "latents": final_latents, 
-                "embeds": data_te["embeds"], 
-                "pooled": data_te["pooled"], 
-                "original_sizes": data_te["original_size"], 
-                "target_sizes": target_size_px, 
+                "latents": final_latents,
+                "embeds": embeds,  # [77, 2048] - no padding needed
+                "pooled": pooled,  # [1280]
+                "original_sizes": data_te["original_size"],
+                "target_sizes": target_size_px,
                 "crop_coords": crop_coords,
                 "latent_path": str(path_te)
             }
             
             # --- Apply Unconditional Dropout ---
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
-                item_data["embeds"] = self.null_embeds
-                item_data["pooled"] = self.null_pooled
+                item_data["embeds"] = self.null_embeds  # Already [77, 2048]
+                item_data["pooled"] = self.null_pooled  # Already [1280]
             # -----------------------------------
 
             if self.use_semantic_loss:
@@ -941,10 +964,11 @@ class ImageTextLatentDataset(Dataset):
                     item_data["original_image"] = None
                     
             return item_data
+            
         except Exception as e:
             print(f"WARNING: Skipping {self.te_files[i]}: {e}")
             return None
-
+        
 class TimestepSampler:
     def __init__(self, config, device):
         self.config = config
@@ -1063,26 +1087,14 @@ def apply_flow_matching_shift(t, shift_factor):
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
     if not batch: return {}
+    
     output = {}
-    if "embeds" in batch[0]:
-        embeds_list = [item["embeds"] for item in batch]
-        if embeds_list[0].dim() == 3: embeds_list = [e.squeeze(0) for e in embeds_list]
-        max_len = max([e.shape[0] for e in embeds_list])
-        padded_embeds = []
-        for e in embeds_list:
-            curr_len = e.shape[0]
-            if curr_len < max_len:
-                padding = torch.zeros((max_len - curr_len, e.shape[1]), dtype=e.dtype)
-                e_padded = torch.cat([e, padding], dim=0)
-                padded_embeds.append(e_padded)
-            else: padded_embeds.append(e)
-        output["embeds"] = torch.stack(padded_embeds)
     for k in batch[0]:
-        if k == "embeds": continue
-        if isinstance(batch[0][k], torch.Tensor): 
+        if isinstance(batch[0][k], torch.Tensor):
             output[k] = torch.stack([item[k] for item in batch])
-        else: 
+        else:
             output[k] = [item[k] for item in batch]
+    
     return output
 
 def create_optimizer(config, params_to_optimize):
@@ -1285,10 +1297,9 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     # 2. Prepare the Trained UNet
     print("   -> Capturing trained UNet state...")
     unet_cpu_state = {
-        k: v.to("cpu", dtype=torch.float16) 
+        k: v.to("cpu", dtype=compute_dtype) # <--- Fix: Use the config dtype (bfloat16)
         for k, v in unet.state_dict().items()
     }
-    
     # 3. Convert Keys using the embedded logic
     print("   -> Converting Diffusers keys to SDXL keys...")
     sdxl_unet_state = convert_unet_keys_manually(unet_cpu_state)
@@ -1296,10 +1307,22 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     # 4. Patch the Base Checkpoint
     print("   -> Merging weights...")
     
-    final_tensors = base_tensors.copy()
+    final_tensors = {} # Create a new dict to ensure cleanliness
+    
+    # Process base tensors (VAE/CLIP)
+    for k, v in base_tensors.items():
+        # If the key is going to be replaced by our training, skip it for now
+        if k in sdxl_unet_state:
+            continue
+        # Otherwise, keep it, but ensure it matches the compute_dtype if you want a pure BF16 file
+        # Or leave it as is. Usually, leaving VAE/CLIP in FP16 is fine, 
+        # but fixing the UNet (above) is critical.
+        final_tensors[k] = v 
+
     update_count = 0
     
     for key, value in sdxl_unet_state.items():
+        # The value is already in compute_dtype (bf16) thanks to the fix above
         final_tensors[key] = value
         update_count += 1
 
