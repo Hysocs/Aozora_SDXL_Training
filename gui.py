@@ -25,7 +25,7 @@ except ImportError:
     class default_config:
         RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
         TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
-        OPTIMIZER_TYPE = "AdamW"
+        OPTIMIZER_TYPE = "Raven"
         # Default allocation for fallback
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
@@ -911,6 +911,22 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.max_steps = max_steps if max_steps > 0 else 1
         self.min_lr_bound = min_lr
         self.max_lr_bound = max_lr if max_lr > min_lr else min_lr + 1e-9
+        
+        # --- ADD THIS BLOCK ---
+        # Clamp existing points to new bounds and update if changed
+        points_changed = False
+        for p in self._points:
+            if p[1] > self.max_lr_bound:
+                p[1] = self.max_lr_bound
+                points_changed = True
+            elif p[1] < self.min_lr_bound:
+                p[1] = self.min_lr_bound
+                points_changed = True
+        
+        if points_changed:
+            self.pointsChanged.emit(self._points)
+        # ----------------------
+        
         self._update_visual_points()
         self.update()
     
@@ -1322,15 +1338,42 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             center = (num_bins - 1) / 2.0
             sigma = num_bins / 3.0
             weights = [math.exp(-((i - center)**2) / (2 * sigma**2)) for i in range(num_bins)]
-        # --- ADD THIS BLOCK ---
         elif name == "Peak Ends & Middle":
-            # 1.0 (Base) + 0.5 (Amplitude)
-            # Peaks at 1.5, Dips at 0.5. 
-            # This creates a gentle wave (3:1 ratio) rather than sharp spikes.
             denom = max(1, num_bins - 1)
             weights = [1.0 + 0.5 * math.cos(4 * math.pi * i / denom) for i in range(num_bins)]
-        # ----------------------
-        
+        elif name == "Logit-Normal (RF)":
+            mu = -0.2
+            sigma = 1.5
+            
+            def logit(p):
+                return math.log(p / (1.0 - p))
+            
+            def normal_cdf(x):
+                """Standard normal cumulative distribution function"""
+                return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+            
+            weights = []
+            for i in range(num_bins):
+                # Calculate bin boundaries in normalized [0, 1] space
+                t_start = i * self.bin_size
+                t_end = min((i + 1) * self.bin_size, 1000)
+                
+                # Normalize to [0,1] with epsilon protection at boundaries
+                eps = 1e-10
+                x_start = max(t_start / 1000.0, eps)
+                x_end = min(t_end / 1000.0, 1.0 - eps)
+                
+                # Logit-Normal CDF: F(x) = Phi((logit(x) - mu) / sigma)
+                prob_start = normal_cdf((logit(x_start) - mu) / sigma)
+                prob_end = normal_cdf((logit(x_end) - mu) / sigma)
+                
+                # Probability mass in this bin
+                prob = prob_end - prob_start
+                weights.append(max(prob, 0.0))
+            
+            if sum(weights) == 0:
+                weights = [1.0] * num_bins
+
         total_weight = sum(weights)
         if total_weight == 0: total_weight = 1
         raw_counts = [(w / total_weight) * self.max_tickets for w in weights]
@@ -1875,7 +1918,7 @@ class TrainingGUI(QtWidgets.QWidget):
         # Skip keys handled manually
         skip_keys = [
             "RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", 
-            "RAVEN_PARAMS", "TITAN_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
+            "RAVEN_PARAMS", "TITAN_PARAMS", "GRYPHON_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
             "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", 
             "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"
         ]
@@ -1936,7 +1979,6 @@ class TrainingGUI(QtWidgets.QWidget):
         titan_params["use_grad_centralization"] = self.widgets['TITAN_use_grad_centralization'].isChecked()
         titan_params["gc_alpha"] = self.widgets['TITAN_gc_alpha'].value()
         config_to_save["TITAN_PARAMS"] = titan_params
-            
         return config_to_save
 
     def save_config(self):
@@ -2272,8 +2314,8 @@ class TrainingGUI(QtWidgets.QWidget):
         
         self.widgets["OPTIMIZER_TYPE"] = NoScrollComboBox()
         # Clean naming with internal ID mapping
-        self.widgets["OPTIMIZER_TYPE"].addItem("Raven: Performance Priority (~12GB VRAM)", "raven")
-        self.widgets["OPTIMIZER_TYPE"].addItem("Titan: VRAM Priority (~6GB VRAM, Slower)", "titan")
+        self.widgets["OPTIMIZER_TYPE"].addItem("Raven: Balanced (~12GB VRAM)", "raven")
+        self.widgets["OPTIMIZER_TYPE"].addItem("Titan: VRAM Savings (~6GB VRAM, Slower)", "titan")
         
         self.widgets["OPTIMIZER_TYPE"].currentIndexChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
@@ -2299,7 +2341,6 @@ class TrainingGUI(QtWidgets.QWidget):
         return optimizer_group
     
     def _toggle_optimizer_widgets(self):
-        # Use currentData() to get "raven" or "titan" safely
         selected_id = self.widgets["OPTIMIZER_TYPE"].currentData()
         
         # Switch stack page
@@ -2438,7 +2479,8 @@ class TrainingGUI(QtWidgets.QWidget):
             "Bell Curve", 
             "Bias Early (Detail)", 
             "Bias Late (Structure)",
-            "Peak Ends & Middle" 
+            "Peak Ends & Middle",
+            "Logit-Normal (RF)"
         ])
         # ------------------------
         controls_layout.addWidget(ts_preset_combo, 1)
@@ -2560,7 +2602,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["TITAN_use_grad_centralization"].setChecked(t_params.get("use_grad_centralization", False))
             self.widgets["TITAN_gc_alpha"].setValue(t_params.get("gc_alpha", 1.0))
             self.widgets["TITAN_gc_alpha"].setEnabled(t_params.get("use_grad_centralization", False))
-            
             self._toggle_optimizer_widgets()
             
             # --- MANUAL TOGGLE UPDATES ---
@@ -2650,6 +2691,17 @@ class TrainingGUI(QtWidgets.QWidget):
         except (ValueError, KeyError): min_lr = 0.0
         try: max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
         except (ValueError, KeyError): max_lr = 1e-6
+        
+
+        if "LR_CUSTOM_CURVE" in self.current_config:
+            clamped_points = []
+            for p in self.current_config["LR_CUSTOM_CURVE"]:
+                # Clamp Y value between min and max bounds
+                clamped_y = max(min_lr, min(max_lr, p[1]))
+                clamped_points.append([p[0], clamped_y])
+            self.current_config["LR_CUSTOM_CURVE"] = clamped_points
+
+        
         self.lr_curve_widget.set_bounds(steps, min_lr, max_lr)
         self.lr_curve_widget.set_points(self.current_config.get("LR_CUSTOM_CURVE", []))
         self._update_epoch_markers_on_graph()

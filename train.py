@@ -33,6 +33,7 @@ import queue
 import tomesd
 from optimizer.raven import RavenAdamW
 from optimizer.titan import TitanAdamW
+from optimizer.velorms import VeloRMS
 import uuid
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -727,20 +728,34 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             
             pixel_values_global = torch.stack(images_global).to(device, dtype=torch.float32)
             
+
             with torch.no_grad():
                 # Encode Logic
                 dist = vae.encode(pixel_values_global).latent_dist
                 latents_global = dist.mean
+                # --- INSERT VERIFICATION HERE (BEFORE normalization) ---
+                if batch_idx == 0:
+                    print(f"\nDEBUG - RAW VAE OUTPUT (before normalization):")
+                    print(f"  Raw latent mean: {latents_global.mean().item():.4f}")
+                    print(f"  Raw latent std: {latents_global.std().item():.4f}")
+                # --- END BEFORE ---
                 
                 # Apply Shift-Scale Normalization (Critical for Flux/NoobAI 32ch VAE)
                 if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
-                    # Flux/NoobAI style: shift then scale
+                    # Use MULTIPLICATION (scale is already inverted: 1/std)
                     latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
                 else:
-                    # Standard SDXL: just scale
                     latents_global = latents_global * vae.config.scaling_factor
                 
-                # --- AUTO DETECT CHANNELS FOR LOGGING ---
+                # --- INSERT VERIFICATION HERE (AFTER normalization) ---
+                if batch_idx == 0:
+                    print(f"\nDEBUG - NORMALIZED LATENTS (after normalization):")
+                    print(f"  Normalized mean: {latents_global.mean().item():.4f} (target: ~0.0)")
+                    print(f"  Normalized std: {latents_global.std().item():.4f} (target: ~1.0)")
+                    print(f"  VAE shift_factor: {vae.config.shift_factor}")
+                    print(f"  VAE scaling_factor: {vae.config.scaling_factor}")
+                    print("-" * 60)
+                # --- END AFTER ---
                 if batch_idx == 0:
                     print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
                     print(f"DEBUG: Latent mean: {latents_global.mean().item():.4f}")
@@ -890,17 +905,31 @@ class ImageTextLatentDataset(Dataset):
             path_te = self.te_files[i]
             data_te = torch.load(path_te, map_location="cpu")
             
+            # --- FIXED VALIDATION LOGIC ---
             cached_shift = data_te.get("vae_shift", 0.0)
             cached_scale = data_te.get("vae_scale", 0.0)
             
-            if self.is_rectified_flow:
-                if abs(cached_shift - 0.0760) > 1e-4 or abs(cached_scale - 0.6043) > 1e-4:
-                    print(f"WARNING: Skipping {path_te}: Scale mismatch! Cache={cached_scale:.4f} vs Expected=0.6043")
-                    return None
-            else:
-                if abs(cached_scale - 0.13025) > 1e-4:
-                    print(f"WARNING: Skipping {path_te}: VAE param mismatch for Standard SDXL.")
-                    return None
+            if cached_shift is None: cached_shift = 0.0
+            
+            if cached_scale < 1e-6:
+                print(f"WARNING: Skipping {path_te}: Invalid cached scale factor (0.0).")
+                return None
+            
+            # 1. Check for Standard SDXL (4-Channel) Profile
+            # Standard SDXL uses scale ~0.13025 and shift usually 0.0
+            is_standard_sdxl = abs(cached_scale - 0.13025) < 1e-4
+
+            # 2. Check for Flux/NoobAI (32-Channel) Profile
+            # Flux/NoobAI uses scale ~0.6043 and shift ~0.0760
+            is_flux_32ch = (abs(cached_scale - 0.6043) < 1e-4) and (abs(cached_shift - 0.0760) < 1e-4)
+
+            # Accept if it matches EITHER valid profile
+            if not (is_standard_sdxl or is_flux_32ch):
+                # If you have custom VAEs that don't match these exact numbers, 
+                # you can comment out this return, but for standard/noobai workflows this protects against mixed caches.
+                print(f"WARNING: Skipping {path_te}: Unknown VAE constants! Scale={cached_scale:.5f}, Shift={cached_shift:.5f}")
+                return None
+            # ------------------------------
             
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
@@ -1080,8 +1109,17 @@ class TimestepSampler:
         pass
 
 def apply_flow_matching_shift(t, shift_factor):
+    """
+    Rectified Flow timestep shift.
+    Higher shift = more weight on later (denoising) timesteps.
+    """
     if shift_factor == 1.0:
         return t
+    
+    # Method 1: Power-based (commonly used in Flux/RF)
+    #return t ** (1.0 / shift_factor)
+    
+    # Method 2: Linear interpolation (SD3 style) - currently what you have
     return (shift_factor * t) / (1.0 + (shift_factor - 1.0) * t)
 
 def custom_collate_fn(batch):
@@ -1099,42 +1137,130 @@ def custom_collate_fn(batch):
 
 def create_optimizer(config, params_to_optimize):
     optimizer_type = config.OPTIMIZER_TYPE.lower()
-    
+
+    def print_lr_graph(curve_points, max_steps):
+        print("--- Custom Learning Rate Schedule ---")
+        if not curve_points:
+            print("No custom curve points provided.")
+            return
+
+        print("Step Percentage -> Learning Rate")
+        for point in curve_points:
+            print(f"{point[0]*100:5.1f}% -> {point[1]:.2e}")
+
+        graph_width = 50
+        graph_height = 10
+        graph = [[' ' for _ in range(graph_width)] for _ in range(graph_height)]
+        
+        min_lr = min(p[1] for p in curve_points)
+        max_lr = max(p[1] for p in curve_points)
+
+        def interpolate(x, x0, y0, x1, y1):
+            if x1 == x0:
+                return y0
+            return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
+
+        for i in range(graph_width):
+            step_percent = i / (graph_width -1)
+            
+            lr = 0
+            for j in range(len(curve_points) - 1):
+                if curve_points[j][0] <= step_percent <= curve_points[j+1][0]:
+                    lr = interpolate(step_percent, curve_points[j][0], curve_points[j][1], curve_points[j+1][0], curve_points[j+1][1])
+                    break
+            
+            if max_lr > min_lr:
+                y = int(((lr - min_lr) / (max_lr - min_lr)) * (graph_height - 1))
+                graph[graph_height - 1 - y][i] = '*'
+            else:
+                graph[graph_height -1][i] = '*'
+
+
+        print("\nLearning Rate Schedule:")
+        for i, row in enumerate(graph):
+            lr_label = max_lr - i * (max_lr-min_lr)/(graph_height-1) if graph_height > 1 and max_lr > min_lr else max_lr
+            print(f"{lr_label:.2e} |{''.join(row)}|")
+        print("       " + "-" * (graph_width+2))
+        print("       0%" + " " * (graph_width - 5) + "100%")
+        print("---")
+
+
     if optimizer_type == "titan":
         print("\n--- Initializing Titan Optimizer (Sync Offloading) ---")
         curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
-        if curve_points: initial_lr = max(point[1] for point in curve_points)
-        else: initial_lr = config.LEARNING_RATE 
-        
+        if curve_points:
+            initial_lr = max(point[1] for point in curve_points)
+            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
+        else:
+            initial_lr = config.LEARNING_RATE
+
         titan_params = getattr(config, 'TITAN_PARAMS', {})
         defaults = default_config.TITAN_PARAMS
         final_params = {**defaults, **titan_params}
 
         return TitanAdamW(
-            params_to_optimize, 
-            lr=initial_lr, 
-            betas=tuple(final_params.get('betas', [0.9, 0.999])), 
-            eps=final_params.get('eps', 1e-8), 
-            weight_decay=final_params.get('weight_decay', 0.01), 
-            debias_strength=final_params.get('debias_strength', 1.0), 
-            use_grad_centralization=final_params.get('use_grad_centralization', False), 
+            params_to_optimize,
+            lr=initial_lr,
+            betas=tuple(final_params.get('betas', [0.9, 0.999])),
+            eps=final_params.get('eps', 1e-8),
+            weight_decay=final_params.get('weight_decay', 0.01),
+            debias_strength=final_params.get('debias_strength', 1.0),
+            use_grad_centralization=final_params.get('use_grad_centralization', False),
             gc_alpha=final_params.get('gc_alpha', 1.0)
         )
 
     elif optimizer_type == "raven":
         print("\n--- Initializing Raven Optimizer ---")
         curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
-        if curve_points: initial_lr = max(point[1] for point in curve_points)
-        else: initial_lr = config.LEARNING_RATE 
+        if curve_points:
+            initial_lr = max(point[1] for point in curve_points)
+            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
+        else:
+            initial_lr = config.LEARNING_RATE
         raven_params = getattr(config, 'RAVEN_PARAMS', {})
-        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(raven_params.get('betas', [0.9, 0.999])), eps=raven_params.get('eps', 1e-8), weight_decay=raven_params.get('weight_decay', 0.01), debias_strength=raven_params.get('debias_strength', 1.0), use_grad_centralization=raven_params.get('use_grad_centralization', False), gc_alpha=raven_params.get('gc_alpha', 1.0))
+        defaults = getattr(default_config, 'RAVEN_PARAMS', {})
+        final_params = {**defaults, **raven_params}
+
+        return RavenAdamW(
+            params_to_optimize,
+            lr=initial_lr,
+            betas=tuple(final_params.get('betas', [0.9, 0.999])),
+            eps=final_params.get('eps', 1e-8),
+            weight_decay=final_params.get('weight_decay', 0.01),
+            debias_strength=final_params.get('debias_strength', 1.0),
+            use_grad_centralization=final_params.get('use_grad_centralization', False),
+            gc_alpha=final_params.get('gc_alpha', 1.0)
+        )
+
+    elif optimizer_type == "velorms":
+        print("\n--- Initializing VeloRMS Optimizer ---")
+        curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
+        if curve_points:
+            initial_lr = max(point[1] for point in curve_points)
+            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
+        else:
+            initial_lr = config.LEARNING_RATE
+        
+        # VeloRMS now uses its own specific parameters
+        velorms_params = getattr(config, 'VELORMS_PARAMS', {})
+        defaults = getattr(default_config, 'VELORMS_PARAMS', {})
+        final_params = {**defaults, **velorms_params}
+
+        # Assuming the VeloRMS class takes these parameters
+        return VeloRMS(
+            params_to_optimize, 
+            lr=initial_lr,
+            # Add any other VeloRMS specific arguments here from final_params
+            # For example:
+            # beta=final_params.get('beta', 0.9),
+            # eps=final_params.get('eps', 1e-8),
+        )
     
     else: 
         raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
-
 # ==============================================================================
-#  SDXL KEY CONVERSION LOGIC (Official Logic Embedded)
+#  OPTIMIZED SDXL KEY CONVERSION & SAVE LOGIC
 # ==============================================================================
 
 def _get_sdxl_unet_conversion_map():
@@ -1220,62 +1346,54 @@ def _get_sdxl_unet_conversion_map():
 
     return unet_conversion_map, unet_conversion_map_resnet, unet_conversion_map_layer
 
-def convert_unet_keys_manually(unet_state_dict):
+def get_unet_key_mapping(current_keys):
     """
-    Applies the SDXL mapping to the trained state dict.
-    Returns a new dictionary with Original keys.
+    Generates a dictionary mapping {HuggingFace_Key: SDXL_Key}.
+    Does NOT handle tensors, only strings.
     """
-    print("   -> Generating SDXL Key Map...")
     map_static, map_resnet, map_layer = _get_sdxl_unet_conversion_map()
     
     # 1. Initialize with current keys
-    mapping = {k: k for k in unet_state_dict.keys()}
+    mapping = {k: k for k in current_keys}
     
-    # 2. Apply static global mappings (Embeddings, etc)
+    # 2. Apply static global mappings
     for sd_name, hf_name in map_static:
         if hf_name in mapping:
             mapping[hf_name] = sd_name
             
     # 3. Apply Resnet internal mappings
-    # We iterate over the KEYS, replacing substrings. 
     for k, v in mapping.items():
         if "resnets" in k:
             for sd_part, hf_part in map_resnet:
                 v = v.replace(hf_part, sd_part)
             mapping[k] = v
             
-    # 4. Apply Block Layer mappings (The complex part)
-    # This matches the prefixes (down_blocks.1...) and swaps them
+    # 4. Apply Block Layer mappings
     for k, v in mapping.items():
         for sd_part, hf_part in map_layer:
-            # We use replace because it handles the tail (transformer_blocks...) automatically
             if hf_part in v:
                 v = v.replace(hf_part, sd_part)
         mapping[k] = v
         
-    # 5. Build final dict
-    new_state_dict = {}
+    # 5. Final Formatting (Add model.diffusion_model prefix)
+    final_mapping = {}
     for hf_name, sd_name in mapping.items():
-        # Ensure the prefix is correct for the final file
         if not sd_name.startswith("model.diffusion_model."):
             final_key = f"model.diffusion_model.{sd_name}"
         else:
             final_key = sd_name
+        final_mapping[hf_name] = final_key
         
-        new_state_dict[final_key] = unet_state_dict[hf_name]
-        
-    return new_state_dict
-
-# ==============================================================================
-#  SAVE FUNCTION
-# ==============================================================================
+    return final_mapping
 
 def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     """
-    Saves the model by:
-    1. Loading the BASE checkpoint (getting VAE/CLIP for free).
-    2. converting the TRAINED UNet to SDXL keys manually.
-    3. Patching the BASE checkpoint and saving.
+    Memory Optimized Save with Dtype Preservation:
+    1. Loads Base Checkpoint.
+    2. Converts ALL base tensors to training dtype (bfloat16/float16).
+    3. Moves trained weights from GPU -> CPU one by one.
+    4. Updates Base Checkpoint dict IN-PLACE.
+    5. Saves unified checkpoint in training dtype.
     """
     from safetensors.torch import load_file, save_file
     import gc
@@ -1285,77 +1403,64 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
     print(f"\nINFO: Saving complete checkpoint to: {output_path}")
+    print(f"   -> Target dtype: {compute_dtype}")
 
-    # 1. Load the original checkpoint tensors (Raw load)
-    print("   -> Loading base checkpoint dictionary (Preserving VAE/CLIP)...")
+    # 1. Build the Key Map (Strings only - negligible RAM)
+    print("   -> Generating Key Map...")
+    hf_keys = list(unet.state_dict().keys())
+    key_map = get_unet_key_mapping(hf_keys)
+
+    # 2. Load Base Checkpoint to CPU
+    print("   -> Loading base checkpoint dictionary...")
     try:
-        base_tensors = load_file(str(base_checkpoint_path))
+        base_tensors = load_file(str(base_checkpoint_path), device="cpu")
     except Exception as e:
         print(f"ERROR: Could not load base checkpoint: {e}")
         return
 
-    # 2. Prepare the Trained UNet
-    print("   -> Capturing trained UNet state...")
-    unet_cpu_state = {
-        k: v.to("cpu", dtype=compute_dtype) # <--- Fix: Use the config dtype (bfloat16)
-        for k, v in unet.state_dict().items()
-    }
-    # 3. Convert Keys using the embedded logic
-    print("   -> Converting Diffusers keys to SDXL keys...")
-    sdxl_unet_state = convert_unet_keys_manually(unet_cpu_state)
-    
-    # 4. Patch the Base Checkpoint
-    print("   -> Merging weights...")
-    
-    final_tensors = {} # Create a new dict to ensure cleanliness
-    
-    # Process base tensors (VAE/CLIP)
-    for k, v in base_tensors.items():
-        # If the key is going to be replaced by our training, skip it for now
-        if k in sdxl_unet_state:
-            continue
-        # Otherwise, keep it, but ensure it matches the compute_dtype if you want a pure BF16 file
-        # Or leave it as is. Usually, leaving VAE/CLIP in FP16 is fine, 
-        # but fixing the UNet (above) is critical.
-        final_tensors[k] = v 
+    # 3. **NEW: Convert ALL base tensors to training dtype**
+    print(f"   -> Converting base checkpoint to {compute_dtype}...")
+    converted_count = 0
+    for key in base_tensors.keys():
+        if base_tensors[key].dtype in [torch.float32, torch.float16, torch.bfloat16]:
+            base_tensors[key] = base_tensors[key].to(dtype=compute_dtype)
+            converted_count += 1
+    print(f"   -> Converted {converted_count} tensors to {compute_dtype}")
 
+    # 4. In-Place Update - Copy ALL UNet layers (frozen + trainable)
+    print("   -> Merging ALL UNet weights (frozen + trainable)...")
+    
     update_count = 0
+    unet_state = unet.state_dict()
     
-    for key, value in sdxl_unet_state.items():
-        # The value is already in compute_dtype (bf16) thanks to the fix above
-        final_tensors[key] = value
-        update_count += 1
+    for hf_key, target_key in key_map.items():
+        if hf_key in unet_state:
+            # Move ALL layers (frozen or trained) to CPU with correct dtype
+            # This ensures frozen layers are also saved in bfloat16
+            tensor_gpu = unet_state[hf_key]
+            tensor_cpu = tensor_gpu.detach().to("cpu", dtype=compute_dtype)
+            
+            # Inject into base checkpoint
+            base_tensors[target_key] = tensor_cpu
+            update_count += 1
+            
+            del tensor_cpu
 
-    print(f"   -> SUCCESS: Updated {update_count} keys.")
+    print(f"   -> Copied {update_count} layers (trainable + frozen in {compute_dtype})")
 
-    # =========================================================
-    #  DEBUG CHECK: Find which keys were NOT updated
-    # =========================================================
-    # Filter for UNet keys in the base model (starting with model.diffusion_model)
-    base_unet_keys = [k for k in final_tensors.keys() if k.startswith("model.diffusion_model.")]
+    # 5. Save to Disk
+    print("   -> Saving to disk (SAFETENSORS)...")
+    save_file(base_tensors, str(output_path))
     
-    # Keys we just updated
-    updated_keys_set = set(sdxl_unet_state.keys())
-    
-    # Find mismatches
-    missing_keys = [k for k in base_unet_keys if k not in updated_keys_set]
-    
-    if len(missing_keys) > 0 and len(missing_keys) < 100:
-        print(f"INFO: The following {len(missing_keys)} keys exist in Base but were NOT updated (likely unused):")
-        for k in missing_keys:
-            print(f"      [MISSING] {k}")
-    elif len(missing_keys) == 0:
-         print("INFO: Perfect match! All base UNet keys were updated.")
-    # =========================================================
+    print(f"   -> Save Complete in {compute_dtype}")
 
-    # 5. Save
-    print("   -> Saving to disk...")
-    save_file(final_tensors, str(output_path))
-    print("   -> Save Complete.")
-
-    # Cleanup
-    del unet_cpu_state, sdxl_unet_state, base_tensors, final_tensors
+    # 6. Cleanup
+    del base_tensors
+    del unet_state
+    del key_map
     gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
 
 def save_checkpoint(global_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
     """
@@ -1437,8 +1542,20 @@ def main():
             # vae_for_caching.config.scaling_factor = 0.1280
             
             # New (NoobAI/Flux2 Specific):
-            vae_for_caching.config.shift_factor = 0.0760
-            vae_for_caching.config.scaling_factor = 0.6043
+            # After loading VAE, check channels
+            if vae_for_caching.config.latent_channels == 32:
+                # Flux2 VAE - Use your profiled values
+                #vae_for_caching.config.shift_factor = 0.0760
+                #vae_for_caching.config.scaling_factor = 0.6043
+                vae_for_caching.config.shift_factor = 0.0760
+                vae_for_caching.config.scaling_factor = 0.6043
+                print("INFO: Detected 32-channel Flux VAE")
+                
+            elif vae_for_caching.config.latent_channels == 4:
+                # Standard SDXL VAE - Use standard SDXL normalization
+                vae_for_caching.config.shift_factor = 0.0  # or None
+                vae_for_caching.config.scaling_factor = 0.13025  # Standard SDXL
+                print("INFO: Detected 4-channel SDXL VAE")
             # ---------------------------
             
             print(f"INFO: [RF MODE] VAE configured with NoobAI parameters:")
@@ -1635,7 +1752,7 @@ def main():
                 if config.is_rectified_flow:
                     t_continuous = timesteps.float() / 1000.0
 
-                    rf_shift = 2.5 
+                    rf_shift = 2.5
                     t_shifted = apply_flow_matching_shift(t_continuous, rf_shift)
 
                     t_expanded = t_shifted.view(-1, 1, 1, 1)
@@ -1678,6 +1795,8 @@ def main():
             if getattr(config, 'LOSS_TYPE', 'Default') == "Semantic":
                 if original_images and None not in original_images:
                     b, c, h, w = latents.shape
+                    
+                    # Generate the map (as you were doing)
                     semantic_map = _generate_semantic_map_for_batch(
                         original_images,
                         config.SEMANTIC_LOSS_BLEND,
@@ -1687,7 +1806,27 @@ def main():
                         dtype=torch.float32,
                         num_channels=c
                     )
-                    modulation = 1.0 + (semantic_map * config.SEMANTIC_LOSS_STRENGTH)
+
+                    # --- THE FIX: TIMESTEP GATING ---
+                    # In your code: t=1 is Noise, t=0 is Image.
+                    # We want the map to be strong at t=0, and weak at t=1.
+                    
+                    # Get the continuous timestep (0 to 1) from your batch logic
+                    # Assuming you used: t_continuous = timesteps.float() / 1000.0
+                    # t_continuous needs to be broadcastable: [batch, 1, 1, 1]
+                    t_factor = (1.0 - t_continuous).view(-1, 1, 1, 1)
+                    
+                    # Option A: Linear Falloff (Simple)
+                    # The Semantic strength is max at t=0, zero at t=1
+                    timestep_adjusted_map = semantic_map * t_factor
+                    
+                    # Option B: Quadratic Falloff (Focuses heavily on the final refinement steps)
+                    # timestep_adjusted_map = semantic_map * (t_factor ** 2)
+
+                    # Apply the adjusted map
+                    # We use the adjusted map for the strength calculation
+                    modulation = 1.0 + (timestep_adjusted_map * config.SEMANTIC_LOSS_STRENGTH)
+                    
                     loss = (per_pixel_loss * modulation).mean()
                 else:
                     loss = per_pixel_loss.mean()
@@ -1697,7 +1836,7 @@ def main():
             accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
             raw_loss_value = loss.detach().item()
             loss = loss / accumulation_steps
-            loss = loss.to(dtype=config.compute_dtype)
+            #loss = loss.to(dtype=config.compute_dtype)
             loss.backward()
 
             diagnostics.step(raw_loss_value)
