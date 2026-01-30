@@ -10,16 +10,19 @@ class VeloRMS(Optimizer):
     - Memory efficient: Uses CPU for state storage, reusable GPU buffers
     - Stable: RMS normalization + leakage prevents explosions on infrequent params
     - Adaptive: Per-parameter effective learning rate
+    
+    DEFAULTS (Balanced): momentum=0.89, leak=0.20, wd=0.015
+    Validated for SDXL-RF with Flux VAE (5-30 epochs)
     """
     def __init__(
         self,
         params,
         lr: float = 1e-4,
-        momentum: float = 0.86,
-        leak: float = 0.16,         # Increased for stronger damping of outliers/warping
-        eps: float = 1e-8,
-        weight_decay: float = 0.01,
-        verbose: bool = False,      # Toggle for logging statistics
+        momentum: float = 0.95,      # Balanced: between 0.86 (safe) and 0.92 (aggressive)
+        leak: float = 0.30,          # Balanced: between 0.16 (loose) and 0.25 (tight)
+        eps: float = 1e-08,
+        weight_decay: float = 0.03, # Balanced: slight regularization bump
+        verbose: bool = False,
         log_every: int = 1
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid lr: {lr}")

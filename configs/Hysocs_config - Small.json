@@ -1,47 +1,47 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/NoobAI-RF-v0.2-Base.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/noobaiFlux2vae_03Aesthetic.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_4509.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "UNCONDITIONAL_DROPOUT": false,
+    "UNCONDITIONAL_DROPOUT": true,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.1,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
-    "MAX_AREA_TOLERANCE": "1.05",
+    "MAX_AREA_TOLERANCE": "1.00",
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "1500",
+    "MAX_TRAIN_STEPS": "4050",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "6",
+    "GRADIENT_ACCUMULATION_STEPS": "4",
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": "50.0",
+    "CLIP_GRAD_NORM": "5.0",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "20024",
-    "UNET_EXCLUDE_TARGETS": "down_blocks.2.attentions.*.ff.*,down_blocks.2.attentions.*.attn1.*,up_blocks.2.attentions.*.attn1.*",
+    "SAVE_EVERY_N_STEPS": "2503",
+    "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            1e-07
+            1e-06
         ],
         [
-            0.06666667,
-            3e-05
+            0.10344828,
+            6e-05
         ],
         [
-            0.93333333,
-            3e-05
+            0.89195402,
+            6e-05
         ],
         [
             1.0,
-            1e-07
+            1e-06
         ]
     ],
     "LR_GRAPH_MIN": "1e-07",
-    "LR_GRAPH_MAX": "3e-05",
+    "LR_GRAPH_MAX": "4e-04",
     "MEMORY_EFFICIENT_ATTENTION": "xformers",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -50,7 +50,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by quilm",
+            "path": "C:\\Users\\Administrator\\Pictures\\Artists\\by akipeko",
             "repeats": 1
         }
     ],
@@ -63,43 +63,43 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            35,
-            66,
-            73,
-            74,
-            74,
-            72,
-            71,
-            69,
-            68,
-            67,
-            65,
-            64,
-            63,
-            62,
-            62,
-            61,
-            60,
-            60,
-            59,
-            58,
-            56,
-            54,
-            49,
-            40,
-            18
+            99,
+            180,
+            198,
+            198,
+            198,
+            189,
+            189,
+            189,
+            180,
+            180,
+            180,
+            180,
+            171,
+            162,
+            162,
+            162,
+            162,
+            162,
+            162,
+            162,
+            144,
+            144,
+            135,
+            108,
+            54
         ]
     },
     "RAVEN_PARAMS": {
         "betas": [
             0.9,
-            0.999
+            0.98
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
-        "debias_strength": 1.0,
-        "use_grad_centralization": false,
-        "gc_alpha": 1.0
+        "weight_decay": 0.06,
+        "debias_strength": 0.9,
+        "use_grad_centralization": true,
+        "gc_alpha": 0.9
     },
     "TITAN_PARAMS": {
         "betas": [
@@ -107,9 +107,15 @@
             0.999
         ],
         "eps": 1e-08,
-        "weight_decay": 0.01,
-        "debias_strength": 1.0,
+        "weight_decay": 0.05,
+        "debias_strength": 0.8,
         "use_grad_centralization": false,
         "gc_alpha": 1.0
+    },
+    "VELORMS_PARAMS": {
+        "momentum": 0.95,
+        "leak": 0.3,
+        "weight_decay": 0.03,
+        "eps": 1e-08
     }
 }

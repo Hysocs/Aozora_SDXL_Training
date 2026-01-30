@@ -23,10 +23,10 @@ try:
 except ImportError:
     # Fallback if config.py is missing
     class default_config:
-        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
-        TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.0, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
+        TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
+        VELORMS_PARAMS = {"momentum": 0.86, "leak": 0.16, "weight_decay": 0.01, "eps": 1e-8}
         OPTIMIZER_TYPE = "Raven"
-        # Default allocation for fallback
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
 def prevent_sleep(enable=True):
@@ -206,6 +206,24 @@ QScrollArea { border: none; }
 QHeaderView::section { background-color: #383552; color: #e0e0e0; border: 1px solid #4a4668; padding: 4px; }
 QTableWidget { gridline-color: #4a4668; background-color: #1a1926; }
 QTableWidget::item:selected { background-color: #ab97e6; color: #1a1926; }
+QSlider::groove:horizontal {
+    border: 1px solid #4a4668;
+    height: 6px;
+    background: #1a1926;
+    margin: 2px 0;
+    border-radius: 3px;
+}
+QSlider::handle:horizontal {
+    background: #ab97e6;
+    border: 1px solid #ab97e6;
+    width: 16px;
+    height: 16px;
+    margin: -6px 0;
+    border-radius: 8px;
+}
+QSlider::handle:horizontal:hover {
+    background: #ffffff;
+}
 """
 
 # --- Helper Classes ---
@@ -1229,7 +1247,6 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self.bg_color = QtGui.QColor("#1a1926")
         self.grid_color = QtGui.QColor("#4a4668")
         
-        # --- THEME UPDATE: Purple Scheme ---
         self.bar_color_even = QtGui.QColor("#6a48d7")  # Main Theme Purple
         self.bar_color_odd = QtGui.QColor("#5839b0")   # Slightly Darker Purple for contrast
         
@@ -1267,31 +1284,17 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             return
 
         # --- SMART SCALING ALGORITHM (Largest Remainder Method) ---
-        
-        # 1. Calculate the ideal float value for each bin based on previous weight
-        # Formula: (Current_Bin_Count / Old_Total) * New_Total
         raw_new_counts = [(c / current_sum) * steps for c in self.counts]
-
-        # 2. Floor the values to get the base integer counts
         new_counts = [int(x) for x in raw_new_counts]
-
-        # 3. Calculate how many tickets are left over due to flooring
         current_new_sum = sum(new_counts)
         deficit = steps - current_new_sum
 
-        # 4. Distribute the deficit (remainder) to the bins with the highest fractional parts
-        # This prevents the "first bin spike" and keeps the curve smooth.
         if deficit > 0:
-            # Create a list of (fractional_part, index)
             fractional_parts = []
             for i, raw_val in enumerate(raw_new_counts):
                 frac = raw_val - new_counts[i]
                 fractional_parts.append((frac, i))
-
-            # Sort by fractional part descending (highest fractions get priority)
             fractional_parts.sort(key=lambda x: x[0], reverse=True)
-
-            # Add 1 ticket to the top 'deficit' bins
             for i in range(deficit):
                 idx_to_increment = fractional_parts[i][1]
                 new_counts[idx_to_increment] += 1
@@ -1299,7 +1302,6 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self.counts = new_counts
         self.update()
         self._emit_change()
-
 
     def set_bin_size(self, size):
         if size <= 0: return
@@ -1326,78 +1328,37 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
 
     def get_allocation(self):
         return {"bin_size": self.bin_size, "counts": self.counts}
-        
-    def apply_preset(self, name):
-        num_bins = len(self.counts)
-        if num_bins == 0: return
-        weights = []
-        if name == "Uniform": weights = [1.0] * num_bins
-        elif name == "Bias Early (Detail)": weights = [(num_bins - i) ** 1.5 for i in range(num_bins)]
-        elif name == "Bias Late (Structure)": weights = [(i + 1) ** 1.5 for i in range(num_bins)]
-        elif name == "Bell Curve":
-            center = (num_bins - 1) / 2.0
-            sigma = num_bins / 3.0
-            weights = [math.exp(-((i - center)**2) / (2 * sigma**2)) for i in range(num_bins)]
-        elif name == "Peak Ends & Middle":
-            denom = max(1, num_bins - 1)
-            weights = [1.0 + 0.5 * math.cos(4 * math.pi * i / denom) for i in range(num_bins)]
-        elif name == "Logit-Normal (RF)":
-            mu = -0.2
-            sigma = 1.5
-            
-            def logit(p):
-                return math.log(p / (1.0 - p))
-            
-            def normal_cdf(x):
-                """Standard normal cumulative distribution function"""
-                return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
-            
-            weights = []
-            for i in range(num_bins):
-                # Calculate bin boundaries in normalized [0, 1] space
-                t_start = i * self.bin_size
-                t_end = min((i + 1) * self.bin_size, 1000)
-                
-                # Normalize to [0,1] with epsilon protection at boundaries
-                eps = 1e-10
-                x_start = max(t_start / 1000.0, eps)
-                x_end = min(t_end / 1000.0, 1.0 - eps)
-                
-                # Logit-Normal CDF: F(x) = Phi((logit(x) - mu) / sigma)
-                prob_start = normal_cdf((logit(x_start) - mu) / sigma)
-                prob_end = normal_cdf((logit(x_end) - mu) / sigma)
-                
-                # Probability mass in this bin
-                prob = prob_end - prob_start
-                weights.append(max(prob, 0.0))
-            
-            if sum(weights) == 0:
-                weights = [1.0] * num_bins
 
+    def generate_from_weights(self, weights):
+        """Applies a specific weight distribution to the current max_tickets"""
+        num_bins = len(self.counts)
+        if num_bins == 0 or not weights: return
+        
         total_weight = sum(weights)
         if total_weight == 0: total_weight = 1
+        
         raw_counts = [(w / total_weight) * self.max_tickets for w in weights]
         new_counts = [int(c) for c in raw_counts]
+        
         diff = self.max_tickets - sum(new_counts)
+        # Distribute remainder
         remainders = sorted([(raw_counts[i] - new_counts[i], i) for i in range(num_bins)], key=lambda x: x[0], reverse=True)
         for i in range(diff):
             new_counts[remainders[i][1]] += 1
+            
         self.counts = new_counts
         self.update()
         self._emit_change()
 
     def _init_bins(self):
         # Re-initialize bins (Uniform distribution)
-        # We ensure self.bin_size is valid
         if self.bin_size <= 0: self.bin_size = 100
-            
         num_bins = math.ceil(1000 / self.bin_size)
         if num_bins <= 0: num_bins = 1
-            
+        
         base_count = self.max_tickets // num_bins
         remainder = self.max_tickets % num_bins
         
-        # Distribute base count + remainder uniformly across the first 'remainder' bins
         self.counts = [base_count + 1 if i < remainder else base_count for i in range(num_bins)]
         self._emit_change()
 
@@ -1424,7 +1385,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
                             self.width() - self.padding['left'] - self.padding['right'],
                             self.height() - self.padding['top'] - self.padding['bottom'])
         is_enabled = self.isEnabled()
-        self._draw_grid_and_axes(painter, rect, is_enabled) # CHANGED: Centralized axis drawing
+        self._draw_grid_and_axes(painter, rect, is_enabled)
         self._draw_bars(painter, rect, is_enabled)
         self._draw_labels(painter, rect, is_enabled)
         self._draw_header(painter, rect, is_enabled)
@@ -1434,18 +1395,15 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         text_color = self.text_color if is_enabled else self.disabled_text_color
         painter.setPen(QtGui.QPen(grid_color, 1, QtCore.Qt.PenStyle.DashLine))
         
-        # Horizontal lines
         for i in range(5):
             y = rect.bottom() - (i / 4.0) * rect.height()
             painter.drawLine(rect.left(), int(y), rect.right(), int(y))
         
-        # Vertical lines and static X-Axis labels
-        num_labels = 6 # e.g., 0, 200, 400, 600, 800, 1000
+        num_labels = 6 
         for i in range(num_labels):
             x = rect.left() + (i / (num_labels - 1)) * rect.width()
-            painter.drawLine(int(x), rect.top(), int(x), rect.bottom()) # Draw grid line
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
             
-            # Draw label text
             value = int((i / (num_labels - 1)) * 1000)
             painter.setPen(text_color)
             label_rect = QtCore.QRectF(x - 30, rect.bottom() + 5, 60, 20)
@@ -1462,7 +1420,6 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             bar_rect = self._get_bin_rect(i, rect)
             is_odd = (i % 2 != 0)
             
-            # Bar coloring
             if is_enabled:
                 painter.setBrush(self.bar_hover_color if i == self._dragging_bin_index else (self.bar_color_odd if is_odd else self.bar_color_even))
             else:
@@ -1471,7 +1428,6 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             painter.setPen(QtCore.Qt.PenStyle.NoPen)
             painter.drawRect(bar_rect)
             
-            # Draw count text on top of bar (staggered)
             if is_enabled:
                 painter.setPen(self.text_color)
                 offset_y = 15 if is_odd else 0
@@ -1486,7 +1442,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
                 text_rect = QtCore.QRectF(bar_rect.left(), text_y, bar_rect.width(), 20)
                 painter.drawText(text_rect, QtCore.Qt.AlignmentFlag.AlignCenter, str(self.counts[i]))
         
-        painter.setFont(original_font) # Restore font
+        painter.setFont(original_font)
 
     def _draw_labels(self, painter, rect, is_enabled):
         painter.setPen(self.text_color if is_enabled else self.disabled_text_color)
@@ -1677,7 +1633,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self._initialize_configs()
         self._setup_ui()
         
-        # CHANGED: Block signals during initial load to prevent double-loading
         self.config_dropdown.blockSignals(True)
         
         # Load last selected config
@@ -1692,7 +1647,6 @@ class TrainingGUI(QtWidgets.QWidget):
         else:
             self._load_first_config()
         
-        # CHANGED: Re-enable signals after initial load
         self.config_dropdown.blockSignals(False)
 
     def _load_first_config(self):
@@ -1723,7 +1677,6 @@ class TrainingGUI(QtWidgets.QWidget):
             if index >= 0:
                 selected_key = self.config_dropdown.itemData(index) if self.config_dropdown.itemData(index) else self.config_dropdown.itemText(index).replace(" ", "_").lower()
                 state = {"last_config": selected_key}
-                # Ensure config directory exists
                 os.makedirs(self.config_dir, exist_ok=True)
                 with open(self.state_file, 'w') as f:
                     json.dump(state, f, indent=4)
@@ -1757,10 +1710,9 @@ class TrainingGUI(QtWidgets.QWidget):
             )
             if reply == QtWidgets.QMessageBox.StandardButton.Yes:
                 self.stop_training()
-                # Wait for process to finish
                 if self.process_runner:
                     self.process_runner.quit()
-                    self.process_runner.wait(2000)  # Wait up to 2 seconds
+                    self.process_runner.wait(2000)
                 if os.name == 'nt':
                     prevent_sleep(False)
                 event.accept()
@@ -1768,14 +1720,12 @@ class TrainingGUI(QtWidgets.QWidget):
                 event.ignore()
                 return
         
-        # Clean up any remaining threads
         if hasattr(self, 'dataset_manager'):
             for thread in self.dataset_manager.loader_threads:
                 if thread.isRunning():
                     thread.quit()
                     thread.wait(1000)
         
-        # Disable sleep prevention if it was enabled
         if os.name == 'nt':
             prevent_sleep(False)
         
@@ -1796,7 +1746,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log("No configs found. Created 'default.json'.")
         self.presets = {}
         for filename in os.listdir(self.config_dir):
-            if filename.endswith(".json") and filename != "gui_state.json":  # CHANGED: Exclude gui_state.json
+            if filename.endswith(".json") and filename != "gui_state.json":
                 name = os.path.splitext(filename)[0]
                 path = os.path.join(self.config_dir, filename)
                 try:
@@ -1918,12 +1868,11 @@ class TrainingGUI(QtWidgets.QWidget):
         # Skip keys handled manually
         skip_keys = [
             "RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", 
-            "RAVEN_PARAMS", "TITAN_PARAMS", "GRYPHON_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
+            "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS", "GRYPHON_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
             "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", 
             "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"
         ]
         
-        # 1. Standard Widget Loop
         for key in self.default_config.keys():
             if key in skip_keys: continue
             live_val = self.current_config.get(key)
@@ -1937,7 +1886,6 @@ class TrainingGUI(QtWidgets.QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save '{key}': {e}")
         
-        # 2. Manual Fields
         config_to_save["TRAINING_MODE"] = self.training_mode_combo.currentText()
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
@@ -1952,7 +1900,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'timestep_histogram'):
             config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
-        # 3. Save RAVEN Params (From RAVEN_ widgets)
         raven_params = {}
         try:
             r_betas = self.widgets['RAVEN_betas'].text().strip()
@@ -1966,7 +1913,6 @@ class TrainingGUI(QtWidgets.QWidget):
         raven_params["gc_alpha"] = self.widgets['RAVEN_gc_alpha'].value()
         config_to_save["RAVEN_PARAMS"] = raven_params
 
-        # 4. Save TITAN Params (From TITAN_ widgets)
         titan_params = {}
         try:
             t_betas = self.widgets['TITAN_betas'].text().strip()
@@ -1979,6 +1925,15 @@ class TrainingGUI(QtWidgets.QWidget):
         titan_params["use_grad_centralization"] = self.widgets['TITAN_use_grad_centralization'].isChecked()
         titan_params["gc_alpha"] = self.widgets['TITAN_gc_alpha'].value()
         config_to_save["TITAN_PARAMS"] = titan_params
+
+        velorms_params = {}
+        velorms_params["momentum"] = self.widgets['VELORMS_momentum'].value()
+        velorms_params["leak"] = self.widgets['VELORMS_leak'].value()
+        velorms_params["weight_decay"] = self.widgets['VELORMS_weight_decay'].value()
+        try: velorms_params["eps"] = float(self.widgets['VELORMS_eps'].text().strip())
+        except: velorms_params["eps"] = 1e-8
+        config_to_save["VELORMS_PARAMS"] = velorms_params
+
         return config_to_save
 
     def save_config(self):
@@ -2104,7 +2059,6 @@ class TrainingGUI(QtWidgets.QWidget):
         top_hbox = QtWidgets.QHBoxLayout()
         top_hbox.setSpacing(20)
         
-        # Groups definition - Updated to replace Spatial Chunking with Unconditional Dropout
         groups = {
             "Batching & DataLoaders": ["CACHING_BATCH_SIZE", "NUM_WORKERS"],
             "Unconditional Dropout": ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE"],
@@ -2120,23 +2074,17 @@ class TrainingGUI(QtWidgets.QWidget):
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
         
-        # Connect Upscale Logic
         if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(lambda state: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(state)))
 
-        # Connect Unconditional Dropout Logic
         if "UNCONDITIONAL_DROPOUT" in self.widgets:
             chk = self.widgets["UNCONDITIONAL_DROPOUT"]
-            
-            # Helper to update dependent widgets based on checkbox state
             def update_dropout_widgets(state):
                 enabled = bool(state)
                 if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
                     self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(enabled)
 
             chk.stateChanged.connect(update_dropout_widgets)
-            
-            # Set initial state immediately
             update_dropout_widgets(chk.isChecked())
     
     def _populate_model_training_tab(self, parent_widget):
@@ -2269,14 +2217,13 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QFormLayout(container)
         layout.setContentsMargins(0, 5, 0, 0)
         
-        # Create widgets with unique keys (e.g., RAVEN_betas vs TITAN_betas)
         self.widgets[f'{prefix}_betas'] = QtWidgets.QLineEdit()
         self.widgets[f'{prefix}_eps'] = QtWidgets.QLineEdit()
         
         wd = NoScrollDoubleSpinBox()
         wd.setRange(0.0, 1.0)
-        wd.setSingleStep(0.00001)   # 1e-5 — small enough for 0.0001, 1e-4, etc.
-        wd.setDecimals(6)           # Shows up to 6 decimal places (plenty for weight decay)
+        wd.setSingleStep(0.00001)
+        wd.setDecimals(6)
         self.widgets[f'{prefix}_weight_decay'] = wd
         
         debias = NoScrollDoubleSpinBox()
@@ -2293,7 +2240,6 @@ class TrainingGUI(QtWidgets.QWidget):
         gc_alpha.setToolTip("Strength of gradient centralization.")
         self.widgets[f'{prefix}_gc_alpha'] = gc_alpha
         
-        # Internal logic connection
         use_gc.stateChanged.connect(lambda state: gc_alpha.setEnabled(bool(state)))
         
         layout.addRow("Betas (b1, b2):", self.widgets[f'{prefix}_betas'])
@@ -2305,6 +2251,48 @@ class TrainingGUI(QtWidgets.QWidget):
         
         return container
 
+    def _build_velorms_form(self, prefix):
+        """Helper for VeloRMS specific optimizer settings."""
+        container = QtWidgets.QWidget()
+        layout = QtWidgets.QFormLayout(container)
+        layout.setContentsMargins(0, 5, 0, 0)
+
+        # Momentum
+        mom = NoScrollDoubleSpinBox()
+        mom.setRange(0.0, 0.999)
+        mom.setSingleStep(0.01)
+        mom.setDecimals(3)
+        mom.setToolTip("Momentum factor (default: 0.86)")
+        self.widgets[f'{prefix}_momentum'] = mom
+        
+        # Leak
+        leak = NoScrollDoubleSpinBox()
+        leak.setRange(0.0, 1.0)
+        leak.setSingleStep(0.01)
+        leak.setDecimals(3)
+        leak.setToolTip("Gradient leakage into RMS (default: 0.16)")
+        self.widgets[f'{prefix}_leak'] = leak
+        
+        # Weight Decay
+        wd = NoScrollDoubleSpinBox()
+        wd.setRange(0.0, 1.0)
+        wd.setSingleStep(0.00001)
+        wd.setDecimals(6)
+        wd.setToolTip("Weight decay coefficient (default: 0.01)")
+        self.widgets[f'{prefix}_weight_decay'] = wd
+
+        # Eps
+        eps = QtWidgets.QLineEdit()
+        eps.setToolTip("Term added to denominator for stability (default: 1e-8)")
+        self.widgets[f'{prefix}_eps'] = eps
+        
+        layout.addRow("Momentum:", mom)
+        layout.addRow("Leak:", leak)
+        layout.addRow("Weight Decay:", wd)
+        layout.addRow("Epsilon (eps):", eps)
+        
+        return container
+
     def _create_optimizer_group(self):
         optimizer_group = QtWidgets.QGroupBox("Optimizer")
         main_layout = QtWidgets.QVBoxLayout(optimizer_group)
@@ -2313,27 +2301,24 @@ class TrainingGUI(QtWidgets.QWidget):
         selector_layout.addWidget(QtWidgets.QLabel("Optimizer Type:"))
         
         self.widgets["OPTIMIZER_TYPE"] = NoScrollComboBox()
-        # Clean naming with internal ID mapping
         self.widgets["OPTIMIZER_TYPE"].addItem("Raven: Balanced (~12GB VRAM)", "raven")
         self.widgets["OPTIMIZER_TYPE"].addItem("Titan: VRAM Savings (~6GB VRAM, Slower)", "titan")
+        self.widgets["OPTIMIZER_TYPE"].addItem("VeloRMS: CPU Offload (Experimental)", "velorms")
         
         self.widgets["OPTIMIZER_TYPE"].currentIndexChanged.connect(self._toggle_optimizer_widgets)
         selector_layout.addWidget(self.widgets["OPTIMIZER_TYPE"], 1)
         main_layout.addLayout(selector_layout)
         
-        # --- STACKED WIDGET IMPLEMENTATION ---
         self.optimizer_settings_group = QtWidgets.QGroupBox("Optimizer Settings")
         group_layout = QtWidgets.QVBoxLayout(self.optimizer_settings_group)
         
         self.optimizer_stack = QtWidgets.QStackedWidget()
-        
-        # Page 0: Raven
         self.raven_page = self._build_optimizer_form("RAVEN")
         self.optimizer_stack.addWidget(self.raven_page)
-        
-        # Page 1: Titan
         self.titan_page = self._build_optimizer_form("TITAN")
         self.optimizer_stack.addWidget(self.titan_page)
+        self.velorms_page = self._build_velorms_form("VELORMS")
+        self.optimizer_stack.addWidget(self.velorms_page)
         
         group_layout.addWidget(self.optimizer_stack)
         main_layout.addWidget(self.optimizer_settings_group)
@@ -2343,13 +2328,13 @@ class TrainingGUI(QtWidgets.QWidget):
     def _toggle_optimizer_widgets(self):
         selected_id = self.widgets["OPTIMIZER_TYPE"].currentData()
         
-        # Switch stack page
         if selected_id == "titan":
             self.optimizer_stack.setCurrentIndex(1)
+        elif selected_id == "velorms":
+            self.optimizer_stack.setCurrentIndex(2)
         else:
-            self.optimizer_stack.setCurrentIndex(0) # Raven is default
+            self.optimizer_stack.setCurrentIndex(0) 
             
-        # Ensure the group box is visible
         if hasattr(self, 'optimizer_settings_group'):
             self.optimizer_settings_group.setVisible(True)
 
@@ -2451,47 +2436,235 @@ class TrainingGUI(QtWidgets.QWidget):
     def _toggle_loss_widgets(self):
         loss_type = self.widgets["LOSS_TYPE"].currentText()
         self.semantic_loss_container.setVisible(loss_type == "Semantic")
-        
+
+    def _add_slider_row(self, layout, label_text, min_val, max_val, default_val, divider):
+            """Helper to create a Label | Slider | SpinBox row."""
+            container = QtWidgets.QWidget()
+            h_layout = QtWidgets.QHBoxLayout(container)
+            h_layout.setContentsMargins(0, 0, 0, 0)
+            
+            lbl = QtWidgets.QLabel(label_text)
+            lbl.setFixedWidth(90)
+            h_layout.addWidget(lbl)
+            
+            slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+            slider.setRange(int(min_val * divider), int(max_val * divider))
+            slider.setValue(int(default_val * divider))
+            
+            spin = NoScrollDoubleSpinBox()
+            spin.setRange(min_val, max_val)
+            spin.setSingleStep(0.1)
+            spin.setValue(default_val)
+            spin.setDecimals(2)
+            # CHANGED: Increased width from 70 to 120 to fix "skinny" look
+            spin.setFixedWidth(120)
+
+            # Sync Logic
+            def on_slider_change(val):
+                new_float = val / divider
+                if abs(spin.value() - new_float) > (0.5 / divider):
+                    spin.setValue(new_float)
+                self._update_timestep_distribution() # Trigger update
+
+            def on_spin_change(val):
+                new_int = int(val * divider)
+                if abs(slider.value() - new_int) > 1:
+                    slider.setValue(new_int)
+                self._update_timestep_distribution() # Trigger update
+
+            slider.valueChanged.connect(on_slider_change)
+            spin.valueChanged.connect(on_spin_change)
+
+            h_layout.addWidget(slider)
+            h_layout.addWidget(spin)
+            
+            layout.addRow(container)
+            return slider, spin
+
     def _create_timestep_sampling_group(self):
         group = QtWidgets.QGroupBox("Timestep Ticket Allocation")
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
-        
+
+        # 1. Histogram Visualization (Top)
         self.timestep_histogram = TimestepHistogramWidget()
         self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
         layout.addWidget(self.timestep_histogram)
-
-        controls_layout = QtWidgets.QHBoxLayout()
         
-        controls_layout.addWidget(QtWidgets.QLabel("Bin Size:"))
+        self.timestep_histogram.allocationChanged.connect(
+            lambda data: self._update_config_from_widget("TIMESTEP_ALLOCATION", self.timestep_histogram)
+        )
+
+        controls_layout = QtWidgets.QVBoxLayout()
+        controls_layout.setContentsMargins(5, 5, 5, 5)
+
+        # 2. Bin Size and Mode Dropdown
+        row1 = QtWidgets.QHBoxLayout()
+        row1.addWidget(QtWidgets.QLabel("Bin Size:"))
         self.bin_size_combo = NoScrollComboBox()
-        self.bin_size_combo.addItems(["40", "50", "100", "200", "250", "500"])
+        self.bin_size_combo.addItems(["30", "40", "50", "100", "200", "250", "500"])
         self.bin_size_combo.setCurrentText("100")
-        controls_layout.addWidget(self.bin_size_combo)
-        
-        controls_layout.addSpacing(20)
+        row1.addWidget(self.bin_size_combo)
+        row1.addSpacing(20)
+        row1.addWidget(QtWidgets.QLabel("Distribution Mode:"))
+        self.ts_mode_combo = NoScrollComboBox()
+        self.ts_mode_combo.addItems(["Wave", "Logit-Normal"])
+        row1.addWidget(self.ts_mode_combo, 1)
+        controls_layout.addLayout(row1)
 
-        controls_layout.addWidget(QtWidgets.QLabel("Presets:"))
-        ts_preset_combo = NoScrollComboBox()
-        # --- UPDATE THIS LIST ---
-        ts_preset_combo.addItems([
-            "Uniform", 
-            "Bell Curve", 
-            "Bias Early (Detail)", 
-            "Bias Late (Structure)",
-            "Peak Ends & Middle",
-            "Logit-Normal (RF)"
-        ])
-        # ------------------------
-        controls_layout.addWidget(ts_preset_combo, 1)
+        # 3. Stacked Widget for Mode-Specific Sliders
+        self.ts_slider_stack = QtWidgets.QStackedWidget()
         
+        # --- Wave Mode Page ---
+        wave_page = QtWidgets.QWidget()
+        wave_layout = QtWidgets.QFormLayout(wave_page)
+        wave_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.slider_wave_freq, self.spin_wave_freq = self._add_slider_row(
+            wave_layout, "Frequency:", 0.0, 5.0, 1.0, 100.0
+        )
+        self.slider_wave_phase, self.spin_wave_phase = self._add_slider_row(
+            wave_layout, "Phase:", 0.0, 6.28, 0.0, 100.0
+        )
+        self.slider_wave_amp, self.spin_wave_amp = self._add_slider_row(
+            wave_layout, "Amplitude:", 0.0, 1.0, 0.0, 100.0
+        )
+        self.ts_slider_stack.addWidget(wave_page)
+
+        # --- Logit-Normal Mode Page ---
+        logit_page = QtWidgets.QWidget()
+        logit_layout = QtWidgets.QFormLayout(logit_page)
+        logit_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.slider_ln_mu, self.spin_ln_mu = self._add_slider_row(
+            logit_layout, "Center (Mu):", -3.0, 3.0, 0.0, 100.0
+        )
+        self.slider_ln_sigma, self.spin_ln_sigma = self._add_slider_row(
+            logit_layout, "Spread (Sigma):", 0.1, 3.0, 1.0, 100.0
+        )
+        self.ts_slider_stack.addWidget(logit_page)
+        
+        controls_layout.addWidget(self.ts_slider_stack)
+
+        # 4. Preset Buttons
+        btn_grid = QtWidgets.QGridLayout()
+        btn_grid.setSpacing(8)
+        
+        def create_preset_btn(text, callback):
+            btn = QtWidgets.QPushButton(text)
+            btn.clicked.connect(callback)
+            btn.setStyleSheet("padding: 4px; font-size: 11px;")
+            return btn
+
+        btn_grid.addWidget(create_preset_btn("Uniform", lambda: self._apply_timestep_preset("Uniform")), 0, 0)
+        btn_grid.addWidget(create_preset_btn("Bell Curve", lambda: self._apply_timestep_preset("Bell Curve")), 0, 1)
+        btn_grid.addWidget(create_preset_btn("Detail (Early)", lambda: self._apply_timestep_preset("Detail")), 0, 2)
+        btn_grid.addWidget(create_preset_btn("Structure (Late)", lambda: self._apply_timestep_preset("Structure")), 1, 0)
+        btn_grid.addWidget(create_preset_btn("Peak Ends", lambda: self._apply_timestep_preset("Peak Ends")), 1, 1)
+        btn_grid.addWidget(create_preset_btn("Peak Middle", lambda: self._apply_timestep_preset("Peak Middle")), 1, 2)
+        btn_grid.addWidget(create_preset_btn("Logit-Normal (RF)", lambda: self._apply_timestep_preset("Logit-Normal (RF)")), 2, 0)
+
+        controls_layout.addLayout(btn_grid)
         layout.addLayout(controls_layout)
-        
+
+        # --- Signal Connections ---
         self.bin_size_combo.currentTextChanged.connect(lambda txt: self.timestep_histogram.set_bin_size(int(txt)))
-        self.timestep_histogram.allocationChanged.connect(lambda data: self._update_config_from_widget("TIMESTEP_ALLOCATION", self.timestep_histogram))
-        ts_preset_combo.currentIndexChanged.connect(lambda: self.timestep_histogram.apply_preset(ts_preset_combo.currentText()))
         
+        # Mode switching
+        self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
+        self.ts_mode_combo.currentIndexChanged.connect(self._update_timestep_distribution)
+
         return group
+
+    def _apply_timestep_preset(self, name):
+        """Sets spinbox values to replicate a preset configuration. SpinBox changes trigger updates."""
+        # Block signals briefly? No, we want the signals to fire to update the slider and the graph.
+        # But we should do it carefully to avoid "jumping" if mode changes.
+        
+        if name == "Uniform":
+            self.ts_mode_combo.setCurrentText("Wave")
+            self.spin_wave_amp.setValue(0.0) # Flat
+            
+        elif name == "Bell Curve":
+            self.ts_mode_combo.setCurrentText("Logit-Normal")
+            self.spin_ln_mu.setValue(0.0)
+            self.spin_ln_sigma.setValue(1.0)
+            
+        elif name == "Detail": # Bias Early (Negative Mu)
+            self.ts_mode_combo.setCurrentText("Logit-Normal")
+            self.spin_ln_mu.setValue(-1.0)
+            self.spin_ln_sigma.setValue(0.8)
+            
+        elif name == "Structure": # Bias Late (Positive Mu)
+            self.ts_mode_combo.setCurrentText("Logit-Normal")
+            self.spin_ln_mu.setValue(1.0)
+            self.spin_ln_sigma.setValue(0.8)
+
+        elif name == "Peak Ends": # U-Shape (High-Low-High)
+            self.ts_mode_combo.setCurrentText("Wave")
+            self.spin_wave_freq.setValue(1.0)
+            self.spin_wave_phase.setValue(0.0) # Phase 0 is Cos(x), starts at 1
+            self.spin_wave_amp.setValue(0.8)
+            
+        elif name == "Peak Middle": # Hill-Shape (Low-High-Low)
+            self.ts_mode_combo.setCurrentText("Wave")
+            self.spin_wave_freq.setValue(1.0)
+            self.spin_wave_phase.setValue(3.14) # Phase PI flips Cos(x), starts at -1
+            self.spin_wave_amp.setValue(0.6)
+
+        elif name == "Logit-Normal (RF)":
+            self.ts_mode_combo.setCurrentText("Logit-Normal")
+            self.spin_ln_mu.setValue(-0.2)
+            self.spin_ln_sigma.setValue(1.5)
+
+    def _update_timestep_distribution(self):
+        """Calculates weights based on current sliders/spinboxes and sends to histogram."""
+        mode = self.ts_mode_combo.currentText()
+        weights = []
+        
+        bin_size = int(self.bin_size_combo.currentText())
+        num_bins = math.ceil(1000 / bin_size)
+        if num_bins <= 0: num_bins = 1
+
+        if mode == "Wave":
+            freq = self.spin_wave_freq.value()
+            phase = self.spin_wave_phase.value()
+            amp = self.spin_wave_amp.value()
+            
+            # W(t) = 1 + A * cos(2*pi*f*t + p)
+            # t is normalized 0 to 1
+            for i in range(num_bins):
+                t = i / max(1, num_bins - 1)
+                val = 1.0 + amp * math.cos(2 * math.pi * freq * t + phase)
+                weights.append(max(0.0, val))
+                
+        elif mode == "Logit-Normal":
+            mu = self.spin_ln_mu.value()
+            sigma = self.spin_ln_sigma.value()
+            
+            def logit(p):
+                return math.log(p / (1.0 - p))
+            
+            def normal_cdf(x):
+                return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
+            
+            for i in range(num_bins):
+                # Calculate bin boundaries in normalized [0, 1] space
+                t_start = i * bin_size
+                t_end = min((i + 1) * bin_size, 1000)
+                
+                eps = 1e-6
+                x_start = max(t_start / 1000.0, eps)
+                x_end = min(t_end / 1000.0, 1.0 - eps)
+                
+                # CDF(end) - CDF(start) = Probability mass in bin
+                prob_start = normal_cdf((logit(x_start) - mu) / sigma)
+                prob_end = normal_cdf((logit(x_end) - mu) / sigma)
+                
+                weight = prob_end - prob_start
+                weights.append(max(0.0, weight))
+
+        self.timestep_histogram.generate_from_weights(weights)
     
     def _create_unet_group(self):
         unet_group = QtWidgets.QGroupBox("UNet Layer Exclusion")
@@ -2564,7 +2737,7 @@ class TrainingGUI(QtWidgets.QWidget):
             # Exclude special keys handled manually
             special_keys = [
                 "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"
-            ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
+            ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "VELORMS_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
             
             for key, widget in self.widgets.items():
                 if key in special_keys: continue
@@ -2602,6 +2775,15 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["TITAN_use_grad_centralization"].setChecked(t_params.get("use_grad_centralization", False))
             self.widgets["TITAN_gc_alpha"].setValue(t_params.get("gc_alpha", 1.0))
             self.widgets["TITAN_gc_alpha"].setEnabled(t_params.get("use_grad_centralization", False))
+
+            # Load VELORMS Params
+            v_defaults = getattr(default_config, "VELORMS_PARAMS", {"momentum": 0.86, "leak": 0.16, "weight_decay": 0.01, "eps": 1e-8})
+            v_params = {**v_defaults, **self.current_config.get("VELORMS_PARAMS", {})}
+            self.widgets["VELORMS_momentum"].setValue(v_params.get("momentum", 0.86))
+            self.widgets["VELORMS_leak"].setValue(v_params.get("leak", 0.16))
+            self.widgets["VELORMS_weight_decay"].setValue(v_params.get("weight_decay", 0.01))
+            self.widgets["VELORMS_eps"].setText(str(v_params.get("eps", 1e-8)))
+
             self._toggle_optimizer_widgets()
             
             # --- MANUAL TOGGLE UPDATES ---
@@ -2616,11 +2798,9 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
             self._toggle_loss_widgets()
 
-            # Fix Upscale Toggle
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(self.current_config.get("SHOULD_UPSCALE", False)))
             
-            # Fix Unconditional Dropout Toggle (Replaces VRAM Chunk logic)
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 is_dropout = self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
                 if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
@@ -2676,7 +2856,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.optimizer_steps_label.setText(f"{optimizer_steps:,}")
             self.epochs_label.setText("∞ (Not enough images for one batch)" if total_epochs == float('inf') else f"{total_epochs:.2f}")
 
-            # Update Histogram Budget
             if hasattr(self, 'timestep_histogram'):
                 self.timestep_histogram.set_total_steps(max_train_steps)
 
@@ -2696,7 +2875,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if "LR_CUSTOM_CURVE" in self.current_config:
             clamped_points = []
             for p in self.current_config["LR_CUSTOM_CURVE"]:
-                # Clamp Y value between min and max bounds
                 clamped_y = max(min_lr, min(max_lr, p[1]))
                 clamped_points.append([p[0], clamped_y])
             self.current_config["LR_CUSTOM_CURVE"] = clamped_points

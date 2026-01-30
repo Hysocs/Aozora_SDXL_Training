@@ -60,60 +60,6 @@ def fix_alpha_channel(img):
         return bg
     return img.convert("RGB")
 
-def generate_character_map(pil_image):
-    np_image_bgr = cv2.cvtColor(np.array(pil_image.convert("RGB")), cv2.COLOR_RGB2BGR)
-    bilateral = cv2.bilateralFilter(np_image_bgr, d=9, sigmaColor=75, sigmaSpace=75)
-    lab_image = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
-    l_channel, a_channel, b_channel = cv2.split(lab_image)
-    mean_a, mean_b = np.mean(a_channel), np.mean(b_channel)
-    saliency_a = np.abs(a_channel.astype(np.float32) - mean_a)
-    saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
-    color_saliency = saliency_a + saliency_b
-    if color_saliency.max() > 0:
-        color_saliency_norm = color_saliency / color_saliency.max()
-    else:
-        color_saliency_norm = np.zeros_like(color_saliency, dtype=np.float32)
-    color_saliency_uint8 = (color_saliency_norm * 255).astype(np.uint8)
-    kernel = np.ones((11, 11), np.uint8)
-    dilated = cv2.dilate(color_saliency_uint8, kernel, iterations=2)
-    eroded = cv2.erode(dilated, kernel, iterations=2)
-    eroded_float = eroded.astype(np.float32) / 255.0
-    final_map = cv2.GaussianBlur(eroded_float, (11, 11), 0)
-    return Image.fromarray(final_map)
-
-def generate_detail_map(pil_image):
-    np_image_gray = np.array(pil_image.convert("L"))
-    sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=5)
-    sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=5)
-    magnitude = np.sqrt(sobelx**2 + sobely**2)
-    if magnitude.max() > 0:
-        magnitude_norm = magnitude / magnitude.max()
-    else:
-        magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
-    final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (1, 1), 0)
-    return Image.fromarray(final_map)
-
-def _generate_semantic_map_for_batch(images, blend_factor, strength, target_size, device, dtype, num_channels):
-    batch_maps = []
-    for img in images:
-        if img is None:
-            weight_map_tensor = torch.zeros(target_size, dtype=dtype)
-            batch_maps.append(weight_map_tensor)
-            continue
-        char_map_pil = generate_character_map(img)
-        detail_map_pil = generate_detail_map(img)
-        char_map_np = np.array(char_map_pil).astype(np.float32)
-        detail_map_np = np.array(detail_map_pil).astype(np.float32)
-        combined_map = ((1.0 - blend_factor) * char_map_np) + (blend_factor * detail_map_np)
-        if combined_map.max() > 0:
-            combined_map = combined_map / combined_map.max()
-        weight_map = np.power(combined_map, 0.8)
-        combined_map_pil = Image.fromarray(weight_map, mode='F').resize(target_size, Image.Resampling.LANCZOS)
-        weight_map_tensor = torch.from_numpy(np.array(combined_map_pil)).float()
-        batch_maps.append(weight_map_tensor)
-    final_map_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
-    return final_map_batch.expand(-1, num_channels, -1, -1)
-
 def generate_train_noise(latents, config):
     return torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
 
@@ -1110,16 +1056,14 @@ class TimestepSampler:
 
 def apply_flow_matching_shift(t, shift_factor):
     """
-    Rectified Flow timestep shift.
+    Rectified Flow timestep shift (schedule warping).
     Higher shift = more weight on later (denoising) timesteps.
+    This is required because the base model was trained with shift=2.5.
     """
     if shift_factor == 1.0:
         return t
     
-    # Method 1: Power-based (commonly used in Flux/RF)
-    #return t ** (1.0 / shift_factor)
-    
-    # Method 2: Linear interpolation (SD3 style) - currently what you have
+    # SD3/Rectified Flow schedule shift
     return (shift_factor * t) / (1.0 + (shift_factor - 1.0) * t)
 
 def custom_collate_fn(batch):
@@ -1241,19 +1185,19 @@ def create_optimizer(config, params_to_optimize):
         else:
             initial_lr = config.LEARNING_RATE
         
-        # VeloRMS now uses its own specific parameters
         velorms_params = getattr(config, 'VELORMS_PARAMS', {})
         defaults = getattr(default_config, 'VELORMS_PARAMS', {})
+        # Merge user config with defaults
         final_params = {**defaults, **velorms_params}
 
-        # Assuming the VeloRMS class takes these parameters
         return VeloRMS(
             params_to_optimize, 
             lr=initial_lr,
-            # Add any other VeloRMS specific arguments here from final_params
-            # For example:
-            # beta=final_params.get('beta', 0.9),
-            # eps=final_params.get('eps', 1e-8),
+            momentum=final_params.get('momentum', 0.86),
+            leak=final_params.get('leak', 0.16),
+            weight_decay=final_params.get('weight_decay', 0.01),
+            eps=final_params.get('eps', 1e-8),
+            verbose=False
         )
     
     else: 
@@ -1527,36 +1471,20 @@ def main():
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
         
-        # 1. Determine where we are getting the VAE from
-        # If the user provided a separate VAE, use it. Otherwise, use the base model checkpoint.
         vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
         
-        # 2. Load the VAE separately first (prevents the Pipeline crash)
         vae_for_caching = load_vae_robust(vae_source, device)
 
-        # 3. Apply necessary scaling configurations
         if config.is_rectified_flow:
-            # --- UPDATE THESE VALUES ---
-            # Old (EQB7/SD3):
-            # vae_for_caching.config.shift_factor = 0.1726
-            # vae_for_caching.config.scaling_factor = 0.1280
-            
-            # New (NoobAI/Flux2 Specific):
-            # After loading VAE, check channels
             if vae_for_caching.config.latent_channels == 32:
-                # Flux2 VAE - Use your profiled values
-                #vae_for_caching.config.shift_factor = 0.0760
-                #vae_for_caching.config.scaling_factor = 0.6043
                 vae_for_caching.config.shift_factor = 0.0760
                 vae_for_caching.config.scaling_factor = 0.6043
                 print("INFO: Detected 32-channel Flux VAE")
                 
             elif vae_for_caching.config.latent_channels == 4:
-                # Standard SDXL VAE - Use standard SDXL normalization
-                vae_for_caching.config.shift_factor = 0.0  # or None
-                vae_for_caching.config.scaling_factor = 0.13025  # Standard SDXL
+                vae_for_caching.config.shift_factor = 0.0
+                vae_for_caching.config.scaling_factor = 0.13025
                 print("INFO: Detected 4-channel SDXL VAE")
-            # ---------------------------
             
             print(f"INFO: [RF MODE] VAE configured with NoobAI parameters:")
             print(f"      - Shift Factor: {vae_for_caching.config.shift_factor}")
@@ -1568,9 +1496,6 @@ def main():
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
 
-        # 4. Load the Pipeline for Text Encoders, INJECTING our pre-loaded VAE
-        # passing vae=vae_for_caching stops Diffusers from trying to load the VAE from the file 
-        # using the wrong config, which fixes the crash.
         base_pipe = StableDiffusionXLPipeline.from_single_file(
             config.SINGLE_FILE_CHECKPOINT_PATH,
             vae=vae_for_caching, 
@@ -1579,7 +1504,6 @@ def main():
             low_cpu_mem_usage=True
         )
         
-        # 5. Proceed with caching
         precompute_and_cache_latents(
             config,
             base_pipe.tokenizer,
@@ -1672,8 +1596,6 @@ def main():
         print("\n--- Fresh start setup complete. Starting training loop. ---")
 
     unet.train()
-    # Removed incorrect key map generation
-    # key_map = _generate_hf_to_sd_unet_key_mapping(list(unet.state_dict().keys()))
     
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     reporter = AsyncReporter(
@@ -1709,6 +1631,7 @@ def main():
     last_step_time = time.time()
     last_optim_step_log_time = time.time()
     done = False
+    micro_step = 0
     
     while not done:
         for batch in dataloader:
@@ -1724,7 +1647,6 @@ def main():
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
-            original_images = batch.get("original_image")
             batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
 
             with torch.autocast(
@@ -1750,18 +1672,23 @@ def main():
                 timesteps_conditioning = None
 
                 if config.is_rectified_flow:
-                    t_continuous = timesteps.float() / 1000.0
-
+                    # Step 1: Normalize ticket pool timesteps to [0, 1]
+                    t_normalized = timesteps.float() / 1000.0
+                    
+                    # Step 2: Apply Flow Matching Shift (model trained with shift=2.5)
                     rf_shift = 2.5
-                    t_shifted = apply_flow_matching_shift(t_continuous, rf_shift)
-
+                    t_shifted = apply_flow_matching_shift(t_normalized, rf_shift)
+                    
+                    # Step 3: Interpolate in latent space
                     t_expanded = t_shifted.view(-1, 1, 1, 1)
                     noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-
                     target = noise - latents
-
-                    timesteps_conditioning = (t_shifted * 1000.0).long()
-
+                    
+                    # Step 4: Convert back for UNet timestep embedding
+                    timesteps_conditioning = (t_shifted * 1000).long()
+                    #repair
+                    #timesteps_conditioning = timesteps
+                    
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                     
@@ -1786,63 +1713,20 @@ def main():
                     }
                 ).sample
 
-            per_pixel_loss = F.mse_loss(
-                pred.float(),
-                target.to(pred.dtype).float(),
-                reduction="none"
-            )
-
-            if getattr(config, 'LOSS_TYPE', 'Default') == "Semantic":
-                if original_images and None not in original_images:
-                    b, c, h, w = latents.shape
-                    
-                    # Generate the map (as you were doing)
-                    semantic_map = _generate_semantic_map_for_batch(
-                        original_images,
-                        config.SEMANTIC_LOSS_BLEND,
-                        config.SEMANTIC_LOSS_STRENGTH,
-                        target_size=(w, h),
-                        device=latents.device,
-                        dtype=torch.float32,
-                        num_channels=c
-                    )
-
-                    # --- THE FIX: TIMESTEP GATING ---
-                    # In your code: t=1 is Noise, t=0 is Image.
-                    # We want the map to be strong at t=0, and weak at t=1.
-                    
-                    # Get the continuous timestep (0 to 1) from your batch logic
-                    # Assuming you used: t_continuous = timesteps.float() / 1000.0
-                    # t_continuous needs to be broadcastable: [batch, 1, 1, 1]
-                    t_factor = (1.0 - t_continuous).view(-1, 1, 1, 1)
-                    
-                    # Option A: Linear Falloff (Simple)
-                    # The Semantic strength is max at t=0, zero at t=1
-                    timestep_adjusted_map = semantic_map * t_factor
-                    
-                    # Option B: Quadratic Falloff (Focuses heavily on the final refinement steps)
-                    # timestep_adjusted_map = semantic_map * (t_factor ** 2)
-
-                    # Apply the adjusted map
-                    # We use the adjusted map for the strength calculation
-                    modulation = 1.0 + (timestep_adjusted_map * config.SEMANTIC_LOSS_STRENGTH)
-                    
-                    loss = (per_pixel_loss * modulation).mean()
-                else:
-                    loss = per_pixel_loss.mean()
-            else:
-                loss = per_pixel_loss.mean()
-
-            accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
+            loss = F.mse_loss(pred.float(), target.to(pred.dtype).float())
             raw_loss_value = loss.detach().item()
-            loss = loss / accumulation_steps
-            #loss = loss.to(dtype=config.compute_dtype)
-            loss.backward()
-
+            
+            accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
+            scaled_loss = loss / accumulation_steps
+            scaled_loss.backward()
+    
+            
             diagnostics.step(raw_loss_value)
-
+            micro_step += 1
+            is_accumulation_step = (micro_step % accumulation_steps == 0)
+            
             diag_data_to_log = None
-            if (global_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+            if is_accumulation_step:
                 
                 if isinstance(optimizer, TitanAdamW):
                     raw_grad_norm = optimizer.clip_grad_norm(
@@ -1853,7 +1737,6 @@ def main():
                         params_to_optimize,
                         float('inf')
                     )
-                    timestep_sampler.update(raw_grad_norm.item())
                     
                     if config.CLIP_GRAD_NORM > 0:
                         torch.nn.utils.clip_grad_norm_(
@@ -1877,7 +1760,7 @@ def main():
                 update_status = 1.0 if raw_grad_norm > 0 else 0.0
 
                 diag_data_to_log = {
-                    'optim_step': (global_step + 1) // config.GRADIENT_ACCUMULATION_STEPS,
+                    'optim_step': global_step // config.GRADIENT_ACCUMULATION_STEPS,
                     'avg_loss': diagnostics.get_average_loss(),
                     'current_lr': optimizer.param_groups[0]['lr'],
                     'raw_grad_norm': raw_grad_norm,
@@ -1888,7 +1771,7 @@ def main():
                 }
                 
                 reporter.check_and_report_anomaly(
-                    global_step + 1,
+                    global_step,
                     raw_grad_norm,
                     clipped_grad_norm,
                     config,
@@ -1901,15 +1784,15 @@ def main():
             global_step_times.append(step_duration)
             last_step_time = time.time()
             elapsed_time = time.time() - training_start_time
-            eta_seconds = (config.MAX_TRAIN_STEPS - (global_step + 1)) * \
+            eta_seconds = (config.MAX_TRAIN_STEPS - global_step) * \
                 (sum(global_step_times) / len(global_step_times))
             
             timing_data = {
                 'raw_step_time': step_duration,
                 'elapsed_time': elapsed_time,
                 'eta': eta_seconds,
-                'loss': loss.item(),
-                'timestep': timesteps[0].item()
+                'loss': raw_loss_value,
+                'timestep': timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
             }
             
             reporter.log_step(
@@ -1917,19 +1800,24 @@ def main():
                 timing_data=timing_data,
                 diag_data=diag_data_to_log
             )
+            
             global_step += 1
             
+            current_optimizer_step = micro_step // accumulation_steps
+            
             if config.SAVE_EVERY_N_STEPS > 0 and \
-               global_step % config.SAVE_EVERY_N_STEPS == 0:
-                print(f"\n--- Saving checkpoint at step {global_step} ---")
+            is_accumulation_step and \
+            current_optimizer_step > 0 and \
+            (current_optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
+                print(f"\n--- Saving checkpoint at optimizer step {current_optimizer_step} (micro-step {global_step}) ---")
 
                 save_checkpoint(
                     global_step,
                     unet,
-                    model_to_load,  # Pass the base checkpoint path
+                    model_to_load,
                     optimizer,
                     lr_scheduler,
-                    None,  # scaler
+                    None,
                     sampler,
                     config
                 )
@@ -1941,7 +1829,7 @@ def main():
     save_model(
         output_path,
         unet,
-        model_to_load,  # Pass the base checkpoint path
+        model_to_load,
         config.compute_dtype
     )
     print("All tasks complete. Final model saved.")

@@ -11,6 +11,68 @@ import random
 from pathlib import Path
 
 # ==============================================================================
+#  ROBUST VAE LOADER
+# ==============================================================================
+def load_vae_robust_gui(path, device):
+    """
+    GUI-friendly version that returns (vae, message, is_32ch) tuple
+    Auto-detects 4-channel SDXL VAE vs 16/32-channel Flux VAE variants
+    """
+    try:
+        # 1. Try loading as a standard SDXL VAE first
+        vae = AutoencoderKL.from_single_file(
+            path, 
+            torch_dtype=torch.float32,
+            low_cpu_mem_usage=False  # Prevents meta device issues
+        )
+        return vae.to(device), "Loaded standard SDXL VAE (4 channels)", False
+        
+    except Exception as e:
+        err_str = str(e)
+        
+        # Check for 32-channel VAE signatures
+        is_32ch_vae = (
+            ("encoder.conv_out.weight" in err_str and "torch.Size([64" in err_str) or
+            ("decoder.conv_in.weight" in err_str and "torch.Size([512, 32" in err_str) or
+            ("torch.Size([64])" in err_str and "torch.Size([8])" in err_str)
+        )
+        
+        # Check for 16-channel VAE signatures
+        is_16ch_vae = (
+            ("encoder.conv_out.weight" in err_str and "torch.Size([32" in err_str) or
+            ("decoder.conv_in.weight" in err_str and "torch.Size([512, 16" in err_str) or
+            ("torch.Size([32])" in err_str and "torch.Size([8])" in err_str)
+        )
+        
+        if is_32ch_vae:
+            try:
+                vae = AutoencoderKL.from_single_file(
+                    path, 
+                    torch_dtype=torch.float32,
+                    latent_channels=32,
+                    ignore_mismatched_sizes=True,
+                    low_cpu_mem_usage=False
+                )
+                return vae.to(device), "Loaded Flux VAE (32 channels)", True
+            except Exception as e2:
+                raise Exception(f"Failed to load 32-channel VAE: {e2}")
+                
+        elif is_16ch_vae:
+            try:
+                vae = AutoencoderKL.from_single_file(
+                    path, 
+                    torch_dtype=torch.float32,
+                    latent_channels=16,
+                    ignore_mismatched_sizes=True,
+                    low_cpu_mem_usage=False
+                )
+                return vae.to(device), "Loaded Flux VAE (16 channels)", True
+            except Exception as e2:
+                raise Exception(f"Failed to load 16-channel VAE: {e2}")
+        else:
+            raise e
+
+# ==============================================================================
 #  HELPER: Debouncer
 # ==============================================================================
 class DebouncedWorker:
@@ -56,6 +118,7 @@ class VAEStatisticsTool:
 
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.vae = None
+        self.is_32ch = False  # Track VAE type
         self.image_paths = []
         self.current_idx = 0
         
@@ -71,6 +134,9 @@ class VAEStatisticsTool:
         self.var_manual_shift = tk.DoubleVar(value=0.0)
         self.var_manual_scale = tk.DoubleVar(value=0.13025)
         
+        # Test mode - bypass normalization
+        self.var_test_raw = tk.BooleanVar(value=False)
+        
         self.worker = DebouncedWorker(self.process_preview, self.update_preview_ui)
         self.setup_ui()
 
@@ -83,6 +149,7 @@ class VAEStatisticsTool:
         
         tk.Button(header, text="1. Load VAE", command=self.load_vae_thread, **btn_opts).pack(side=tk.LEFT, padx=10)
         tk.Button(header, text="2. Select Image Folder", command=self.select_folder, **btn_opts).pack(side=tk.LEFT, padx=10)
+        tk.Button(header, text="TEST VAE", command=self.test_vae_direct, bg="#cc0000", fg="white", relief="flat", padx=10, pady=5).pack(side=tk.LEFT, padx=10)
         
         self.lbl_status = tk.Label(header, text="Status: Waiting for input...", bg="#1e1e1e", fg="cyan", font=("Consolas", 11))
         self.lbl_status.pack(side=tk.RIGHT, padx=20)
@@ -144,16 +211,19 @@ class VAEStatisticsTool:
         
         tk.Label(sliders_f, text="MANUAL PREVIEW (Shift/Scale)", bg="#222", fg="white").pack(pady=5)
         
+        # Test Raw VAE checkbox
+        tk.Checkbutton(sliders_f, text="Test Raw VAE (No Normalization)", variable=self.var_test_raw, 
+                      bg="#222", fg="yellow", selectcolor="#333", command=self.trigger_preview).pack()
+        
         s1 = tk.Frame(sliders_f, bg="#222")
         s1.pack(fill=tk.X, padx=10)
         tk.Label(s1, text="Shift:", bg="#222", fg="#aaa", width=6).pack(side=tk.LEFT)
-        tk.Scale(s1, variable=self.var_manual_shift, from_=-2.0, to=2.0, resolution=0.0001, orient=tk.HORIZONTAL, bg="#222", fg="white", command=self.trigger_preview).pack(side=tk.LEFT, fill=tk.X, expand=True)
+        tk.Scale(s1, variable=self.var_manual_shift, from_=-100.0, to=100.0, resolution=0.0001, orient=tk.HORIZONTAL, bg="#222", fg="white", command=self.trigger_preview).pack(side=tk.LEFT, fill=tk.X, expand=True)
         
         s2 = tk.Frame(sliders_f, bg="#222")
         s2.pack(fill=tk.X, padx=10, pady=5)
         tk.Label(s2, text="Scale:", bg="#222", fg="#aaa", width=6).pack(side=tk.LEFT)
-        tk.Scale(s2, variable=self.var_manual_scale, from_=0.01, to=2.0, resolution=0.0001, orient=tk.HORIZONTAL, bg="#222", fg="white", command=self.trigger_preview).pack(side=tk.LEFT, fill=tk.X, expand=True)
-
+        tk.Scale(s2, variable=self.var_manual_scale, from_=0.01, to=100.0, resolution=0.0001, orient=tk.HORIZONTAL, bg="#222", fg="white", command=self.trigger_preview).pack(side=tk.LEFT, fill=tk.X, expand=True)
         # Image Area
         self.lbl_preview = tk.Label(viz_frame, bg="black", text="Visual Check Area")
         self.lbl_preview.pack(fill=tk.BOTH, expand=True)
@@ -176,14 +246,32 @@ class VAEStatisticsTool:
         if not path: return
         self.lbl_status.config(text="Loading VAE...", fg="yellow")
         try:
-            try:
-                self.vae = AutoencoderKL.from_single_file(path).to(self.device, dtype=torch.float32)
-            except:
-                self.vae = AutoencoderKL.from_single_file(path, latent_channels=32, ignore_mismatched_sizes=True).to(self.device, dtype=torch.float32)
-            self.lbl_status.config(text=f"VAE Loaded", fg="#00ff00")
+            # Use robust loader
+            self.vae, msg, self.is_32ch = load_vae_robust_gui(path, self.device)
+            
+            # Debug: Print actual VAE config
+            print(f"DEBUG: VAE latent_channels = {self.vae.config.latent_channels}")
+            print(f"DEBUG: is_32ch flag = {self.is_32ch}")
+            
+            self.lbl_status.config(text=msg, fg="#00ff00")
+            self.log(f"VAE Loaded: {msg}")
+            
+            # Set default slider values based on VAE type
+            # NOTE: Official Flux VAE uses DIVISION, so we start with NO normalization (0 shift, 1.0 scale)
+            if self.is_32ch:
+                self.log("Detected 32-channel VAE - Starting with neutral values")
+                self.log("Run scan to calculate optimal shift/scale for YOUR dataset")
+                self.var_manual_shift.set(0.0)
+                self.var_manual_scale.set(1.0)
+            else:
+                self.log("Detected 4-channel VAE - Defaults set for SDXL")
+                self.var_manual_shift.set(0.0)
+                self.var_manual_scale.set(0.13025)
+            
             self.trigger_preview()
         except Exception as e:
             self.lbl_status.config(text=f"VAE Error: {e}", fg="red")
+            self.log(f"ERROR: {e}")
 
     def select_folder(self):
         path = filedialog.askdirectory()
@@ -240,8 +328,12 @@ class VAEStatisticsTool:
                     img = img.resize((w,h), Image.Resampling.LANCZOS)
                     t = tf(img).unsqueeze(0).to(self.device)
                     
-                    # Encode -> Latent Dist -> Mean
-                    latents = self.vae.encode(t).latent_dist.mean
+                    # Encode -> Get latents (handle both SDXL and Flux VAE)
+                    encoder_output = self.vae.encode(t)
+                    if hasattr(encoder_output, 'latent_dist'):
+                        latents = encoder_output.latent_dist.mean
+                    else:
+                        latents = encoder_output
                     
                     # Accumulate Stats
                     all_means.append(latents.mean().item())
@@ -260,7 +352,6 @@ class VAEStatisticsTool:
             return
             
         # --- CALCULATE STATISTICS ---
-        # Note: Calculating mean of means is roughly accurate for uniform sized batches
         raw_mean = np.mean(all_means)
         raw_std = np.mean(all_stds)
         
@@ -273,12 +364,20 @@ class VAEStatisticsTool:
         self.log(f"----------------------")
 
         # --- CALCULATE NORMALIZATION ---
-        # Goal: (Raw - Shift) * Scale -> Mean=0, Std=1
+        # Goal: (Raw - Shift) / Scale -> Mean=0, Std=1 (for Flux VAE)
+        # or    (Raw - Shift) * Scale -> Mean=0, Std=1 (for SDXL VAE)
         
         calc_shift = raw_mean
-        calc_scale = 1.0 / raw_std
+        
+        if self.is_32ch:
+            # Flux VAE uses DIVISION
+            calc_scale = raw_std  # Not inverted!
+        else:
+            # SDXL VAE uses MULTIPLICATION
+            calc_scale = 1.0 / raw_std
         
         self.log(f"--- CALCULATED CONFIG ---")
+        self.log(f"VAE Type: {'Flux (32ch)' if self.is_32ch else 'SDXL (4ch)'}")
         self.log(f"Target Mean: 0.0")
         self.log(f"Target Std : 1.0")
         self.log(f"Rec. Shift : {calc_shift:.4f}")
@@ -286,13 +385,12 @@ class VAEStatisticsTool:
         self.log(f"----------------------")
         
         # --- VERIFICATION STEP ---
-        # Let's apply this math to our gathered stats to prove it works
-        # Norm = (Raw - Shift) * Scale
-        # NormMean = (RawMean - Shift) * Scale
-        # NormStd  = RawStd * Scale
-        
-        verify_mean = (raw_mean - calc_shift) * calc_scale
-        verify_std = raw_std * calc_scale
+        if self.is_32ch:
+            verify_mean = (raw_mean - calc_shift) / calc_scale
+            verify_std = raw_std / calc_scale
+        else:
+            verify_mean = (raw_mean - calc_shift) * calc_scale
+            verify_std = raw_std * calc_scale
         
         self.log(f"--- VERIFICATION ---")
         self.log(f"New Mean   : {verify_mean:.4f} (Ideal: 0)")
@@ -336,10 +434,75 @@ class VAEStatisticsTool:
         args = {
             "path": self.image_paths[self.current_idx],
             "shift": self.var_manual_shift.get(),
-            "scale": self.var_manual_scale.get()
+            "scale": self.var_manual_scale.get(),
+            "test_raw": self.var_test_raw.get()
         }
         self.lbl_fname.config(text=f"{args['path'].name}")
         self.worker.request(args)
+    
+    def test_vae_direct(self):
+        """Test VAE with absolutely zero manipulation - pure encode/decode"""
+        if not self.image_paths or not self.vae:
+            self.log("ERROR: Load VAE and images first")
+            return
+            
+        self.log("\n=== DIRECT VAE TEST (Zero Manipulation) ===")
+        
+        img = Image.open(self.image_paths[self.current_idx]).convert("RGB")
+        w, h = 256, 256  # Small test
+        img = img.resize((w, h), Image.Resampling.LANCZOS)
+        
+        # Test 1: Standard preprocessing [-1, 1]
+        t_pix = transforms.ToTensor()(img).unsqueeze(0).to(self.device)
+        t_pix_normalized = (t_pix - 0.5) * 2.0  # [-1, 1]
+        
+        self.log(f"Test 1: Standard [-1, 1] preprocessing")
+        self.log(f"Input range: [{t_pix_normalized.min().item():.4f}, {t_pix_normalized.max().item():.4f}]")
+        
+        with torch.no_grad():
+            enc_out = self.vae.encode(t_pix_normalized)
+            if hasattr(enc_out, 'latent_dist'):
+                latent = enc_out.latent_dist.mean
+            else:
+                latent = enc_out
+            
+            self.log(f"Latent mean: {latent.mean().item():.4f}, std: {latent.std().item():.4f}")
+            
+            dec_out = self.vae.decode(latent)
+            if hasattr(dec_out, 'sample'):
+                decoded = dec_out.sample
+            else:
+                decoded = dec_out
+            
+            self.log(f"Decoded mean: {decoded.mean().item():.4f}, std: {decoded.std().item():.4f}")
+            decoded_test1 = (decoded / 2 + 0.5).clamp(0, 1)
+            self.log(f"Final range: [{decoded_test1.min().item():.4f}, {decoded_test1.max().item():.4f}]")
+        
+        # Test 2: Try [0, 1] preprocessing (maybe Flux expects this?)
+        self.log(f"\nTest 2: Alternative [0, 1] preprocessing")
+        self.log(f"Input range: [{t_pix.min().item():.4f}, {t_pix.max().item():.4f}]")
+        
+        with torch.no_grad():
+            enc_out = self.vae.encode(t_pix)
+            if hasattr(enc_out, 'latent_dist'):
+                latent = enc_out.latent_dist.mean
+            else:
+                latent = enc_out
+            
+            self.log(f"Latent mean: {latent.mean().item():.4f}, std: {latent.std().item():.4f}")
+            
+            dec_out = self.vae.decode(latent)
+            if hasattr(dec_out, 'sample'):
+                decoded = dec_out.sample
+            else:
+                decoded = dec_out
+            
+            self.log(f"Decoded mean: {decoded.mean().item():.4f}, std: {decoded.std().item():.4f}")
+            decoded_test2 = decoded.clamp(0, 1)
+            self.log(f"Final range: [{decoded_test2.min().item():.4f}, {decoded_test2.max().item():.4f}]")
+        
+        self.log("=== END TEST ===\n")
+        self.log("Check if Test 2 has better std/range!")
 
     def process_preview(self, args):
         img = Image.open(args["path"]).convert("RGB")
@@ -357,25 +520,95 @@ class VAEStatisticsTool:
         t_pix = (t_pix - 0.5) * 2.0
         
         with torch.no_grad():
-            raw = self.vae.encode(t_pix).latent_dist.mean
+            # Get raw latents from encoder
+            encoder_output = self.vae.encode(t_pix)
             
-            # Apply Math (Simulate Normalization)
+            # CRITICAL: Flux VAE returns latents directly, SDXL returns a distribution
+            if hasattr(encoder_output, 'latent_dist'):
+                # SDXL VAE - has a distribution
+                raw = encoder_output.latent_dist.mean
+                print(f"DEBUG: Encoder returned distribution (sampling mean)")
+            else:
+                # Flux VAE - direct latents (no distribution)
+                raw = encoder_output
+                print(f"DEBUG: Encoder returned direct tensor")
+            
+            print(f"DEBUG: Raw latent shape: {raw.shape}, mean: {raw.mean().item():.4f}, std: {raw.std().item():.4f}")
+            print(f"DEBUG: VAE config latent_channels: {self.vae.config.latent_channels}")
+            print(f"DEBUG: is_32ch flag: {self.is_32ch}")
+            
             shift = args["shift"]
             scale = args["scale"]
+            test_raw = args["test_raw"]
+            
             if scale == 0: scale = 0.0001
             
-            # This is what gets saved to cache
-            stored = (raw - shift) * scale
+            # Determine normalization type based on LATENT CHANNELS, not output format
+            use_flux_norm = (self.vae.config.latent_channels >= 16)
             
-            # CLAMPING CHECK (Training Integrity)
-            clamped = torch.clamp(stored, -4.0, 4.0)
+            # TEST MODE: Skip normalization entirely
+            if test_raw:
+                rec_input = raw
+                print(f"DEBUG: RAW TEST MODE - no normalization applied")
+            elif use_flux_norm:
+                # Official Flux VAE: Uses DIVISION for encoding (not multiplication)
+                # Formula: normalized = (raw - shift) / scale
+                stored = (raw - shift) / scale
+                
+                # CLAMPING CHECK (Training Integrity)
+                clamped = torch.clamp(stored, -4.0, 4.0)
+                
+                # Reverse: raw = (normalized * scale) + shift
+                rec_input = (clamped * scale) + shift
+                print(f"DEBUG: Flux normalization (div) - shift={shift:.4f}, scale={scale:.4f}")
+            else:
+                # SDXL VAE: Uses MULTIPLICATION
+                # Formula: normalized = (raw - shift) * scale
+                stored = (raw - shift) * scale
+                
+                # CLAMPING CHECK
+                clamped = torch.clamp(stored, -4.0, 4.0)
+                
+                # Reverse: raw = (normalized / scale) + shift
+                rec_input = (clamped / scale) + shift
+                print(f"DEBUG: SDXL normalization (mul) - shift={shift:.4f}, scale={scale:.4f}")
             
-            # Reverse
-            rec_input = (clamped / scale) + shift
-            decoded = self.vae.decode(rec_input).sample
+            print(f"DEBUG: Decoder input shape: {rec_input.shape}, mean: {rec_input.mean().item():.4f}, std: {rec_input.std().item():.4f}")
             
-            decoded = (decoded / 2 + 0.5).clamp(0, 1)
+            # Decode back to image
+            decoder_output = self.vae.decode(rec_input)
+            
+            # Handle different decoder output formats
+            if hasattr(decoder_output, 'sample'):
+                decoded = decoder_output.sample
+                print(f"DEBUG: Decoder output has .sample attribute")
+            else:
+                # Flux VAE returns tensor directly
+                decoded = decoder_output
+                print(f"DEBUG: Decoder output is direct tensor")
+            
+            print(f"DEBUG: Decoded shape: {decoded.shape}, mean: {decoded.mean().item():.4f}, std: {decoded.std().item():.4f}")
+            
+            # CRITICAL: Check the output range and normalize accordingly
+            decoded_min = decoded.min().item()
+            decoded_max = decoded.max().item()
+            
+            if decoded_min >= -1.5 and decoded_max <= 1.5:
+                # Output is in [-1, 1] range (standard)
+                decoded = (decoded / 2 + 0.5).clamp(0, 1)
+                print(f"DEBUG: Applied [-1,1] -> [0,1] normalization")
+            elif decoded_min >= -0.5 and decoded_max <= 0.5:
+                # Output is in tighter range, needs different scaling
+                decoded = (decoded + 0.5).clamp(0, 1)
+                print(f"DEBUG: Applied shifted normalization")
+            else:
+                # Already in [0, 1] or needs manual scaling
+                decoded = (decoded - decoded_min) / (decoded_max - decoded_min + 1e-8)
+                print(f"DEBUG: Applied min-max normalization: [{decoded_min:.4f}, {decoded_max:.4f}]")
+            
             dec_np = decoded.cpu().permute(0, 2, 3, 1).numpy()[0]
+            
+            print(f"DEBUG: Final image range: [{dec_np.min():.4f}, {dec_np.max():.4f}]")
             
         rec_img = Image.fromarray((dec_np * 255).astype(np.uint8))
         

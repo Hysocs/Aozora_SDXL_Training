@@ -84,11 +84,11 @@ TITAN_PARAMS = {
     "use_grad_centralization": False,
     "gc_alpha": 1.0
 }
-GRYPHON_PARAMS = {
-    "betas": [0.965, 0.99],
-    "rho": 0.03,            
-    "weight_decay": 0.01,   
-    "hessian_interval": 10
+VELORMS_PARAMS = {
+    "momentum": 0.86,
+    "leak": 0.16,
+    "weight_decay": 0.01,
+    "eps": 1e-8
 }
 # --- Noise Configuration ---
 NOISE_TYPE = "Default"
