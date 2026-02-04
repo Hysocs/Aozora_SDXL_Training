@@ -3152,7 +3152,15 @@ class DatasetManagerWidget(QtWidgets.QWidget):
 
     def get_total_repeats(self): return sum(ds["image_count"] * ds["repeats"] for ds in self.datasets)
     def get_datasets_config(self): return [{"path": ds["path"], "repeats": ds["repeats"]} for ds in self.datasets]
-
+    def _format_caption_for_display(self, text, max_chars=50):
+        """Force wrap long strings by inserting manual line breaks"""
+        import textwrap
+        # Break long words, preserve existing newlines
+        wrapped = textwrap.fill(text, width=max_chars, 
+                            break_long_words=True,
+                            replace_whitespace=False,
+                            drop_whitespace=False)
+        return wrapped
     def _start_loading_path(self, path, repeats=1):
         self.loading_label.setText(f"Scanning: {Path(path).name}...")
         loader = DatasetLoaderThread(path)
@@ -3211,23 +3219,31 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self._update_preview_for_card(idx)
         
     def _update_preview_for_card(self, idx):
-        if idx >= len(self.dataset_widgets): return
+        if idx >= len(self.dataset_widgets): 
+            return
         ds = self.datasets[idx]
         widgets = self.dataset_widgets[idx]
         current_data = ds["images_data"][ds["current_preview_idx"]]
+        
         if not current_data["caption_loaded"]:
             if current_data["caption_path"]:
                 try:
-                    with open(current_data["caption_path"], 'r', encoding='utf-8') as f: current_data["caption"] = f.read().strip()
-                except Exception: current_data["caption"] = "[Error reading caption]"
-            else: current_data["caption"] = "[No caption file]"
+                    with open(current_data["caption_path"], 'r', encoding='utf-8') as f: 
+                        current_data["caption"] = f.read().strip()
+                except Exception: 
+                    current_data["caption"] = "[Error reading caption]"
+            else: 
+                current_data["caption"] = "[No caption file]"
             current_data["caption_loaded"] = True
+        
+        # Update image preview
         pixmap = QtGui.QPixmap(current_data["image_path"])
-        if not pixmap.isNull(): pixmap = pixmap.scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
+        if not pixmap.isNull(): 
+            pixmap = pixmap.scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
         widgets["preview_label"].setPixmap(pixmap)
-        caption_text = current_data["caption"]
-        if len(caption_text) > 200: caption_text = caption_text[:200] + "..."
-        widgets["caption_label"].setText(caption_text)
+        
+        # Update caption - NO TRUNCATION, full text with scrolling
+        widgets["caption_text"].setPlainText(current_data["caption"])
         widgets["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
         
     def repopulate_dataset_grid(self):
@@ -3275,19 +3291,44 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             counter_nav_layout.addWidget(right_arrow)
             preview_section.addLayout(counter_nav_layout)
             top_section.addLayout(preview_section)
+
+
             caption_container = QtWidgets.QWidget()
             caption_container.setStyleSheet("QWidget { background-color: #2c2a3e; border: 1px solid #4a4668; border-radius: 4px; }")
+            caption_container.setMinimumWidth(150)
+            caption_container.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+
             caption_layout = QtWidgets.QVBoxLayout(caption_container)
             caption_layout.setContentsMargins(8, 8, 8, 8)
+
             caption_title = QtWidgets.QLabel("<b>Caption Preview:</b>")
             caption_title.setStyleSheet("color: #ab97e6; font-size: 11px;")
             caption_layout.addWidget(caption_title)
-            caption_label = QtWidgets.QLabel("Loading...")
-            caption_label.setWordWrap(True)
-            caption_label.setStyleSheet("color: #e0e0e0; font-size: 12px;")
-            caption_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignTop)
-            caption_layout.addWidget(caption_label, 1)
+
+            # QTextEdit with full height support and scrolling
+            caption_text = QtWidgets.QTextEdit("Loading...")
+            caption_text.setReadOnly(True)
+            caption_text.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
+            caption_text.setLineWrapMode(QtWidgets.QTextEdit.LineWrapMode.WidgetWidth)
+            caption_text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            caption_text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            caption_text.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
+            # REMOVED: setMaximumHeight restriction - allow it to expand
+            caption_text.setMinimumHeight(183)  # Minimum to match image, but can grow
+            caption_text.setStyleSheet("""
+                QTextEdit { 
+                    background-color: #2c2a3e; 
+                    color: #e0e0e0; 
+                    font-size: 12px; 
+                    border: none; 
+                    padding: 0px; 
+                }
+            """)
+            caption_layout.addWidget(caption_text, 1)
+
             top_section.addWidget(caption_container, 1)
+
+
             card_layout.addLayout(top_section)
             separator = QtWidgets.QFrame()
             separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
@@ -3331,7 +3372,13 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             btn_layout.addWidget(clear_btn)
             card_layout.addLayout(btn_layout)
             self.dataset_grid.addWidget(card, row, col)
-            self.dataset_widgets.append({"preview_label": preview_label, "caption_label": caption_label, "counter_label": counter_label, "repeats_total_label": repeats_total_label, "clear_btn": clear_btn})
+            self.dataset_widgets.append({
+                "preview_label": preview_label, 
+                "caption_text": caption_text,  # Changed from caption_label
+                "counter_label": counter_label, 
+                "repeats_total_label": repeats_total_label, 
+                "clear_btn": clear_btn
+            })
             self._update_preview_for_card(idx)
         if dataset_count % COLUMNS != 0:
             for empty_col in range((dataset_count % COLUMNS), COLUMNS): self.dataset_grid.setColumnStretch(empty_col, 1)
