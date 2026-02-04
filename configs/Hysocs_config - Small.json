@@ -14,13 +14,13 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "2500",
+    "MAX_TRAIN_STEPS": "5500",
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": "8",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "5.0",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "700",
+    "SAVE_EVERY_N_STEPS": "400",
     "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
@@ -28,12 +28,12 @@
             1e-06
         ],
         [
-            0.05,
-            3e-05
+            0.11724138,
+            1e-05
         ],
         [
             0.94942529,
-            3e-05
+            1e-05
         ],
         [
             1.0,
@@ -41,13 +41,13 @@
         ]
     ],
     "LR_GRAPH_MIN": "1e-06",
-    "LR_GRAPH_MAX": "3e-05",
+    "LR_GRAPH_MAX": "1e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
     "TIMESTEP_MODE": "Logit-Normal",
-    "TRAINING_MODE": "Rectified Flow (NoobAI Variant)",
+    "TRAINING_MODE": "Rectified Flow (SDXL)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
@@ -55,7 +55,7 @@
             "repeats": 1
         },
         {
-            "path": "C:\\Users\\Administrator\\Pictures\\Artists\\by akipeko",
+            "path": "C:/Users/Administrator/Pictures/Artists/by akipeko",
             "repeats": 1
         }
     ],
@@ -68,31 +68,31 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            23,
+            20,
+            123,
+            230,
+            306,
+            354,
+            381,
+            392,
+            393,
+            386,
+            372,
+            354,
+            333,
+            310,
+            284,
+            257,
+            228,
+            199,
+            169,
+            138,
+            108,
             78,
-            112,
-            130,
-            140,
-            145,
-            147,
-            145,
-            143,
-            140,
-            137,
-            132,
-            127,
-            121,
-            117,
-            110,
-            103,
-            97,
-            88,
-            78,
-            67,
-            55,
-            38,
-            22,
-            5
+            50,
+            26,
+            8,
+            1
         ]
     },
     "RAVEN_PARAMS": {

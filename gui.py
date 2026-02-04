@@ -2104,7 +2104,7 @@ class TrainingGUI(QtWidgets.QWidget):
         mode_group = QtWidgets.QGroupBox("Training Mode")
         mode_layout = QtWidgets.QHBoxLayout(mode_group)
         self.training_mode_combo = NoScrollComboBox()
-        self.training_mode_combo.addItems(["Standard (SDXL)", "Rectified Flow (NoobAI Variant)"])
+        self.training_mode_combo.addItems(["Standard (SDXL)", "Rectified Flow (SDXL)"])
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
         mode_layout.addWidget(self.training_mode_combo)
         col1_layout.addWidget(mode_group)
@@ -2150,11 +2150,11 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_lr_button_states(-1)
 
     def _on_training_mode_changed(self, text):
-        is_rf = "Rectified Flow" in text
+        is_rf = "Rectified Flow (SDXL)" in text
         if hasattr(self, 'scheduler_group'): self.scheduler_group.setEnabled(not is_rf)
         if hasattr(self, 'noise_group'): self.noise_group.setEnabled(not is_rf)
         
-        disabled_tooltip = "This configuration is hardcoded for Rectified Flow training."
+        disabled_tooltip = "This configuration is hardcoded for SDXL Rectified Flow training."
         if is_rf:
             if hasattr(self, 'scheduler_group'): self.scheduler_group.setToolTip(disabled_tooltip)
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip(disabled_tooltip)
@@ -3024,7 +3024,7 @@ class TrainingGUI(QtWidgets.QWidget):
     
     def get_current_cache_folder_name(self):
         mode = self.training_mode_combo.currentText()
-        if "Rectified Flow" in mode: return ".precomputed_embeddings_cache_rf_noobai"
+        if "Rectified Flow (SDXL)" in mode: return ".precomputed_embeddings_cache_rf_noobai"
         else: return ".precomputed_embeddings_cache"
 
     def start_training(self):

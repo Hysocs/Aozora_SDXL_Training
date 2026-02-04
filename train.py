@@ -109,7 +109,7 @@ class TrainingConfig:
         self._load_from_user_config()
         self._type_check_and_correct()
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
-        self.is_rectified_flow = getattr(self, "TRAINING_MODE", "Standard (SDXL)") == "Rectified Flow (NoobAI Variant)"
+        self.is_rectified_flow = getattr(self, "TRAINING_MODE", "Standard (SDXL)") == "Rectified Flow (SDXL)"
 
     def _load_from_user_config(self):
         parser = argparse.ArgumentParser(description="Load a specific training configuration.")
@@ -1565,7 +1565,7 @@ def main():
 
     scheduler = None
     if config.is_rectified_flow:
-        print(f"\n--- Using Loss: Rectified Flow (Velocity Matching) ---")
+        print(f"\n--- Using Loss: SDXL Rectified Flow (Velocity Matching) ---")
     else:
         prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
         print(f"\n--- Using Loss: Standard SDXL ({prediction_type}) ---")
@@ -1627,24 +1627,31 @@ def main():
                 timesteps_conditioning = None
 
                 if config.is_rectified_flow:
-                    # Step 1: Normalize ticket pool timesteps to [0, 1]
+                    # Sample timesteps (0-999 from your ticket pool)
+                    
+                    # Normalize to [0, 1)
                     t_normalized = timesteps.float() / 1000.0
                     
-                    # Step 2: Apply Flow Matching Shift (model trained with shift=2.5)
+                    # Apply flow matching shift to get noise level (sigma)
                     rf_shift = 2.5
-                    t_shifted = apply_flow_matching_shift(t_normalized, rf_shift)
+                    sigma = apply_flow_matching_shift(t_normalized, rf_shift)
                     
-                    # Step 3: Interpolate in latent space
-                    t_expanded = t_shifted.view(-1, 1, 1, 1)
-                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                    # For rectified flow, timestep and sigma are related but distinct
+                    # In the standard formulation: timestep = sigma * 1000 (shifted)
+                    # This matches your existing model's training
+                    
+                    # Use sigma for noise interpolation
+                    sigma_expanded = sigma.view(-1, 1, 1, 1)
+                    noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
                     target = noise - latents
                     
-                    # Step 4: Convert back for UNet timestep embedding
-                    timesteps_conditioning = (t_shifted * 1000).long()
-                    #repair (Only use if the model is needing to be de sharpened)
-                    #timesteps_conditioning = timesteps
-                    #v2 repair
-                    #timesteps_conditioning = timesteps.long()
+                    # Pass shifted timestep to UNet (matching your existing model)
+                    # Example timesteps_conditioning = (sigma * 1000).long()
+                    #timesteps_conditioning = (t_shifted * 1000).long()
+                    
+                    # SAFER: Clamp to valid range to avoid edge cases
+                    #timesteps_conditioning = torch.clamp(timesteps_conditioning, min=0, max=999)
+                    timesteps_conditioning = timesteps.long()
 
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
