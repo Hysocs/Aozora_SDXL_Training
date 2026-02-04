@@ -14,13 +14,13 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "4050",
+    "MAX_TRAIN_STEPS": "1500",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "4",
+    "GRADIENT_ACCUMULATION_STEPS": "8",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "5.0",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "2503",
+    "SAVE_EVERY_N_STEPS": "700",
     "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
@@ -28,29 +28,30 @@
             1e-06
         ],
         [
-            0.10344828,
-            6e-05
+            0.05,
+            3e-05
         ],
         [
-            0.89195402,
-            6e-05
+            0.94942529,
+            3e-05
         ],
         [
             1.0,
             1e-06
         ]
     ],
-    "LR_GRAPH_MIN": "1e-07",
-    "LR_GRAPH_MAX": "4e-04",
-    "MEMORY_EFFICIENT_ATTENTION": "xformers",
+    "LR_GRAPH_MIN": "1e-06",
+    "LR_GRAPH_MAX": "3e-05",
+    "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
+    "TIMESTEP_MODE": "Logit-Normal",
     "TRAINING_MODE": "Rectified Flow (NoobAI Variant)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:\\Users\\Administrator\\Pictures\\Artists\\by akipeko",
+            "path": "C:/Users/Administrator/Pictures\\Artists\\by Momikyo67528",
             "repeats": 1
         }
     ],
@@ -63,43 +64,43 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            99,
-            180,
-            198,
-            198,
-            198,
-            189,
-            189,
-            189,
-            180,
-            180,
-            180,
-            180,
-            171,
-            162,
-            162,
-            162,
-            162,
-            162,
-            162,
-            162,
-            144,
-            144,
-            135,
-            108,
-            54
+            14,
+            47,
+            67,
+            78,
+            84,
+            87,
+            88,
+            87,
+            86,
+            84,
+            82,
+            79,
+            76,
+            73,
+            70,
+            66,
+            62,
+            58,
+            53,
+            47,
+            40,
+            33,
+            23,
+            13,
+            3
         ]
     },
     "RAVEN_PARAMS": {
         "betas": [
             0.9,
-            0.98
+            0.99
         ],
         "eps": 1e-08,
-        "weight_decay": 0.06,
-        "debias_strength": 0.9,
-        "use_grad_centralization": true,
-        "gc_alpha": 0.9
+        "weight_decay": 0.01,
+        "debias_strength": 1.0,
+        "use_grad_centralization": false,
+        "gc_alpha": 0.5
     },
     "TITAN_PARAMS": {
         "betas": [
@@ -113,9 +114,9 @@
         "gc_alpha": 1.0
     },
     "VELORMS_PARAMS": {
-        "momentum": 0.95,
-        "leak": 0.3,
-        "weight_decay": 0.03,
-        "eps": 1e-08
+        "momentum": 0.85,
+        "leak": 0.05,
+        "weight_decay": 0.01,
+        "eps": 0.0001
     }
 }

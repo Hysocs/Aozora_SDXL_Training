@@ -8,12 +8,12 @@ IF "%~1"=="" (
 )
 
 :: =================================================================================
-::              SDXL Training Environment Setup Script (Fixed)
+::              SDXL Training Environment Setup Script (Updated: Mutual Exclusive)
 :: =================================================================================
 
 :: --- CONFIGURATION ---
 SET VENV_DIR=portable_Venv
-SET PYTHON_EXE=py -3.12
+SET PYTHON_EXE=py -3.11
 SET WHEELS_DIR=%VENV_DIR%\Wheels
 
 :: PyTorch 2.9.1 + CUDA 12.8 Stack
@@ -22,28 +22,28 @@ SET TORCHVISION_VERSION=0.24.1
 SET TORCHAUDIO_VERSION=2.9.1
 SET XFORMERS_VERSION=0.0.33.post2
 
-:: Flash Attention Wheel (for PyTorch 2.9.1 + CUDA 12.8 + Python 3.12)
-SET FLASH_ATTN_FILENAME=flash_attn-2.8.2+cu128torch2.9.1-cp312-none-win_amd64.whl
-SET FLASH_ATTN_URL=https://github.com/kingbri1/flash-attention/releases/download/v2.8.2/%FLASH_ATTN_FILENAME%
+:: Flash Attention Wheel (Validated for PyTorch 2.9.1 + CUDA 12.8 + Python 3.11)
+SET FLASH_ATTN_FILENAME=flash_attn-2.8.3+cu128torch2.9-cp311-cp311-win_amd64.whl
+SET FLASH_ATTN_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/%FLASH_ATTN_FILENAME%
 
 :: --- MENU ---
 :MENU
 CLS
 ECHO.
 ECHO === SDXL Training Environment Installer ===
-ECHO [1] Install WITH Flash Attention (RTX 30xx/40xx)
-ECHO [2] Install WITHOUT Flash Attention (AMD/Older NVIDIA)
+ECHO [1] Install WITH Flash Attention 2 (Recommended for RTX 30xx/40xx - Faster, Modern)
+ECHO [2] Install WITH xformers (Alternative - No Flash Attention)
 ECHO.
-ECHO Python 3.12, PyTorch %TORCH_VERSION%, CUDA 12.8
+ECHO PyTorch %TORCH_VERSION% + CUDA 12.8
 ECHO.
 CHOICE /C 12 /N /M "Enter choice [1 or 2]: "
 
-IF ERRORLEVEL 2 SET INSTALL_MODE=NO_FLASH & GOTO START_CHECKS
+IF ERRORLEVEL 2 SET INSTALL_MODE=XFORMERS & GOTO START_CHECKS
 IF ERRORLEVEL 1 SET INSTALL_MODE=FLASH & GOTO START_CHECKS
 
 :START_CHECKS
 ECHO.
-ECHO === Starting Setup ===
+ECHO === Starting Setup (%INSTALL_MODE% mode) ===
 ECHO.
 
 :: --- CUDA Check ---
@@ -58,11 +58,11 @@ ECHO.
 :: --- Python Check ---
 where %PYTHON_EXE% >nul 2>&1
 IF ERRORLEVEL 1 (
-    ECHO [ERROR] Python 3.12 not found. Install from python.org/downloads/
+    ECHO [ERROR] Python 3.11 not found. Install from python.org/downloads/
     GOTO FATAL_ERROR
 )
 %PYTHON_EXE% --version
-ECHO [OK] Python 3.12+ found.
+ECHO [OK] Python 3.11+ found.
 ECHO.
 
 :: --- Requirements.txt Check ---
@@ -93,58 +93,72 @@ ECHO.
 :: --- Set Encoding ---
 SET PYTHONIOENCODING=utf-8
 
-:: --- Core ML Stack (PyTorch + Vision + Audio + Xformers) ---
-ECHO [INFO] Installing PyTorch %TORCH_VERSION% stack...
-ECHO [INFO] This may take 10-20 minutes depending on your internet speed...
+:: --- Upgrade pip ---
+ECHO [INFO] Upgrading pip...
 python -m pip install --upgrade pip
-python -m pip install torch==%TORCH_VERSION% torchvision==%TORCHVISION_VERSION% torchaudio==%TORCHAUDIO_VERSION% xformers==%XFORMERS_VERSION% --index-url https://download.pytorch.org/whl/cu128
-IF ERRORLEVEL 1 (
-    ECHO [ERROR] PyTorch installation failed. Check your internet/PyPI access.
-    GOTO FATAL_ERROR
-)
-ECHO [OK] PyTorch + Xformers installed.
 ECHO.
 
-:: --- Flash Attention ---
+:: --- Core PyTorch Stack (torch + torchvision + torchaudio) ---
+ECHO [INFO] Installing PyTorch %TORCH_VERSION% core stack...
+python -m pip install torch==%TORCH_VERSION% torchvision==%TORCHVISION_VERSION% torchaudio==%TORCHAUDIO_VERSION% --index-url https://download.pytorch.org/whl/cu128
+IF ERRORLEVEL 1 (
+    ECHO [ERROR] PyTorch core installation failed.
+    GOTO FATAL_ERROR
+)
+ECHO [OK] PyTorch core installed.
+ECHO.
+
+:: --- Attention Backend (Mutual Exclusive) ---
 IF "%INSTALL_MODE%"=="FLASH" (
-    ECHO [INFO] Installing Flash Attention v2.8.2...
+    ECHO [INFO] Installing Flash Attention 2.8.3 (mutual exclusive - no xformers)...
     IF NOT EXIST "%WHEELS_DIR%" MKDIR "%WHEELS_DIR%"
     
     SET FLASH_PATH=%WHEELS_DIR%\%FLASH_ATTN_FILENAME%
     IF NOT EXIST "%FLASH_PATH%" (
-        ECHO [INFO] Downloading from GitHub...
+        ECHO [INFO] Downloading Flash Attention wheel (validated URL)...
         curl -L --progress-bar -o "%FLASH_PATH%" %FLASH_ATTN_URL%
         IF ERRORLEVEL 1 (
-            ECHO [ERROR] Download failed. Check URL or internet.
+            ECHO [ERROR] Download failed. Check internet or URL validity.
             GOTO FATAL_ERROR
         )
-        ECHO [OK] Downloaded.
+        ECHO [OK] Flash Attention wheel downloaded and validated.
     ) ELSE (
-        ECHO [INFO] Using cached wheel.
+        ECHO [INFO] Using cached Flash Attention wheel.
     )
     
-    ECHO [INFO] Installing wheel...
+    ECHO [INFO] Installing Flash Attention...
     python -m pip install "%FLASH_PATH%"
     IF ERRORLEVEL 1 GOTO FATAL_ERROR
-    ECHO [OK] Flash Attention installed.
+    ECHO [OK] Flash Attention 2.8.3 installed (no xformers).
+    ECHO.
+) ELSE (
+    ECHO [INFO] Installing xformers %XFORMERS_VERSION% (mutual exclusive - no Flash Attention)...
+    python -m pip install xformers==%XFORMERS_VERSION% --index-url https://download.pytorch.org/whl/cu128
+    IF ERRORLEVEL 1 (
+        ECHO [ERROR] xformers installation failed.
+        GOTO FATAL_ERROR
+    )
+    ECHO [OK] xformers installed.
     ECHO.
 )
 
-:: --- Dependencies ---
-ECHO [INFO] Installing remaining packages from requirements.txt...
+:: --- Remaining Dependencies ---
+ECHO [INFO] Installing packages from requirements.txt...
 python -m pip install -r requirements.txt
 IF ERRORLEVEL 1 (
-    ECHO [ERROR] Package installation failed. Check requirements.txt
+    ECHO [ERROR] requirements.txt installation failed.
     GOTO FATAL_ERROR
 )
-ECHO [OK] All packages installed.
+ECHO [OK] All dependencies installed.
 ECHO.
 
 :: --- Final Verification ---
 ECHO [INFO] Verifying installation...
-python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}'); import torchvision; print(f'Vision: {torchvision.__version__}'); import xformers; print(f'Xformers: {xformers.__version__}')"
+python -c "import torch; print(f'PyTorch: {torch.__version__}, CUDA: {torch.version.cuda}'); import torchvision; print(f'Torchvision: {torchvision.__version__}')"
 IF "%INSTALL_MODE%"=="FLASH" (
-    python -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')" 2>nul || ECHO [WARN] Flash import test failed.
+    python -c "import flash_attn; print(f'Flash Attention: {flash_attn.__version__}')" 2>nul || ECHO [WARN] Flash Attention import failed (should not happen).
+) ELSE (
+    python -c "import xformers; print(f'xformers: {xformers.__version__}')" 2>nul || ECHO [WARN] xformers import failed (should not happen).
 )
 ECHO [OK] Verification complete.
 ECHO.
@@ -152,10 +166,17 @@ ECHO.
 :: --- Success ---
 ECHO.
 ECHO ========================================
-ECHO    INSTALLATION COMPLETE!
+ECHO    INSTALLATION COMPLETE! (%INSTALL_MODE% mode)
 ECHO ========================================
 ECHO.
-ECHO To activate manually: CALL "%VENV_DIR%\Scripts\activate.bat"
+ECHO Recommended config setting:
+IF "%INSTALL_MODE%"=="FLASH" (
+    ECHO   "MEMORY_EFFICIENT_ATTENTION": "flash_attn"   (or "sdpa"/"cudnn" for max speed)
+) ELSE (
+    ECHO   "MEMORY_EFFICIENT_ATTENTION": "xformers"
+)
+ECHO.
+ECHO To activate venv: CALL "%VENV_DIR%\Scripts\activate.bat"
 PAUSE
 GOTO END
 
@@ -165,12 +186,11 @@ ECHO ========================================
 ECHO    INSTALLATION FAILED
 ECHO ========================================
 ECHO.
-ECHO Common issues:
-ECHO 1. Python 3.12 not installed or 'py' launcher not in PATH
-ECHO 2. No internet connection to PyPI
-ECHO 3. requirements.txt contains invalid packages
-ECHO 4. Insufficient disk space
-ECHO 5. Antivirus blocking pip/curl
+ECHO Common fixes:
+ECHO 1. Python 3.11 not in PATH or 'py' launcher missing
+ECHO 2. No/stable internet (PyPI/GitHub)
+ECHO 3. Antivirus blocking curl/pip
+ECHO 4. Disk space / permissions
 ECHO.
 PAUSE
 

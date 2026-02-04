@@ -1592,7 +1592,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "BETA_SCHEDULE": {"label": "Beta Schedule:", "tooltip": "Noise schedule for the diffuser.", "widget": "QComboBox", "options": ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]},
         "MAX_TRAIN_STEPS": {"label": "Max Training Steps:", "tooltip": "Total number of training steps.", "widget": "QLineEdit"},
         "BATCH_SIZE": {"label": "Batch Size:", "tooltip": "Number of samples per batch.", "widget": "QSpinBox", "range": (1, 32)},
-        "SAVE_EVERY_N_STEPS": {"label": "Save Every N Steps:", "tooltip": "How often to save a checkpoint.", "widget": "QLineEdit"},
+        "SAVE_EVERY_N_STEPS": {"label": "Save Every N (Optimizer Steps)", "tooltip": "Determines when the training run will save a checkpoint based on optimizer steps.", "widget": "QLineEdit"},
         "GRADIENT_ACCUMULATION_STEPS": {"label": "Gradient Accumulation:", "tooltip": "Simulates a larger batch size.", "widget": "QLineEdit"},
         "MIXED_PRECISION": {"label": "Mixed Precision:", "tooltip": "bfloat16 for modern GPUs, float16 for older.", "widget": "QComboBox", "options": ["bfloat16", "float16"]},
         "CLIP_GRAD_NORM": {"label": "Gradient Clipping:", "tooltip": "Maximum gradient norm. Set to 0 to disable.", "widget": "QLineEdit"},
@@ -1603,7 +1603,7 @@ class TrainingGUI(QtWidgets.QWidget):
         "LR_GRAPH_MIN": {"label": "Graph Min LR:", "tooltip": "The minimum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "LR_GRAPH_MAX": {"label": "Graph Max LR:", "tooltip": "The maximum learning rate displayed on the Y-axis.", "widget": "QLineEdit"},
         "NOISE_SCHEDULER": {"label": "Noise Scheduler:", "tooltip": "The noise scheduler to use for training. EulerDiscrete is experimental.", "widget": "QComboBox", "options": ["DDPMScheduler", "DDIMScheduler", "EulerDiscreteScheduler (Experimental)"]},
-        "MEMORY_EFFICIENT_ATTENTION": {"label": "Attention Backend:", "tooltip": "Select the attention mechanism to use.", "widget": "QComboBox", "options": ["xformers", "sdpa"]},
+        "MEMORY_EFFICIENT_ATTENTION": {"label": "Attention Backend:", "tooltip": "Select the attention mechanism to use.", "widget": "QComboBox", "options": ["sdpa", "flex_attn", "cudnn","xformers (Only if no Flash)"]},
         "USE_ZERO_TERMINAL_SNR": {"label": "Use Zero-Terminal SNR", "tooltip": "Rescales noise schedule for better dynamic range.", "widget": "QCheckBox"},
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
@@ -1896,6 +1896,7 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
         config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
         config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
+        config_to_save["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         
         if hasattr(self, 'timestep_histogram'):
             config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
@@ -2480,6 +2481,19 @@ class TrainingGUI(QtWidgets.QWidget):
             
             layout.addRow(container)
             return slider, spin
+    
+    def _reset_timestep_sliders(self):
+        mode = self.ts_mode_combo.currentText()
+        if mode == "Wave":
+            self.spin_wave_amp.setValue(0.0)
+            self.spin_wave_freq.setValue(1.0)
+            self.spin_wave_phase.setValue(0.0)
+        elif mode == "Logit-Normal":
+            self.spin_ln_mu.setValue(0.0)
+            self.spin_ln_sigma.setValue(1.0)
+        elif mode == "Beta":
+            self.spin_beta_alpha.setValue(3.0)
+            self.spin_beta_beta.setValue(3.0)
 
     def _create_timestep_sampling_group(self):
         group = QtWidgets.QGroupBox("Timestep Ticket Allocation")
@@ -2508,14 +2522,14 @@ class TrainingGUI(QtWidgets.QWidget):
         row1.addSpacing(20)
         row1.addWidget(QtWidgets.QLabel("Distribution Mode:"))
         self.ts_mode_combo = NoScrollComboBox()
-        self.ts_mode_combo.addItems(["Wave", "Logit-Normal"])
+        self.ts_mode_combo.addItems(["Wave", "Logit-Normal", "Beta"])
         row1.addWidget(self.ts_mode_combo, 1)
         controls_layout.addLayout(row1)
 
         # 3. Stacked Widget for Mode-Specific Sliders
         self.ts_slider_stack = QtWidgets.QStackedWidget()
         
-        # --- Wave Mode Page ---
+        # --- Wave Mode Page (Page 0) ---
         wave_page = QtWidgets.QWidget()
         wave_layout = QtWidgets.QFormLayout(wave_page)
         wave_layout.setContentsMargins(0, 0, 0, 0)
@@ -2531,7 +2545,7 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         self.ts_slider_stack.addWidget(wave_page)
 
-        # --- Logit-Normal Mode Page ---
+        # --- Logit-Normal Mode Page (Page 1) ---
         logit_page = QtWidgets.QWidget()
         logit_layout = QtWidgets.QFormLayout(logit_page)
         logit_layout.setContentsMargins(0, 0, 0, 0)
@@ -2543,12 +2557,24 @@ class TrainingGUI(QtWidgets.QWidget):
             logit_layout, "Spread (Sigma):", 0.1, 3.0, 1.0, 100.0
         )
         self.ts_slider_stack.addWidget(logit_page)
+
+        # --- Beta Mode Page (Page 2) ---
+        beta_page = QtWidgets.QWidget()
+        beta_layout = QtWidgets.QFormLayout(beta_page)
+        beta_layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.slider_beta_alpha, self.spin_beta_alpha = self._add_slider_row(
+            beta_layout, "Alpha:", 0.1, 10.0, 3.0, 100.0
+        )
+        self.slider_beta_beta, self.spin_beta_beta = self._add_slider_row(
+            beta_layout, "Beta:", 0.1, 10.0, 3.0, 100.0
+        )
+        self.ts_slider_stack.addWidget(beta_page)
         
         controls_layout.addWidget(self.ts_slider_stack)
 
-        # 4. Preset Buttons
-        btn_grid = QtWidgets.QGridLayout()
-        btn_grid.setSpacing(8)
+        # 4. Stacked Widget for Presets Buttons
+        self.ts_button_stack = QtWidgets.QStackedWidget()
         
         def create_preset_btn(text, callback):
             btn = QtWidgets.QPushButton(text)
@@ -2556,22 +2582,47 @@ class TrainingGUI(QtWidgets.QWidget):
             btn.setStyleSheet("padding: 4px; font-size: 11px;")
             return btn
 
-        btn_grid.addWidget(create_preset_btn("Uniform", lambda: self._apply_timestep_preset("Uniform")), 0, 0)
-        btn_grid.addWidget(create_preset_btn("Bell Curve", lambda: self._apply_timestep_preset("Bell Curve")), 0, 1)
-        btn_grid.addWidget(create_preset_btn("Detail (Early)", lambda: self._apply_timestep_preset("Detail")), 0, 2)
-        btn_grid.addWidget(create_preset_btn("Structure (Late)", lambda: self._apply_timestep_preset("Structure")), 1, 0)
-        btn_grid.addWidget(create_preset_btn("Peak Ends", lambda: self._apply_timestep_preset("Peak Ends")), 1, 1)
-        btn_grid.addWidget(create_preset_btn("Peak Middle", lambda: self._apply_timestep_preset("Peak Middle")), 1, 2)
-        btn_grid.addWidget(create_preset_btn("Logit-Normal (RF)", lambda: self._apply_timestep_preset("Logit-Normal (RF)")), 2, 0)
+        # --- Wave Presets ---
+        wave_btn_page = QtWidgets.QWidget()
+        wave_btn_layout = QtWidgets.QGridLayout(wave_btn_page)
+        wave_btn_layout.setSpacing(8)
+        wave_btn_layout.setContentsMargins(0, 0, 0, 0)
+        wave_btn_layout.addWidget(create_preset_btn("Uniform (Flat)", lambda: self._apply_timestep_preset("Uniform")), 0, 0)
+        wave_btn_layout.addWidget(create_preset_btn("Peak Ends", lambda: self._apply_timestep_preset("Peak Ends")), 0, 1)
+        wave_btn_layout.addWidget(create_preset_btn("Peak Middle", lambda: self._apply_timestep_preset("Peak Middle")), 0, 2)
+        self.ts_button_stack.addWidget(wave_btn_page)
 
-        controls_layout.addLayout(btn_grid)
+        # --- Logit-Normal Presets ---
+        ln_btn_page = QtWidgets.QWidget()
+        ln_btn_layout = QtWidgets.QGridLayout(ln_btn_page)
+        ln_btn_layout.setSpacing(8)
+        ln_btn_layout.setContentsMargins(0, 0, 0, 0)
+        ln_btn_layout.addWidget(create_preset_btn("Bell Curve", lambda: self._apply_timestep_preset("Bell Curve")), 0, 0)
+        ln_btn_layout.addWidget(create_preset_btn("Detail (Early)", lambda: self._apply_timestep_preset("Detail")), 0, 1)
+        ln_btn_layout.addWidget(create_preset_btn("Structure (Late)", lambda: self._apply_timestep_preset("Structure")), 0, 2)
+        ln_btn_layout.addWidget(create_preset_btn("Logit-Normal (RF/SD3 Recommended)", lambda: self._apply_timestep_preset("Logit-Normal (RF/SD3 Recommended)")), 1, 0)
+        self.ts_button_stack.addWidget(ln_btn_page)
+
+        # --- Beta Presets ---
+        beta_btn_page = QtWidgets.QWidget()
+        beta_btn_layout = QtWidgets.QGridLayout(beta_btn_page)
+        beta_btn_layout.setSpacing(8)
+        beta_btn_layout.setContentsMargins(0, 0, 0, 0)
+        beta_btn_layout.addWidget(create_preset_btn("Symmetric (3,3)", lambda: self._apply_timestep_preset("Beta Symmetric")), 0, 0)
+        beta_btn_layout.addWidget(create_preset_btn("Right Skew (2,5)", lambda: self._apply_timestep_preset("Beta Right Skew")), 0, 1)
+        beta_btn_layout.addWidget(create_preset_btn("Left Skew (5,2)", lambda: self._apply_timestep_preset("Beta Left Skew")), 0, 2)
+        beta_btn_layout.addWidget(create_preset_btn("U-Shape (0.5,0.5)", lambda: self._apply_timestep_preset("Beta U-Shape")), 1, 0)
+        self.ts_button_stack.addWidget(beta_btn_page)
+
+        controls_layout.addWidget(self.ts_button_stack)
         layout.addLayout(controls_layout)
 
         # --- Signal Connections ---
         self.bin_size_combo.currentTextChanged.connect(lambda txt: self.timestep_histogram.set_bin_size(int(txt)))
         
-        # Mode switching
+        # Mode switching (Link both Slider Stack and Button Stack)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
+        self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self._update_timestep_distribution)
 
         return group
@@ -2579,7 +2630,6 @@ class TrainingGUI(QtWidgets.QWidget):
     def _apply_timestep_preset(self, name):
         """Sets spinbox values to replicate a preset configuration. SpinBox changes trigger updates."""
         # Block signals briefly? No, we want the signals to fire to update the slider and the graph.
-        # But we should do it carefully to avoid "jumping" if mode changes.
         
         if name == "Uniform":
             self.ts_mode_combo.setCurrentText("Wave")
@@ -2612,10 +2662,30 @@ class TrainingGUI(QtWidgets.QWidget):
             self.spin_wave_phase.setValue(3.14) # Phase PI flips Cos(x), starts at -1
             self.spin_wave_amp.setValue(0.6)
 
-        elif name == "Logit-Normal (RF)":
+        elif name == "Logit-Normal (RF/SD3 Recommended)":
             self.ts_mode_combo.setCurrentText("Logit-Normal")
-            self.spin_ln_mu.setValue(-0.2)
-            self.spin_ln_sigma.setValue(1.5)
+            self.spin_ln_mu.setValue(-0.5)
+            self.spin_ln_sigma.setValue(1.0)
+
+        elif name == "Beta Symmetric":
+            self.ts_mode_combo.setCurrentText("Beta")
+            self.spin_beta_alpha.setValue(3.0)
+            self.spin_beta_beta.setValue(3.0)
+
+        elif name == "Beta Right Skew":
+            self.ts_mode_combo.setCurrentText("Beta")
+            self.spin_beta_alpha.setValue(2.0)
+            self.spin_beta_beta.setValue(5.0)
+
+        elif name == "Beta Left Skew":
+            self.ts_mode_combo.setCurrentText("Beta")
+            self.spin_beta_alpha.setValue(5.0)
+            self.spin_beta_beta.setValue(2.0)
+
+        elif name == "Beta U-Shape":
+            self.ts_mode_combo.setCurrentText("Beta")
+            self.spin_beta_alpha.setValue(0.5)
+            self.spin_beta_beta.setValue(0.5)
 
     def _update_timestep_distribution(self):
         """Calculates weights based on current sliders/spinboxes and sends to histogram."""
@@ -2663,6 +2733,24 @@ class TrainingGUI(QtWidgets.QWidget):
                 
                 weight = prob_end - prob_start
                 weights.append(max(0.0, weight))
+
+        elif mode == "Beta":
+            alpha = self.spin_beta_alpha.value()
+            beta = self.spin_beta_beta.value()
+
+            # Beta PDF: f(x; a, b) = x^(a-1) * (1-x)^(b-1) / B(a,b)
+            # We omit B(a,b) because we normalize weights anyway.
+            for i in range(num_bins):
+                # Sample at the center of the bin
+                t_center = (i * bin_size) + (bin_size / 2)
+                x = t_center / 1000.0
+                
+                # Clamp slightly to avoid 0^neg or 1^neg errors
+                eps = 1e-4
+                x = max(eps, min(1.0 - eps, x))
+                
+                val = (x ** (alpha - 1)) * ((1 - x) ** (beta - 1))
+                weights.append(max(0.0, val))
 
         self.timestep_histogram.generate_from_weights(weights)
     
@@ -2736,7 +2824,7 @@ class TrainingGUI(QtWidgets.QWidget):
             
             # Exclude special keys handled manually
             special_keys = [
-                "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"
+                "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION", "TIMESTEP_MODE"
             ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "VELORMS_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
             
             for key, widget in self.widgets.items():
@@ -2816,6 +2904,23 @@ class TrainingGUI(QtWidgets.QWidget):
                         self.bin_size_combo.setCurrentText(str(allocation["bin_size"]))
                         self.bin_size_combo.blockSignals(False)
                     self.timestep_histogram.set_allocation(allocation)
+                
+                # Load saved mode (default to Wave if missing)
+                ts_mode = self.current_config.get("TIMESTEP_MODE", "Wave")
+                
+                # Temporarily disconnect the automatic distribution generation
+                self.ts_mode_combo.currentIndexChanged.disconnect(self._update_timestep_distribution)
+                
+                # Set the mode (this will still switch the slider/button stacks because those connections remain active)
+                self.ts_mode_combo.setCurrentText(ts_mode)
+                
+                # Re-connect the generation trigger
+                self.ts_mode_combo.currentIndexChanged.connect(self._update_timestep_distribution)
+                
+                # Reset sliders to their default values for the loaded mode (so we don't accidentally keep old tweaks)
+                self._reset_timestep_sliders()
+            if ts_mode and hasattr(self, 'ts_mode_combo'):
+                self.ts_mode_combo.setCurrentText(ts_mode)
                 
             if hasattr(self, "dataset_manager"): 
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))

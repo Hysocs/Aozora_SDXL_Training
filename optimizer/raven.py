@@ -21,7 +21,7 @@ class RavenAdamW(Optimizer):
         weight_decay: float = 0.06,                # Balanced: prevents overfitting without flattening
         eps: float = 1e-08,                        # Safer for FP16 than 1e-08
         debias_strength: float = 0.9,              # Balanced: smooth early steps
-        use_grad_centralization: bool = True,      # Balanced: ON (critical for stability)
+        use_grad_centralization: bool = False,      # Balanced: ON (critical for stability)
         gc_alpha: float = 0.9,                     # Balanced: 90% strength centering
     ):
         if not 0.0 <= lr: raise ValueError(f"Invalid learning rate: {lr}")

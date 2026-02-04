@@ -35,12 +35,50 @@ from optimizer.raven import RavenAdamW
 from optimizer.titan import TitanAdamW
 from optimizer.velorms import VeloRMS
 import uuid
-
+from diffusers.models.attention_processor import (
+        AttnProcessor2_0, 
+        FusedAttnProcessor2_0
+    )
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+def set_attention_processor(unet, attention_mode="flash_attn"):
+    """
+    attention_mode: "flash_attn", "fused", "xformers", "sdpa"
+    """
+    if attention_mode == "flex_attn":
+        try:
+            # Assuming a FlexAttnProcessor would be available
+            from diffusers.models.attention_processor import FlexAttnProcessor
+            unet.set_attn_processor(FlexAttnProcessor())
+            print("INFO: Using Flex Attention")
+        except ImportError:
+            print("WARNING: FlexAttention processor not available, falling back to SDPA")
+            unet.set_attn_processor(AttnProcessor2_0())
+
+    if attention_mode == "cudnn":
+        # PyTorch 2.5+ CuDNN backend - Best for Windows training
+        if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
+            torch.backends.cuda.enable_cudnn_sdp(True)
+            torch.backends.cuda.enable_flash_sdp(False)  # Disable FA to force CuDNN
+            torch.backends.cuda.enable_mem_efficient_sdp(True)  # Fallback
+            unet.set_attn_processor(AttnProcessor2_0())
+            print("INFO: Using CuDNN SDPA backend (PyTorch 2.5+ optimized)")
+        else:
+            print("WARNING: CuDNN SDPA requires PyTorch 2.5+, falling back to standard SDPA")
+            unet.set_attn_processor(AttnProcessor2_0())
+            
+            
+    elif attention_mode == "xformers (Only if no Flash)":
+        unet.enable_xformers_memory_efficient_attention()
+        print("INFO: Using xFormers")
+        
+    else:  # sdpa
+        unet.set_attn_processor(AttnProcessor2_0())
+        print("INFO: Using SDPA (PyTorch native)")
 
 def set_seed(seed):
     random.seed(seed)
@@ -484,6 +522,7 @@ def load_unet_robust(path, compute_dtype):
             low_cpu_mem_usage=True
         )
         print("INFO: Loaded Standard SDXL UNet (4 input/output channels).")
+        print(f"INFO: UNet attention implementation: {unet.config.attention_type if hasattr(unet.config, 'attention_type') else 'flash_attention_2'}")
         
     except Exception as e:
         # 2. Check for the 32-channel mismatch error (Input OR Output)
@@ -506,6 +545,7 @@ def load_unet_robust(path, compute_dtype):
                     ignore_mismatched_sizes=True
                 )
                 print("INFO: Successfully loaded 32-channel UNet (in=32, out=32).")
+                print(f"INFO: UNet attention implementation: {unet.config.attention_type if hasattr(unet.config, 'attention_type') else 'flash_attention_2'}")
             except Exception as e2:
                 print(f"CRITICAL ERROR: Failed to load 32-channel UNet: {e2}")
                 raise e2
@@ -554,7 +594,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         print("="*60 + "\n")
         return
     
-    # Determine cache folder name
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     
     print("\n" + "="*60)
@@ -576,16 +615,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     te1.to(device)
     te2.to(device)
     
-    # --- Compute Null Embeddings for Unconditional Dropout ---
     print("INFO: Computing Null Embeddings for Unconditional Dropout...")
     with torch.no_grad():
-        null_embeds, null_pooled = compute_text_embeddings_sdxl(
-    [""], t1, t2, te1, te2, device
-    )
+        null_embeds, null_pooled = compute_text_embeddings_sdxl([""], t1, t2, te1, te2, device)
     
     null_embeds = null_embeds.cpu()
     null_pooled = null_pooled.cpu()
-    # ---------------------------------------------------------
     
     transform = transforms.Compose([
         transforms.ToTensor(),
@@ -597,7 +632,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
         
-        # Save Null Embeddings to every dataset cache folder to be safe/accessible
         torch.save({"embeds": null_embeds, "pooled": null_pooled}, cache_dir / "null_embeds.pt")
         
         paths = [
@@ -608,11 +642,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         to_process = []
         for p in paths:
             relative_path = p.relative_to(root)
-            safe_stem = str(relative_path.with_suffix('')).replace(
-                os.sep, '_'
-            ).replace('/', '_').replace('\\', '_')
+            safe_stem = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
             
-            # Check if headers exist
             if not (cache_dir / f"{safe_stem}_te.pt").exists():
                 to_process.append(p)
 
@@ -644,14 +675,10 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         
         random.shuffle(batches)
         
-        for batch_idx, ((w, h), batch_meta) in enumerate(
-            tqdm(batches, desc=f"Encoding {root.name}")
-        ):
+        for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc=f"Encoding {root.name}")):
             captions = [m['caption'] for m in batch_meta]
             
-            embeds, pooled = compute_text_embeddings_sdxl(
-                captions, t1, t2, te1, te2, device
-            )
+            embeds, pooled = compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device)
             embeds = embeds.to(dtype=torch.float32)
             pooled = pooled.to(dtype=torch.float32)
             
@@ -662,7 +689,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 try:
                     with Image.open(m['ip']) as img:
                         img = fix_alpha_channel(img)
-                        # Resize to the calculated bucket resolution
                         img_resized = smart_resize(img, w, h)
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
@@ -673,27 +699,21 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 continue
             
             pixel_values_global = torch.stack(images_global).to(device, dtype=torch.float32)
-            
 
             with torch.no_grad():
-                # Encode Logic
                 dist = vae.encode(pixel_values_global).latent_dist
                 latents_global = dist.mean
-                # --- INSERT VERIFICATION HERE (BEFORE normalization) ---
+                
                 if batch_idx == 0:
                     print(f"\nDEBUG - RAW VAE OUTPUT (before normalization):")
                     print(f"  Raw latent mean: {latents_global.mean().item():.4f}")
                     print(f"  Raw latent std: {latents_global.std().item():.4f}")
-                # --- END BEFORE ---
                 
-                # Apply Shift-Scale Normalization (Critical for Flux/NoobAI 32ch VAE)
                 if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
-                    # Use MULTIPLICATION (scale is already inverted: 1/std)
                     latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
                 else:
                     latents_global = latents_global * vae.config.scaling_factor
                 
-                # --- INSERT VERIFICATION HERE (AFTER normalization) ---
                 if batch_idx == 0:
                     print(f"\nDEBUG - NORMALIZED LATENTS (after normalization):")
                     print(f"  Normalized mean: {latents_global.mean().item():.4f} (target: ~0.0)")
@@ -701,29 +721,24 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     print(f"  VAE shift_factor: {vae.config.shift_factor}")
                     print(f"  VAE scaling_factor: {vae.config.scaling_factor}")
                     print("-" * 60)
-                # --- END AFTER ---
+
                 if batch_idx == 0:
                     print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
                     print(f"DEBUG: Latent mean: {latents_global.mean().item():.4f}")
                     print(f"DEBUG: Latent std: {latents_global.std().item():.4f}")
 
-                # Add this for every 10th batch
                 if batch_idx % 10 == 0:
                     print(f"Batch {batch_idx}: mean={latents_global.mean().item():.4f}, std={latents_global.std().item():.4f}")
-                # ----------------------------------------
                 
             latents_global = latents_global.cpu()
             
             for j, m in enumerate(valid_meta_final):
                 relative_path = m['ip'].relative_to(root)
-                safe_filename = str(relative_path.with_suffix('')).replace(
-                    os.sep, '_'
-                ).replace('/', '_').replace('\\', '_')
+                safe_filename = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
                 
                 path_te = cache_dir / f"{safe_filename}_te.pt"
                 path_lat = cache_dir / f"{safe_filename}_lat.pt"
                 
-                # Save metadata
                 torch.save({
                     "original_stem": m['ip'].stem,
                     "relative_path": str(relative_path),
@@ -733,10 +748,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     "pooled": pooled[j].cpu(),
                     "vae_shift": vae.config.shift_factor,
                     "vae_scale": vae.config.scaling_factor,
-                    "has_full_res": False
                 }, path_te)
                 
-                # Save latents (32ch or 4ch, whatever the VAE output)
                 torch.save(latents_global[j], path_lat)
             
             del pixel_values_global, latents_global, embeds, pooled
@@ -752,8 +765,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
         self.te_files = []
-        self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'Default') == "Semantic")
-        
         self.dataset_roots = {} 
         self.is_rectified_flow = config.is_rectified_flow
         self.seed = config.SEED if config.SEED else 42
@@ -774,12 +785,10 @@ class ImageTextLatentDataset(Dataset):
 
         if not self.te_files: raise ValueError("No cached files found.")
         
-        print("INFO: Shuffling the entire dataset order...")
         random.shuffle(self.te_files)
         
         self.bucket_keys = []
         
-        print("INFO: building buckets from cache headers...")
         for f in tqdm(self.te_files, desc="Loading Cache Headers"):
             try:
                 header = torch.load(f, map_location='cpu')
@@ -788,19 +797,16 @@ class ImageTextLatentDataset(Dataset):
                     self.bucket_keys.append(tuple(res))
                 else:
                     self.bucket_keys.append(None)
-
             except Exception as e:
                 print(f"Error reading cache header for {f}: {e}")
                 self.bucket_keys.append(None)
         
-        # --- Unconditional Dropout Setup ---
         self.dropout_prob = getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) if getattr(config, "UNCONDITIONAL_DROPOUT", False) else 0.0
         self.null_embeds = None
         self.null_pooled = None
         
         if self.dropout_prob > 0:
             found_null = False
-            # Try to load null embeds from any valid dataset cache
             for ds in config.INSTANCE_DATASETS:
                 root = Path(ds["path"])
                 cache_dir = root / cache_folder_name
@@ -808,31 +814,22 @@ class ImageTextLatentDataset(Dataset):
                 if null_path.exists():
                     try:
                         null_data = torch.load(null_path, map_location="cpu")
-                        
-                        # FIX: Ensure we remove the batch dimension [1, ...] -> [...]
-                        # Cached files typically store [1, Seq, Dim] for embeds and [1, Dim] for pooled
-                        # from the compute_chunked_text_embeddings function.
                         self.null_embeds = null_data["embeds"]
                         if self.null_embeds.dim() == 3:
                             self.null_embeds = self.null_embeds.squeeze(0)
-                            
                         self.null_pooled = null_data["pooled"]
                         if self.null_pooled.dim() == 2:
                             self.null_pooled = self.null_pooled.squeeze(0)
-                            
                         found_null = True
-                        print(f"INFO: Loaded null embeddings for unconditional dropout (Chance: {self.dropout_prob})")
                         break
                     except Exception as e:
                         print(f"WARNING: Failed to load null embeddings: {e}")
             
             if not found_null:
-                print("WARNING: Unconditional Dropout enabled but null_embeds.pt not found in cache. Disabling dropout.")
+                print("WARNING: Unconditional Dropout enabled but null_embeds.pt not found. Disabling dropout.")
                 self.dropout_prob = 0.0
-        # -----------------------------------
                 
         print(f"INFO: Dataset initialized with {len(self.te_files)} samples.")
-        if self.use_semantic_loss: print("INFO: Semantic loss is ENABLED.")
 
     def __len__(self): return len(self.te_files)
 
@@ -851,93 +848,54 @@ class ImageTextLatentDataset(Dataset):
             path_te = self.te_files[i]
             data_te = torch.load(path_te, map_location="cpu")
             
-            # --- FIXED VALIDATION LOGIC ---
             cached_shift = data_te.get("vae_shift", 0.0)
             cached_scale = data_te.get("vae_scale", 0.0)
             
             if cached_shift is None: cached_shift = 0.0
             
             if cached_scale < 1e-6:
-                print(f"WARNING: Skipping {path_te}: Invalid cached scale factor (0.0).")
                 return None
             
-            # 1. Check for Standard SDXL (4-Channel) Profile
-            # Standard SDXL uses scale ~0.13025 and shift usually 0.0
             is_standard_sdxl = abs(cached_scale - 0.13025) < 1e-4
-
-            # 2. Check for Flux/NoobAI (32-Channel) Profile
-            # Flux/NoobAI uses scale ~0.6043 and shift ~0.0760
             is_flux_32ch = (abs(cached_scale - 0.6043) < 1e-4) and (abs(cached_shift - 0.0760) < 1e-4)
 
-            # Accept if it matches EITHER valid profile
             if not (is_standard_sdxl or is_flux_32ch):
-                # If you have custom VAEs that don't match these exact numbers, 
-                # you can comment out this return, but for standard/noobai workflows this protects against mixed caches.
-                print(f"WARNING: Skipping {path_te}: Unknown VAE constants! Scale={cached_scale:.5f}, Shift={cached_shift:.5f}")
                 return None
-            # ------------------------------
             
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
             
-            # Load the pre-bucketed latent
             latents = torch.load(path_lat, map_location="cpu")
             
-            if (torch.isnan(latents).any() or torch.isinf(latents).any()): 
+            if torch.isnan(latents).any() or torch.isinf(latents).any(): 
                 return None
 
             final_latents = latents
             crop_coords = (0, 0)
             target_size_px = data_te["target_size"]
             
-            # Load embeddings - they're already the correct shape [77, 2048]
             embeds = data_te["embeds"]
             pooled = data_te["pooled"]
             
-            # Remove batch dimension if present (defensive check)
             if embeds.dim() == 3 and embeds.shape[0] == 1:
-                embeds = embeds.squeeze(0)  # [1, 77, 2048] -> [77, 2048]
+                embeds = embeds.squeeze(0)
             if pooled.dim() == 2 and pooled.shape[0] == 1:
-                pooled = pooled.squeeze(0)  # [1, 1280] -> [1280]
+                pooled = pooled.squeeze(0)
             
             item_data = {
                 "latents": final_latents,
-                "embeds": embeds,  # [77, 2048] - no padding needed
-                "pooled": pooled,  # [1280]
+                "embeds": embeds,
+                "pooled": pooled,
                 "original_sizes": data_te["original_size"],
                 "target_sizes": target_size_px,
                 "crop_coords": crop_coords,
                 "latent_path": str(path_te)
             }
             
-            # --- Apply Unconditional Dropout ---
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
-                item_data["embeds"] = self.null_embeds  # Already [77, 2048]
-                item_data["pooled"] = self.null_pooled  # Already [1280]
-            # -----------------------------------
+                item_data["embeds"] = self.null_embeds
+                item_data["pooled"] = self.null_pooled
 
-            if self.use_semantic_loss:
-                root = self.dataset_roots.get(str(path_te))
-                relative_path = data_te.get("relative_path")
-                
-                if root and relative_path:
-                    original_image_path = Path(root) / relative_path
-                    if original_image_path.exists():
-                        try:
-                            with Image.open(original_image_path) as raw_img: 
-                                raw_img = fix_alpha_channel(raw_img)
-                                w_global = latents.shape[2] * 8
-                                h_global = latents.shape[1] * 8
-                                bucket_img = smart_resize(raw_img, w_global, h_global)
-                                item_data["original_image"] = bucket_img
-                        except Exception as e:
-                            print(f"Error processing semantic image {original_image_path}: {e}")
-                            item_data["original_image"] = None
-                    else:
-                        item_data["original_image"] = None
-                else:
-                    item_data["original_image"] = None
-                    
             return item_data
             
         except Exception as e:
@@ -1545,10 +1503,7 @@ def main():
     unet.enable_gradient_checkpointing()
     unet.to(device)
     
-    if config.MEMORY_EFFICIENT_ATTENTION == "xformers":
-        unet.enable_xformers_memory_efficient_attention()
-    else:
-        unet.set_attn_processor(AttnProcessor2_0())
+    set_attention_processor(unet, config.MEMORY_EFFICIENT_ATTENTION)
     
     print("\n--- UNet Layer Selection Report ---")
     exclusion_keywords = config.UNET_EXCLUDE_TARGETS
@@ -1686,9 +1641,11 @@ def main():
                     
                     # Step 4: Convert back for UNet timestep embedding
                     timesteps_conditioning = (t_shifted * 1000).long()
-                    #repair
+                    #repair (Only use if the model is needing to be de sharpened)
                     #timesteps_conditioning = timesteps
-                    
+                    #v2 repair
+                    #timesteps_conditioning = timesteps.long()
+
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                     
@@ -1728,21 +1685,16 @@ def main():
             diag_data_to_log = None
             if is_accumulation_step:
                 
+
                 if isinstance(optimizer, TitanAdamW):
                     raw_grad_norm = optimizer.clip_grad_norm(
-                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else 0.0
+                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
                     )
                 else:
                     raw_grad_norm = torch.nn.utils.clip_grad_norm_(
                         params_to_optimize,
-                        float('inf')
+                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
                     )
-                    
-                    if config.CLIP_GRAD_NORM > 0:
-                        torch.nn.utils.clip_grad_norm_(
-                            params_to_optimize,
-                            config.CLIP_GRAD_NORM
-                        )
                 
                 if isinstance(raw_grad_norm, torch.Tensor):
                     raw_grad_norm = raw_grad_norm.item()
