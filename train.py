@@ -1085,14 +1085,14 @@ class TimestepSampler:
 
 def apply_flow_matching_shift(t, shift_factor):
     """
-    Rectified Flow timestep shift (schedule warping).
-    Higher shift = more weight on later (denoising) timesteps.
-    This is required because the base model was trained with shift=2.5.
+    SD3/Flux schedule warping.
+    t: normalized timestep [0, 1]
+    shift_factor: typically 1.0 (no shift) to 3.0+ (heavy shift)
+    
+    Returns sigma ∈ [0, 1] — the warped noise level
     """
     if shift_factor == 1.0:
         return t
-    
-    # SD3/Rectified Flow schedule shift
     return (shift_factor * t) / (1.0 + (shift_factor - 1.0) * t)
 
 def custom_collate_fn(batch):
@@ -1703,18 +1703,88 @@ def main():
                 noisy_latents = None
                 timesteps_conditioning = None
 
-                if config.is_rectified_flow:
+                #if config.is_rectified_flow:
                     # Standard Rectified Flow: Straight-line interpolation (SD3 Equation 13)
-                    t_normalized = timesteps.float() / 1000.0
-                    t_expanded = t_normalized.view(-1, 1, 1, 1)
+                    #t_normalized = timesteps.float() / 1000.0
+                    #t_expanded = t_normalized.view(-1, 1, 1, 1)
                     
                     # Straight line interpolation
-                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                    target = noise - latents
+                    #noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                    #target = noise - latents
                     
                     # Proper timestep conditioning (aligned)
-                    timesteps_conditioning = (t_normalized * 1000).long()
-                    timesteps_conditioning = torch.clamp(timesteps_conditioning, 0, 999)
+                    #timesteps_conditioning = (t_normalized * 1000).long()
+                    #timesteps_conditioning = torch.clamp(timesteps_conditioning, 0, 999)
+
+
+                if config.is_rectified_flow:
+                    t_normalized = timesteps.float() / 1000.0  # [0, 1]
+                    shift_factor = getattr(config, "RF_SHIFT_FACTOR", 2.5)
+                    rf_mode = getattr(config, "RECTIFIED_FLOW_MODE", "no_shift").lower()
+                    
+                    if rf_mode == "no_shift":
+                        # Standard Rectified Flow (SD3 baseline)
+                        # No warping applied anywhere
+                        t_expanded = t_normalized.view(-1, 1, 1, 1)
+                        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                        target = noise - latents
+                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
+                        
+                    elif rf_mode == "shift_noise":
+                        # Apply shift to noise interpolation, keep timestep conditioning unshifted
+                        # This creates a mismatch between the noise schedule and what the model sees
+                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
+                        sigma_expanded = sigma.view(-1, 1, 1, 1)
+                        
+                        noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
+                        target = noise - latents  # Target is still the velocity
+                        
+                        # Feed UNSHIFTED timesteps to model (deliberate mismatch)
+                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
+                        
+                    elif rf_mode == "shift_cond":
+                        # Keep noise interpolation standard, shift only the timestep embedding
+                        # Model sees shifted time but gets standard interpolated noise
+                        t_expanded = t_normalized.view(-1, 1, 1, 1)
+                        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                        target = noise - latents
+                        
+                        # Feed SHIFTED timesteps to model
+                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
+                        timesteps_conditioning = (sigma * 1000).long().clamp(0, 999)
+                        
+                    elif rf_mode == "shift_both":
+                        # Apply shift to both noise interpolation AND timestep conditioning
+                        # Fully aligned - model sees shifted time and shifted noise
+                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
+                        sigma_expanded = sigma.view(-1, 1, 1, 1)
+                        
+                        noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
+                        target = noise - latents
+                        
+                        # Feed SHIFTED timesteps to model (aligned with noise)
+                        timesteps_conditioning = (sigma * 1000).long().clamp(0, 999)
+                        
+                    elif rf_mode == "noise_boost":
+                        # Universal Noise Boost: Add X% more noise at ALL timesteps
+                        # Uses RF_SHIFT_FACTOR as boost multiplier (e.g., 1.25 = 25% more noise)
+                        # Solves both: low timesteps too easy + high timesteps not pure noise
+                        boost_factor = shift_factor  # Reuse shift_factor as boost multiplier
+                        
+                        # Apply universal boost to noise ratio
+                        boosted_noise_ratio = torch.clamp(t_normalized * boost_factor, 0.0, 1.0)
+                        boosted_noise_ratio = boosted_noise_ratio.view(-1, 1, 1, 1)
+                        
+                        # Interpolate with BOOSTED noise
+                        noisy_latents = (1 - boosted_noise_ratio) * latents + boosted_noise_ratio * noise
+                        target = noise - latents
+                        
+                        # Model sees UNBOOSTED timesteps (creates universal mismatch)
+                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
+                        
+                    else:
+                        raise ValueError(f"Unknown RECTIFIED_FLOW_MODE: {rf_mode}. "
+                                       f"Use: no_shift | shift_noise | shift_cond | shift_both | noise_boost")       
 
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)

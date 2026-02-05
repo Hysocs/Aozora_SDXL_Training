@@ -1615,6 +1615,21 @@ class TrainingGUI(QtWidgets.QWidget):
         "VAE_SHIFT_FACTOR": {"label": "VAE Shift Factor:", "tooltip": "Latent shift mean.", "widget": "QDoubleSpinBox", "range": (-10.0, 10.0), "step": 0.0001, "decimals": 4},
         "VAE_SCALING_FACTOR": {"label": "VAE Scaling Factor:", "tooltip": "Latent scaling factor.", "widget": "QDoubleSpinBox", "range": (0.0, 10.0), "step": 0.0001, "decimals": 5},
         "VAE_LATENT_CHANNELS": {"label": "Latent Channels:", "tooltip": "4 for Standard/EQ, 32 for Flux/NoobAI.", "widget": "QSpinBox", "range": (4, 128)},
+
+        "RECTIFIED_FLOW_MODE": {
+            "label": "RF Weighting Mode:",
+            "tooltip": "Weighting scheme for Rectified Flow loss. 'no_shift' is linear uniform.",
+            "widget": "QComboBox",
+            "options": ["no_shift","shift_noise","shift_cond","shift_both", "noise_boost"]
+        },
+        "RF_SHIFT_FACTOR": {
+            "label": "RF Shift Factor:",
+            "tooltip": "Shift factor for SD3/Flux schedules. (e.g., 3.0 for SD3, 1.15 for Flux-Schnell).",
+            "widget": "QDoubleSpinBox",
+            "range": (0.0, 100.0),
+            "step": 0.01,
+            "decimals": 4
+        },
     }
 
     def __init__(self):
@@ -1890,6 +1905,14 @@ class TrainingGUI(QtWidgets.QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save '{key}': {e}")
         
+        # --- NEW: Explicitly save RF Params ---
+        # We do this explicitly because they might not be in your default_config import yet
+        if "RECTIFIED_FLOW_MODE" in self.widgets:
+            config_to_save["RECTIFIED_FLOW_MODE"] = self.widgets["RECTIFIED_FLOW_MODE"].currentText()
+        if "RF_SHIFT_FACTOR" in self.widgets:
+            config_to_save["RF_SHIFT_FACTOR"] = self.widgets["RF_SHIFT_FACTOR"].value()
+        # --------------------------------------
+
         config_to_save["TRAINING_MODE"] = self.training_mode_combo.currentText()
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         config_to_save["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
@@ -1905,6 +1928,9 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'timestep_histogram'):
             config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
+        # ... (Rest of the function remains the same: RAVEN, TITAN, VAE params) ...
+        # (Be sure to include the rest of the existing function here)
+        
         raven_params = {}
         try:
             r_betas = self.widgets['RAVEN_betas'].text().strip()
@@ -1939,7 +1965,6 @@ class TrainingGUI(QtWidgets.QWidget):
         except: velorms_params["eps"] = 1e-8
         config_to_save["VELORMS_PARAMS"] = velorms_params
 
-        # --- VAE PARAMS ---
         config_to_save["VAE_SHIFT_FACTOR"] = self.widgets["VAE_SHIFT_FACTOR"].value()
         config_to_save["VAE_SCALING_FACTOR"] = self.widgets["VAE_SCALING_FACTOR"].value()
         config_to_save["VAE_LATENT_CHANNELS"] = self.widgets["VAE_LATENT_CHANNELS"].value()
@@ -2174,6 +2199,8 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _on_training_mode_changed(self, text):
         is_rf = "Rectified Flow (SDXL)" in text
+        
+        # Existing logic for scheduler/noise groups
         if hasattr(self, 'scheduler_group'): self.scheduler_group.setEnabled(not is_rf)
         if hasattr(self, 'noise_group'): self.noise_group.setEnabled(not is_rf)
         
@@ -2186,6 +2213,13 @@ class TrainingGUI(QtWidgets.QWidget):
             if hasattr(self, 'noise_group'): self.noise_group.setToolTip("")
         
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
+
+        # --- NEW: Toggle Visibility of RF Params ---
+        if hasattr(self, 'rf_params_container'):
+            self.rf_params_container.setVisible(is_rf)
+            if is_rf:
+                self._update_rf_settings_state()
+        # -------------------------------------------
 
     def _create_form_group(self, title, keys):
         group = QtWidgets.QGroupBox(title)
@@ -2231,10 +2265,30 @@ class TrainingGUI(QtWidgets.QWidget):
     def _create_core_training_group(self):
         core_group = QtWidgets.QGroupBox("Core Training Parameters")
         layout = QtWidgets.QFormLayout(core_group)
+        
+        # Standard Params
         core_keys = ["MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "SAVE_EVERY_N_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"]
-        for key in core_keys: self._add_widget_to_form(layout, key)
-        return core_group
+        for key in core_keys: 
+            self._add_widget_to_form(layout, key)
 
+        # --- NEW: Rectified Flow Specific Container ---
+        self.rf_params_container = QtWidgets.QWidget()
+        rf_layout = QtWidgets.QFormLayout(self.rf_params_container)
+        rf_layout.setContentsMargins(0, 0, 0, 0) # Tight fit
+        
+        self._add_widget_to_form(rf_layout, "RECTIFIED_FLOW_MODE")
+        self._add_widget_to_form(rf_layout, "RF_SHIFT_FACTOR")
+        
+        # Connect the mode combo to enable/disable the shift factor
+        if "RECTIFIED_FLOW_MODE" in self.widgets:
+            self.widgets["RECTIFIED_FLOW_MODE"].currentTextChanged.connect(self._update_rf_settings_state)
+
+        # Add the container to the main layout
+        layout.addRow(self.rf_params_container)
+        # ----------------------------------------------
+
+        return core_group
+    
     def _build_optimizer_form(self, prefix):
         """Helper to create a layout of widgets for a specific optimizer prefix."""
         container = QtWidgets.QWidget()
@@ -3124,7 +3178,17 @@ class TrainingGUI(QtWidgets.QWidget):
                 epoch_data.append((current_epoch_step / max_steps, int(current_epoch_step)))
                 current_epoch_step += steps_per_epoch
         self.lr_curve_widget.set_epoch_data(epoch_data)
-    
+
+    def _update_rf_settings_state(self, text=None):
+        """Disables Shift Factor if mode is standard"""
+        if "RECTIFIED_FLOW_MODE" not in self.widgets or "RF_SHIFT_FACTOR" not in self.widgets:
+            return
+            
+        mode = self.widgets["RECTIFIED_FLOW_MODE"].currentText()
+        # Enable Shift Factor only if NOT standard
+        should_enable = "standard" not in mode.lower()
+        self.widgets["RF_SHIFT_FACTOR"].setEnabled(should_enable)   
+
     def _update_lr_button_states(self, selected_index):
         if hasattr(self, 'remove_point_btn'):
             is_removable = selected_index > 0 and selected_index < len(self.lr_curve_widget.get_points()) - 1
