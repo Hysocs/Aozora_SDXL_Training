@@ -512,54 +512,61 @@ def check_if_caching_needed(config):
             
     return needs_caching
 
-def load_unet_robust(path, compute_dtype):
+def load_unet_robust(path, compute_dtype, target_channels=4):
     print(f"INFO: Loading UNet from: {Path(path).name}")
+    
+    # Base arguments for loading
+    load_kwargs = {
+        "torch_dtype": compute_dtype,
+        "low_cpu_mem_usage": True,
+    }
+
+    # If the user Config specifies non-standard channels (e.g., 32 for Flux/NoobAI),
+    # we inject them into the loading arguments immediately.
+    if target_channels is not None and target_channels != 4:
+        print(f"INFO: Config requests {target_channels} channels. Forcing UNet input/output dimensions...")
+        load_kwargs["in_channels"] = target_channels
+        load_kwargs["out_channels"] = target_channels
+        load_kwargs["ignore_mismatched_sizes"] = True
+
     try:
-        # 1. Try loading as Standard SDXL (4 channels)
-        unet = UNet2DConditionModel.from_single_file(
-            path,
-            torch_dtype=compute_dtype,
-            low_cpu_mem_usage=True
-        )
-        print("INFO: Loaded Standard SDXL UNet (4 input/output channels).")
+        unet = UNet2DConditionModel.from_single_file(path, **load_kwargs)
+        
+        print(f"INFO: Loaded UNet (Channels: In={unet.config.in_channels} / Out={unet.config.out_channels})")
         print(f"INFO: UNet attention implementation: {unet.config.attention_type if hasattr(unet.config, 'attention_type') else 'flash_attention_2'}")
         
-    except Exception as e:
-        # 2. Check for the 32-channel mismatch error (Input OR Output)
-        err_str = str(e)
-        
-        # We check for both "conv_in" (Input) and "conv_out" (Output) errors
-        is_channel_error = ("conv_in.weight" in err_str and "32" in err_str) or \
-                           ("conv_out.weight" in err_str and "32" in err_str)
-                           
-        if is_channel_error:
-            print("INFO: Detected Flux/NoobAI UNet (32 channels). Switching config...")
-            try:
-                # Force the UNet to use 32 channels for BOTH Input and Output
-                unet = UNet2DConditionModel.from_single_file(
-                    path,
-                    torch_dtype=compute_dtype,
-                    low_cpu_mem_usage=True,
-                    in_channels=32,   # Fixes conv_in mismatch
-                    out_channels=32,  # Fixes conv_out mismatch
-                    ignore_mismatched_sizes=True
-                )
-                print("INFO: Successfully loaded 32-channel UNet (in=32, out=32).")
-                print(f"INFO: UNet attention implementation: {unet.config.attention_type if hasattr(unet.config, 'attention_type') else 'flash_attention_2'}")
-            except Exception as e2:
-                print(f"CRITICAL ERROR: Failed to load 32-channel UNet: {e2}")
-                raise e2
-        else:
-            # If it's a real error (corruption, etc), raise it
-            raise e
-            
-    return unet
+        return unet
 
-def load_vae_robust(path, device):
+    except Exception as e:
+        print(f"CRITICAL ERROR: Failed to load UNet with target_channels={target_channels}.")
+        print(f"Error Details: {e}")
+        # If we forced 32 and it failed, or if we tried 4 and it failed, we raise.
+        raise e
+
+def load_vae_robust(path, device, target_channels=None):
     """
-    Safely loads a VAE, auto-detecting if it is a 32-channel (Flux/Reflow) variant.
+    Safely loads a VAE. If target_channels is set in config, it forces that configuration.
+    Otherwise, it attempts auto-detection.
     """
     print(f"INFO: Attempting to load VAE from: {path}")
+    
+    # If config explicitly sets channels, try that first
+    if target_channels is not None:
+        print(f"INFO: Config requests VAE with {target_channels} channels.")
+        try:
+            vae = AutoencoderKL.from_single_file(
+                path, 
+                torch_dtype=torch.float32,
+                latent_channels=target_channels,
+                ignore_mismatched_sizes=True 
+            )
+            print(f"INFO: Successfully loaded VAE with {target_channels} channels (forced by config).")
+            return vae.to(device)
+        except Exception as e:
+            print(f"WARNING: Failed to force load VAE with {target_channels} channels: {e}")
+            print("INFO: Falling back to auto-detection...")
+
+    # Standard Auto-detection / Fallback logic
     try:
         # 1. Try loading as a standard SDXL VAE first
         vae = AutoencoderKL.from_single_file(path, torch_dtype=torch.float32)
@@ -804,7 +811,11 @@ class ImageTextLatentDataset(Dataset):
         self.dropout_prob = getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) if getattr(config, "UNCONDITIONAL_DROPOUT", False) else 0.0
         self.null_embeds = None
         self.null_pooled = None
+
+        self.target_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
+        self.target_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
         
+
         if self.dropout_prob > 0:
             found_null = False
             for ds in config.INSTANCE_DATASETS:
@@ -831,6 +842,59 @@ class ImageTextLatentDataset(Dataset):
                 
         print(f"INFO: Dataset initialized with {len(self.te_files)} samples.")
 
+    def _validate_cache_compatibility(self):
+        """Check first few cache files match expected VAE config. Halts if mismatch detected."""
+        print("INFO: Validating cache VAE compatibility...")
+        incompatible_count = 0
+        checked = 0
+        first_mismatch = None
+        
+        for f in self.te_files[:20]:  # Check first 20 files
+            try:
+                data_te = torch.load(f, map_location="cpu")
+                cached_shift = data_te.get("vae_shift", 0.0) or 0.0
+                cached_scale = data_te.get("vae_scale", 0.0) or 0.13025
+                
+                scale_match = abs(cached_scale - self.target_scale) < 1e-4
+                shift_match = (self.target_shift is None or 
+                              abs(cached_shift - self.target_shift) < 1e-4)
+                
+                if not scale_match or not shift_match:
+                    incompatible_count += 1
+                    if first_mismatch is None:
+                        first_mismatch = {
+                            'file': f,
+                            'cached_shift': cached_shift,
+                            'cached_scale': cached_scale,
+                            'expected_shift': self.target_shift,
+                            'expected_scale': self.target_scale
+                        }
+                        
+                checked += 1
+            except Exception as e:
+                print(f"WARNING: Could not check cache file {f}: {e}")
+        
+        if incompatible_count > 0:
+            # Get dataset paths from instance variable instead of config
+            dataset_paths = list(set(self.dataset_roots.values()))
+            
+            print(f"\n{'='*70}")
+            print("CRITICAL: CACHE VAE MISMATCH DETECTED")
+            print(f"{'='*70}")
+            print(f"Checked {checked} files, found {incompatible_count} incompatible.")
+            print(f"\nFirst mismatch:")
+            print(f"  File: {first_mismatch['file']}")
+            print(f"  Cached:  shift={first_mismatch['cached_shift']}, scale={first_mismatch['cached_scale']}")
+            print(f"  Expected: shift={first_mismatch['expected_shift']}, scale={first_mismatch['expected_scale']}")
+            print(f"\nSOLUTION:")
+            print(f"  1. Delete cache folder(s): {dataset_paths}")
+            print(f"  2. Re-run training to regenerate cache with correct VAE settings")
+            print(f"  3. Or adjust VAE_SHIFT_FACTOR/VAE_SCALING_FACTOR to match cache")
+            print(f"{'='*70}\n")
+            raise ValueError(f"Cache VAE config mismatch. {incompatible_count}/{checked} files incompatible. Please delete cache and regenerate.")
+        else:
+            print(f"INFO: Cache VAE config validated ({checked} samples checked).")
+            
     def __len__(self): return len(self.te_files)
 
     def _init_worker_rng(self):
@@ -851,16 +915,23 @@ class ImageTextLatentDataset(Dataset):
             cached_shift = data_te.get("vae_shift", 0.0)
             cached_scale = data_te.get("vae_scale", 0.0)
             
+            # Handle defaults if missing in cache
             if cached_shift is None: cached_shift = 0.0
-            
-            if cached_scale < 1e-6:
-                return None
-            
-            is_standard_sdxl = abs(cached_scale - 0.13025) < 1e-4
-            is_flux_32ch = (abs(cached_scale - 0.6043) < 1e-4) and (abs(cached_shift - 0.0760) < 1e-4)
+            if cached_scale is None or cached_scale == 0:
+                # Fallback for old cache files (Standard SDXL default)
+                cached_scale = 0.13025 
 
-            if not (is_standard_sdxl or is_flux_32ch):
-                return None
+            # --- UPDATED VALIDATION LOGIC ---
+            # Instead of checking hardcoded values, we check if the cache 
+            # matches the CURRENT training configuration.
+            
+            config_shift = getattr(self, 'target_shift', None)
+            config_scale = getattr(self, 'target_scale', None)
+
+            if self.target_scale is not None:
+                self._validate_cache_compatibility()
+            
+            # -------------------------------
             
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
@@ -1431,25 +1502,30 @@ def main():
         
         vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
         
-        vae_for_caching = load_vae_robust(vae_source, device)
+        # 1. Load VAE with Configured Channels
+        target_channels = getattr(config, 'VAE_LATENT_CHANNELS', None)
+        vae_for_caching = load_vae_robust(vae_source, device, target_channels=target_channels)
 
-        if config.is_rectified_flow:
-            if vae_for_caching.config.latent_channels == 32:
-                vae_for_caching.config.shift_factor = 0.0760
-                vae_for_caching.config.scaling_factor = 0.6043
-                print("INFO: Detected 32-channel Flux VAE")
-                
-            elif vae_for_caching.config.latent_channels == 4:
-                vae_for_caching.config.shift_factor = 0.0
-                vae_for_caching.config.scaling_factor = 0.13025
-                print("INFO: Detected 4-channel SDXL VAE")
-            
-            print(f"INFO: [RF MODE] VAE configured with NoobAI parameters:")
-            print(f"      - Shift Factor: {vae_for_caching.config.shift_factor}")
-            print(f"      - Scale Factor: {vae_for_caching.config.scaling_factor}")
-        else:
-            vae_for_caching.config.shift_factor = None
-            vae_for_caching.config.scaling_factor = 0.13025
+        # 2. Determine Scale and Shift factors
+        # Priority: Config Value -> Auto-detected Defaults -> Standard Defaults
+        
+        # Get defaults based on the *loaded* VAE (Auto-detection)
+        is_32_ch = vae_for_caching.config.latent_channels == 32
+        detected_shift = 0.0760 if is_32_ch else 0.0
+        detected_scale = 0.6043 if is_32_ch else 0.13025
+        
+        # Get Config values
+        conf_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
+        conf_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
+        
+        # Apply Configuration (with fallback to detection)
+        vae_for_caching.config.shift_factor = conf_shift if conf_shift is not None else detected_shift
+        vae_for_caching.config.scaling_factor = conf_scale if conf_scale is not None else detected_scale
+
+        print(f"\nINFO: VAE Configuration Finalized:")
+        print(f"      - Channels: {vae_for_caching.config.latent_channels}")
+        print(f"      - Shift Factor: {vae_for_caching.config.shift_factor} {'(From Config)' if conf_shift is not None else '(Auto-detected)'}")
+        print(f"      - Scale Factor: {vae_for_caching.config.scaling_factor} {'(From Config)' if conf_scale is not None else '(Auto-detected)'}")
         
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
@@ -1479,7 +1555,8 @@ def main():
     print(f"\n--- Loading Model ---")
     print(f"INFO: Loading UNet for training from: {model_to_load.name}")
     
-    unet = load_unet_robust(model_to_load, config.compute_dtype)
+    target_channels = getattr(config, 'VAE_LATENT_CHANNELS', 4)
+    unet = load_unet_robust(model_to_load, config.compute_dtype, target_channels)
     
     gc.collect()
     torch.cuda.empty_cache()
@@ -1627,31 +1704,17 @@ def main():
                 timesteps_conditioning = None
 
                 if config.is_rectified_flow:
-                    # Sample timesteps (0-999 from your ticket pool)
-                    
-                    # Normalize to [0, 1)
+                    # Standard Rectified Flow: Straight-line interpolation (SD3 Equation 13)
                     t_normalized = timesteps.float() / 1000.0
+                    t_expanded = t_normalized.view(-1, 1, 1, 1)
                     
-                    # Apply flow matching shift to get noise level (sigma)
-                    rf_shift = 2.5
-                    sigma = apply_flow_matching_shift(t_normalized, rf_shift)
-                    
-                    # For rectified flow, timestep and sigma are related but distinct
-                    # In the standard formulation: timestep = sigma * 1000 (shifted)
-                    # This matches your existing model's training
-                    
-                    # Use sigma for noise interpolation
-                    sigma_expanded = sigma.view(-1, 1, 1, 1)
-                    noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
+                    # Straight line interpolation
+                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
                     target = noise - latents
                     
-                    # Pass shifted timestep to UNet (matching your existing model)
-                    # Example timesteps_conditioning = (sigma * 1000).long()
-                    #timesteps_conditioning = (t_shifted * 1000).long()
-                    
-                    # SAFER: Clamp to valid range to avoid edge cases
-                    #timesteps_conditioning = torch.clamp(timesteps_conditioning, min=0, max=999)
-                    timesteps_conditioning = timesteps.long()
+                    # Proper timestep conditioning (aligned)
+                    timesteps_conditioning = (t_normalized * 1000).long()
+                    timesteps_conditioning = torch.clamp(timesteps_conditioning, 0, 999)
 
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)

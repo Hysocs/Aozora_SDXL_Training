@@ -105,3 +105,7 @@ USE_ZERO_TERMINAL_SNR = True
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
 TIMESTEP_MODE = "Wave"
+# --- VAE Configuration ---
+VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
+VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
+VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this

@@ -1611,6 +1611,10 @@ class TrainingGUI(QtWidgets.QWidget):
         "LOSS_TYPE": {"label": "Loss Type:", "tooltip": "Use default MSE loss or weighted Semantic loss.", "widget": "QComboBox", "options": ["Default", "Semantic"]},
         "SEMANTIC_LOSS_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
         "SEMANTIC_LOSS_STRENGTH": {"label": "Overall Strength:", "tooltip": "How much to increase loss in important areas. 0.5 = subtle, 1.0 = standard, 2.0 = strong.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
+        # --- NEW VAE PARAMS ---
+        "VAE_SHIFT_FACTOR": {"label": "VAE Shift Factor:", "tooltip": "Latent shift mean.", "widget": "QDoubleSpinBox", "range": (-10.0, 10.0), "step": 0.0001, "decimals": 4},
+        "VAE_SCALING_FACTOR": {"label": "VAE Scaling Factor:", "tooltip": "Latent scaling factor.", "widget": "QDoubleSpinBox", "range": (0.0, 10.0), "step": 0.0001, "decimals": 5},
+        "VAE_LATENT_CHANNELS": {"label": "Latent Channels:", "tooltip": "4 for Standard/EQ, 32 for Flux/NoobAI.", "widget": "QSpinBox", "range": (4, 128)},
     }
 
     def __init__(self):
@@ -1935,6 +1939,11 @@ class TrainingGUI(QtWidgets.QWidget):
         except: velorms_params["eps"] = 1e-8
         config_to_save["VELORMS_PARAMS"] = velorms_params
 
+        # --- VAE PARAMS ---
+        config_to_save["VAE_SHIFT_FACTOR"] = self.widgets["VAE_SHIFT_FACTOR"].value()
+        config_to_save["VAE_SCALING_FACTOR"] = self.widgets["VAE_SCALING_FACTOR"].value()
+        config_to_save["VAE_LATENT_CHANNELS"] = self.widgets["VAE_LATENT_CHANNELS"].value()
+
         return config_to_save
 
     def save_config(self):
@@ -2125,7 +2134,21 @@ class TrainingGUI(QtWidgets.QWidget):
         row2.addWidget(self._create_core_training_group(), 1)
         self.scheduler_group = self._create_scheduler_config_group()
         row2.addWidget(self.scheduler_group, 1)
-        row2.addWidget(self._create_unet_group(), 1)
+
+        # --- UPDATED LAYOUT FOR RIGHT COLUMN (VAE + UNET) ---
+        right_col_widget = QtWidgets.QWidget()
+        right_col_layout = QtWidgets.QVBoxLayout(right_col_widget)
+        right_col_layout.setContentsMargins(0, 0, 0, 0)
+        right_col_layout.setSpacing(20)
+        
+        # VAE Group on Top
+        right_col_layout.addWidget(self._create_vae_group())
+        # UNet Group Below
+        right_col_layout.addWidget(self._create_unet_group())
+        
+        row2.addWidget(right_col_widget, 1)
+        # ----------------------------------------------------
+
         main_layout.addLayout(row2)
 
         row3 = QtWidgets.QHBoxLayout()
@@ -2759,7 +2782,106 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QFormLayout(unet_group)
         self._add_widget_to_form(layout, "UNET_EXCLUDE_TARGETS")
         return unet_group
-    
+
+    def _create_vae_group(self):
+        vae_group = QtWidgets.QGroupBox("VAE Configuration")
+        layout = QtWidgets.QVBoxLayout(vae_group)
+        layout.setSpacing(10)
+        
+        # Inputs
+        form_layout = QtWidgets.QFormLayout()
+        self._add_widget_to_form(form_layout, "VAE_LATENT_CHANNELS")
+        self._add_widget_to_form(form_layout, "VAE_SHIFT_FACTOR")
+        self._add_widget_to_form(form_layout, "VAE_SCALING_FACTOR")
+        layout.addLayout(form_layout)
+        
+        # Presets Buttons
+        presets_label = QtWidgets.QLabel("Presets:")
+        presets_label.setStyleSheet("color: #ab97e6; font-weight: bold;")
+        layout.addWidget(presets_label)
+        
+        btn_layout = QtWidgets.QHBoxLayout()
+        btn_sdxl = QtWidgets.QPushButton("Standard SDXL")
+        btn_sdxl.clicked.connect(lambda: self._apply_vae_preset(0.0, 0.13025, 4))
+        btn_flux = QtWidgets.QPushButton("Flux/NoobAI (32ch)")
+        btn_flux.clicked.connect(lambda: self._apply_vae_preset(0.0760, 0.6043, 32))
+        btn_eq = QtWidgets.QPushButton("EQ VAE")
+        btn_eq.clicked.connect(lambda: self._apply_vae_preset(0.1726, 0.1280, 4))
+        
+        btn_layout.addWidget(btn_sdxl)
+        btn_layout.addWidget(btn_flux)
+        btn_layout.addWidget(btn_eq)
+        layout.addLayout(btn_layout)
+        
+        # Auto Detect Button
+        separator = QtWidgets.QFrame()
+        separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
+        separator.setStyleSheet("border: 1px solid #4a4668; margin: 5px 0;")
+        layout.addWidget(separator)
+        
+        btn_detect = QtWidgets.QPushButton("Run Auto-Detect Tool")
+        btn_detect.setStyleSheet("background-color: #383552; color: #ab97e6; border: 1px solid #6a48d7;")
+        btn_detect.setToolTip("Launches a separate tool to scan your VAE and suggest values.")
+        btn_detect.clicked.connect(self.launch_vae_detector)
+        layout.addWidget(btn_detect)
+
+        return vae_group
+
+    def _apply_vae_preset(self, shift, scale, channels):
+        """Helper to set VAE GUI values from buttons"""
+        self.widgets["VAE_SHIFT_FACTOR"].setValue(shift)
+        self.widgets["VAE_SCALING_FACTOR"].setValue(scale)
+        self.widgets["VAE_LATENT_CHANNELS"].setValue(channels)
+        self.log(f"Applied VAE Preset: Shift={shift}, Scale={scale}, Ch={channels}")
+
+    def launch_vae_detector(self):
+        """
+        Launches the external VAE detection script, passing the current config path.
+        """
+        # --- GET CURRENT CONFIG PATH ---
+        index = self.config_dropdown.currentIndex()
+        if index < 0:
+            QtWidgets.QMessageBox.warning(self, "No Config Selected", "Please select a configuration from the dropdown first.")
+            return
+
+        selected_key = self.config_dropdown.itemData(index)
+        config_path = os.path.join(self.config_dir, f"{selected_key}.json")
+
+        if not os.path.exists(config_path):
+            QtWidgets.QMessageBox.critical(self, "Config Not Found", f"The configuration file could not be found:\n{config_path}\n\nPlease save the configuration first.")
+            return
+
+        # --- FIND THE SCRIPT ---
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        possible_paths = [
+            os.path.join(script_dir, "vae_diagnostics.py"),
+            os.path.join(script_dir, "tools", "vae_diagnostics.py")
+        ]
+        
+        target_script = None
+        for p in possible_paths:
+            if os.path.exists(p):
+                target_script = p
+                break
+        
+        if not target_script:
+            self.log("Error: Could not find 'vae_diagnostics.py' in root or tools/ folder.")
+            QtWidgets.QMessageBox.warning(self, "Tool Not Found", "Could not find 'vae_diagnostics.py'.")
+            return
+
+        # --- LAUNCH THE SCRIPT WITH ARGUMENT ---
+        try:
+            command = [sys.executable, target_script, "--config", os.path.abspath(config_path)]
+            
+            if os.name == 'nt':
+                subprocess.Popen(command, cwd=os.path.dirname(target_script), creationflags=subprocess.CREATE_NEW_CONSOLE)
+            else:
+                subprocess.Popen(command, cwd=os.path.dirname(target_script))
+                
+            self.log(f"Launched VAE Detector with config: {selected_key}.json")
+        except Exception as e:
+            self.log(f"Error launching tool: {e}")
+
     def _create_advanced_group(self):
         advanced_group = QtWidgets.QGroupBox("Miscellaneous")
         layout = QtWidgets.QFormLayout(advanced_group)
