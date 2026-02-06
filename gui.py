@@ -1615,13 +1615,6 @@ class TrainingGUI(QtWidgets.QWidget):
         "VAE_SHIFT_FACTOR": {"label": "VAE Shift Factor:", "tooltip": "Latent shift mean.", "widget": "QDoubleSpinBox", "range": (-10.0, 10.0), "step": 0.0001, "decimals": 4},
         "VAE_SCALING_FACTOR": {"label": "VAE Scaling Factor:", "tooltip": "Latent scaling factor.", "widget": "QDoubleSpinBox", "range": (0.0, 10.0), "step": 0.0001, "decimals": 5},
         "VAE_LATENT_CHANNELS": {"label": "Latent Channels:", "tooltip": "4 for Standard/EQ, 32 for Flux/NoobAI.", "widget": "QSpinBox", "range": (4, 128)},
-
-        "RECTIFIED_FLOW_MODE": {
-            "label": "RF Weighting Mode:",
-            "tooltip": "Weighting scheme for Rectified Flow loss. 'no_shift' is linear uniform.",
-            "widget": "QComboBox",
-            "options": ["no_shift","shift_noise","shift_cond","shift_both", "noise_boost"]
-        },
         "RF_SHIFT_FACTOR": {
             "label": "RF Shift Factor:",
             "tooltip": "Shift factor for SD3/Flux schedules. (e.g., 3.0 for SD3, 1.15 for Flux-Schnell).",
@@ -1907,8 +1900,6 @@ class TrainingGUI(QtWidgets.QWidget):
         
         # --- NEW: Explicitly save RF Params ---
         # We do this explicitly because they might not be in your default_config import yet
-        if "RECTIFIED_FLOW_MODE" in self.widgets:
-            config_to_save["RECTIFIED_FLOW_MODE"] = self.widgets["RECTIFIED_FLOW_MODE"].currentText()
         if "RF_SHIFT_FACTOR" in self.widgets:
             config_to_save["RF_SHIFT_FACTOR"] = self.widgets["RF_SHIFT_FACTOR"].value()
         # --------------------------------------
@@ -2276,12 +2267,8 @@ class TrainingGUI(QtWidgets.QWidget):
         rf_layout = QtWidgets.QFormLayout(self.rf_params_container)
         rf_layout.setContentsMargins(0, 0, 0, 0) # Tight fit
         
-        self._add_widget_to_form(rf_layout, "RECTIFIED_FLOW_MODE")
         self._add_widget_to_form(rf_layout, "RF_SHIFT_FACTOR")
         
-        # Connect the mode combo to enable/disable the shift factor
-        if "RECTIFIED_FLOW_MODE" in self.widgets:
-            self.widgets["RECTIFIED_FLOW_MODE"].currentTextChanged.connect(self._update_rf_settings_state)
 
         # Add the container to the main layout
         layout.addRow(self.rf_params_container)
@@ -3181,13 +3168,9 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _update_rf_settings_state(self, text=None):
         """Disables Shift Factor if mode is standard"""
-        if "RECTIFIED_FLOW_MODE" not in self.widgets or "RF_SHIFT_FACTOR" not in self.widgets:
+        if "RF_SHIFT_FACTOR" not in self.widgets:
             return
-            
-        mode = self.widgets["RECTIFIED_FLOW_MODE"].currentText()
-        # Enable Shift Factor only if NOT standard
-        should_enable = "standard" not in mode.lower()
-        self.widgets["RF_SHIFT_FACTOR"].setEnabled(should_enable)   
+        self.widgets["RF_SHIFT_FACTOR"].setEnabled(True)   
 
     def _update_lr_button_states(self, selected_index):
         if hasattr(self, 'remove_point_btn'):

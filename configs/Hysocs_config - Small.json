@@ -1,39 +1,41 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/noobaiFlux2vae_03Aesthetic.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/chenkinnoobXLV02_v02.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/rouwei_v080Vpred_step_4509.safetensors",
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "UNCONDITIONAL_DROPOUT": true,
+    "UNCONDITIONAL_DROPOUT": false,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.1,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
-    "MAX_AREA_TOLERANCE": "1.00",
+    "MAX_AREA_TOLERANCE": "1.15",
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "8500",
+    "MAX_TRAIN_STEPS": "1750",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "6",
+    "GRADIENT_ACCUMULATION_STEPS": "5",
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": "5.0",
+    "CLIP_GRAD_NORM": "10.0",
     "SEED": 64,
     "SAVE_EVERY_N_STEPS": "2000",
-    "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
+    "UNET_EXCLUDE_TARGETS": [
+        "up_blocks.0.attentions.*.ff.net.*"
+    ],
     "LR_CUSTOM_CURVE": [
         [
             0.0,
             1e-06
         ],
         [
-            0.06666667,
-            6e-05
+            0.05,
+            4e-05
         ],
         [
-            0.93103448,
-            6e-05
+            0.94942529,
+            4e-05
         ],
         [
             1.0,
@@ -41,30 +43,23 @@
         ]
     ],
     "LR_GRAPH_MIN": "1e-06",
-    "LR_GRAPH_MAX": "6e-05",
+    "LR_GRAPH_MAX": "4e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
     "TIMESTEP_MODE": "Wave",
-    "VAE_SHIFT_FACTOR": 0.076,
-    "VAE_SCALING_FACTOR": 0.6043,
-    "VAE_LATENT_CHANNELS": 32,
-    "RECTIFIED_FLOW_MODE": "no_shift",
-    "RF_SHIFT_FACTOR": 2.5,
+    "VAE_SHIFT_FACTOR": 0.0,
+    "VAE_SCALING_FACTOR": 0.13025,
+    "VAE_LATENT_CHANNELS": 4,
+    "RF_SHIFT_FACTOR": 2.0,
+    "RF_USE_DYNAMIC_SHIFT": true,
+    "RF_BASE_PIXELS": 1048576,
     "TRAINING_MODE": "Rectified Flow (SDXL)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\CG\\Romantic relationship",
-            "repeats": 1
-        },
-        {
-            "path": "C:\\Users\\Administrator\\Pictures\\CG\\Fate_Empire of Dirt",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by kawakami rokkaku",
+            "path": "C:/Users/Administrator/Pictures\\Artists\\by koahri",
             "repeats": 1
         }
     ],
@@ -77,31 +72,31 @@
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            190,
-            196,
-            211,
-            236,
-            268,
-            306,
-            346,
-            386,
-            424,
-            456,
-            481,
-            497,
-            502,
-            497,
-            481,
-            457,
-            424,
-            387,
-            347,
-            306,
-            269,
-            236,
-            211,
-            196,
-            190
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70,
+            70
         ]
     },
     "RAVEN_PARAMS": {

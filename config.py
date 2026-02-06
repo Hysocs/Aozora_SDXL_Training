@@ -109,5 +109,6 @@ TIMESTEP_MODE = "Wave"
 VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
-RECTIFIED_FLOW_MODE = "no_shift"  # "no_shift" | "shift_noise" | "shift_cond" | "shift_both"
 RF_SHIFT_FACTOR = 2.5  # Shift strength for applicable modes
+RF_USE_DYNAMIC_SHIFT = True  # bool
+RF_BASE_PIXELS = 1048576  # 1024*1024 = 1048576

@@ -981,15 +981,27 @@ class TimestepSampler:
         self.total_tickets_needed = self.max_train_steps * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
         
+        # RF-specific settings from config
+        self.is_rectified_flow = getattr(config, "is_rectified_flow", False)
+        self.shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
+        self.use_dynamic_shift = getattr(config, "RF_USE_DYNAMIC_SHIFT", False)
+        self.base_pixels = getattr(config, "RF_BASE_PIXELS", 1048576)
+        
+        # Existing ticket pool logic - unchanged
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
         
         print(f"INFO: Initialized Ticket Pool Timestep Sampler")
         print(f"      Total tickets: {len(self.ticket_pool)}, Seed: {self.seed}")
+        if self.is_rectified_flow:
+            print(f"      RF Shift: {self.shift_factor}")
+            if self.use_dynamic_shift:
+                print(f"      Dynamic Shift: Enabled (Base: {self.base_pixels}px)")
         self._print_sampling_distribution()
 
     def _build_ticket_pool(self, allocation):
+        # Your existing ticket pool logic - completely unchanged
         use_fallback = False
         if not allocation or "counts" not in allocation or "bin_size" not in allocation:
             print("WARNING: TIMESTEP_ALLOCATION missing. Fallback to Uniform.")
@@ -1014,10 +1026,12 @@ class TimestepSampler:
         rng = np.random.Generator(np.random.PCG64(self.seed))
         
         for i, count in enumerate(counts):
-            if count <= 0: continue
+            if count <= 0: 
+                continue
             start_t = i * self.bin_size
             end_t = min(1000, (i + 1) * self.bin_size)
-            if start_t >= 1000: break
+            if start_t >= 1000: 
+                break
             num_tickets = int(count * multiplier)
             bin_samples = rng.integers(start_t, end_t, size=num_tickets).tolist()
             pool.extend(bin_samples)
@@ -1038,12 +1052,38 @@ class TimestepSampler:
             
         return pool
 
+    def get_dynamic_shift(self, height, width):
+        """Calculate dynamic shift based on image resolution"""
+        if not self.use_dynamic_shift:
+            return self.shift_factor
+        
+        current_pixels = height * width
+        ratio = current_pixels / self.base_pixels
+        # Square root scaling for area ratio
+        dynamic_shift = self.shift_factor * math.sqrt(ratio)
+        
+        return dynamic_shift
+
+    def apply_flow_shift(self, t_normalized, shift_factor):
+        """
+        SD3/Flux schedule warping equation.
+        t_normalized: [0, 1] tensor
+        shift_factor: float (1.0 = no shift, 3.0 = SD3/Flux standard)
+        
+        Returns: shifted t in [0, 1]
+        """
+        if shift_factor == 1.0 or shift_factor is None:
+            return t_normalized
+        # The SD3/Flux equation
+        return (shift_factor * t_normalized) / (1.0 + (shift_factor - 1.0) * t_normalized)
+
     def set_current_step(self, step):
         consumed_tickets = step * self.config.BATCH_SIZE
         self.pool_index = consumed_tickets % len(self.ticket_pool)
         print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Step {step})")
 
     def sample(self, batch_size):
+        # Unchanged - just return timesteps from pool
         indices = []
         for _ in range(batch_size):
             if self.pool_index >= len(self.ticket_pool):
@@ -1053,6 +1093,7 @@ class TimestepSampler:
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def _print_sampling_distribution(self):
+        # Your existing visualization code - unchanged
         print("\n" + "="*80)
         print("TIMESTEP TICKET POOL DISTRIBUTION")
         print(f"Total Pool Size: {len(self.ticket_pool):,} | Seed: {self.seed}")
@@ -1072,7 +1113,8 @@ class TimestepSampler:
             end = min(1000, start + vis_bin_size)
             c = ((timesteps >= start) & (timesteps < end)).sum().item()
             counts.append((f"{start}-{end}", c))
-            if c > max_count: max_count = c
+            if c > max_count: 
+                max_count = c
             
         for label, count in counts:
             pct = (count / len(self.ticket_pool)) * 100
@@ -1083,17 +1125,6 @@ class TimestepSampler:
     def update(self, raw_grad_norm):
         pass
 
-def apply_flow_matching_shift(t, shift_factor):
-    """
-    SD3/Flux schedule warping.
-    t: normalized timestep [0, 1]
-    shift_factor: typically 1.0 (no shift) to 3.0+ (heavy shift)
-    
-    Returns sigma ∈ [0, 1] — the warped noise level
-    """
-    if shift_factor == 1.0:
-        return t
-    return (shift_factor * t) / (1.0 + (shift_factor - 1.0) * t)
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
@@ -1718,73 +1749,32 @@ def main():
 
 
                 if config.is_rectified_flow:
-                    t_normalized = timesteps.float() / 1000.0  # [0, 1]
-                    shift_factor = getattr(config, "RF_SHIFT_FACTOR", 2.5)
-                    rf_mode = getattr(config, "RECTIFIED_FLOW_MODE", "no_shift").lower()
+                    # Get timesteps from sampler ONCE (uniform distribution from your ticket pool)
+                    timesteps = timestep_sampler.sample(latents.shape[0])
+                    t_normalized = timesteps.float() / 1000.0  # Convert to [0, 1]
                     
-                    if rf_mode == "no_shift":
-                        # Standard Rectified Flow (SD3 baseline)
-                        # No warping applied anywhere
-                        t_expanded = t_normalized.view(-1, 1, 1, 1)
-                        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                        target = noise - latents
-                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
-                        
-                    elif rf_mode == "shift_noise":
-                        # Apply shift to noise interpolation, keep timestep conditioning unshifted
-                        # This creates a mismatch between the noise schedule and what the model sees
-                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
-                        sigma_expanded = sigma.view(-1, 1, 1, 1)
-                        
-                        noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
-                        target = noise - latents  # Target is still the velocity
-                        
-                        # Feed UNSHIFTED timesteps to model (deliberate mismatch)
-                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
-                        
-                    elif rf_mode == "shift_cond":
-                        # Keep noise interpolation standard, shift only the timestep embedding
-                        # Model sees shifted time but gets standard interpolated noise
-                        t_expanded = t_normalized.view(-1, 1, 1, 1)
-                        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                        target = noise - latents
-                        
-                        # Feed SHIFTED timesteps to model
-                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
-                        timesteps_conditioning = (sigma * 1000).long().clamp(0, 999)
-                        
-                    elif rf_mode == "shift_both":
-                        # Apply shift to both noise interpolation AND timestep conditioning
-                        # Fully aligned - model sees shifted time and shifted noise
-                        sigma = apply_flow_matching_shift(t_normalized, shift_factor)
-                        sigma_expanded = sigma.view(-1, 1, 1, 1)
-                        
-                        noisy_latents = (1 - sigma_expanded) * latents + sigma_expanded * noise
-                        target = noise - latents
-                        
-                        # Feed SHIFTED timesteps to model (aligned with noise)
-                        timesteps_conditioning = (sigma * 1000).long().clamp(0, 999)
-                        
-                    elif rf_mode == "noise_boost":
-                        # Universal Noise Boost: Add X% more noise at ALL timesteps
-                        # Uses RF_SHIFT_FACTOR as boost multiplier (e.g., 1.25 = 25% more noise)
-                        # Solves both: low timesteps too easy + high timesteps not pure noise
-                        boost_factor = shift_factor  # Reuse shift_factor as boost multiplier
-                        
-                        # Apply universal boost to noise ratio
-                        boosted_noise_ratio = torch.clamp(t_normalized * boost_factor, 0.0, 1.0)
-                        boosted_noise_ratio = boosted_noise_ratio.view(-1, 1, 1, 1)
-                        
-                        # Interpolate with BOOSTED noise
-                        noisy_latents = (1 - boosted_noise_ratio) * latents + boosted_noise_ratio * noise
-                        target = noise - latents
-                        
-                        # Model sees UNBOOSTED timesteps (creates universal mismatch)
-                        timesteps_conditioning = (t_normalized * 1000).long().clamp(0, 999)
-                        
+                    # Get shift factor (static or dynamic based on resolution)
+                    shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
+                    
+                    if timestep_sampler.use_dynamic_shift:
+                        # Get resolution from batch - use first item's target size
+                        # batch["target_sizes"] is a list of (h, w) tuples
+                        h, w = batch["target_sizes"][0]
+                        current_shift = timestep_sampler.get_dynamic_shift(h, w)
                     else:
-                        raise ValueError(f"Unknown RECTIFIED_FLOW_MODE: {rf_mode}. "
-                                       f"Use: no_shift | shift_noise | shift_cond | shift_both | noise_boost")       
+                        current_shift = shift_factor
+                    
+                    # Apply SD3/Flux shift warping to the timestep
+                    t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
+                    t_expanded = t_shifted.view(-1, 1, 1, 1)
+                    
+                    # Standard rectified flow interpolation with SHIFTED timestep
+                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                    target = noise - latents
+                    
+                    # Model sees SHIFTED timestep (aligned with noise interpolation)
+                    timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
+
 
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
