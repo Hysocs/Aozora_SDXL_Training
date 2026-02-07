@@ -1608,9 +1608,45 @@ class TrainingGUI(QtWidgets.QWidget):
         "GRAD_SPIKE_THRESHOLD_HIGH": {"label": "Spike Threshold (High):", "tooltip": "Trigger detector if gradient norm exceeds this value.", "widget": "QLineEdit"},
         "GRAD_SPIKE_THRESHOLD_LOW": {"label": "Spike Threshold (Low):", "tooltip": "Trigger detector if gradient norm is below this value.", "widget": "QLineEdit"},
         "NOISE_OFFSET": {"label": "Noise Offset Strength:", "tooltip": "Improves learning of dark/bright images. Try 0.05.", "widget": "QDoubleSpinBox", "range": (0.0, 0.5), "step": 0.01, "decimals": 3},
-        "LOSS_TYPE": {"label": "Loss Type:", "tooltip": "Use default MSE loss or weighted Semantic loss.", "widget": "QComboBox", "options": ["Default", "Semantic"]},
-        "SEMANTIC_LOSS_BLEND": {"label": "Detail vs Character Balance:", "tooltip": "Blends between character shape (0.0) and detail/edges (1.0). 0.5 = equal mix.", "widget": "QDoubleSpinBox", "range": (0.0, 1.0), "step": 0.05, "decimals": 2},
-        "SEMANTIC_LOSS_STRENGTH": {"label": "Overall Strength:", "tooltip": "How much to increase loss in important areas. 0.5 = subtle, 1.0 = standard, 2.0 = strong.", "widget": "QDoubleSpinBox", "range": (0.0, 5.0), "step": 0.1, "decimals": 2},
+        "LOSS_TYPE": {
+            "label": "Loss Type:", 
+            "tooltip": "Select the loss function strategy.", 
+            "widget": "QComboBox", 
+            "options": ["MSE", "Semantic", "Huber_Adaptive"]
+        },
+        "SEMANTIC_CHAR_WEIGHT": {
+            "label": "Character Region Weight:",
+            "tooltip": "How strongly to weight the character/blob regions (salient colored areas). 0.0 = ignore character shape, 1.0 = full character detection, 2.0 = boosted. Stacks with detail via Soft Max.",
+            "widget": "QDoubleSpinBox",
+            "range": (0.0, 2.0),
+            "step": 0.05,
+            "decimals": 2
+        },
+        "SEMANTIC_DETAIL_WEIGHT": {
+            "label": "Lineart/Detail Weight:",
+            "tooltip": "How strongly to weight fine details, edges, and lineart. 0.0 = ignore lines, 1.0 = full edge detection, 2.0 = boosted line emphasis. Stacks with character via Soft Max without cancellation.",
+            "widget": "QDoubleSpinBox",
+            "range": (0.0, 2.0),
+            "step": 0.05,
+            "decimals": 2
+        },
+        # --- NEW HUBER PARAMS ---
+        "LOSS_HUBER_BETA": {
+            "label": "Huber Beta:", 
+            "tooltip": "Threshold where quadratic loss turns linear (0.5 is standard). Lower = more robust to outliers.", 
+            "widget": "QDoubleSpinBox", 
+            "range": (0.01, 1.0), 
+            "step": 0.05, 
+            "decimals": 2
+        },
+        "LOSS_ADAPTIVE_DAMPING": {
+            "label": "Adaptive Damping:", 
+            "tooltip": "Controls sensitivity to magnitude. Prevents division by zero.", 
+            "widget": "QDoubleSpinBox", 
+            "range": (0.001, 1.0), 
+            "step": 0.01, 
+            "decimals": 3
+        },
         # --- NEW VAE PARAMS ---
         "VAE_SHIFT_FACTOR": {"label": "VAE Shift Factor:", "tooltip": "Latent shift mean.", "widget": "QDoubleSpinBox", "range": (-10.0, 10.0), "step": 0.0001, "decimals": 4},
         "VAE_SCALING_FACTOR": {"label": "VAE Scaling Factor:", "tooltip": "Latent scaling factor.", "widget": "QDoubleSpinBox", "range": (0.0, 10.0), "step": 0.0001, "decimals": 5},
@@ -1880,8 +1916,10 @@ class TrainingGUI(QtWidgets.QWidget):
         # Skip keys handled manually
         skip_keys = [
             "RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", 
-            "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS", "GRYPHON_PARAMS", "NOISE_TYPE", "NOISE_OFFSET", 
-            "LOSS_TYPE", "SEMANTIC_LOSS_BLEND", "SEMANTIC_LOSS_STRENGTH", 
+            "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS", "GRYPHON_PARAMS", 
+            "NOISE_TYPE", "NOISE_OFFSET", 
+            "LOSS_TYPE", "SEMANTIC_CHAR_WEIGHT", "SEMANTIC_DETAIL_WEIGHT",
+            "LOSS_HUBER_BETA", "LOSS_ADAPTIVE_DAMPING",  # <--- ADDED HERE
             "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"
         ]
         
@@ -1912,8 +1950,10 @@ class TrainingGUI(QtWidgets.QWidget):
         config_to_save["NOISE_TYPE"] = self.widgets["NOISE_TYPE"].currentText()
         config_to_save["NOISE_OFFSET"] = self.widgets["NOISE_OFFSET"].value()
         config_to_save["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
-        config_to_save["SEMANTIC_LOSS_BLEND"] = self.widgets["SEMANTIC_LOSS_BLEND"].value()
-        config_to_save["SEMANTIC_LOSS_STRENGTH"] = self.widgets["SEMANTIC_LOSS_STRENGTH"].value()
+        config_to_save["SEMANTIC_CHAR_WEIGHT"] = self.widgets["SEMANTIC_CHAR_WEIGHT"].value()
+        config_to_save["SEMANTIC_DETAIL_WEIGHT"] = self.widgets["SEMANTIC_DETAIL_WEIGHT"].value()
+        config_to_save["LOSS_HUBER_BETA"] = self.widgets["LOSS_HUBER_BETA"].value()             # <--- ADDED
+        config_to_save["LOSS_ADAPTIVE_DAMPING"] = self.widgets["LOSS_ADAPTIVE_DAMPING"].value() # <--- ADDED
         config_to_save["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         
         if hasattr(self, 'timestep_histogram'):
@@ -2483,24 +2523,44 @@ class TrainingGUI(QtWidgets.QWidget):
         group = QtWidgets.QGroupBox("Loss Configuration")
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
+        
         form_layout = QtWidgets.QFormLayout()
+        
+        # 1. Loss Type Dropdown
         self.widgets["LOSS_TYPE"] = NoScrollComboBox()
-        self.widgets["LOSS_TYPE"].addItems(["Default", "Semantic"])
+        # Ensure these options match exactly what the training code expects
+        self.widgets["LOSS_TYPE"].addItems(["MSE", "Semantic", "Huber_Adaptive"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form_layout.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
         layout.addLayout(form_layout)
+        
+        # 2. Container for Semantic Loss (Hidden by default)
         self.semantic_loss_container = QtWidgets.QWidget()
         semantic_layout = QtWidgets.QFormLayout(self.semantic_loss_container)
         semantic_layout.setContentsMargins(0, 0, 0, 0)
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_LOSS_BLEND")
-        self._add_widget_to_form(semantic_layout, "SEMANTIC_LOSS_STRENGTH")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_CHAR_WEIGHT")
+        self._add_widget_to_form(semantic_layout, "SEMANTIC_DETAIL_WEIGHT")
         layout.addWidget(self.semantic_loss_container)
+
+        # 3. Container for Huber Adaptive Loss (Hidden by default)
+        self.huber_loss_container = QtWidgets.QWidget()
+        huber_layout = QtWidgets.QFormLayout(self.huber_loss_container)
+        huber_layout.setContentsMargins(0, 0, 0, 0)
+        self._add_widget_to_form(huber_layout, "LOSS_HUBER_BETA")
+        self._add_widget_to_form(huber_layout, "LOSS_ADAPTIVE_DAMPING")
+        layout.addWidget(self.huber_loss_container)
+        
         layout.addStretch(1)
         return group
 
     def _toggle_loss_widgets(self):
         loss_type = self.widgets["LOSS_TYPE"].currentText()
+        
+        # Show Semantic controls only if Semantic is selected
         self.semantic_loss_container.setVisible(loss_type == "Semantic")
+        
+        # Show Huber controls only if Huber_Adaptive is selected
+        self.huber_loss_container.setVisible(loss_type == "Huber_Adaptive")
 
     def _add_slider_row(self, layout, label_text, min_val, max_val, default_val, divider):
             """Helper to create a Label | Slider | SpinBox row."""
@@ -2988,7 +3048,7 @@ class TrainingGUI(QtWidgets.QWidget):
             # Exclude special keys handled manually
             special_keys = [
                 "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION", "TIMESTEP_MODE"
-            ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "VELORMS_", "SEMANTIC_LOSS_", "NOISE_OFFSET"))]
+            ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "VELORMS_", "SEMANTIC_LOSS_", "LOSS_HUBER_", "LOSS_ADAPTIVE_", "NOISE_OFFSET"))]
             
             for key, widget in self.widgets.items():
                 if key in special_keys: continue
@@ -3043,10 +3103,16 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
             self._toggle_noise_widgets()
             
-            loss_type = self.current_config.get("LOSS_TYPE", "Default")
+            loss_type = self.current_config.get("LOSS_TYPE", "MSE")
             self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
-            self.widgets["SEMANTIC_LOSS_BLEND"].setValue(self.current_config.get("SEMANTIC_LOSS_BLEND", 0.5))
-            self.widgets["SEMANTIC_LOSS_STRENGTH"].setValue(self.current_config.get("SEMANTIC_LOSS_STRENGTH", 0.8))
+            
+            # Semantic Params
+            self.widgets["SEMANTIC_CHAR_WEIGHT"].setValue(self.current_config.get("SEMANTIC_CHAR_WEIGHT", 0.5))
+            self.widgets["SEMANTIC_DETAIL_WEIGHT"].setValue(self.current_config.get("SEMANTIC_DETAIL_WEIGHT", 0.8))
+            
+            # Huber Params
+            self.widgets["LOSS_HUBER_BETA"].setValue(self.current_config.get("LOSS_HUBER_BETA", 0.5))
+            self.widgets["LOSS_ADAPTIVE_DAMPING"].setValue(self.current_config.get("LOSS_ADAPTIVE_DAMPING", 0.1))
             self._toggle_loss_widgets()
 
             if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:

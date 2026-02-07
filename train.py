@@ -39,6 +39,7 @@ from diffusers.models.attention_processor import (
         AttnProcessor2_0, 
         FusedAttnProcessor2_0
     )
+from tools.semantic import generate_semantic_map_batch_softmax
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
@@ -475,40 +476,79 @@ def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
     pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=0)  # [B, 1280]
     
     return prompt_embeds, pooled_prompt_embeds
+
 def check_if_caching_needed(config):
     needs_caching = False
     
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+    semantic_cache_folder_name = ".semantic_maps_cache"
+    use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
     
     # Check for Null Embeddings if Dropout is ON
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
-         if config.INSTANCE_DATASETS:
-             ds0 = config.INSTANCE_DATASETS[0]
-             if not (Path(ds0["path"]) / cache_folder_name / "null_embeds.pt").exists():
-                 print("INFO: Null embeddings for unconditional dropout missing. Caching needed.")
-                 needs_caching = True
+        if config.INSTANCE_DATASETS:
+            ds0 = config.INSTANCE_DATASETS[0]
+            if not (Path(ds0["path"]) / cache_folder_name / "null_embeds.pt").exists():
+                print("INFO: Null embeddings for unconditional dropout missing. Caching needed.")
+                needs_caching = True
 
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
+        
         if not root.exists():
             print(f"WARNING: Dataset path {root} does not exist, skipping.")
             continue
-        image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
+            
+        image_paths = [
+            p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
+            for p in root.rglob(f"*{ext}")
+        ]
+        
         if not image_paths:
             print(f"INFO: No images found in {root}, skipping.")
             continue
+            
         cache_dir = root / cache_folder_name
+        
         if not cache_dir.exists():
             print(f"INFO: Cache directory doesn't exist for {root}, caching needed.")
             needs_caching = True
             continue
         
+        # Check semantic cache if needed
+        if use_semantic_loss:
+            semantic_cache_dir = root / semantic_cache_folder_name
+            
+            if not semantic_cache_dir.exists():
+                print(f"INFO: Semantic cache directory doesn't exist for {root}, caching needed.")
+                needs_caching = True
+                continue
+        
         cached_te_files = list(cache_dir.glob("*_te.pt"))
+        
         if len(cached_te_files) < len(image_paths):
             print(f"INFO: Found {len(image_paths)} images but only {len(cached_te_files)} cached files in {root}")
             needs_caching = True
         else:
-            print(f"INFO: All {len(image_paths)} images appear to be cached in {root}")
+            # Check if semantic maps exist for all files
+            if use_semantic_loss:
+                semantic_cache_dir = root / semantic_cache_folder_name
+                missing_semantic = 0
+                
+                for te_file in cached_te_files:
+                    safe_name = te_file.stem.replace('_te', '')
+                    sem_path = semantic_cache_dir / f"{safe_name}_sem.pt"
+                    
+                    if not sem_path.exists():
+                        missing_semantic += 1
+                
+                if missing_semantic > 0:
+                    print(f"INFO: {missing_semantic} semantic maps missing in {root}")
+                    needs_caching = True
+                else:
+                    print(f"INFO: All {len(image_paths)} images and semantic maps cached in {root}")
+            else:
+                print(f"INFO: All {len(image_paths)} images appear to be cached in {root}")
             
     return needs_caching
 
@@ -603,9 +643,15 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     
+    # Determine if we need semantic map caching
+    use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
+    semantic_cache_folder_name = ".semantic_maps_cache"
+    
     print("\n" + "="*60)
     print(f"STARTING VRAM-OPTIMIZED CACHING FOR: {config.TRAINING_MODE}")
     print(f"Using cache folder: {cache_folder_name}")
+    if use_semantic_loss:
+        print(f"Semantic maps will be cached to: {semantic_cache_folder_name}")
     print(f"VAE Channels: {vae.config.latent_channels}")
     print("="*60 + "\n")
     
@@ -639,6 +685,11 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
         
+        # Create semantic cache directory if needed
+        semantic_cache_dir = root / semantic_cache_folder_name if use_semantic_loss else None
+        if use_semantic_loss:
+            semantic_cache_dir.mkdir(exist_ok=True)
+        
         torch.save({"embeds": null_embeds, "pooled": null_pooled}, cache_dir / "null_embeds.pt")
         
         paths = [
@@ -651,11 +702,15 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             relative_path = p.relative_to(root)
             safe_stem = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
             
-            if not (cache_dir / f"{safe_stem}_te.pt").exists():
+            te_exists = (cache_dir / f"{safe_stem}_te.pt").exists()
+            lat_exists = (cache_dir / f"{safe_stem}_lat.pt").exists()
+            sem_exists = (semantic_cache_dir / f"{safe_stem}_sem.pt").exists() if use_semantic_loss else True
+            
+            if not te_exists or not lat_exists or (use_semantic_loss and not sem_exists):
                 to_process.append(p)
 
         if not to_process:
-            print(f"INFO: All images in {root.name} are already cached.")
+            print(f"INFO: All images in {root.name} are already cached (including semantic maps).")
             continue
             
         print(f"INFO: Validating and Bucketing {len(to_process)} images from {root.name}...")
@@ -691,6 +746,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             
             images_global = []
             valid_meta_final = []
+            original_images_for_semantic = [] if use_semantic_loss else None
             
             for m in batch_meta:
                 try:
@@ -699,6 +755,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         img_resized = smart_resize(img, w, h)
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
+                        
+                        # Store original PIL image for semantic map generation
+                        if use_semantic_loss:
+                            # Reload original for semantic processing (need full quality)
+                            with Image.open(m['ip']) as orig_img:
+                                orig_img = fix_alpha_channel(orig_img)
+                                original_images_for_semantic.append(orig_img)
+                                
                 except Exception as e:
                     print(f"Skipping {m['ip']}: {e}")
             
@@ -728,6 +792,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     print(f"  VAE shift_factor: {vae.config.shift_factor}")
                     print(f"  VAE scaling_factor: {vae.config.scaling_factor}")
                     print("-" * 60)
+                    
+                if batch_idx == 0:
+                    print("\n=== VAE CHANNEL BALANCE DIAGNOSTIC ===")
+                    for i in range(latents_global.shape[1]):
+                        ch_mean = latents_global[:, i].mean().item()
+                        ch_std = latents_global[:, i].std().item()
+                        print(f"Channel {i}: mean={ch_mean:.4f}, std={ch_std:.4f}")
+                    print("=" * 50 + "\n")
 
                 if batch_idx == 0:
                     print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
@@ -739,12 +811,36 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 
             latents_global = latents_global.cpu()
             
+            # Generate and cache semantic maps if needed
+            semantic_maps = None
+            if use_semantic_loss and original_images_for_semantic:
+                char_weight = getattr(config, "SEMANTIC_CHAR_WEIGHT", 1.0)
+                detail_weight = getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0)
+                # Target size is latent size (w/8, h/8 for SDXL)
+                latent_w, latent_h = w // 8, h // 8
+                
+                semantic_maps = generate_semantic_map_batch_softmax(
+                    images=original_images_for_semantic,
+                    char_weight=char_weight,
+                    detail_weight=detail_weight,
+                    target_size=(latent_w, latent_h),
+                    device="cpu",  # Keep on CPU to save VRAM during caching
+                    dtype=torch.float32,
+                    num_channels=latents_global.shape[1]  # Match latent channels
+                )
+                semantic_maps = semantic_maps.cpu()
+                
+                if batch_idx == 0:
+                    print(f"\nDEBUG: Semantic map shape: {semantic_maps.shape}")
+                    print(f"DEBUG: Semantic map range: [{semantic_maps.min():.4f}, {semantic_maps.max():.4f}]")
+            
             for j, m in enumerate(valid_meta_final):
                 relative_path = m['ip'].relative_to(root)
                 safe_filename = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
                 
                 path_te = cache_dir / f"{safe_filename}_te.pt"
                 path_lat = cache_dir / f"{safe_filename}_lat.pt"
+                path_sem = semantic_cache_dir / f"{safe_filename}_sem.pt" if use_semantic_loss else None
                 
                 torch.save({
                     "original_stem": m['ip'].stem,
@@ -758,8 +854,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 }, path_te)
                 
                 torch.save(latents_global[j], path_lat)
+                
+                # Save semantic map if generated
+                if semantic_maps is not None:
+                    torch.save(semantic_maps[j], path_sem)
             
             del pixel_values_global, latents_global, embeds, pooled
+            if semantic_maps is not None:
+                del semantic_maps
+            if original_images_for_semantic:
+                del original_images_for_semantic
+            
             if batch_idx % 20 == 0:
                 torch.cuda.empty_cache()
 
@@ -778,11 +883,13 @@ class ImageTextLatentDataset(Dataset):
         self.worker_rng = None
         
         cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+        semantic_cache_folder_name = ".semantic_maps_cache"
 
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             cache_dir = root / cache_folder_name
-            if not cache_dir.exists(): continue
+            if not cache_dir.exists(): 
+                continue
             
             files = list(cache_dir.glob("*_te.pt"))
             for f in files:
@@ -790,7 +897,8 @@ class ImageTextLatentDataset(Dataset):
                 
             self.te_files.extend(files * int(ds.get("repeats", 1)))
 
-        if not self.te_files: raise ValueError("No cached files found.")
+        if not self.te_files: 
+            raise ValueError("No cached files found.")
         
         random.shuffle(self.te_files)
         
@@ -815,6 +923,43 @@ class ImageTextLatentDataset(Dataset):
         self.target_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
         self.target_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
         
+        # --- SEMANTIC LOSS CONFIGURATION ---
+        self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic")
+        self.semantic_cache_roots = {}  # Map te_file path to semantic cache dir
+        
+        if self.use_semantic_loss:
+            print("INFO: Semantic loss is ENABLED. Loading from cached semantic maps.")
+            # Build mapping to semantic cache directories
+            for ds in config.INSTANCE_DATASETS:
+                root = Path(ds["path"])
+                semantic_cache_dir = root / semantic_cache_folder_name
+                cache_dir = root / cache_folder_name
+                
+                if not semantic_cache_dir.exists():
+                    print(f"WARNING: Semantic cache directory not found: {semantic_cache_dir}")
+                    print(f"         Please run caching first with LOSS_TYPE='Semantic' in config.")
+                    continue
+                
+                # Map each te_file to its semantic cache directory
+                for f in cache_dir.glob("*_te.pt"):
+                    self.semantic_cache_roots[str(f)] = semantic_cache_dir
+            
+            # Verify we have semantic maps for all files
+            missing_semantic = []
+            for te_file in self.te_files:
+                semantic_dir = self.semantic_cache_roots.get(str(te_file))
+                if semantic_dir:
+                    safe_name = Path(te_file).stem.replace('_te', '')
+                    sem_path = semantic_dir / f"{safe_name}_sem.pt"
+                    if not sem_path.exists():
+                        missing_semantic.append(te_file)
+                else:
+                    missing_semantic.append(te_file)
+            
+            if missing_semantic:
+                print(f"WARNING: {len(missing_semantic)} files missing semantic maps.")
+                print(f"         First few: {[str(p) for p in missing_semantic[:3]]}")
+        # --- END SEMANTIC LOSS CONFIGURATION ---
 
         if self.dropout_prob > 0:
             found_null = False
@@ -875,7 +1020,6 @@ class ImageTextLatentDataset(Dataset):
                 print(f"WARNING: Could not check cache file {f}: {e}")
         
         if incompatible_count > 0:
-            # Get dataset paths from instance variable instead of config
             dataset_paths = list(set(self.dataset_roots.values()))
             
             print(f"\n{'='*70}")
@@ -895,7 +1039,8 @@ class ImageTextLatentDataset(Dataset):
         else:
             print(f"INFO: Cache VAE config validated ({checked} samples checked).")
             
-    def __len__(self): return len(self.te_files)
+    def __len__(self): 
+        return len(self.te_files)
 
     def _init_worker_rng(self):
         worker_info = torch.utils.data.get_worker_info()
@@ -912,27 +1057,6 @@ class ImageTextLatentDataset(Dataset):
             path_te = self.te_files[i]
             data_te = torch.load(path_te, map_location="cpu")
             
-            cached_shift = data_te.get("vae_shift", 0.0)
-            cached_scale = data_te.get("vae_scale", 0.0)
-            
-            # Handle defaults if missing in cache
-            if cached_shift is None: cached_shift = 0.0
-            if cached_scale is None or cached_scale == 0:
-                # Fallback for old cache files (Standard SDXL default)
-                cached_scale = 0.13025 
-
-            # --- UPDATED VALIDATION LOGIC ---
-            # Instead of checking hardcoded values, we check if the cache 
-            # matches the CURRENT training configuration.
-            
-            config_shift = getattr(self, 'target_shift', None)
-            config_scale = getattr(self, 'target_scale', None)
-
-            if self.target_scale is not None:
-                self._validate_cache_compatibility()
-            
-            # -------------------------------
-            
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
             
@@ -942,30 +1066,41 @@ class ImageTextLatentDataset(Dataset):
                 return None
 
             final_latents = latents
-            crop_coords = (0, 0)
-            target_size_px = data_te["target_size"]
-            
-            embeds = data_te["embeds"]
-            pooled = data_te["pooled"]
-            
-            if embeds.dim() == 3 and embeds.shape[0] == 1:
-                embeds = embeds.squeeze(0)
-            if pooled.dim() == 2 and pooled.shape[0] == 1:
-                pooled = pooled.squeeze(0)
             
             item_data = {
                 "latents": final_latents,
-                "embeds": embeds,
-                "pooled": pooled,
+                "embeds": data_te["embeds"].squeeze(0) if data_te["embeds"].dim() == 3 else data_te["embeds"],
+                "pooled": data_te["pooled"].squeeze(0) if data_te["pooled"].dim() == 2 else data_te["pooled"],
                 "original_sizes": data_te["original_size"],
-                "target_sizes": target_size_px,
-                "crop_coords": crop_coords,
+                "target_sizes": data_te["target_size"],
+                "crop_coords": (0, 0),
                 "latent_path": str(path_te)
             }
             
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
                 item_data["embeds"] = self.null_embeds
                 item_data["pooled"] = self.null_pooled
+
+            # --- LOAD CACHED SEMANTIC MAP ---
+            if self.use_semantic_loss:
+                semantic_dir = self.semantic_cache_roots.get(str(path_te))
+                if semantic_dir:
+                    safe_name = Path(path_te).stem.replace('_te', '')
+                    sem_path = semantic_dir / f"{safe_name}_sem.pt"
+                    
+                    if sem_path.exists():
+                        semantic_map = torch.load(sem_path, map_location="cpu")
+                        item_data["semantic_map"] = semantic_map
+                    else:
+                        print(f"WARNING: Semantic map not found: {sem_path}")
+                        # Create fallback uniform map
+                        c, h, w = final_latents.shape
+                        item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
+                else:
+                    # Create fallback uniform map
+                    c, h, w = final_latents.shape
+                    item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
+            # --- END SEMANTIC MAP LOADING ---
 
             return item_data
             
@@ -1128,11 +1263,15 @@ class TimestepSampler:
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
-    if not batch: return {}
+    if not batch: 
+        return {}
     
     output = {}
     for k in batch[0]:
-        if isinstance(batch[0][k], torch.Tensor):
+        if k == "original_image":
+            # Pass PIL images as a simple list, do not stack
+            output[k] = [item[k] for item in batch]
+        elif isinstance(batch[0][k], torch.Tensor):
             output[k] = torch.stack([item[k] for item in batch])
         else:
             output[k] = [item[k] for item in batch]
@@ -1800,7 +1939,48 @@ def main():
                     }
                 ).sample
 
-            loss = F.mse_loss(pred.float(), target.to(pred.dtype).float())
+            pred_f = pred.float()
+            target_f = target.float()
+            
+            loss_type = getattr(config, "LOSS_TYPE", "MSE")
+
+            # 1. HUBER ADAPTIVE
+            if loss_type == "Huber_Adaptive":
+                huber_beta = getattr(config, "LOSS_HUBER_BETA", 0.5)
+                damping = getattr(config, "LOSS_ADAPTIVE_DAMPING", 0.1)
+                
+                base_loss = F.smooth_l1_loss(pred_f, target_f, beta=huber_beta, reduction='none')
+                target_mag = target_f.abs().mean(dim=[1,2,3], keepdim=True).clamp_min(1e-4)
+                weight = 1.0 / (target_mag + damping) 
+                weight = weight / weight.mean()
+                loss = (base_loss * weight).mean()
+
+            # 2. SEMANTIC LOSS (Cached maps - no CV2 processing)
+            elif loss_type == "Semantic":
+                per_pixel_loss = F.mse_loss(pred_f, target_f, reduction="none")
+                
+                # Load cached semantic map instead of generating live
+                semantic_maps = batch.get("semantic_map")
+                
+                if semantic_maps is not None:
+                    # Move to correct device and dtype
+                    semantic_maps = semantic_maps.to(device, dtype=torch.float32)
+                    
+                    # Ensure shapes match (semantic map should already match latent shape)
+                    if semantic_maps.shape == per_pixel_loss.shape:
+                        # Modulation: 1.0 base + semantic weight
+                        modulation = 1.0 + semantic_maps
+                        loss = (per_pixel_loss * modulation).mean()
+                    else:
+                        print(f"WARNING: Semantic map shape mismatch. Map: {semantic_maps.shape}, Loss: {per_pixel_loss.shape}")
+                        loss = per_pixel_loss.mean()
+                else:
+                    print("WARNING: Semantic loss enabled but no cached maps found. Using standard MSE.")
+                    loss = per_pixel_loss.mean()
+            # 3. DEFAULT (MSE)
+            else: 
+                loss = F.mse_loss(pred_f, target_f, reduction="mean")
+
             raw_loss_value = loss.detach().item()
             
             accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS

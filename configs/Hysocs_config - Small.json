@@ -6,7 +6,7 @@
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4509.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "UNCONDITIONAL_DROPOUT": false,
+    "UNCONDITIONAL_DROPOUT": true,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.1,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
@@ -14,36 +14,106 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "1750",
+    "MAX_TRAIN_STEPS": "10000",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "5",
+    "GRADIENT_ACCUMULATION_STEPS": "8",
     "MIXED_PRECISION": "bfloat16",
-    "CLIP_GRAD_NORM": "10.0",
+    "CLIP_GRAD_NORM": "8.5",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "2000",
-    "UNET_EXCLUDE_TARGETS": [
-        "up_blocks.0.attentions.*.ff.net.*"
-    ],
+    "SAVE_EVERY_N_STEPS": "700",
+    "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            1e-06
+            5e-06
         ],
         [
             0.05,
-            4e-05
+            5e-05
         ],
         [
-            0.94942529,
-            4e-05
+            0.0975,
+            4.9723e-05
+        ],
+        [
+            0.145,
+            4.88988e-05
+        ],
+        [
+            0.1925,
+            4.75476e-05
+        ],
+        [
+            0.24,
+            4.57029e-05
+        ],
+        [
+            0.2875,
+            4.34099e-05
+        ],
+        [
+            0.335,
+            4.07252e-05
+        ],
+        [
+            0.3825,
+            3.77148e-05
+        ],
+        [
+            0.43,
+            3.44529e-05
+        ],
+        [
+            0.4775,
+            3.10198e-05
+        ],
+        [
+            0.525,
+            2.75e-05
+        ],
+        [
+            0.5725,
+            2.39802e-05
+        ],
+        [
+            0.62,
+            2.05471e-05
+        ],
+        [
+            0.6675,
+            1.72852e-05
+        ],
+        [
+            0.715,
+            1.42748e-05
+        ],
+        [
+            0.7625,
+            1.15901e-05
+        ],
+        [
+            0.81,
+            9.2971e-06
+        ],
+        [
+            0.8575,
+            7.4524e-06
+        ],
+        [
+            0.905,
+            6.1012e-06
+        ],
+        [
+            0.9525,
+            5.277e-06
         ],
         [
             1.0,
-            1e-06
+            5e-06
         ]
     ],
-    "LR_GRAPH_MIN": "1e-06",
-    "LR_GRAPH_MAX": "4e-05",
+    "LR_GRAPH_MIN": "5e-06",
+    "LR_GRAPH_MAX": "5e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -52,61 +122,63 @@
     "VAE_SHIFT_FACTOR": 0.0,
     "VAE_SCALING_FACTOR": 0.13025,
     "VAE_LATENT_CHANNELS": 4,
-    "RF_SHIFT_FACTOR": 2.0,
+    "RF_SHIFT_FACTOR": 3.0,
     "RF_USE_DYNAMIC_SHIFT": true,
     "RF_BASE_PIXELS": 1048576,
     "TRAINING_MODE": "Rectified Flow (SDXL)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by koahri",
+            "path": "C:/Users/Administrator/Pictures\\Artists\\by magui3",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "LOSS_TYPE": "Default",
-    "SEMANTIC_LOSS_BLEND": 0.5,
-    "SEMANTIC_LOSS_STRENGTH": 1.5,
+    "LOSS_TYPE": "Semantic",
+    "SEMANTIC_CHAR_WEIGHT": 0.6,
+    "SEMANTIC_DETAIL_WEIGHT": 0.8,
+    "LOSS_HUBER_BETA": 0.5,
+    "LOSS_ADAPTIVE_DAMPING": 0.1,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70,
-            70
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400,
+            400
         ]
     },
     "RAVEN_PARAMS": {
         "betas": [
             0.9,
-            0.99
+            0.98
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "debias_strength": 1.0,
+        "debias_strength": 0.9,
         "use_grad_centralization": false,
         "gc_alpha": 0.5
     },
