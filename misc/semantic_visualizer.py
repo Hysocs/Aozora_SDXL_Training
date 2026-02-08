@@ -1,6 +1,13 @@
 import sys
 import numpy as np
+import os
 from PIL import Image
+
+script_dir = os.path.dirname(os.path.abspath(__file__))
+# Get the parent directory (the one containing misc and tools)
+parent_dir = os.path.dirname(script_dir)
+# Add the parent directory to the Python path
+sys.path.insert(0, parent_dir)
 
 import torch
 
@@ -15,11 +22,11 @@ from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
 
 try:
+    # This import will now work correctly
     from tools.semantic import generate_character_map, generate_detail_map
 except ImportError:
     print("CRITICAL ERROR: Could not find 'tools/semantic.py'.")
     sys.exit(1)
-
 
 def fix_alpha_channel(img):
     if img.mode == 'P' and 'transparency' in img.info:
