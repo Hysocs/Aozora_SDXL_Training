@@ -5,7 +5,7 @@
 >
 > **Note:** Sorry for any previously failed attempts at training. Getting this stable on consumer hardware is tricky.
 
-A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or have a million CLI flags to get lost in.
+A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or require you to train at lower resolutions.
 
 Works with v-prediction and Flow Matching models (NoobAI, Illustrious, etc.) out of the box.
 
@@ -69,7 +69,7 @@ Checkpoints save to `output/checkpoints/` every N steps. If it crashes, resume f
 - Python 3.10
 - NVIDIA GPU with 12GB+ VRAM
 - About 20GB free disk space for the environment
-- 32GB of vram for offloading
+- 32GB of ram for offloading
 
 ## Notes
 
