@@ -1,10 +1,9 @@
 # Aozora SDXL Trainer
 
-&lt;details&gt;
-  &lt;summary&gt;⚠️ &lt;strong&gt;Beta Software&lt;/strong&gt;&lt;/summary&gt;
-  
-This is still in active development. It works, but expect rough edges. The goal is making SDXL training actually run on 12GB cards without the pain.
-&lt;/details&gt;
+> [!WARNING]
+> **Beta Software:** This is still in active development. It works, but expect rough edges. The goal is making SDXL training actually run on 12GB cards without the pain.
+
+**Note:** Sorry for any previously failed attempts at training. Getting this stable on consumer hardware is tricky.
 
 A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or have a million CLI flags to get lost in.
 
