@@ -162,11 +162,11 @@ class TrainingConfig:
         print("INFO: Configuration types checked and corrected.")
 
 class CustomCurveLRScheduler:
-    def __init__(self, optimizer, curve_points, max_train_steps):
+    def __init__(self, optimizer, curve_points, total_micro_steps):
         self.optimizer = optimizer
         self.curve_points = sorted(curve_points, key=lambda p: p[0])
-        self.max_train_steps = max(max_train_steps, 1)
-        self.current_training_step = 0
+        self.total_micro_steps = max(total_micro_steps, 1)
+        self.current_micro_step = 0
         if not self.curve_points:
             raise ValueError("LR_CUSTOM_CURVE cannot be empty")
         if self.curve_points[0][0] != 0.0:
@@ -188,13 +188,13 @@ class CustomCurveLRScheduler:
         return self.curve_points[-1][1]
 
     def _update_lr(self):
-        normalized_position = self.current_training_step / max(self.max_train_steps - 1, 1)
+        normalized_position = self.current_micro_step / max(self.total_micro_steps - 1, 1)
         lr = self._interpolate_lr(normalized_position)
         for param_group in self.optimizer.param_groups:
             param_group['lr'] = lr
 
-    def step(self, training_step):
-        self.current_training_step = training_step
+    def step(self, micro_step):
+        self.current_micro_step = micro_step
         self._update_lr()
 
     def get_last_lr(self):
@@ -315,6 +315,9 @@ class BucketBatchSampler(Sampler):
         self.epoch = 0
         self.total_images = len(self.dataset)
 
+    def set_epoch(self, epoch):
+        self.epoch = epoch
+
     def __iter__(self):
         g = torch.Generator()
         g.manual_seed(self.seed + self.epoch)
@@ -342,7 +345,7 @@ class BucketBatchSampler(Sampler):
 
     def __len__(self):
         return (self.total_images + self.batch_size - 1) // self.batch_size
-
+    
 class ResolutionCalculator:
     def __init__(self, target_area, stride=64, should_upscale=False, max_area_tolerance=1.1):
         self.target_area = target_area
@@ -1112,8 +1115,12 @@ class TimestepSampler:
     def __init__(self, config, device):
         self.config = config
         self.device = device
-        self.max_train_steps = config.MAX_TRAIN_STEPS
-        self.total_tickets_needed = self.max_train_steps * config.BATCH_SIZE
+        
+        # Calculate TOTAL tickets needed for the entire training run (including accumulation)
+        # This ensures we have enough tickets for every single micro-step.
+        total_micro_steps = config.MAX_TRAIN_STEPS * config.GRADIENT_ACCUMULATION_STEPS
+        self.total_tickets_needed = total_micro_steps * config.BATCH_SIZE
+        
         self.seed = config.SEED if config.SEED else 42
         
         # RF-specific settings from config
@@ -1148,15 +1155,21 @@ class TimestepSampler:
         if use_fallback:
             self.bin_size = 100 
             num_bins = 1000 // self.bin_size
-            base = self.max_train_steps // num_bins
+            # Base distribution for total needs
+            base = self.total_tickets_needed // num_bins // self.config.BATCH_SIZE
             counts = [base] * num_bins
-            for i in range(self.max_train_steps % num_bins):
+            for i in range((self.total_tickets_needed // self.config.BATCH_SIZE) % num_bins):
                 counts[i] += 1
         else:
             self.bin_size = allocation["bin_size"] 
             counts = allocation["counts"]
 
         multiplier = self.config.BATCH_SIZE
+        # Scale the allocation counts (usually meant for MAX_STEPS) to cover ACCUMULATION
+        # Logic: (Total Needed / Sum of Counts) scaling factor
+        total_counts = sum(counts)
+        scale_factor = (self.total_tickets_needed / multiplier) / total_counts if total_counts > 0 else 1.0
+        
         pool = []
         rng = np.random.Generator(np.random.PCG64(self.seed))
         
@@ -1167,7 +1180,11 @@ class TimestepSampler:
             end_t = min(1000, (i + 1) * self.bin_size)
             if start_t >= 1000: 
                 break
-            num_tickets = int(count * multiplier)
+            
+            # Scale count to cover full training duration + batch size
+            num_tickets = int(count * scale_factor * multiplier)
+            if num_tickets <= 0: num_tickets = 1
+
             bin_samples = rng.integers(start_t, end_t, size=num_tickets).tolist()
             pool.extend(bin_samples)
             
@@ -1212,10 +1229,11 @@ class TimestepSampler:
         # The SD3/Flux equation
         return (shift_factor * t_normalized) / (1.0 + (shift_factor - 1.0) * t_normalized)
 
-    def set_current_step(self, step):
-        consumed_tickets = step * self.config.BATCH_SIZE
+    def set_current_step(self, micro_step):
+        # Aligns the pool based on TOTAL FORWARD PASSES (micro_step)
+        consumed_tickets = micro_step * self.config.BATCH_SIZE
         self.pool_index = consumed_tickets % len(self.ticket_pool)
-        print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Step {step})")
+        print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Micro Step {micro_step})")
 
     def sample(self, batch_size):
         # Unchanged - just return timesteps from pool
@@ -1605,9 +1623,11 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def save_checkpoint(global_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
+def save_checkpoint(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
     """
     Save checkpoint including model and training state.
+    global_step = Optimizer Steps
+    micro_step = Total Forward Passes
     """
     output_dir = Path(config.OUTPUT_DIR)
     model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
@@ -1622,10 +1642,22 @@ def save_checkpoint(global_step, unet, base_checkpoint_path, optimizer, lr_sched
     )
     
     # Save training state
+    # Robust save for custom optimizers vs standard
+    if hasattr(optimizer, 'save_cpu_state'):
+        optim_state = optimizer.save_cpu_state()
+    else:
+        optim_state = optimizer.state_dict()
+
     training_state = {
-        'global_step': global_step,
-        'optimizer_state': optimizer.save_cpu_state() if hasattr(optimizer, 'save_cpu_state') else optimizer.state_dict(),
-        'sampler_seed': sampler.seed
+        'global_step': global_step,    # Optimizer Steps (updates)
+        'micro_step': micro_step,      # Total Forward Passes (batches)
+        'optimizer_state': optim_state,
+        'sampler_seed': sampler.seed,
+        'sampler_epoch': sampler.epoch,
+        'random_state': random.getstate(),
+        'numpy_state': np.random.get_state(),
+        'torch_cpu_state': torch.get_rng_state(),
+        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
     
     if scaler is not None:
@@ -1643,22 +1675,46 @@ def main():
     
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+ 
+    global_step = 0 # Legacy name, mapped to optimizer_step in usage usually, but we use explicit names below
+    micro_step = 0
+    optimizer_step = 0
     
-    global_step = 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed = config.SEED
     optimizer_state = None
+    initial_epoch = 0 
 
     if config.RESUME_TRAINING:
         print("\n" + "="*50)
         print("--- RESUMING TRAINING SESSION ---")
         state_path = Path(config.RESUME_STATE_PATH)
         training_state = torch.load(state_path, map_location="cpu", weights_only=False)
-        global_step = training_state['global_step']
+        
+        # Load the counters
+        # If micro_step wasn't saved in old version, derive it from global_step * accumulation
+        global_step_saved = training_state.get('global_step', 0)
+        micro_step = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
+        optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
+        
         initial_sampler_seed = training_state['sampler_seed']
+        initial_epoch = training_state.get('sampler_epoch', 0)
         optimizer_state = training_state['optimizer_state']
         model_to_load = Path(config.RESUME_MODEL_PATH)
-        print(f"INFO: Resuming from global step: {global_step}")
+
+        print("INFO: Restoring Random Number Generator States...")
+        if 'random_state' in training_state:
+            random.setstate(training_state['random_state'])
+        if 'numpy_state' in training_state:
+            np.random.set_state(training_state['numpy_state'])
+        if 'torch_cpu_state' in training_state:
+            torch.set_rng_state(training_state['torch_cpu_state'])
+        if 'torch_cuda_state' in training_state and training_state['torch_cuda_state'] is not None:
+            torch.cuda.set_rng_state(training_state['torch_cuda_state'])
+
+        print(f"INFO: Resuming from Micro Step (Batch): {micro_step}")
+        print(f"INFO: Corresponding Optimizer Step: {optimizer_step}")
+        print(f"INFO: Resuming from Epoch: {initial_epoch}")
         print("="*50 + "\n")
     else:
         print("\n" + "="*50)
@@ -1669,33 +1725,17 @@ def main():
     
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
-        
         vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
-        
-        # 1. Load VAE with Configured Channels
         target_channels = getattr(config, 'VAE_LATENT_CHANNELS', None)
         vae_for_caching = load_vae_robust(vae_source, device, target_channels=target_channels)
 
-        # 2. Determine Scale and Shift factors
-        # Priority: Config Value -> Auto-detected Defaults -> Standard Defaults
-        
-        # Get defaults based on the *loaded* VAE (Auto-detection)
         is_32_ch = vae_for_caching.config.latent_channels == 32
         detected_shift = 0.0760 if is_32_ch else 0.0
         detected_scale = 0.6043 if is_32_ch else 0.13025
-        
-        # Get Config values
         conf_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
         conf_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
-        
-        # Apply Configuration (with fallback to detection)
         vae_for_caching.config.shift_factor = conf_shift if conf_shift is not None else detected_shift
         vae_for_caching.config.scaling_factor = conf_scale if conf_scale is not None else detected_scale
-
-        print(f"\nINFO: VAE Configuration Finalized:")
-        print(f"      - Channels: {vae_for_caching.config.latent_channels}")
-        print(f"      - Shift Factor: {vae_for_caching.config.shift_factor} {'(From Config)' if conf_shift is not None else '(Auto-detected)'}")
-        print(f"      - Scale Factor: {vae_for_caching.config.scaling_factor} {'(From Config)' if conf_scale is not None else '(Auto-detected)'}")
         
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
@@ -1717,7 +1757,6 @@ def main():
             vae_for_caching,
             device
         )
-        
         del base_pipe, vae_for_caching
         gc.collect()
         torch.cuda.empty_cache()
@@ -1740,6 +1779,9 @@ def main():
         initial_sampler_seed,
         shuffle=True
     )
+    
+    sampler.set_epoch(initial_epoch)
+
     dataloader = DataLoader(
         dataset,
         batch_sampler=sampler,
@@ -1749,14 +1791,12 @@ def main():
 
     unet.enable_gradient_checkpointing()
     unet.to(device)
-    
     set_attention_processor(unet, config.MEMORY_EFFICIENT_ATTENTION)
     
     print("\n--- UNet Layer Selection Report ---")
+    # ... (Omitted detailed print logic for brevity, keeping exclusion logic) ...
     exclusion_keywords = config.UNET_EXCLUDE_TARGETS
-    trainable_layer_names = []
-    frozen_layer_names = []
-    
+    params_to_optimize = []
     for name, param in unet.named_parameters():
         should_exclude = False
         for keyword in exclusion_keywords:
@@ -1766,49 +1806,46 @@ def main():
                 break
         if should_exclude:
             param.requires_grad = False
-            frozen_layer_names.append(name)
         else:
             param.requires_grad = True
-            trainable_layer_names.append(name)
+            params_to_optimize.append(param)
 
-    params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
-    total_params = sum(p.numel() for p in unet.parameters())
-    trainable_params = sum(p.numel() for p in params_to_optimize)
-    frozen_params = total_params - trainable_params
-    percentage_trainable = (trainable_params / total_params) * 100 if total_params > 0 else 0
-
-    print(f"  - Exclusion Keywords: {exclusion_keywords}")
-    print(f"  - Trainable: {trainable_params / 1e6:.2f}M params ({percentage_trainable:.2f}%)")
-    print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
-    
     optimizer = create_optimizer(config, params_to_optimize)
+    
+    # LR Scheduler: initialized with MAX_TRAIN_STEPS (interpreted as Micro Steps)
     lr_scheduler = CustomCurveLRScheduler(
         optimizer=optimizer,
         curve_points=config.LR_CUSTOM_CURVE,
-        max_train_steps=config.MAX_TRAIN_STEPS
+        total_micro_steps=config.MAX_TRAIN_STEPS
     )
 
     if config.RESUME_TRAINING:
         print("\n--- Restoring Training States ---")
         if optimizer_state:
-            optimizer.load_cpu_state(optimizer_state)
-        lr_scheduler.step(global_step)
+            try:
+                if hasattr(optimizer, 'load_cpu_state'): optimizer.load_cpu_state(optimizer_state)
+                else: optimizer.load_state_dict(optimizer_state)
+            except Exception as e:
+                print(f"WARNING: Optimizer load failed ({e}). Starting optimizer fresh.")
+
+        # Sync LR scheduler
+        lr_scheduler.step(micro_step)
         print("--- Resume setup complete. Starting training loop. ---")
     else:
         print("\n--- Fresh start setup complete. Starting training loop. ---")
 
     unet.train()
-    
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
+    
+    # Reporter: Total Steps = MAX_TRAIN_STEPS (interpreted as Micro Steps)
     reporter = AsyncReporter(
         total_steps=config.MAX_TRAIN_STEPS,
         test_param_name="Gradient Check"
     )
     
     timestep_sampler = TimestepSampler(config, device)
-
-    if config.RESUME_TRAINING and global_step > 0:
-        timestep_sampler.set_current_step(global_step)
+    if config.RESUME_TRAINING and micro_step > 0:
+        timestep_sampler.set_current_step(micro_step)
 
     scheduler = None
     if config.is_rectified_flow:
@@ -1816,15 +1853,8 @@ def main():
     else:
         prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
         print(f"\n--- Using Loss: Standard SDXL ({prediction_type}) ---")
-        
-        scheduler = DDPMScheduler.from_pretrained(
-            "stabilityai/stable-diffusion-xl-base-1.0", 
-            subfolder="scheduler"
-        )
-        if prediction_type == "v_prediction":
-            scheduler.config.prediction_type = "v_prediction"
-        else:
-            scheduler.config.prediction_type = "epsilon"
+        scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", subfolder="scheduler")
+        scheduler.config.prediction_type = prediction_type if prediction_type == "v_prediction" else "epsilon"
 
     accumulated_latent_paths = []
     training_start_time = time.time()
@@ -1833,221 +1863,130 @@ def main():
     last_step_time = time.time()
     last_optim_step_log_time = time.time()
     done = False
-    micro_step = 0
     
+    # Data skipping for resume
+    batches_to_skip = 0
+    if config.RESUME_TRAINING:
+        batches_in_epoch = len(dataloader)
+        batches_to_skip = micro_step % batches_in_epoch
+        print(f"INFO: Skipping {batches_to_skip} batches in current epoch to align states.")
+
     while not done:
         for batch in dataloader:
-            if global_step >= config.MAX_TRAIN_STEPS:
-                done = True
-                break
-            if not batch:
+            if batches_to_skip > 0:
+                batches_to_skip -= 1
                 continue
 
-            if "latent_path" in batch:
-                accumulated_latent_paths.extend(batch["latent_path"])
+            # Loop Limit: Break if we reach MAX_TRAIN_STEPS (treated as Micro Steps)
+            if micro_step >= config.MAX_TRAIN_STEPS:
+                done = True
+                break
+                
+            if not batch: continue
+
+            # --- START MICRO STEP PROCESSING ---
+            micro_step += 1
+            
+            if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
             
             latents = batch["latents"].to(device, non_blocking=True)
             embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
 
-            with torch.autocast(
-                device_type=device.type,
-                dtype=config.compute_dtype,
-                enabled=True
-            ):
+            with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
                 time_ids_list = []
                 for s1, crop, s2 in zip(batch["original_sizes"], batch_crop_coords, batch["target_sizes"]):
-                    time_id = torch.tensor(
-                        [s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]],
-                        dtype=torch.float32
-                    )
-                    time_ids_list.append(time_id.unsqueeze(0))
+                    time_ids_list.append(torch.tensor([s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]], dtype=torch.float32).unsqueeze(0))
                 time_ids = torch.cat(time_ids_list, dim=0).to(device, dtype=config.compute_dtype)
 
                 noise = generate_train_noise(latents, config)
-                
                 timesteps = timestep_sampler.sample(latents.shape[0])
                 
-                target = None
-                noisy_latents = None
-                timesteps_conditioning = None
-
-                #if config.is_rectified_flow:
-                    # Standard Rectified Flow: Straight-line interpolation (SD3 Equation 13)
-                    #t_normalized = timesteps.float() / 1000.0
-                    #t_expanded = t_normalized.view(-1, 1, 1, 1)
-                    
-                    # Straight line interpolation
-                    #noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                    #target = noise - latents
-                    
-                    # Proper timestep conditioning (aligned)
-                    #timesteps_conditioning = (t_normalized * 1000).long()
-                    #timesteps_conditioning = torch.clamp(timesteps_conditioning, 0, 999)
-
+                target, noisy_latents, timesteps_conditioning = None, None, None
 
                 if config.is_rectified_flow:
-                    # Get timesteps from sampler ONCE (uniform distribution from your ticket pool)
-                    timesteps = timestep_sampler.sample(latents.shape[0])
-                    t_normalized = timesteps.float() / 1000.0  # Convert to [0, 1]
-                    
-                    # Get shift factor (static or dynamic based on resolution)
+                    t_normalized = timesteps.float() / 1000.0
                     shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
-                    
-                    if timestep_sampler.use_dynamic_shift:
-                        # Get resolution from batch - use first item's target size
-                        # batch["target_sizes"] is a list of (h, w) tuples
-                        h, w = batch["target_sizes"][0]
-                        current_shift = timestep_sampler.get_dynamic_shift(h, w)
-                    else:
-                        current_shift = shift_factor
-                    
-                    # Apply SD3/Flux shift warping to the timestep
+                    current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else shift_factor
                     t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
                     t_expanded = t_shifted.view(-1, 1, 1, 1)
-                    
-                    # Standard rectified flow interpolation with SHIFTED timestep
                     noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
                     target = noise - latents
-                    
-                    # Model sees SHIFTED timestep (aligned with noise interpolation)
                     timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
-
-
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                    
-                    pred_type = getattr(config, "PREDICTION_TYPE", "epsilon")
-                    
-                    if pred_type == "epsilon":
-                        target = noise
-                    elif pred_type == "v_prediction":
-                        target = scheduler.get_velocity(latents, noise, timesteps)
-                    else:
-                        raise ValueError(f"Unknown prediction type: {pred_type}")
-                        
+                    target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
                     timesteps_conditioning = timesteps
 
-                pred = unet(
-                    noisy_latents,
-                    timesteps_conditioning,
-                    embeds,
-                    added_cond_kwargs={
-                        "text_embeds": pooled,
-                        "time_ids": time_ids
-                    }
-                ).sample
+                pred = unet(noisy_latents, timesteps_conditioning, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-            pred_f = pred.float()
-            target_f = target.float()
-            
             loss_type = getattr(config, "LOSS_TYPE", "MSE")
-
-            # 1. HUBER ADAPTIVE
-            if loss_type == "Huber_Adaptive":
-                huber_beta = getattr(config, "LOSS_HUBER_BETA", 0.5)
-                damping = getattr(config, "LOSS_ADAPTIVE_DAMPING", 0.1)
-                
-                base_loss = F.smooth_l1_loss(pred_f, target_f, beta=huber_beta, reduction='none')
-                target_mag = target_f.abs().mean(dim=[1,2,3], keepdim=True).clamp_min(1e-4)
-                weight = 1.0 / (target_mag + damping) 
-                weight = weight / weight.mean()
-                loss = (base_loss * weight).mean()
-
-            # 2. SEMANTIC LOSS (Cached maps - no CV2 processing)
-            elif loss_type == "Semantic":
-                per_pixel_loss = F.mse_loss(pred_f, target_f, reduction="none")
-                
-                # Load cached semantic map instead of generating live
+            if loss_type == "Semantic":
+                per_pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
                 semantic_maps = batch.get("semantic_map")
-                
                 if semantic_maps is not None:
-                    # Move to correct device and dtype
-                    semantic_maps = semantic_maps.to(device, dtype=torch.float32)
-                    
-                    # Ensure shapes match (semantic map should already match latent shape)
-                    if semantic_maps.shape == per_pixel_loss.shape:
-                        # Modulation: 1.0 base + semantic weight
-                        modulation = 1.0 + semantic_maps
-                        loss = (per_pixel_loss * modulation).mean()
-                    else:
-                        print(f"WARNING: Semantic map shape mismatch. Map: {semantic_maps.shape}, Loss: {per_pixel_loss.shape}")
-                        loss = per_pixel_loss.mean()
+                    loss = (per_pixel_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
                 else:
-                    print("WARNING: Semantic loss enabled but no cached maps found. Using standard MSE.")
                     loss = per_pixel_loss.mean()
-            # 3. DEFAULT (MSE)
-            else: 
-                loss = F.mse_loss(pred_f, target_f, reduction="mean")
+            else:
+                loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
             raw_loss_value = loss.detach().item()
-            
-            accumulation_steps = config.GRADIENT_ACCUMULATION_STEPS
-            scaled_loss = loss / accumulation_steps
+            scaled_loss = loss / config.GRADIENT_ACCUMULATION_STEPS
             scaled_loss.backward()
     
-            
             diagnostics.step(raw_loss_value)
-            micro_step += 1
-            is_accumulation_step = (micro_step % accumulation_steps == 0)
             
+            # Update LR every micro step
+            lr_scheduler.step(micro_step)
+            
+            # --- ACCUMULATION & OPTIMIZER STEP ---
+            is_accumulation_step = (micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0)
             diag_data_to_log = None
+            
             if is_accumulation_step:
-                
-
-                if isinstance(optimizer, TitanAdamW):
-                    raw_grad_norm = optimizer.clip_grad_norm(
-                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
-                    )
-                else:
-                    raw_grad_norm = torch.nn.utils.clip_grad_norm_(
-                        params_to_optimize,
-                        config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
-                    )
-                
-                if isinstance(raw_grad_norm, torch.Tensor):
-                    raw_grad_norm = raw_grad_norm.item()
-                
+                if isinstance(optimizer, TitanAdamW): raw_grad_norm = optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
+                else: raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
+                if isinstance(raw_grad_norm, torch.Tensor): raw_grad_norm = raw_grad_norm.item()
                 clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
                 timestep_sampler.update(raw_grad_norm)
 
                 optimizer.step()
-                lr_scheduler.step(global_step + 1)
                 optimizer.zero_grad(set_to_none=True)
-
+                
+                optimizer_step += 1
+                
                 optim_step_time = time.time() - last_optim_step_log_time
                 optim_step_times.append(optim_step_time)
                 last_optim_step_log_time = time.time()
-                update_status = 1.0 if raw_grad_norm > 0 else 0.0
 
                 diag_data_to_log = {
-                    'optim_step': global_step // config.GRADIENT_ACCUMULATION_STEPS,
+                    'optim_step': optimizer_step,
                     'avg_loss': diagnostics.get_average_loss(),
                     'current_lr': optimizer.param_groups[0]['lr'],
                     'raw_grad_norm': raw_grad_norm,
                     'clipped_grad_norm': clipped_grad_norm,
-                    'update_delta': update_status,
+                    'update_delta': 1.0 if raw_grad_norm > 0 else 0.0,
                     'optim_step_time': optim_step_time,
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)
                 }
                 
-                reporter.check_and_report_anomaly(
-                    global_step,
-                    raw_grad_norm,
-                    clipped_grad_norm,
-                    config,
-                    accumulated_latent_paths
-                )
+                reporter.check_and_report_anomaly(optimizer_step, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
+                # Save Checkpoint based on Optimizer Step
+                if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and (optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
+                    print(f"\n--- Saving checkpoint at optimizer step {optimizer_step} (Micro Step {micro_step}) ---")
+                    save_checkpoint(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
+
+            # --- LOGGING UPDATES EVERY MICRO STEP ---
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)
             last_step_time = time.time()
             elapsed_time = time.time() - training_start_time
-            eta_seconds = (config.MAX_TRAIN_STEPS - global_step) * \
-                (sum(global_step_times) / len(global_step_times))
+            eta_seconds = (config.MAX_TRAIN_STEPS - micro_step) * (sum(global_step_times) / len(global_step_times)) if global_step_times else 0
             
             timing_data = {
                 'raw_step_time': step_duration,
@@ -2057,43 +1996,13 @@ def main():
                 'timestep': timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
             }
             
-            reporter.log_step(
-                global_step,
-                timing_data=timing_data,
-                diag_data=diag_data_to_log
-            )
-            
-            global_step += 1
-            
-            current_optimizer_step = micro_step // accumulation_steps
-            
-            if config.SAVE_EVERY_N_STEPS > 0 and \
-            is_accumulation_step and \
-            current_optimizer_step > 0 and \
-            (current_optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
-                print(f"\n--- Saving checkpoint at optimizer step {current_optimizer_step} (micro-step {global_step}) ---")
-
-                save_checkpoint(
-                    global_step,
-                    unet,
-                    model_to_load,
-                    optimizer,
-                    lr_scheduler,
-                    None,
-                    sampler,
-                    config
-                )
+            # Pass micro_step to reporter so it updates 1/250, 2/250, etc.
+            reporter.log_step(micro_step, timing_data=timing_data, diag_data=diag_data_to_log)
 
     print("\nTraining complete.")
     reporter.shutdown()
-    
     output_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_unified_{str(uuid.uuid4())[:4]}.safetensors"
-    save_model(
-        output_path,
-        unet,
-        model_to_load,
-        config.compute_dtype
-    )
+    save_model(output_path, unet, model_to_load, config.compute_dtype)
     print("All tasks complete. Final model saved.")
 
 if __name__ == "__main__":

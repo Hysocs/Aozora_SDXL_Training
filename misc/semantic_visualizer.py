@@ -1,19 +1,16 @@
 import sys
 import numpy as np
 import os
+import cv2
+import gc
 from PIL import Image
-
-script_dir = os.path.dirname(os.path.abspath(__file__))
-# Get the parent directory (the one containing misc and tools)
-parent_dir = os.path.dirname(script_dir)
-# Add the parent directory to the Python path
-sys.path.insert(0, parent_dir)
-
 import torch
+from diffusers import AutoencoderKL
 
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
-    QFileDialog, QSlider, QDoubleSpinBox, QFormLayout, QGroupBox
+    QFileDialog, QSlider, QDoubleSpinBox, QFormLayout, QGroupBox, QCheckBox,
+    QProgressBar, QMessageBox
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
@@ -21,13 +18,7 @@ from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
 
-try:
-    # This import will now work correctly
-    from tools.semantic import generate_character_map, generate_detail_map
-except ImportError:
-    print("CRITICAL ERROR: Could not find 'tools/semantic.py'.")
-    sys.exit(1)
-
+# --- IMAGE UTILS ---
 def fix_alpha_channel(img):
     if img.mode == 'P' and 'transparency' in img.info:
         img = img.convert('RGBA')
@@ -37,135 +28,301 @@ def fix_alpha_channel(img):
         return bg
     return img.convert("RGB")
 
+# --- SEMANTIC LOGIC (Tighter Kernels) ---
+def generate_character_map(pil_image):
+    if pil_image.mode != "RGB":
+        pil_image = pil_image.convert("RGB")
+    np_image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
+    
+    # Bilateral filter to smooth noise but keep edges
+    bilateral = cv2.bilateralFilter(np_image_bgr, d=5, sigmaColor=50, sigmaSpace=50)
+    lab_image = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
+    l_channel, a_channel, b_channel = cv2.split(lab_image)
+    
+    mean_a, mean_b = np.mean(a_channel), np.mean(b_channel)
+    saliency_a = np.abs(a_channel.astype(np.float32) - mean_a)
+    saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
+    color_saliency = saliency_a + saliency_b
+   
+    if color_saliency.max() > 1e-6:
+        color_saliency_norm = color_saliency / color_saliency.max()
+    else:
+        color_saliency_norm = np.zeros_like(color_saliency, dtype=np.float32)
+   
+    # REDUCED BLUR: Was (21, 21) -> Now (9, 9)
+    # This keeps the character mask tighter to the actual subject
+    final_map = cv2.GaussianBlur(color_saliency_norm, (9, 9), 0)
+    return final_map
+
+def generate_detail_map(pil_image):
+    np_image_gray = np.array(pil_image.convert("L"))
+    
+    sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=3)
+    sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=3)
+    magnitude = np.sqrt(sobelx**2 + sobely**2)
+   
+    if magnitude.max() > 1e-6:
+        magnitude_norm = magnitude / magnitude.max()
+    else:
+        magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
+   
+    # REDUCED BLUR: Was (9, 9) -> Now (3, 3)
+    # Just enough to prevent aliasing, but tight enough to not "box" empty space
+    final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (3, 3), 0)
+    return final_map
+
+# --- THREADS ---
+
+class VAELoaderThread(QThread):
+    finished = pyqtSignal(object, str)
+    error = pyqtSignal(str)
+
+    def __init__(self, path):
+        super().__init__()
+        self.path = path
+
+    def run(self):
+        try:
+            dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+            try:
+                vae = AutoencoderKL.from_single_file(
+                    self.path, torch_dtype=dtype
+                )
+            except Exception as e:
+                if "latent_channels" in str(e) or "size mismatch" in str(e):
+                    vae = AutoencoderKL.from_single_file(
+                        self.path, torch_dtype=dtype, 
+                        latent_channels=32, ignore_mismatched_sizes=True
+                    )
+                else:
+                    raise e
+            
+            vae.enable_tiling()
+            vae.enable_slicing()
+            vae.eval()
+            
+            if torch.cuda.is_available():
+                vae = vae.to("cuda")
+                
+            msg = f"Loaded VAE: {vae.config.latent_channels} Ch ({dtype})"
+            self.finished.emit(vae, msg)
+        except Exception as e:
+            self.error.emit(str(e))
 
 class ComputeThread(QThread):
-    result_ready = pyqtSignal(object, object)
-    
+    result_ready = pyqtSignal(object, object) 
+
     def __init__(self):
         super().__init__()
-        self.char_map = None
-        self.detail_map = None
+        self.original_pil = None
+        self.char_map_raw = None
+        self.detail_map_raw = None
         self.char_weight = 1.0
         self.detail_weight = 1.0
-        self.original_image = None
-        
-    def set_data(self, char_map, detail_map, char_weight, detail_weight, original_image):
-        self.char_map = char_map
-        self.detail_map = detail_map
-        self.char_weight = char_weight
-        self.detail_weight = detail_weight
-        self.original_image = original_image
-        
-# GUI ComputeThread
+        self.vae = None
+        self.use_latent_view = False
+        self.smooth_view = False  # New Flag
+        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+    def set_data(self, orig_pil, char_map, detail_map, cw, dw, vae, use_latent_view, smooth_view):
+        self.original_pil = orig_pil
+        self.char_map_raw = char_map
+        self.detail_map_raw = detail_map
+        self.char_weight = cw
+        self.detail_weight = dw
+        self.vae = vae
+        self.use_latent_view = use_latent_view
+        self.smooth_view = smooth_view
+
     def run(self):
-        char_np = np.array(self.char_map).astype(np.float32)
-        detail_np = np.array(self.detail_map).astype(np.float32)
+        if self.original_pil is None: return
+
+        combined = (self.char_map_raw * self.char_weight) + (self.detail_map_raw * self.detail_weight)
+        combined = np.clip(combined, 0.0, 10.0)
+
+        final_bg = self.original_pil
+        final_map = combined
         
-        # Asymmetric gamma: boost character mids, keep detail sharp
-        char_boosted = np.power(char_np, 0.7) * self.char_weight
-        detail_scaled = detail_np * self.detail_weight  # gamma 1.0 = linear
+        MAX_RES = 2048
+
+        if self.use_latent_view:
+            w, h = self.original_pil.size
+            if w > MAX_RES or h > MAX_RES:
+                scale = min(MAX_RES/w, MAX_RES/h)
+                w = int(w * scale)
+                h = int(h * scale)
+
+            w = (w // 64) * 64
+            h = (h // 64) * 64
+            
+            latent_w = max(1, w // 8)
+            latent_h = max(1, h // 8)
+            
+            # VAE Reconstruct
+            if self.vae:
+                try:
+                    img_resized = self.original_pil.resize((w, h), Image.Resampling.LANCZOS)
+                    tensor = torch.from_numpy(np.array(img_resized)).to(dtype=self.dtype)
+                    tensor = tensor / 127.5 - 1.0
+                    tensor = tensor.permute(2, 0, 1).unsqueeze(0).to(self.device)
+                    
+                    with torch.no_grad():
+                        latents = self.vae.encode(tensor).latent_dist.sample()
+                        decoded = self.vae.decode(latents).sample
+                        
+                    decoded_cpu = decoded.cpu()
+                    del tensor, latents, decoded
+                    torch.cuda.empty_cache()
+                        
+                    decoded_cpu = (decoded_cpu / 2 + 0.5).clamp(0, 1)
+                    decoded_np = decoded_cpu.permute(0, 2, 3, 1).numpy()[0]
+                    final_bg = Image.fromarray((decoded_np * 255).astype(np.uint8))
+                except Exception as e:
+                    final_bg = self.original_pil.resize((w, h))
+                    torch.cuda.empty_cache()
+            else:
+                temp = self.original_pil.resize((latent_w, latent_h), Image.Resampling.BILINEAR)
+                final_bg = temp.resize((w, h), Image.Resampling.NEAREST)
+
+            # --- MAP GENERATION ---
+            map_pil = Image.fromarray(combined, mode='F')
+            
+            # 1. Downscale to Latent (Critical Step - Simulates Loss Resolution)
+            map_latent = map_pil.resize((latent_w, latent_h), Image.Resampling.BILINEAR)
+            
+            # 2. Upscale to View (Visualization Step)
+            if self.smooth_view:
+                # Bicubic creates a smooth heatmap (No blocks)
+                map_vis = map_latent.resize((w, h), Image.Resampling.BICUBIC)
+            else:
+                # Nearest creates the "Box" view (Accurate to latent boundaries)
+                map_vis = map_latent.resize((w, h), Image.Resampling.NEAREST)
+                
+            final_map = np.array(map_vis)
+            
+        else:
+            if combined.shape[:2][::-1] != self.original_pil.size:
+                map_pil = Image.fromarray(combined, mode='F')
+                map_vis = map_pil.resize(self.original_pil.size, Image.Resampling.BILINEAR)
+                final_map = np.array(map_vis)
         
-        # Soft max with balanced sharpness
-        combined = np.logaddexp(char_boosted * 4, detail_scaled * 4) / 4
-        combined = np.clip(combined, 0, 1)
-        
-        # Final gamma for smooth falloff
-        weight_map = np.power(combined, 0.8)
-        modulation_map = 1.0 + weight_map
-        
-        self.result_ready.emit(modulation_map, weight_map)
+        gc.collect()
+        self.result_ready.emit(final_bg, final_map)
 
 
 class SemanticVisualizer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Semantic Loss Visualizer (Soft Max)')
-        self.setGeometry(100, 100, 1200, 800)
+        self.setWindowTitle('Semantic Latent Visualizer (Refined)')
+        self.setGeometry(100, 100, 1300, 850)
 
+        # State
         self.original_image = None
-        self.char_map_pil = None
-        self.detail_map_pil = None
-        self.cbar = None
-        self.current_modulation_map = None
-        self.current_weight_map = None
+        self.vae_model = None
+        self.char_map_raw = None
+        self.detail_map_raw = None
         
+        self.bg_image = None
+        self.weight_map = None
+        self.cbar = None
+        
+        self._needs_recompute = False
+
         self.compute_thread = ComputeThread()
         self.compute_thread.result_ready.connect(self._on_compute_finished)
-        self._pending_update = False
+        self.vae_thread = None
 
         self._setup_ui()
         self._create_colormap()
 
     def _create_colormap(self):
         colors = [
-            (0.0, 0.0, 1.0),  # Blue (low)
-            (0.85, 0.85, 1.0),  # Light blue
-            (1.0, 1.0, 1.0),  # White
-            (1.0, 0.85, 0.85),  # Light red
-            (1.0, 0.0, 0.0),  # Red (high)
+            (0.0, 0.0, 0.5),    # Dark Blue (0.0)
+            (0.0, 0.0, 1.0),    # Blue
+            (0.0, 1.0, 1.0),    # Cyan
+            (1.0, 1.0, 0.0),    # Yellow
+            (1.0, 0.0, 0.0),    # Red (High)
         ]
-        self.red_blue_cmap = LinearSegmentedColormap.from_list("red_blue", colors)
-        
+        self.heatmap_cmap = LinearSegmentedColormap.from_list("custom_heat", colors)
+
     def _setup_ui(self):
         main_layout = QHBoxLayout(self)
 
-        controls_panel = QGroupBox("Soft Max Semantic Controls")
-        controls_panel.setFixedWidth(320)
+        # --- CONTROLS ---
+        controls_panel = QGroupBox("Configuration")
+        controls_panel.setFixedWidth(350)
         controls_layout = QVBoxLayout(controls_panel)
 
-        self.btn_load = QPushButton("Load Image...")
-        self.btn_load.clicked.connect(self._load_image)
-        controls_layout.addWidget(self.btn_load)
-        
+        # Model
+        model_group = QGroupBox("VAE / Model")
+        model_layout = QVBoxLayout(model_group)
+        self.btn_load_vae = QPushButton("Load Model/VAE...")
+        self.btn_load_vae.clicked.connect(self._load_vae_dialog)
+        self.lbl_vae_status = QLabel("No Model Loaded")
+        self.lbl_vae_status.setStyleSheet("color: gray;")
+        model_layout.addWidget(self.btn_load_vae)
+        model_layout.addWidget(self.lbl_vae_status)
+        controls_layout.addWidget(model_group)
+
+        # Image
+        self.btn_load_img = QPushButton("Load Target Image...")
+        self.btn_load_img.setStyleSheet("background-color: #6a48d7; color: white; font-weight: bold; padding: 10px;")
+        self.btn_load_img.clicked.connect(self._load_image)
+        controls_layout.addWidget(self.btn_load_img)
         self.lbl_filename = QLabel("No image loaded.")
-        self.lbl_filename.setWordWrap(True)
         controls_layout.addWidget(self.lbl_filename)
 
-        form_layout = QFormLayout()
-        form_layout.setContentsMargins(10, 15, 10, 10)
-        form_layout.setSpacing(12)
+        # View Mode
+        view_group = QGroupBox("View Settings")
+        view_layout = QVBoxLayout(view_group)
+        
+        self.chk_latent_view = QCheckBox("Simulate Latent Size (1/8th)")
+        self.chk_latent_view.setChecked(True)
+        self.chk_latent_view.toggled.connect(self._trigger_update)
+        view_layout.addWidget(self.chk_latent_view)
+        
+        # NEW: Smooth View Toggle
+        self.chk_smooth_vis = QCheckBox("Smooth Heatmap (No Grid)")
+        self.chk_smooth_vis.setChecked(False)
+        self.chk_smooth_vis.setToolTip("Interpolates the grid to look like a smooth heatmap instead of blocks")
+        self.chk_smooth_vis.toggled.connect(self._trigger_update)
+        view_layout.addWidget(self.chk_smooth_vis)
+        
+        self.chk_show_bg = QCheckBox("Show Background Image")
+        self.chk_show_bg.setChecked(True)
+        self.chk_show_bg.toggled.connect(self._render)
+        view_layout.addWidget(self.chk_show_bg)
 
-        # Character Weight (0-2.0)
-        self.slider_char, self.spin_char = self._create_control(
-            0.0, 2.0, 1.0, 100
-        )
-        form_layout.addRow("Character Weight:", self.spin_char)
+        self.chk_autoscale = QCheckBox("Auto-Scale Intensity")
+        self.chk_autoscale.setChecked(False)
+        self.chk_autoscale.toggled.connect(self._render)
+        view_layout.addWidget(self.chk_autoscale)
+        
+        controls_layout.addWidget(view_group)
+
+        # Weights
+        form_layout = QFormLayout()
+        self.slider_char, self.spin_char = self._create_control(0.0, 5.0, 1.0, 100)
+        form_layout.addRow("Char Weight:", self.spin_char)
         form_layout.addRow(self.slider_char)
 
-        # Detail Weight (0-2.0)
-        self.slider_detail, self.spin_detail = self._create_control(
-            0.0, 2.0, 1.0, 100
-        )
+        self.slider_detail, self.spin_detail = self._create_control(0.0, 5.0, 1.0, 100)
         form_layout.addRow("Detail Weight:", self.spin_detail)
         form_layout.addRow(self.slider_detail)
-
         controls_layout.addLayout(form_layout)
         
-        # Info text
-        info = QLabel(
-            "<small><b>Soft Max Formula:</b><br>"
-            "combined = log(exp(char×4) + exp(detail×4)) / 4<br><br>"
-            "<b>Character Weight:</b> Blob/region detection strength<br>"
-            "<b>Detail Weight:</b> Lineart/edge detection strength<br><br>"
-            "Red = High loss multiplier | Blue = Base loss (1.0x)</small>"
-        )
-        info.setWordWrap(True)
-        controls_layout.addWidget(info)
-        
-        # Presets
-        preset_layout = QHBoxLayout()
-        for name, cw, dw in [("Balanced", 1.0, 1.0), ("Lines", 0.3, 1.5), ("Char", 1.5, 0.3)]:
-            btn = QPushButton(name)
-            btn.clicked.connect(lambda _, c=cw, d=dw: self._set_preset(c, d))
-            preset_layout.addWidget(btn)
-        controls_layout.addLayout(preset_layout)
-        
+        btn_clear = QPushButton("Clear VRAM")
+        btn_clear.clicked.connect(self._force_clear_vram)
+        controls_layout.addWidget(btn_clear)
+
         controls_layout.addStretch()
         main_layout.addWidget(controls_panel)
 
-        # Display
+        # --- DISPLAY ---
         display_panel = QVBoxLayout()
-        self.figure = Figure(figsize=(9, 9), dpi=100)
+        self.figure = Figure(figsize=(10, 10), dpi=100)
+        self.figure.patch.set_facecolor('#f0f0f0')
         self.canvas = FigureCanvas(self.figure)
         self.ax = self.figure.add_subplot(111)
         self.ax.axis('off')
@@ -180,92 +337,126 @@ class SemanticVisualizer(QWidget):
         
         spin = QDoubleSpinBox()
         spin.setRange(min_val, max_val)
-        spin.setSingleStep(0.05)
+        spin.setSingleStep(0.1)
         spin.setValue(default)
         spin.setDecimals(2)
         
         slider.valueChanged.connect(lambda v: spin.setValue(v / divider))
         spin.valueChanged.connect(lambda v: slider.setValue(int(v * divider)))
         spin.valueChanged.connect(self._trigger_update)
-        
         return slider, spin
 
-    def _set_preset(self, cw, dw):
-        self.spin_char.setValue(cw)
-        self.spin_detail.setValue(dw)
+    # --- LOGIC ---
 
-    def _trigger_update(self):
-        if not self._pending_update:
-            self._pending_update = True
-            from PyQt6.QtCore import QTimer
-            QTimer.singleShot(30, self._debounced_compute)
+    def _force_clear_vram(self):
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
 
-    def _debounced_compute(self):
-        self._pending_update = False
-        self._update_async()
+    def _load_vae_dialog(self):
+        path, _ = QFileDialog.getOpenFileName(self, "Select Model", "", "Files (*.safetensors *.pt)")
+        if not path: return
+        self.btn_load_vae.setEnabled(False)
+        self.lbl_vae_status.setText("Loading...")
+        self.vae_thread = VAELoaderThread(path)
+        self.vae_thread.finished.connect(self._on_vae_loaded)
+        self.vae_thread.error.connect(self._on_vae_error)
+        self.vae_thread.start()
+
+    def _on_vae_loaded(self, vae, msg):
+        self.vae_model = vae
+        self.btn_load_vae.setEnabled(True)
+        self.lbl_vae_status.setText(f"✔ {msg}")
+        self._trigger_update()
+
+    def _on_vae_error(self, err):
+        self.btn_load_vae.setEnabled(True)
+        self.lbl_vae_status.setText(f"Error")
+        QMessageBox.critical(self, "Error", err)
 
     def _load_image(self):
-        filepath, _ = QFileDialog.getOpenFileName(
-            self, "Open Image", "", "Image Files (*.png *.jpg *.jpeg *.webp *.bmp)"
-        )
-        if not filepath:
-            return
+        filepath, _ = QFileDialog.getOpenFileName(self, "Open Image", "", "Images (*.png *.jpg *.webp)")
+        if not filepath: return
         try:
-            pil_image = Image.open(filepath)
-            self.original_image = fix_alpha_channel(pil_image)
-            self.lbl_filename.setText(f"<b>File:</b> {filepath.split('/')[-1]}")
-            self.char_map_pil = generate_character_map(self.original_image)
-            self.detail_map_pil = generate_detail_map(self.original_image)
-            self._update_async()
+            pil = Image.open(filepath)
+            self.original_image = fix_alpha_channel(pil)
+            self.lbl_filename.setText(f"File: {filepath.split('/')[-1]}")
+            self.char_map_raw = generate_character_map(self.original_image)
+            self.detail_map_raw = generate_detail_map(self.original_image)
+            self._trigger_update()
         except Exception as e:
-            self.lbl_filename.setText(f"<font color='red'>Error: {e}</font>")
+            self.lbl_filename.setText(f"Error: {e}")
 
-    def _update_async(self):
-        if self.original_image is None:
+    def _trigger_update(self):
+        self._needs_recompute = True
+        self._try_start_thread()
+
+    def _try_start_thread(self):
+        if self.compute_thread.isRunning():
             return
-        self.compute_thread.set_data(
-            self.char_map_pil, 
-            self.detail_map_pil,
-            self.spin_char.value(),
-            self.spin_detail.value(),
-            self.original_image
-        )
-        if not self.compute_thread.isRunning():
+        
+        if self._needs_recompute and self.original_image is not None:
+            self._needs_recompute = False
+            self.compute_thread.set_data(
+                self.original_image,
+                self.char_map_raw,
+                self.detail_map_raw,
+                self.spin_char.value(),
+                self.spin_detail.value(),
+                self.vae_model,
+                self.chk_latent_view.isChecked(),
+                self.chk_smooth_vis.isChecked() # Pass new flag
+            )
             self.compute_thread.start()
 
-    def _on_compute_finished(self, modulation_map, weight_map):
-        self.current_modulation_map = modulation_map
-        self.current_weight_map = weight_map
+    def _on_compute_finished(self, bg_img, weight_map):
+        self.bg_image = bg_img
+        self.weight_map = weight_map
         self._render()
+        if self._needs_recompute:
+            self._try_start_thread()
 
     def _render(self):
-        if self.current_modulation_map is None:
-            return
-            
-        self.ax.clear()
-        self.ax.imshow(self.original_image)
+        if self.bg_image is None or self.weight_map is None: return
         
-        # Fixed 60% opacity for clean visualization
+        self.ax.clear()
+        self.ax.axis('off')
+        
+        if self.chk_show_bg.isChecked():
+            self.ax.imshow(self.bg_image)
+            bg_alpha = 0.55
+        else:
+            black_bg = np.zeros_like(np.array(self.bg_image))
+            self.ax.imshow(black_bg)
+            bg_alpha = 1.0
+        
+        mx = np.max(self.weight_map)
+        avg = np.mean(self.weight_map)
+        
+        v_max = max(0.1, mx) if self.chk_autoscale.isChecked() else 3.0
+            
         heatmap = self.ax.imshow(
-            self.current_weight_map,
-            cmap=self.red_blue_cmap,
-            alpha=1.0,
-            interpolation='bilinear',
-            vmin=0.0, vmax=1.0
+            self.weight_map,
+            cmap=self.heatmap_cmap,
+            alpha=bg_alpha,
+            vmin=0.0, vmax=v_max
         )
         
         if self.cbar:
             self.cbar.update_normal(heatmap)
         else:
             self.cbar = self.figure.colorbar(heatmap, ax=self.ax, fraction=0.046, pad=0.04)
-        self.cbar.set_label("Loss Weight")
         
-        min_m = self.current_modulation_map.min()
-        max_m = self.current_modulation_map.max()
-        self.ax.set_title(f"Soft Max | Multiplier: {min_m:.2f}x - {max_m:.2f}x")
-        self.ax.axis('off')
-        self.canvas.draw()
+        self.cbar.set_label("Semantic Score")
 
+        title = f"Avg: {avg:.2f} | Max: {mx:.2f}"
+        if self.chk_smooth_vis.isChecked():
+            title += " (Smooth Heatmap)"
+        else:
+            title += " (Exact Latent Grid)"
+            
+        self.ax.set_title(title)
+        self.canvas.draw()
 
 if __name__ == '__main__':
     app = QApplication(sys.argv)

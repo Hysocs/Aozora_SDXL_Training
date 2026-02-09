@@ -4,97 +4,102 @@ import torch
 from PIL import Image
 
 def generate_character_map(pil_image):
+    """
+    Generates a map focusing on broad color regions and subjects.
+    """
     if pil_image.mode != "RGB":
         pil_image = pil_image.convert("RGB")
         
     np_image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     
-    # REDUCE bilateral filtering (was d=9, now 5)
+    # Bilateral filter smooths colors while preserving edges
     bilateral = cv2.bilateralFilter(np_image_bgr, d=5, sigmaColor=50, sigmaSpace=50)
     lab_image = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab_image)
     
+    # Use color deviation to find salient regions
     mean_a, mean_b = np.mean(a_channel), np.mean(b_channel)
     saliency_a = np.abs(a_channel.astype(np.float32) - mean_a)
     saliency_b = np.abs(b_channel.astype(np.float32) - mean_b)
     color_saliency = saliency_a + saliency_b
    
-    if color_saliency.max() > 0:
+    if color_saliency.max() > 1e-6:
         color_saliency_norm = color_saliency / color_saliency.max()
     else:
         color_saliency_norm = np.zeros_like(color_saliency, dtype=np.float32)
    
-    color_saliency_uint8 = (color_saliency_norm * 255).astype(np.uint8)
+    # **FIX:** Reduced blur kernel to (9, 9) to match visualizer.
+    # This creates a tighter, more accurate mask around the subject.
+    final_map_np = cv2.GaussianBlur(color_saliency_norm, (9, 9), 0)
    
-    # SMALLER kernel (was 11x11, now 7x7) and FEWER iterations
-    kernel = np.ones((7, 7), np.uint8)
-    dilated = cv2.dilate(color_saliency_uint8, kernel, iterations=1)
-    eroded = cv2.erode(dilated, kernel, iterations=1)
-   
-    eroded_float = eroded.astype(np.float32) / 255.0
-    
-    # SMALLER Gaussian blur (was 11x11, now 5x5)
-    final_map = cv2.GaussianBlur(eroded_float, (5, 5), 0)
-   
-    return Image.fromarray(final_map, mode='F')  # Return as float
+    return final_map_np # Return numpy array directly
 
 def generate_detail_map(pil_image):
+    """
+    Generates a map focusing on lines, edges, and high-frequency details.
+    """
     np_image_gray = np.array(pil_image.convert("L"))
     
-    # Use larger kernel for better edge detection
-    sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=3)  # ksize=3 is sharper
+    # Sobel filters detect edges
+    sobelx = cv2.Sobel(np_image_gray, cv2.CV_64F, 1, 0, ksize=3)
     sobely = cv2.Sobel(np_image_gray, cv2.CV_64F, 0, 1, ksize=3)
     magnitude = np.sqrt(sobelx**2 + sobely**2)
    
-    if magnitude.max() > 0:
+    if magnitude.max() > 1e-6:
         magnitude_norm = magnitude / magnitude.max()
     else:
         magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
    
-    # NO blur for maximum sharpness, or use very minimal
-    # final_map = magnitude_norm.astype(np.float32)  # Option 1: No blur
-    final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (3, 3), 0.5)  # Option 2: Minimal
+    # **FIX:** Reduced blur kernel to (3, 3) to match visualizer.
+    # This provides just enough anti-aliasing without "boxing" empty space.
+    final_map_np = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (3, 3), 0)
    
-    return Image.fromarray(final_map, mode='F')
+    return final_map_np # Return numpy array directly
 
 
-# Training generate_semantic_map_batch_softmax
 def generate_semantic_map_batch_softmax(images, char_weight, detail_weight, 
                                         target_size, device, dtype, num_channels):
+    """
+    The final function called by the trainer.
+    Now perfectly aligned with the visualizer's logic.
+    """
     batch_maps = []
    
     for img in images:
         if img is None:
-            batch_maps.append(torch.zeros(target_size, dtype=dtype))
+            # Use target_size (W, H) to create a tensor of (H, W)
+            batch_maps.append(torch.zeros((target_size[1], target_size[0]), dtype=dtype))
             continue
         
-        # Work at original resolution
-        original_size = img.size  # (width, height)
+        # 1. Generate Raw Maps (now returns numpy)
+        char_np = generate_character_map(img)
+        detail_np = generate_detail_map(img)
         
-        char_map_pil = generate_character_map(img)
-        detail_map_pil = generate_detail_map(img)
+        # 2. Linear Combination (Stable and Aligned)
+        combined = (char_np * char_weight) + (detail_np * detail_weight)
         
-        char_np = np.array(char_map_pil).astype(np.float32)
-        detail_np = np.array(detail_map_pil).astype(np.float32)
+        # Clip max value to prevent extreme spikes, but allow high values
+        combined = np.clip(combined, 0.0, 10.0) 
         
-        # Process at full resolution
-        char_boosted = np.power(char_np, 0.7) * char_weight
-        detail_scaled = detail_np * detail_weight
+        # 3. Downsample Safely to Target Latent Size
+        # `target_size` from the trainer is the latent resolution (e.g., 128x128)
+        # We must use BILINEAR to correctly average the values, matching the visualizer.
+        # This is the step that makes the map look "weaker", but is mathematically correct.
         
-        combined = np.logaddexp(char_boosted * 4, detail_scaled * 4) / 4
-        combined = np.clip(combined, 0, 1)
-        weight_map = np.power(combined, 0.8)
+        # Convert to PIL for reliable resizing
+        weight_map_pil = Image.fromarray(combined, mode='F')
         
-        # ONLY resize at the very end, and use better interpolation
-        if original_size != target_size:
-            weight_map_pil = Image.fromarray(weight_map, mode='F').resize(
-                target_size, Image.Resampling.LANCZOS
+        if weight_map_pil.size != target_size:
+            weight_map_pil = weight_map_pil.resize(
+                target_size, Image.Resampling.BILINEAR
             )
-            weight_map_tensor = torch.from_numpy(np.array(weight_map_pil)).float()
-        else:
-            weight_map_tensor = torch.from_numpy(weight_map).float()
-            
+        
+        # Convert final resized map to a tensor
+        weight_map_tensor = torch.from_numpy(np.array(weight_map_pil)).to(dtype)
         batch_maps.append(weight_map_tensor)
     
-    final_map_batch = torch.stack(batch_maps).unsqueeze(1).to(device, dtype=dtype)
-    return final_map_batch.expand(-1, num_channels, -1, -1)
+    # Stack batch and expand to match latent channels
+    final_map_batch = torch.stack(batch_maps).to(device)
+    final_map_batch = final_map_batch.unsqueeze(1).expand(-1, num_channels, -1, -1)
+    
+    return final_map_batch
