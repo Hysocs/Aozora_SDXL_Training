@@ -2,14 +2,15 @@
 
 > [!WARNING]
 > **Beta Software:** This is still in active development. It works, but expect rough edges. The goal is making SDXL training actually run on 12GB cards without the pain.
+>
 > **Note:** Sorry for any previously failed attempts at training. Getting this stable on consumer hardware is tricky.
 
 A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or have a million CLI flags to get lost in.
 
 Works with v-prediction and Flow Matching models (NoobAI, Illustrious, etc.) out of the box.
 
-<img src="https://i.ibb.co/N6QXLq54/pythonw-od-DE3-O0cu-I.png" alt="Gui" width="850"/>
-<img src="https://i.ibb.co/k69rRYrg/pythonw-Pr9q-Hu-DVls.png" alt="Gui" width="850"/>
+<img src="https://thumbs2.imgbox.com/9c/f2/iQZQ9LHl_t.png" alt="Gui" width="850"/>
+<img src="https://thumbs2.imgbox.com/81/c8/yB61nX4p_t.png" alt="Gui" width="850"/>
 
 ## Who This Is For
 
