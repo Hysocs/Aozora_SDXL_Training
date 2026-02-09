@@ -1,7 +1,9 @@
 # Aozora SDXL Trainer
 
 > [!WARNING]
-> **Beta Software:** This is still in active development. It works, but expect rough edges. The goal is making SDXL training actually run on 12GB cards without the pain.
+> **Beta Software:** This is still under active development and in beta. It is fully functional, successfully training 80–90% of the full UNet using only 11.80 GB VRAM, with ~1.55 seconds per iteration and ~15 seconds per optimizer step.
+>
+> Some rough edges and minor issues are to be expected. The primary goal is to make SDXL training practical and efficient on 12 GB VRAM GPUs without the usual compromises or complexity.
 >
 > **Note:** Sorry for any previously failed attempts at training. Getting this stable on consumer hardware is tricky.
 
