@@ -905,7 +905,7 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.min_lr_bound = 0.0
         self.max_lr_bound = 1.0e-6
         self.epoch_data = []
-        # CHANGED: Left padding set to 60 as a compromise for better spacing.
+
         self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
         self.point_radius = 8
         self._dragging_point_index = -1
@@ -930,8 +930,6 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.min_lr_bound = min_lr
         self.max_lr_bound = max_lr if max_lr > min_lr else min_lr + 1e-9
         
-        # --- ADD THIS BLOCK ---
-        # Clamp existing points to new bounds and update if changed
         points_changed = False
         for p in self._points:
             if p[1] > self.max_lr_bound:
@@ -943,7 +941,6 @@ class LRCurveWidget(QtWidgets.QWidget):
         
         if points_changed:
             self.pointsChanged.emit(self._points)
-        # ----------------------
         
         self._update_visual_points()
         self.update()
@@ -3548,7 +3545,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             caption_text.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             caption_text.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
             caption_text.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
-            # REMOVED: setMaximumHeight restriction - allow it to expand
             caption_text.setMinimumHeight(183)  # Minimum to match image, but can grow
             caption_text.setStyleSheet("""
                 QTextEdit { 

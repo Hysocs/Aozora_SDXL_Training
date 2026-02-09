@@ -52,7 +52,6 @@ def set_attention_processor(unet, attention_mode="flash_attn"):
     """
     if attention_mode == "flex_attn":
         try:
-            # Assuming a FlexAttnProcessor would be available
             from diffusers.models.attention_processor import FlexAttnProcessor
             unet.set_attn_processor(FlexAttnProcessor())
             print("INFO: Using Flex Attention")
@@ -61,7 +60,6 @@ def set_attention_processor(unet, attention_mode="flash_attn"):
             unet.set_attn_processor(AttnProcessor2_0())
 
     if attention_mode == "cudnn":
-        # PyTorch 2.5+ CuDNN backend - Best for Windows training
         if hasattr(torch.backends.cuda, 'enable_cudnn_sdp'):
             torch.backends.cuda.enable_cudnn_sdp(True)
             torch.backends.cuda.enable_flash_sdp(False)  # Disable FA to force CuDNN
@@ -100,11 +98,8 @@ def fix_alpha_channel(img):
     return img.convert("RGB")
 
 def generate_train_noise(latents, config, step, seed):
-    # Create a generator specific to this step
-    # This ensures Step 129 always gets the same noise, regardless of resume history
     g = torch.Generator(device=latents.device)
-    # We use a formula to create a unique seed per step
-    # (Base Seed + Step Index) ensures unique but deterministic noise
+
     step_seed = (seed + step) % (2**32 - 1)
     g.manual_seed(step_seed)
     
@@ -377,17 +372,13 @@ class ResolutionCalculator:
         scaled_w = width * scale
         scaled_h = height * scale
         
-        # 3. Snap the ideal dimensions to the nearest grid multiple (e.g., 64px)
-        # This creates a bucket that is mathematically the closest possible to the target area
-        # while respecting the original aspect ratio and the grid constraint.
         target_w = int(round(scaled_w / self.stride) * self.stride)
         target_h = int(round(scaled_h / self.stride) * self.stride)
         
         return max(target_w, self.stride), max(target_h, self.stride)
 
 def smart_resize(image, target_w, target_h):
-    # This function uses a single-pass resampling method with a float-precision crop box
-    # to achieve the highest quality downscaling with zero aspect ratio distortion.
+
     
     src_w, src_h = image.size
     
@@ -395,8 +386,6 @@ def smart_resize(image, target_w, target_h):
     target_aspect = target_w / target_h
     src_aspect = src_w / src_h
     
-    # 2. Determine the precise crop box on the SOURCE image in float coordinates.
-    # This prevents any intermediate resizing or rounding errors.
     if src_aspect > target_aspect:
         # Source is wider than target -> Crop width, keep full height
         crop_w = src_h * target_aspect
@@ -413,10 +402,6 @@ def smart_resize(image, target_w, target_h):
     # 3. Define the box (left, top, right, bottom)
     box = (x_offset, y_offset, x_offset + crop_w, y_offset + crop_h)
     
-    # 4. Resize in ONE operation.
-    # The `box` argument tells Pillow to take pixels from this precise region of the
-    # source image and map them to the new `(target_w, target_h)` dimensions.
-    # LANCZOS is the sharpest, highest-quality filter for downscaling.
     return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS, box=box)
 
 def validate_and_assign_resolution(args):
@@ -572,8 +557,6 @@ def load_unet_robust(path, compute_dtype, target_channels=4):
         "low_cpu_mem_usage": True,
     }
 
-    # If the user Config specifies non-standard channels (e.g., 32 for Flux/NoobAI),
-    # we inject them into the loading arguments immediately.
     if target_channels is not None and target_channels != 4:
         print(f"INFO: Config requests {target_channels} channels. Forcing UNet input/output dimensions...")
         load_kwargs["in_channels"] = target_channels
@@ -1802,9 +1785,10 @@ def main():
     set_attention_processor(unet, config.MEMORY_EFFICIENT_ATTENTION)
     
     print("\n--- UNet Layer Selection Report ---")
-    # ... (Omitted detailed print logic for brevity, keeping exclusion logic) ...
     exclusion_keywords = config.UNET_EXCLUDE_TARGETS
-    params_to_optimize = []
+    trainable_layer_names = []
+    frozen_layer_names = []
+    
     for name, param in unet.named_parameters():
         should_exclude = False
         for keyword in exclusion_keywords:
@@ -1814,10 +1798,21 @@ def main():
                 break
         if should_exclude:
             param.requires_grad = False
+            frozen_layer_names.append(name)
         else:
             param.requires_grad = True
-            params_to_optimize.append(param)
+            trainable_layer_names.append(name)
 
+    params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
+    total_params = sum(p.numel() for p in unet.parameters())
+    trainable_params = sum(p.numel() for p in params_to_optimize)
+    frozen_params = total_params - trainable_params
+    percentage_trainable = (trainable_params / total_params) * 100 if total_params > 0 else 0
+
+    print(f"  - Exclusion Keywords: {exclusion_keywords}")
+    print(f"  - Trainable: {trainable_params / 1e6:.2f}M params ({percentage_trainable:.2f}%)")
+    print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
+    
     optimizer = create_optimizer(config, params_to_optimize)
     
     # LR Scheduler: initialized with MAX_TRAIN_STEPS (interpreted as Micro Steps)

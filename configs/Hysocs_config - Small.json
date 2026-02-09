@@ -14,42 +14,42 @@
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "250",
+    "MAX_TRAIN_STEPS": "39243",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "8",
+    "GRADIENT_ACCUMULATION_STEPS": "16",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "8.5",
     "SEED": 64,
-    "SAVE_EVERY_N_STEPS": "16",
+    "SAVE_EVERY_N_STEPS": "830",
     "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            3e-06
+            2e-06
         ],
         [
-            0.07816092,
-            6e-05
+            0.03,
+            2e-05
         ],
         [
-            0.50114943,
-            6e-05
+            0.52413793,
+            2e-05
         ],
         [
-            0.54712644,
-            1.45322e-05
+            0.56321839,
+            6.5217e-06
         ],
         [
-            0.92873563,
-            1.45322e-05
+            0.93793103,
+            6.5217e-06
         ],
         [
             1.0,
-            3e-06
+            2e-06
         ]
     ],
-    "LR_GRAPH_MIN": "3e-06",
-    "LR_GRAPH_MAX": "6e-05",
+    "LR_GRAPH_MIN": "2e-06",
+    "LR_GRAPH_MAX": "2e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -65,7 +65,11 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\CG\\from Elfheim",
+            "path": "C:/Users/Administrator/Pictures/Artists",
+            "repeats": 1
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/CG",
             "repeats": 1
         }
     ],
@@ -73,38 +77,38 @@
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
     "LOSS_TYPE": "Semantic",
-    "SEMANTIC_CHAR_WEIGHT": 0.15,
-    "SEMANTIC_DETAIL_WEIGHT": 0.25,
+    "SEMANTIC_CHAR_WEIGHT": 0.1,
+    "SEMANTIC_DETAIL_WEIGHT": 0.2,
     "LOSS_HUBER_BETA": 0.5,
     "LOSS_ADAPTIVE_DAMPING": 0.1,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10,
-            10
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1570,
+            1569,
+            1569,
+            1569,
+            1569,
+            1569,
+            1569,
+            1569
         ]
     },
     "RAVEN_PARAMS": {
