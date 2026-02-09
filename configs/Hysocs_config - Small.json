@@ -62,7 +62,7 @@
     "RF_USE_DYNAMIC_SHIFT": true,
     "RF_BASE_PIXELS": 1048576,
     "TRAINING_MODE": "Rectified Flow (SDXL)",
-    "RESUME_TRAINING": true,
+    "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
             "path": "C:/Users/Administrator/Pictures\\CG\\from Elfheim",

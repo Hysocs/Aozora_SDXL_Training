@@ -99,8 +99,16 @@ def fix_alpha_channel(img):
         return bg
     return img.convert("RGB")
 
-def generate_train_noise(latents, config):
-    return torch.randn(latents.shape, device=latents.device, dtype=latents.dtype)
+def generate_train_noise(latents, config, step, seed):
+    # Create a generator specific to this step
+    # This ensures Step 129 always gets the same noise, regardless of resume history
+    g = torch.Generator(device=latents.device)
+    # We use a formula to create a unique seed per step
+    # (Base Seed + Step Index) ensures unique but deterministic noise
+    step_seed = (seed + step) % (2**32 - 1)
+    g.manual_seed(step_seed)
+    
+    return torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=g)
 
 class TrainingConfig:
     def __init__(self):
@@ -1900,7 +1908,7 @@ def main():
                     time_ids_list.append(torch.tensor([s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]], dtype=torch.float32).unsqueeze(0))
                 time_ids = torch.cat(time_ids_list, dim=0).to(device, dtype=config.compute_dtype)
 
-                noise = generate_train_noise(latents, config)
+                noise = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
                 timesteps = timestep_sampler.sample(latents.shape[0])
                 
                 target, noisy_latents, timesteps_conditioning = None, None, None
