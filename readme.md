@@ -25,7 +25,7 @@ Works with v-prediction and Flow Matching models (NoobAI, Illustrious, etc.) out
 **Custom Optimizers**
 Two built-in optimizers designed specifically for 12GB training:
 
-- **RavenAdamW**: Pre-allocates GPU buffers so you don't get OOM errors mid-training. Keeps momentum/variance states on CPU, computes updates on GPU using shared buffers. Has proper weight decay ordering (decay happens before the update, not after) and optional gradient centralization. About 20% faster than standard optimizers for SDXL.
+- **RavenAdamW**: Pre-allocates GPU buffers so you don't get OOM errors mid-training. Keeps momentum/variance states on CPU, computes updates on GPU using shared buffers. Has proper weight decay ordering (decay happens before the update, not after) and optional gradient centralization. Uses 50% less vram than Adamw8bit while being float32 percision.
 
 - **VeloRMS**: Even more memory efficient. Uses velocity + RMS normalization with a small "leak" of gradient info to keep things stable on sparse updates (like when training specific layers). Also CPU-offloads states. Includes verbose logging mode that prints diagnostics every N steps so you can see if your model is about to explode.
 
