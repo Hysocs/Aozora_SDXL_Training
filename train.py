@@ -359,16 +359,16 @@ class ResolutionCalculator:
     def calculate_resolution(self, width, height):
         current_area = width * height
         
-        # If image is smaller than target and upscaling is disabled, just snap to a nearby grid
+   
         if not self.should_upscale and current_area < self.target_area:
             w = int(width // self.stride) * self.stride
             h = int(height // self.stride) * self.stride
             return max(w, self.stride), max(h, self.stride)
 
-        # 1. Calculate the ideal scale to match the target pixel area
+       
         scale = math.sqrt(self.target_area / current_area)
         
-        # 2. Determine the "ideal" floating-point dimensions
+       
         scaled_w = width * scale
         scaled_h = height * scale
         
@@ -382,7 +382,6 @@ def smart_resize(image, target_w, target_h):
     
     src_w, src_h = image.size
     
-    # 1. Calculate aspect ratios to determine crop direction
     target_aspect = target_w / target_h
     src_aspect = src_w / src_h
     
@@ -399,7 +398,7 @@ def smart_resize(image, target_w, target_h):
         x_offset = 0.0
         y_offset = (src_h - crop_h) / 2.0
         
-    # 3. Define the box (left, top, right, bottom)
+    
     box = (x_offset, y_offset, x_offset + crop_w, y_offset + crop_h)
     
     return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS, box=box)
@@ -467,7 +466,7 @@ def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
             prompt_embeds_list.append(prompt_embeds)
             pooled_prompt_embeds_list.append(pooled_prompt_embeds)
     
-    # Stack batches
+    
     prompt_embeds = torch.cat(prompt_embeds_list, dim=0)  # [B, 77, 2048]
     pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=0)  # [B, 1280]
     
@@ -480,7 +479,7 @@ def check_if_caching_needed(config):
     semantic_cache_folder_name = ".semantic_maps_cache"
     use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
     
-    # Check for Null Embeddings if Dropout is ON
+    
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
         if config.INSTANCE_DATASETS:
             ds0 = config.INSTANCE_DATASETS[0]
@@ -511,7 +510,7 @@ def check_if_caching_needed(config):
             needs_caching = True
             continue
         
-        # Check semantic cache if needed
+        
         if use_semantic_loss:
             semantic_cache_dir = root / semantic_cache_folder_name
             
@@ -526,7 +525,7 @@ def check_if_caching_needed(config):
             print(f"INFO: Found {len(image_paths)} images but only {len(cached_te_files)} cached files in {root}")
             needs_caching = True
         else:
-            # Check if semantic maps exist for all files
+            
             if use_semantic_loss:
                 semantic_cache_dir = root / semantic_cache_folder_name
                 missing_semantic = 0
@@ -551,7 +550,7 @@ def check_if_caching_needed(config):
 def load_unet_robust(path, compute_dtype, target_channels=4):
     print(f"INFO: Loading UNet from: {Path(path).name}")
     
-    # Base arguments for loading
+    
     load_kwargs = {
         "torch_dtype": compute_dtype,
         "low_cpu_mem_usage": True,
@@ -574,7 +573,7 @@ def load_unet_robust(path, compute_dtype, target_channels=4):
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to load UNet with target_channels={target_channels}.")
         print(f"Error Details: {e}")
-        # If we forced 32 and it failed, or if we tried 4 and it failed, we raise.
+        
         raise e
 
 def load_vae_robust(path, device, target_channels=None):
@@ -584,7 +583,7 @@ def load_vae_robust(path, device, target_channels=None):
     """
     print(f"INFO: Attempting to load VAE from: {path}")
     
-    # If config explicitly sets channels, try that first
+    
     if target_channels is not None:
         print(f"INFO: Config requests VAE with {target_channels} channels.")
         try:
@@ -600,19 +599,19 @@ def load_vae_robust(path, device, target_channels=None):
             print(f"WARNING: Failed to force load VAE with {target_channels} channels: {e}")
             print("INFO: Falling back to auto-detection...")
 
-    # Standard Auto-detection / Fallback logic
+    
     try:
-        # 1. Try loading as a standard SDXL VAE first
+        
         vae = AutoencoderKL.from_single_file(path, torch_dtype=torch.float32)
         print("INFO: Loaded standard SDXL VAE (4 channels).")
         
     except Exception as e:
-        # 2. Check for the specific shape mismatch error
+        
         err_str = str(e)
         if "conv_out.weight" in err_str and "but got torch.Size([64" in err_str:
             print("INFO: Detected Flux/SDXL-Modified VAE (32 channels). Switching configuration...")
             try:
-                # Force 32 channels and ignore size mismatches
+                
                 vae = AutoencoderKL.from_single_file(
                     path, 
                     torch_dtype=torch.float32,
@@ -637,7 +636,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     
-    # Determine if we need semantic map caching
+   
     use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
     semantic_cache_folder_name = ".semantic_maps_cache"
     
@@ -679,7 +678,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
         
-        # Create semantic cache directory if needed
+        
         semantic_cache_dir = root / semantic_cache_folder_name if use_semantic_loss else None
         if use_semantic_loss:
             semantic_cache_dir.mkdir(exist_ok=True)
@@ -750,9 +749,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
                         
-                        # Store original PIL image for semantic map generation
+                       
                         if use_semantic_loss:
-                            # Reload original for semantic processing (need full quality)
+                            
                             with Image.open(m['ip']) as orig_img:
                                 orig_img = fix_alpha_channel(orig_img)
                                 original_images_for_semantic.append(orig_img)
@@ -805,12 +804,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 
             latents_global = latents_global.cpu()
             
-            # Generate and cache semantic maps if needed
+            
             semantic_maps = None
             if use_semantic_loss and original_images_for_semantic:
                 char_weight = getattr(config, "SEMANTIC_CHAR_WEIGHT", 1.0)
                 detail_weight = getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0)
-                # Target size is latent size (w/8, h/8 for SDXL)
+                
                 latent_w, latent_h = w // 8, h // 8
                 
                 semantic_maps = generate_semantic_map_batch_softmax(
@@ -818,9 +817,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     char_weight=char_weight,
                     detail_weight=detail_weight,
                     target_size=(latent_w, latent_h),
-                    device="cpu",  # Keep on CPU to save VRAM during caching
+                    device="cpu",  
                     dtype=torch.float32,
-                    num_channels=latents_global.shape[1]  # Match latent channels
+                    num_channels=latents_global.shape[1]  
                 )
                 semantic_maps = semantic_maps.cpu()
                 
@@ -849,7 +848,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 
                 torch.save(latents_global[j], path_lat)
                 
-                # Save semantic map if generated
+          
                 if semantic_maps is not None:
                     torch.save(semantic_maps[j], path_sem)
             
@@ -917,13 +916,13 @@ class ImageTextLatentDataset(Dataset):
         self.target_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
         self.target_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
         
-        # --- SEMANTIC LOSS CONFIGURATION ---
+ 
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic")
-        self.semantic_cache_roots = {}  # Map te_file path to semantic cache dir
+        self.semantic_cache_roots = {}  
         
         if self.use_semantic_loss:
             print("INFO: Semantic loss is ENABLED. Loading from cached semantic maps.")
-            # Build mapping to semantic cache directories
+   
             for ds in config.INSTANCE_DATASETS:
                 root = Path(ds["path"])
                 semantic_cache_dir = root / semantic_cache_folder_name
@@ -934,11 +933,11 @@ class ImageTextLatentDataset(Dataset):
                     print(f"         Please run caching first with LOSS_TYPE='Semantic' in config.")
                     continue
                 
-                # Map each te_file to its semantic cache directory
+          
                 for f in cache_dir.glob("*_te.pt"):
                     self.semantic_cache_roots[str(f)] = semantic_cache_dir
             
-            # Verify we have semantic maps for all files
+
             missing_semantic = []
             for te_file in self.te_files:
                 semantic_dir = self.semantic_cache_roots.get(str(te_file))
@@ -953,7 +952,7 @@ class ImageTextLatentDataset(Dataset):
             if missing_semantic:
                 print(f"WARNING: {len(missing_semantic)} files missing semantic maps.")
                 print(f"         First few: {[str(p) for p in missing_semantic[:3]]}")
-        # --- END SEMANTIC LOSS CONFIGURATION ---
+ 
 
         if self.dropout_prob > 0:
             found_null = False
@@ -988,7 +987,7 @@ class ImageTextLatentDataset(Dataset):
         checked = 0
         first_mismatch = None
         
-        for f in self.te_files[:20]:  # Check first 20 files
+        for f in self.te_files[:20]:  
             try:
                 data_te = torch.load(f, map_location="cpu")
                 cached_shift = data_te.get("vae_shift", 0.0) or 0.0
@@ -1075,7 +1074,7 @@ class ImageTextLatentDataset(Dataset):
                 item_data["embeds"] = self.null_embeds
                 item_data["pooled"] = self.null_pooled
 
-            # --- LOAD CACHED SEMANTIC MAP ---
+
             if self.use_semantic_loss:
                 semantic_dir = self.semantic_cache_roots.get(str(path_te))
                 if semantic_dir:
@@ -1087,14 +1086,14 @@ class ImageTextLatentDataset(Dataset):
                         item_data["semantic_map"] = semantic_map
                     else:
                         print(f"WARNING: Semantic map not found: {sem_path}")
-                        # Create fallback uniform map
+
                         c, h, w = final_latents.shape
                         item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
                 else:
-                    # Create fallback uniform map
+
                     c, h, w = final_latents.shape
                     item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
-            # --- END SEMANTIC MAP LOADING ---
+
 
             return item_data
             
@@ -1107,20 +1106,19 @@ class TimestepSampler:
         self.config = config
         self.device = device
         
-        # Calculate TOTAL tickets needed for the entire training run (including accumulation)
-        # This ensures we have enough tickets for every single micro-step.
+
         total_micro_steps = config.MAX_TRAIN_STEPS * config.GRADIENT_ACCUMULATION_STEPS
         self.total_tickets_needed = total_micro_steps * config.BATCH_SIZE
         
         self.seed = config.SEED if config.SEED else 42
         
-        # RF-specific settings from config
+
         self.is_rectified_flow = getattr(config, "is_rectified_flow", False)
         self.shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
         self.use_dynamic_shift = getattr(config, "RF_USE_DYNAMIC_SHIFT", False)
         self.base_pixels = getattr(config, "RF_BASE_PIXELS", 1048576)
         
-        # Existing ticket pool logic - unchanged
+
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
@@ -1134,7 +1132,7 @@ class TimestepSampler:
         self._print_sampling_distribution()
 
     def _build_ticket_pool(self, allocation):
-        # Your existing ticket pool logic - completely unchanged
+
         use_fallback = False
         if not allocation or "counts" not in allocation or "bin_size" not in allocation:
             print("WARNING: TIMESTEP_ALLOCATION missing. Fallback to Uniform.")
@@ -1146,7 +1144,7 @@ class TimestepSampler:
         if use_fallback:
             self.bin_size = 100 
             num_bins = 1000 // self.bin_size
-            # Base distribution for total needs
+
             base = self.total_tickets_needed // num_bins // self.config.BATCH_SIZE
             counts = [base] * num_bins
             for i in range((self.total_tickets_needed // self.config.BATCH_SIZE) % num_bins):
@@ -1156,8 +1154,6 @@ class TimestepSampler:
             counts = allocation["counts"]
 
         multiplier = self.config.BATCH_SIZE
-        # Scale the allocation counts (usually meant for MAX_STEPS) to cover ACCUMULATION
-        # Logic: (Total Needed / Sum of Counts) scaling factor
         total_counts = sum(counts)
         scale_factor = (self.total_tickets_needed / multiplier) / total_counts if total_counts > 0 else 1.0
         
@@ -1172,7 +1168,6 @@ class TimestepSampler:
             if start_t >= 1000: 
                 break
             
-            # Scale count to cover full training duration + batch size
             num_tickets = int(count * scale_factor * multiplier)
             if num_tickets <= 0: num_tickets = 1
 
@@ -1202,7 +1197,6 @@ class TimestepSampler:
         
         current_pixels = height * width
         ratio = current_pixels / self.base_pixels
-        # Square root scaling for area ratio
         dynamic_shift = self.shift_factor * math.sqrt(ratio)
         
         return dynamic_shift
@@ -1221,13 +1215,11 @@ class TimestepSampler:
         return (shift_factor * t_normalized) / (1.0 + (shift_factor - 1.0) * t_normalized)
 
     def set_current_step(self, micro_step):
-        # Aligns the pool based on TOTAL FORWARD PASSES (micro_step)
         consumed_tickets = micro_step * self.config.BATCH_SIZE
         self.pool_index = consumed_tickets % len(self.ticket_pool)
         print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Micro Step {micro_step})")
 
     def sample(self, batch_size):
-        # Unchanged - just return timesteps from pool
         indices = []
         for _ in range(batch_size):
             if self.pool_index >= len(self.ticket_pool):
@@ -1237,7 +1229,6 @@ class TimestepSampler:
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
     def _print_sampling_distribution(self):
-        # Your existing visualization code - unchanged
         print("\n" + "="*80)
         print("TIMESTEP TICKET POOL DISTRIBUTION")
         print(f"Total Pool Size: {len(self.ticket_pool):,} | Seed: {self.seed}")
@@ -1278,7 +1269,6 @@ def custom_collate_fn(batch):
     output = {}
     for k in batch[0]:
         if k == "original_image":
-            # Pass PIL images as a simple list, do not stack
             output[k] = [item[k] for item in batch]
         elif isinstance(batch[0][k], torch.Tensor):
             output[k] = torch.stack([item[k] for item in batch])
@@ -1395,7 +1385,6 @@ def create_optimizer(config, params_to_optimize):
         
         velorms_params = getattr(config, 'VELORMS_PARAMS', {})
         defaults = getattr(default_config, 'VELORMS_PARAMS', {})
-        # Merge user config with defaults
         final_params = {**defaults, **velorms_params}
 
         return VeloRMS(
@@ -1410,10 +1399,6 @@ def create_optimizer(config, params_to_optimize):
     
     else: 
         raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
-
-# ==============================================================================
-#  OPTIMIZED SDXL KEY CONVERSION & SAVE LOGIC
-# ==============================================================================
 
 def _get_sdxl_unet_conversion_map():
     """
@@ -1450,43 +1435,43 @@ def _get_sdxl_unet_conversion_map():
 
     unet_conversion_map_layer = []
 
-    # Dynamic logic for Down/Up blocks
-    for i in range(3): # Loop over downblocks
-        for j in range(2): # Loop over resnets
+    
+    for i in range(3): 
+        for j in range(2): 
             hf_down_res_prefix = f"down_blocks.{i}.resnets.{j}."
             sd_down_res_prefix = f"input_blocks.{3 * i + j + 1}.0."
             unet_conversion_map_layer.append((sd_down_res_prefix, hf_down_res_prefix))
 
-            if i > 0: # Attentions only in Down 1 and 2
+            if i > 0: 
                 hf_down_atn_prefix = f"down_blocks.{i}.attentions.{j}."
                 sd_down_atn_prefix = f"input_blocks.{3 * i + j + 1}.1."
                 unet_conversion_map_layer.append((sd_down_atn_prefix, hf_down_atn_prefix))
 
-        for j in range(3): # Upblocks usually have 3 resnets in SDXL
+        for j in range(3): 
             hf_up_res_prefix = f"up_blocks.{i}.resnets.{j}."
             sd_up_res_prefix = f"output_blocks.{3 * i + j}.0."
             unet_conversion_map_layer.append((sd_up_res_prefix, hf_up_res_prefix))
 
-            if i < 2: # Attentions only in Up 0 and 1
+            if i < 2: 
                 hf_up_atn_prefix = f"up_blocks.{i}.attentions.{j}."
                 sd_up_atn_prefix = f"output_blocks.{3 * i + j}.1."
                 unet_conversion_map_layer.append((sd_up_atn_prefix, hf_up_atn_prefix))
 
         if i < 3:
-            # Downsamplers
+            
             hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0.conv."
             sd_downsample_prefix = f"input_blocks.{3 * (i + 1)}.0.op."
             unet_conversion_map_layer.append((sd_downsample_prefix, hf_downsample_prefix))
 
-            # Upsamplers
+            
             hf_upsample_prefix = f"up_blocks.{i}.upsamplers.0."
             sd_upsample_prefix = f"output_blocks.{3 * i + 2}.{1 if i == 0 else 2}."
             unet_conversion_map_layer.append((sd_upsample_prefix, hf_upsample_prefix))
 
-    # Handle oddity in output blocks
+    
     unet_conversion_map_layer.append(("output_blocks.2.2.conv.", "output_blocks.2.1.conv."))
 
-    # Mid Block
+    
     hf_mid_atn_prefix = "mid_block.attentions.0."
     sd_mid_atn_prefix = "middle_block.1."
     unet_conversion_map_layer.append((sd_mid_atn_prefix, hf_mid_atn_prefix))
@@ -1505,29 +1490,29 @@ def get_unet_key_mapping(current_keys):
     """
     map_static, map_resnet, map_layer = _get_sdxl_unet_conversion_map()
     
-    # 1. Initialize with current keys
+    
     mapping = {k: k for k in current_keys}
     
-    # 2. Apply static global mappings
+    
     for sd_name, hf_name in map_static:
         if hf_name in mapping:
             mapping[hf_name] = sd_name
             
-    # 3. Apply Resnet internal mappings
+    
     for k, v in mapping.items():
         if "resnets" in k:
             for sd_part, hf_part in map_resnet:
                 v = v.replace(hf_part, sd_part)
             mapping[k] = v
             
-    # 4. Apply Block Layer mappings
+    
     for k, v in mapping.items():
         for sd_part, hf_part in map_layer:
             if hf_part in v:
                 v = v.replace(hf_part, sd_part)
         mapping[k] = v
         
-    # 5. Final Formatting (Add model.diffusion_model prefix)
+    
     final_mapping = {}
     for hf_name, sd_name in mapping.items():
         if not sd_name.startswith("model.diffusion_model."):
@@ -1557,12 +1542,12 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     print(f"\nINFO: Saving complete checkpoint to: {output_path}")
     print(f"   -> Target dtype: {compute_dtype}")
 
-    # 1. Build the Key Map (Strings only - negligible RAM)
+    
     print("   -> Generating Key Map...")
     hf_keys = list(unet.state_dict().keys())
     key_map = get_unet_key_mapping(hf_keys)
 
-    # 2. Load Base Checkpoint to CPU
+    
     print("   -> Loading base checkpoint dictionary...")
     try:
         base_tensors = load_file(str(base_checkpoint_path), device="cpu")
@@ -1570,7 +1555,7 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
         print(f"ERROR: Could not load base checkpoint: {e}")
         return
 
-    # 3. **NEW: Convert ALL base tensors to training dtype**
+    
     print(f"   -> Converting base checkpoint to {compute_dtype}...")
     converted_count = 0
     for key in base_tensors.keys():
@@ -1579,7 +1564,7 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
             converted_count += 1
     print(f"   -> Converted {converted_count} tensors to {compute_dtype}")
 
-    # 4. In-Place Update - Copy ALL UNet layers (frozen + trainable)
+    
     print("   -> Merging ALL UNet weights (frozen + trainable)...")
     
     update_count = 0
@@ -1587,12 +1572,12 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     
     for hf_key, target_key in key_map.items():
         if hf_key in unet_state:
-            # Move ALL layers (frozen or trained) to CPU with correct dtype
-            # This ensures frozen layers are also saved in bfloat16
+            
+            
             tensor_gpu = unet_state[hf_key]
             tensor_cpu = tensor_gpu.detach().to("cpu", dtype=compute_dtype)
             
-            # Inject into base checkpoint
+            
             base_tensors[target_key] = tensor_cpu
             update_count += 1
             
@@ -1600,13 +1585,13 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
 
     print(f"   -> Copied {update_count} layers (trainable + frozen in {compute_dtype})")
 
-    # 5. Save to Disk
+    
     print("   -> Saving to disk (SAFETENSORS)...")
     save_file(base_tensors, str(output_path))
     
     print(f"   -> Save Complete in {compute_dtype}")
 
-    # 6. Cleanup
+    
     del base_tensors
     del unet_state
     del key_map
@@ -1624,7 +1609,7 @@ def save_checkpoint(global_step, micro_step, unet, base_checkpoint_path, optimiz
     model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
     state_filename = f"training_state_step_{global_step}.pt"
     
-    # Save complete model checkpoint
+    
     save_model(
         output_dir / model_filename,
         unet,
@@ -1632,16 +1617,16 @@ def save_checkpoint(global_step, micro_step, unet, base_checkpoint_path, optimiz
         config.compute_dtype
     )
     
-    # Save training state
-    # Robust save for custom optimizers vs standard
+    
+    
     if hasattr(optimizer, 'save_cpu_state'):
         optim_state = optimizer.save_cpu_state()
     else:
         optim_state = optimizer.state_dict()
 
     training_state = {
-        'global_step': global_step,    # Optimizer Steps (updates)
-        'micro_step': micro_step,      # Total Forward Passes (batches)
+        'global_step': global_step,    
+        'micro_step': micro_step,      
         'optimizer_state': optim_state,
         'sampler_seed': sampler.seed,
         'sampler_epoch': sampler.epoch,
@@ -1667,7 +1652,7 @@ def main():
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
  
-    global_step = 0 # Legacy name, mapped to optimizer_step in usage usually, but we use explicit names below
+    global_step = 0 
     micro_step = 0
     optimizer_step = 0
     
@@ -1682,8 +1667,7 @@ def main():
         state_path = Path(config.RESUME_STATE_PATH)
         training_state = torch.load(state_path, map_location="cpu", weights_only=False)
         
-        # Load the counters
-        # If micro_step wasn't saved in old version, derive it from global_step * accumulation
+
         global_step_saved = training_state.get('global_step', 0)
         micro_step = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
         optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
@@ -1815,7 +1799,7 @@ def main():
     
     optimizer = create_optimizer(config, params_to_optimize)
     
-    # LR Scheduler: initialized with MAX_TRAIN_STEPS (interpreted as Micro Steps)
+
     lr_scheduler = CustomCurveLRScheduler(
         optimizer=optimizer,
         curve_points=config.LR_CUSTOM_CURVE,
@@ -1831,7 +1815,7 @@ def main():
             except Exception as e:
                 print(f"WARNING: Optimizer load failed ({e}). Starting optimizer fresh.")
 
-        # Sync LR scheduler
+
         lr_scheduler.step(micro_step)
         print("--- Resume setup complete. Starting training loop. ---")
     else:
@@ -1840,7 +1824,7 @@ def main():
     unet.train()
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     
-    # Reporter: Total Steps = MAX_TRAIN_STEPS (interpreted as Micro Steps)
+
     reporter = AsyncReporter(
         total_steps=config.MAX_TRAIN_STEPS,
         test_param_name="Gradient Check"
@@ -1867,7 +1851,7 @@ def main():
     last_optim_step_log_time = time.time()
     done = False
     
-    # Data skipping for resume
+
     batches_to_skip = 0
     if config.RESUME_TRAINING:
         batches_in_epoch = len(dataloader)
@@ -1880,14 +1864,14 @@ def main():
                 batches_to_skip -= 1
                 continue
 
-            # Loop Limit: Break if we reach MAX_TRAIN_STEPS (treated as Micro Steps)
+
             if micro_step >= config.MAX_TRAIN_STEPS:
                 done = True
                 break
                 
             if not batch: continue
 
-            # --- START MICRO STEP PROCESSING ---
+
             micro_step += 1
             
             if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
@@ -1941,10 +1925,10 @@ def main():
     
             diagnostics.step(raw_loss_value)
             
-            # Update LR every micro step
+
             lr_scheduler.step(micro_step)
             
-            # --- ACCUMULATION & OPTIMIZER STEP ---
+
             is_accumulation_step = (micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0)
             diag_data_to_log = None
             
@@ -1979,12 +1963,10 @@ def main():
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
-                # Save Checkpoint based on Optimizer Step
                 if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and (optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
                     print(f"\n--- Saving checkpoint at optimizer step {optimizer_step} (Micro Step {micro_step}) ---")
                     save_checkpoint(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
 
-            # --- LOGGING UPDATES EVERY MICRO STEP ---
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)
             last_step_time = time.time()
@@ -1999,7 +1981,6 @@ def main():
                 'timestep': timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
             }
             
-            # Pass micro_step to reporter so it updates 1/250, 2/250, etc.
             reporter.log_step(micro_step, timing_data=timing_data, diag_data=diag_data_to_log)
 
     print("\nTraining complete.")

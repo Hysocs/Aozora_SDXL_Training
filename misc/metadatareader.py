@@ -1,44 +1,84 @@
-import customtkinter as ctk
-from tkinter import filedialog, messagebox
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
 from safetensors.torch import load_file, save_file
 from safetensors import safe_open
 import json
-import os # Make sure os is imported
+import os
 
-class MetadataEditorApp(ctk.CTk):
+class MetadataEditorApp(tk.Tk):
     def __init__(self):
         super().__init__()
 
         self.title("Safetensors Metadata Editor")
         self.geometry("800x600")
-        ctk.set_appearance_mode("System")
-
+        
+        # Configure grid weights
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(1, weight=1)
 
         self.file_path = None
         self.metadata = {}
 
-        self.top_frame = ctk.CTkFrame(self)
+        # Top frame
+        self.top_frame = tk.Frame(self, bd=1, relief="solid")
         self.top_frame.grid(row=0, column=0, padx=10, pady=10, sticky="ew")
         self.top_frame.grid_columnconfigure(1, weight=1)
 
-        self.load_button = ctk.CTkButton(self.top_frame, text="Load Model", command=self.load_model)
-        self.load_button.grid(row=0, column=0, padx=(0, 5), pady=5)
+        self.load_button = tk.Button(
+            self.top_frame, 
+            text="Load Model", 
+            command=self.load_model,
+            width=12,
+            relief="raised",
+            bd=2
+        )
+        self.load_button.grid(row=0, column=0, padx=(5, 5), pady=5)
 
-        self.file_label = ctk.CTkLabel(self.top_frame, text="No model loaded", anchor="w")
+        self.file_label = tk.Label(
+            self.top_frame, 
+            text="No model loaded", 
+            anchor="w",
+            padx=5
+        )
         self.file_label.grid(row=0, column=1, padx=5, pady=5, sticky="ew")
 
-        self.textbox = ctk.CTkTextbox(self, wrap="word", font=("Courier New", 13))
-        self.textbox.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
-        self.textbox.insert("1.0", "Load a .safetensors file to see its metadata.")
-        self.textbox.configure(state="disabled")
+        # Text widget with scrollbar
+        self.text_frame = tk.Frame(self)
+        self.text_frame.grid(row=1, column=0, padx=10, pady=(0, 10), sticky="nsew")
+        self.text_frame.grid_rowconfigure(0, weight=1)
+        self.text_frame.grid_columnconfigure(0, weight=1)
 
-        self.bottom_frame = ctk.CTkFrame(self)
+        self.textbox = tk.Text(
+            self.text_frame, 
+            wrap="word", 
+            font=("Courier New", 13),
+            undo=True,
+            relief="sunken",
+            bd=2
+        )
+        self.textbox.grid(row=0, column=0, sticky="nsew")
+
+        # Add scrollbar
+        self.scrollbar = tk.Scrollbar(self.text_frame, command=self.textbox.yview)
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+        self.textbox.config(yscrollcommand=self.scrollbar.set)
+
+        self.textbox.insert("1.0", "Load a .safetensors file to see its metadata.")
+        self.textbox.config(state="disabled")
+
+        # Bottom frame
+        self.bottom_frame = tk.Frame(self, bd=1, relief="solid")
         self.bottom_frame.grid(row=2, column=0, padx=10, pady=(0, 10), sticky="ew")
         self.bottom_frame.grid_columnconfigure(0, weight=1)
-        
-        self.save_button = ctk.CTkButton(self.bottom_frame, text="Save Metadata to New File", command=self.save_metadata, state="disabled")
+
+        self.save_button = tk.Button(
+            self.bottom_frame, 
+            text="Save Metadata to New File", 
+            command=self.save_metadata, 
+            state="disabled",
+            relief="raised",
+            bd=2
+        )
         self.save_button.grid(row=0, column=0, padx=5, pady=5)
 
 
@@ -56,16 +96,16 @@ class MetadataEditorApp(ctk.CTk):
             if self.metadata is None:
                 self.metadata = {}
 
-            self.file_label.configure(text=os.path.basename(self.file_path))
-            self.textbox.configure(state="normal")
+            self.file_label.config(text=os.path.basename(self.file_path))
+            self.textbox.config(state="normal")
             self.textbox.delete("1.0", "end")
             pretty_metadata = json.dumps(self.metadata, indent=4, sort_keys=True)
             self.textbox.insert("1.0", pretty_metadata)
-            self.save_button.configure(state="normal")
+            self.save_button.config(state="normal")
         except Exception as e:
             messagebox.showerror("Error", f"Failed to load metadata from file:\n{e}")
-            self.file_label.configure(text="Failed to load model.")
-            self.save_button.configure(state="disabled")
+            self.file_label.config(text="Failed to load model.")
+            self.save_button.config(state="disabled")
 
     def save_metadata(self):
         """

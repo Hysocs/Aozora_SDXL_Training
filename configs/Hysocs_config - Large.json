@@ -9,8 +9,8 @@
     "UNCONDITIONAL_DROPOUT": true,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.1,
     "SHOULD_UPSCALE": true,
-    "TARGET_PIXEL_AREA": "1048576",
-    "MAX_AREA_TOLERANCE": "1.15",
+    "TARGET_PIXEL_AREA": "131072",
+    "MAX_AREA_TOLERANCE": "1.0",
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
@@ -21,7 +21,7 @@
     "CLIP_GRAD_NORM": "8.5",
     "SEED": 64,
     "SAVE_EVERY_N_STEPS": "700",
-    "UNET_EXCLUDE_TARGETS": "up_blocks.0.attentions.*.ff.net.*",
+    "UNET_EXCLUDE_TARGETS": "",
     "LR_CUSTOM_CURVE": [
         [
             0.0,
@@ -67,11 +67,16 @@
     "RF_BASE_PIXELS": 1048576,
     "TRAINING_MODE": "Rectified Flow (SDXL)",
     "RESUME_TRAINING": false,
-    "INSTANCE_DATASETS": [],
+    "INSTANCE_DATASETS": [
+        {
+            "path": "C:/Users/Administrator/Pictures/Artists/by quilm",
+            "repeats": 1
+        }
+    ],
     "OPTIMIZER_TYPE": "raven",
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
-    "LOSS_TYPE": "Semantic",
+    "LOSS_TYPE": "MSE",
     "SEMANTIC_CHAR_WEIGHT": 0.1,
     "SEMANTIC_DETAIL_WEIGHT": 0.2,
     "LOSS_HUBER_BETA": 0.5,

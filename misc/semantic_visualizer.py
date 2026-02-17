@@ -10,13 +10,16 @@ from diffusers import AutoencoderKL
 from PyQt6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QPushButton, QLabel,
     QFileDialog, QSlider, QDoubleSpinBox, QFormLayout, QGroupBox, QCheckBox,
-    QProgressBar, QMessageBox
+    QProgressBar, QMessageBox, QTabWidget
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 
 from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg as FigureCanvas
 from matplotlib.figure import Figure
 from matplotlib.colors import LinearSegmentedColormap
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from matplotlib.gridspec import GridSpec
 
 # --- IMAGE UTILS ---
 def fix_alpha_channel(img):
@@ -34,7 +37,6 @@ def generate_character_map(pil_image):
         pil_image = pil_image.convert("RGB")
     np_image_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
     
-    # Bilateral filter to smooth noise but keep edges
     bilateral = cv2.bilateralFilter(np_image_bgr, d=5, sigmaColor=50, sigmaSpace=50)
     lab_image = cv2.cvtColor(bilateral, cv2.COLOR_BGR2LAB)
     l_channel, a_channel, b_channel = cv2.split(lab_image)
@@ -49,8 +51,6 @@ def generate_character_map(pil_image):
     else:
         color_saliency_norm = np.zeros_like(color_saliency, dtype=np.float32)
    
-    # REDUCED BLUR: Was (21, 21) -> Now (9, 9)
-    # This keeps the character mask tighter to the actual subject
     final_map = cv2.GaussianBlur(color_saliency_norm, (9, 9), 0)
     return final_map
 
@@ -66,8 +66,6 @@ def generate_detail_map(pil_image):
     else:
         magnitude_norm = np.zeros_like(magnitude, dtype=np.float32)
    
-    # REDUCED BLUR: Was (9, 9) -> Now (3, 3)
-    # Just enough to prevent aliasing, but tight enough to not "box" empty space
     final_map = cv2.GaussianBlur(magnitude_norm.astype(np.float32), (3, 3), 0)
     return final_map
 
@@ -121,7 +119,7 @@ class ComputeThread(QThread):
         self.detail_weight = 1.0
         self.vae = None
         self.use_latent_view = False
-        self.smooth_view = False  # New Flag
+        self.smooth_view = False
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
         self.dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
@@ -159,7 +157,6 @@ class ComputeThread(QThread):
             latent_w = max(1, w // 8)
             latent_h = max(1, h // 8)
             
-            # VAE Reconstruct
             if self.vae:
                 try:
                     img_resized = self.original_pil.resize((w, h), Image.Resampling.LANCZOS)
@@ -185,18 +182,12 @@ class ComputeThread(QThread):
                 temp = self.original_pil.resize((latent_w, latent_h), Image.Resampling.BILINEAR)
                 final_bg = temp.resize((w, h), Image.Resampling.NEAREST)
 
-            # --- MAP GENERATION ---
             map_pil = Image.fromarray(combined, mode='F')
-            
-            # 1. Downscale to Latent (Critical Step - Simulates Loss Resolution)
             map_latent = map_pil.resize((latent_w, latent_h), Image.Resampling.BILINEAR)
             
-            # 2. Upscale to View (Visualization Step)
             if self.smooth_view:
-                # Bicubic creates a smooth heatmap (No blocks)
                 map_vis = map_latent.resize((w, h), Image.Resampling.BICUBIC)
             else:
-                # Nearest creates the "Box" view (Accurate to latent boundaries)
                 map_vis = map_latent.resize((w, h), Image.Resampling.NEAREST)
                 
             final_map = np.array(map_vis)
@@ -214,15 +205,15 @@ class ComputeThread(QThread):
 class SemanticVisualizer(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Semantic Latent Visualizer (Refined)')
-        self.setGeometry(100, 100, 1300, 850)
+        self.setWindowTitle('Semantic Visualizer - Educational Edition')
+        self.setGeometry(100, 100, 1400, 900)
 
         # State
         self.original_image = None
         self.vae_model = None
         self.char_map_raw = None
         self.detail_map_raw = None
-        
+        self.vae_reconstructed = None  # Store for MSE calc
         self.bg_image = None
         self.weight_map = None
         self.cbar = None
@@ -282,7 +273,6 @@ class SemanticVisualizer(QWidget):
         self.chk_latent_view.toggled.connect(self._trigger_update)
         view_layout.addWidget(self.chk_latent_view)
         
-        # NEW: Smooth View Toggle
         self.chk_smooth_vis = QCheckBox("Smooth Heatmap (No Grid)")
         self.chk_smooth_vis.setChecked(False)
         self.chk_smooth_vis.setToolTip("Interpolates the grid to look like a smooth heatmap instead of blocks")
@@ -311,6 +301,19 @@ class SemanticVisualizer(QWidget):
         form_layout.addRow("Detail Weight:", self.spin_detail)
         form_layout.addRow(self.slider_detail)
         controls_layout.addLayout(form_layout)
+        
+        # Export Button (New)
+        self.btn_export = QPushButton("📊 Export Educational Grid")
+        self.btn_export.setStyleSheet("""
+            background-color: #2E86AB; 
+            color: white; 
+            font-weight: bold; 
+            padding: 12px;
+            border-radius: 5px;
+        """)
+        self.btn_export.clicked.connect(self._export_educational_grid)
+        self.btn_export.setEnabled(False)
+        controls_layout.addWidget(self.btn_export)
         
         btn_clear = QPushButton("Clear VRAM")
         btn_clear.clicked.connect(self._force_clear_vram)
@@ -345,8 +348,6 @@ class SemanticVisualizer(QWidget):
         spin.valueChanged.connect(lambda v: slider.setValue(int(v * divider)))
         spin.valueChanged.connect(self._trigger_update)
         return slider, spin
-
-    # --- LOGIC ---
 
     def _force_clear_vram(self):
         gc.collect()
@@ -383,6 +384,7 @@ class SemanticVisualizer(QWidget):
             self.lbl_filename.setText(f"File: {filepath.split('/')[-1]}")
             self.char_map_raw = generate_character_map(self.original_image)
             self.detail_map_raw = generate_detail_map(self.original_image)
+            self.btn_export.setEnabled(True)
             self._trigger_update()
         except Exception as e:
             self.lbl_filename.setText(f"Error: {e}")
@@ -405,7 +407,7 @@ class SemanticVisualizer(QWidget):
                 self.spin_detail.value(),
                 self.vae_model,
                 self.chk_latent_view.isChecked(),
-                self.chk_smooth_vis.isChecked() # Pass new flag
+                self.chk_smooth_vis.isChecked()
             )
             self.compute_thread.start()
 
@@ -458,6 +460,173 @@ class SemanticVisualizer(QWidget):
         self.ax.set_title(title)
         self.canvas.draw()
 
+    def _export_educational_grid(self):
+        """Unified colormap starting at 1.0× (blue) - shows base + semantic boost"""
+        if self.original_image is None:
+            QMessageBox.warning(self, "Warning", "Please load an image first")
+            return
+            
+        try:
+            import matplotlib.pyplot as plt
+            import numpy as np
+            
+            orig_np = np.array(self.original_image)
+            h, w = orig_np.shape[:2]
+            target_h = 512
+            scale = target_h / h
+            target_w = int(w * scale)
+            
+            def resize_arr(img):
+                if isinstance(img, Image.Image):
+                    return np.array(img.resize((target_w, target_h), Image.Resampling.LANCZOS))
+                return cv2.resize(img, (target_w, target_h))
+            
+            orig_arr = resize_arr(self.original_image)
+            
+            if self.vae_model and self.bg_image is not None:
+                vae_arr = resize_arr(self.bg_image)
+            else:
+                vae_arr = orig_arr.copy()
+            
+            char_r = resize_arr(self.char_map_raw)
+            detail_r = resize_arr(self.detail_map_raw)
+            
+            # Semantic weights are ADDED to base 1.0×
+            def get_total_weight(cw, dw):
+                semantic_boost = char_r * cw + detail_r * dw
+                return 1.0 + semantic_boost
+            
+            # MSE is uniform 1.0× (baseline, no boost)
+            mse_map = np.ones_like(char_r) * 1.0
+            
+            # Scale: 1.0× (blue) to 3.5× (red)
+            vmin, vmax = 1.0, 3.5
+            
+            unified_cmap = self.heatmap_cmap
+            
+            def apply_cmap(data):
+                normalized = (data - vmin) / (vmax - vmin)
+                rgba = unified_cmap(np.clip(normalized, 0, 1))
+                return (rgba[:, :, :3] * 255).astype(np.uint8)
+            
+            def blend(base, weight_map):
+                heat = apply_cmap(weight_map)
+                return (base * 0.3 + heat * 0.7).astype(np.uint8)
+            
+            # Build rows
+            row0 = np.concatenate([
+                orig_arr,
+                blend(orig_arr, mse_map),
+                apply_cmap(mse_map)
+            ], axis=1)
+            
+            sem_std = get_total_weight(1.0, 1.0)
+            row1 = np.concatenate([
+                vae_arr,
+                blend(vae_arr, sem_std),
+                apply_cmap(sem_std)
+            ], axis=1)
+            
+            sem_high = get_total_weight(2.5, 2.5)
+            row2 = np.concatenate([
+                vae_arr,
+                blend(vae_arr, sem_high),
+                apply_cmap(sem_high)
+            ], axis=1)
+            
+            full_grid = np.concatenate([row0, row1, row2], axis=0)
+            grid_h, grid_w = full_grid.shape[:2]
+            aspect = grid_w / grid_h
+            
+            fig_height = 10
+            fig_width = fig_height * aspect * 1.12
+            
+            fig = plt.figure(figsize=(fig_width, fig_height), facecolor='white')
+            
+            img_left = 0.12
+            img_width = 0.78
+            img_bottom = 0.08
+            img_height = 0.82
+            
+            ax_img = fig.add_axes([img_left, img_bottom, img_width, img_height])
+            ax_img.imshow(full_grid)
+            ax_img.axis('off')
+            
+            # Column titles
+            col_width = img_width / 3
+            titles = ['Base Image', 'Loss Weight (1.0× + Semantic)', 'Weight Map Only']
+            
+            for i, title in enumerate(titles):
+                x_pos = img_left + (i + 0.5) * col_width
+                fig.text(x_pos, 0.92, title, 
+                        ha='center', va='bottom', fontsize=11,
+                        fontweight='bold', color='#2E86AB',
+                        bbox=dict(boxstyle='round,pad=0.2', facecolor='white', 
+                                 edgecolor='#2E86AB', linewidth=1.5))
+            
+            # Row labels
+            row_height = img_height / 3
+            row_labels = ['MSE Loss\n(1.0× Base)', 
+                         'Semantic +1.0×', 
+                         'Semantic +2.5×']
+            
+            for i, label in enumerate(row_labels):
+                y_pos = img_bottom + (2.5 - i) * row_height
+                fig.text(img_left - 0.008, y_pos, label, 
+                        ha='right', va='center', fontsize=10, fontweight='bold', color='#222',
+                        bbox=dict(boxstyle='round,pad=0.3', facecolor='white', 
+                                 edgecolor='gray', linewidth=0.5))
+            
+            # Colorbars - scale 1.0× to 3.5×
+            cbar_width = 0.025
+            cbar_left = img_left + img_width + 0.005
+            
+            for i in range(3):
+                y_bottom = img_bottom + (2 - i) * row_height + 0.02
+                y_height = row_height - 0.04
+                
+                ax_cbar = fig.add_axes([cbar_left, y_bottom, cbar_width, y_height])
+                
+                # FIX: Create gradient image properly (H x W x 3)
+                gradient = np.linspace(0, 1, 256)
+                # Get RGB values from colormap (256, 4) -> take only RGB
+                colors = unified_cmap(gradient)[:, :3]  # (256, 3)
+                # Reshape to (256, 1, 3) for vertical bar
+                gradient_img = colors.reshape(256, 1, 3)
+                
+                ax_cbar.imshow(gradient_img, aspect='auto', origin='lower')
+                
+                ax_cbar.set_xticks([])
+                # Ticks at 1.0×, 2.0×, 3.0×, 3.5×
+                tick_positions = [0, (2.0-vmin)/(vmax-vmin), (3.0-vmin)/(vmax-vmin), 1.0]
+                tick_labels = ['1.0×', '2.0×', '3.0×', '3.5×']
+                tick_indices = [int(p*255) for p in tick_positions]
+                ax_cbar.set_yticks(tick_indices)
+                ax_cbar.set_yticklabels(tick_labels, fontsize=8)
+                ax_cbar.tick_params(axis='y', which='both', pad=3)
+                ax_cbar.yaxis.tick_right()
+                
+                if i == 1:
+                    label_x = cbar_left + cbar_width + 0.01
+                    label_y = y_bottom + y_height / 2
+                    fig.text(label_x, label_y, 'Total\nLoss\nWeight', 
+                            ha='left', va='center', fontsize=9, fontweight='bold',
+                            linespacing=0.9)
+            
+            fig.suptitle('Loss Comparison: Base 1.0× + Semantic (Blue=1.0, Red=3.0)', 
+                        fontsize=12, fontweight='bold', y=0.98)
+            
+            save_path, _ = QFileDialog.getSaveFileName(self, "Save Grid", "loss_comparison.png", "PNG (*.png)")
+            if save_path:
+                plt.savefig(save_path, dpi=200, facecolor='white', bbox_inches='tight', pad_inches=0.05)
+                plt.close()
+            else:
+                plt.show()
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", str(e))
+            import traceback
+            traceback.print_exc()
 if __name__ == '__main__':
     app = QApplication(sys.argv)
     window = SemanticVisualizer()

@@ -2,19 +2,19 @@
     "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/chenkinnoobXLV02_v02.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/chenkinnoobXLV02_v02_step_16.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_16.pt",
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/chenkinnoobXLV02_v02_step_4150.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4150.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
     "UNCONDITIONAL_DROPOUT": true,
-    "UNCONDITIONAL_DROPOUT_CHANCE": 0.1,
+    "UNCONDITIONAL_DROPOUT_CHANCE": 0.15000000000000002,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
     "MAX_AREA_TOLERANCE": "1.0",
     "NOISE_SCHEDULER": "DDPMScheduler",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "39243",
+    "MAX_TRAIN_STEPS": "91567",
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": "16",
     "MIXED_PRECISION": "bfloat16",
@@ -25,31 +25,47 @@
     "LR_CUSTOM_CURVE": [
         [
             0.0,
-            2e-06
+            2e-07
         ],
         [
-            0.03,
+            0.028,
             2e-05
         ],
         [
-            0.52413793,
+            0.437,
             2e-05
         ],
         [
-            0.56321839,
-            6.5217e-06
+            0.505,
+            1e-05
         ],
         [
-            0.93793103,
-            6.5217e-06
+            0.591,
+            1e-05
+        ],
+        [
+            0.661,
+            2.5e-05
+        ],
+        [
+            0.7251,
+            3.46025e-05
+        ],
+        [
+            0.857,
+            3.46025e-05
+        ],
+        [
+            0.929,
+            2e-05
         ],
         [
             1.0,
-            2e-06
+            2e-07
         ]
     ],
-    "LR_GRAPH_MIN": "2e-06",
-    "LR_GRAPH_MAX": "2e-05",
+    "LR_GRAPH_MIN": "2e-07",
+    "LR_GRAPH_MAX": "5e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -58,18 +74,18 @@
     "VAE_SHIFT_FACTOR": 0.0,
     "VAE_SCALING_FACTOR": 0.13025,
     "VAE_LATENT_CHANNELS": 4,
-    "RF_SHIFT_FACTOR": 3.0,
+    "RF_SHIFT_FACTOR": 2.0,
     "RF_USE_DYNAMIC_SHIFT": true,
     "RF_BASE_PIXELS": 1048576,
     "TRAINING_MODE": "Rectified Flow (SDXL)",
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures/Artists",
+            "path": "C:/Users/Administrator/Pictures/CG",
             "repeats": 1
         },
         {
-            "path": "C:/Users/Administrator/Pictures/CG",
+            "path": "C:/Users/Administrator/Pictures/Artists",
             "repeats": 1
         }
     ],
@@ -77,38 +93,38 @@
     "NOISE_TYPE": "Default",
     "NOISE_OFFSET": 0.025,
     "LOSS_TYPE": "Semantic",
-    "SEMANTIC_CHAR_WEIGHT": 0.1,
-    "SEMANTIC_DETAIL_WEIGHT": 0.2,
+    "SEMANTIC_CHAR_WEIGHT": 0.12,
+    "SEMANTIC_DETAIL_WEIGHT": 0.22,
     "LOSS_HUBER_BETA": 0.5,
     "LOSS_ADAPTIVE_DAMPING": 0.1,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1570,
-            1569,
-            1569,
-            1569,
-            1569,
-            1569,
-            1569,
-            1569
+            3664,
+            3664,
+            3664,
+            3664,
+            3664,
+            3664,
+            3663,
+            3663,
+            3663,
+            3663,
+            3663,
+            3663,
+            3663,
+            3663,
+            3663,
+            3662,
+            3662,
+            3662,
+            3662,
+            3662,
+            3662,
+            3661,
+            3661,
+            3661,
+            3661
         ]
     },
     "RAVEN_PARAMS": {
@@ -118,7 +134,7 @@
         ],
         "eps": 1e-08,
         "weight_decay": 0.01,
-        "debias_strength": 0.9,
+        "debias_strength": 0.95,
         "use_grad_centralization": false,
         "gc_alpha": 0.5
     },

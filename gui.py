@@ -21,7 +21,7 @@ from PyQt6.QtCore import QFileInfo
 try:
     import config as default_config
 except ImportError:
-    # Fallback if config.py is missing
+    # Fallback if config.py is missing (This isnt needed but the optimizers can bsod if not, likely never called)
     class default_config:
         RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
         TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
@@ -238,7 +238,6 @@ class NoScrollDoubleSpinBox(QtWidgets.QDoubleSpinBox):
 
 class NoScrollComboBox(QtWidgets.QComboBox):
     def wheelEvent(self, event):
-        # Ignore the event so it propagates to the parent (scroll area)
         event.ignore()
 
 class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
@@ -1032,7 +1031,7 @@ class LRCurveWidget(QtWidgets.QWidget):
         log_max, log_min = self._get_log_range()
         log_range = log_max - log_min
         
-        # Draw Grid Labels
+
         for i in range(5):
             normalized_y = 1.0 - (i / 4.0)
             if i == 0:
@@ -1048,7 +1047,7 @@ class LRCurveWidget(QtWidgets.QWidget):
             
             y = rect.top() + (i / 4.0) * rect.height()
             
-            # Y-Axis Labels (Aligned Right within the padding)
+        
             painter.drawText(QtCore.QRect(0, int(y - 10), self.padding['left'] - 5, 20),
                              QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter, label)
             
@@ -1056,7 +1055,7 @@ class LRCurveWidget(QtWidgets.QWidget):
             label_x = str(step_val)
             x = rect.left() + (i / 4.0) * rect.width()
             
-            # X-Axis Labels (Straight line, no stagger)
+   
             painter.drawText(QtCore.QRect(int(x - 50), rect.bottom() + 5, 100, 20),
                              QtCore.Qt.AlignmentFlag.AlignCenter, label_x)
                              
@@ -1064,7 +1063,7 @@ class LRCurveWidget(QtWidgets.QWidget):
         small_font.setPointSize(8)
         painter.setFont(small_font)
         
-        # Epoch Labels (Dotted Lines) - These are distinct from grid labels
+
         for norm_x, step_count in self.epoch_data:
             x = rect.left() + norm_x * rect.width()
             label_rect = QtCore.QRect(int(x - 40), rect.bottom() + 25, 80, 15)
@@ -1251,7 +1250,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self.text_color = QtGui.QColor("#e0e0e0")
         self.alert_color = QtGui.QColor("#e53935")
         
-        # Disabled Colors
+       
         self.disabled_bar_color = QtGui.QColor("#383552")
         self.disabled_text_color = QtGui.QColor("#5c5a70")
 
@@ -1268,19 +1267,19 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
 
         if steps <= 0: steps = 1
         
-        # Save the new max
+        
         self.max_tickets = steps
         
-        # Get current state
+     
         current_sum = sum(self.counts)
         num_bins = len(self.counts)
 
-        # If the graph is empty or has no tickets yet, just initialize a flat distribution
+     
         if num_bins == 0 or current_sum == 0:
             self._init_bins()
             return
 
-        # --- SMART SCALING ALGORITHM (Largest Remainder Method) ---
+     
         raw_new_counts = [(c / current_sum) * steps for c in self.counts]
         new_counts = [int(x) for x in raw_new_counts]
         current_new_sum = sum(new_counts)
@@ -1338,7 +1337,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         new_counts = [int(c) for c in raw_counts]
         
         diff = self.max_tickets - sum(new_counts)
-        # Distribute remainder
+       
         remainders = sorted([(raw_counts[i] - new_counts[i], i) for i in range(num_bins)], key=lambda x: x[0], reverse=True)
         for i in range(diff):
             new_counts[remainders[i][1]] += 1
@@ -1348,7 +1347,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self._emit_change()
 
     def _init_bins(self):
-        # Re-initialize bins (Uniform distribution)
+     
         if self.bin_size <= 0: self.bin_size = 100
         num_bins = math.ceil(1000 / self.bin_size)
         if num_bins <= 0: num_bins = 1
@@ -1627,7 +1626,7 @@ class TrainingGUI(QtWidgets.QWidget):
             "step": 0.05,
             "decimals": 2
         },
-        # --- NEW HUBER PARAMS ---
+        
         "LOSS_HUBER_BETA": {
             "label": "Huber Beta:", 
             "tooltip": "Threshold where quadratic loss turns linear (0.5 is standard). Lower = more robust to outliers.", 
@@ -1644,7 +1643,7 @@ class TrainingGUI(QtWidgets.QWidget):
             "step": 0.01, 
             "decimals": 3
         },
-        # --- NEW VAE PARAMS ---
+       
         "VAE_SHIFT_FACTOR": {"label": "VAE Shift Factor:", "tooltip": "Latent shift mean.", "widget": "QDoubleSpinBox", "range": (-10.0, 10.0), "step": 0.0001, "decimals": 4},
         "VAE_SCALING_FACTOR": {"label": "VAE Scaling Factor:", "tooltip": "Latent scaling factor.", "widget": "QDoubleSpinBox", "range": (0.0, 10.0), "step": 0.0001, "decimals": 5},
         "VAE_LATENT_CHANNELS": {"label": "Latent Channels:", "tooltip": "4 for Standard/EQ, 32 for Flux/NoobAI.", "widget": "QSpinBox", "range": (4, 128)},
@@ -1680,7 +1679,7 @@ class TrainingGUI(QtWidgets.QWidget):
         
         self.config_dropdown.blockSignals(True)
         
-        # Load last selected config
+      
         last_config = self._load_gui_state()
         if last_config and last_config in self.presets:
             index = self.config_dropdown.findData(last_config)
@@ -1745,7 +1744,7 @@ class TrainingGUI(QtWidgets.QWidget):
         """Handle window close - save state and clean up"""
         self._save_gui_state()
         
-        # Stop any running training process
+ 
         if self.process_runner and self.process_runner.isRunning():
             reply = QtWidgets.QMessageBox.question(
                 self, 
@@ -1910,7 +1909,7 @@ class TrainingGUI(QtWidgets.QWidget):
         
     def _prepare_config_to_save(self):
         config_to_save = {}
-        # Skip keys handled manually
+
         skip_keys = [
             "RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE", 
             "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS", "GRYPHON_PARAMS", 
@@ -1933,11 +1932,9 @@ class TrainingGUI(QtWidgets.QWidget):
             except Exception as e:
                 self.log(f"Warning: Could not save '{key}': {e}")
         
-        # --- NEW: Explicitly save RF Params ---
-        # We do this explicitly because they might not be in your default_config import yet
         if "RF_SHIFT_FACTOR" in self.widgets:
             config_to_save["RF_SHIFT_FACTOR"] = self.widgets["RF_SHIFT_FACTOR"].value()
-        # --------------------------------------
+
 
         config_to_save["TRAINING_MODE"] = self.training_mode_combo.currentText()
         config_to_save["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
@@ -1955,9 +1952,6 @@ class TrainingGUI(QtWidgets.QWidget):
         
         if hasattr(self, 'timestep_histogram'):
             config_to_save["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
-
-        # ... (Rest of the function remains the same: RAVEN, TITAN, VAE params) ...
-        # (Be sure to include the rest of the existing function here)
         
         raven_params = {}
         try:
@@ -2188,19 +2182,19 @@ class TrainingGUI(QtWidgets.QWidget):
         self.scheduler_group = self._create_scheduler_config_group()
         row2.addWidget(self.scheduler_group, 1)
 
-        # --- UPDATED LAYOUT FOR RIGHT COLUMN (VAE + UNET) ---
+      
         right_col_widget = QtWidgets.QWidget()
         right_col_layout = QtWidgets.QVBoxLayout(right_col_widget)
         right_col_layout.setContentsMargins(0, 0, 0, 0)
         right_col_layout.setSpacing(20)
         
-        # VAE Group on Top
+      
         right_col_layout.addWidget(self._create_vae_group())
-        # UNet Group Below
+     
         right_col_layout.addWidget(self._create_unet_group())
         
         row2.addWidget(right_col_widget, 1)
-        # ----------------------------------------------------
+     
 
         main_layout.addLayout(row2)
 
@@ -2228,7 +2222,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _on_training_mode_changed(self, text):
         is_rf = "Rectified Flow (SDXL)" in text
         
-        # Existing logic for scheduler/noise groups
+      
         if hasattr(self, 'scheduler_group'): self.scheduler_group.setEnabled(not is_rf)
         if hasattr(self, 'noise_group'): self.noise_group.setEnabled(not is_rf)
         
@@ -2242,12 +2236,12 @@ class TrainingGUI(QtWidgets.QWidget):
         
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
 
-        # --- NEW: Toggle Visibility of RF Params ---
+      
         if hasattr(self, 'rf_params_container'):
             self.rf_params_container.setVisible(is_rf)
             if is_rf:
                 self._update_rf_settings_state()
-        # -------------------------------------------
+       
 
     def _create_form_group(self, title, keys):
         group = QtWidgets.QGroupBox(title)
@@ -2294,22 +2288,22 @@ class TrainingGUI(QtWidgets.QWidget):
         core_group = QtWidgets.QGroupBox("Core Training Parameters")
         layout = QtWidgets.QFormLayout(core_group)
         
-        # Standard Params
+       
         core_keys = ["MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "SAVE_EVERY_N_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"]
         for key in core_keys: 
             self._add_widget_to_form(layout, key)
 
-        # --- NEW: Rectified Flow Specific Container ---
+       
         self.rf_params_container = QtWidgets.QWidget()
         rf_layout = QtWidgets.QFormLayout(self.rf_params_container)
-        rf_layout.setContentsMargins(0, 0, 0, 0) # Tight fit
+        rf_layout.setContentsMargins(0, 0, 0, 0) 
         
         self._add_widget_to_form(rf_layout, "RF_SHIFT_FACTOR")
         
 
-        # Add the container to the main layout
+   
         layout.addRow(self.rf_params_container)
-        # ----------------------------------------------
+   
 
         return core_group
     
@@ -2359,7 +2353,7 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QFormLayout(container)
         layout.setContentsMargins(0, 5, 0, 0)
 
-        # Momentum
+       
         mom = NoScrollDoubleSpinBox()
         mom.setRange(0.0, 0.999)
         mom.setSingleStep(0.01)
@@ -2367,7 +2361,7 @@ class TrainingGUI(QtWidgets.QWidget):
         mom.setToolTip("Momentum factor (default: 0.86)")
         self.widgets[f'{prefix}_momentum'] = mom
         
-        # Leak
+       
         leak = NoScrollDoubleSpinBox()
         leak.setRange(0.0, 1.0)
         leak.setSingleStep(0.01)
@@ -2375,7 +2369,7 @@ class TrainingGUI(QtWidgets.QWidget):
         leak.setToolTip("Gradient leakage into RMS (default: 0.16)")
         self.widgets[f'{prefix}_leak'] = leak
         
-        # Weight Decay
+       
         wd = NoScrollDoubleSpinBox()
         wd.setRange(0.0, 1.0)
         wd.setSingleStep(0.00001)
@@ -2383,7 +2377,7 @@ class TrainingGUI(QtWidgets.QWidget):
         wd.setToolTip("Weight decay coefficient (default: 0.01)")
         self.widgets[f'{prefix}_weight_decay'] = wd
 
-        # Eps
+       
         eps = QtWidgets.QLineEdit()
         eps.setToolTip("Term added to denominator for stability (default: 1e-8)")
         self.widgets[f'{prefix}_eps'] = eps
@@ -2523,15 +2517,15 @@ class TrainingGUI(QtWidgets.QWidget):
         
         form_layout = QtWidgets.QFormLayout()
         
-        # 1. Loss Type Dropdown
+        
         self.widgets["LOSS_TYPE"] = NoScrollComboBox()
-        # Ensure these options match exactly what the training code expects
+       
         self.widgets["LOSS_TYPE"].addItems(["MSE", "Semantic", "Huber_Adaptive"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form_layout.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
         layout.addLayout(form_layout)
         
-        # 2. Container for Semantic Loss (Hidden by default)
+      
         self.semantic_loss_container = QtWidgets.QWidget()
         semantic_layout = QtWidgets.QFormLayout(self.semantic_loss_container)
         semantic_layout.setContentsMargins(0, 0, 0, 0)
@@ -2539,7 +2533,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self._add_widget_to_form(semantic_layout, "SEMANTIC_DETAIL_WEIGHT")
         layout.addWidget(self.semantic_loss_container)
 
-        # 3. Container for Huber Adaptive Loss (Hidden by default)
+       
         self.huber_loss_container = QtWidgets.QWidget()
         huber_layout = QtWidgets.QFormLayout(self.huber_loss_container)
         huber_layout.setContentsMargins(0, 0, 0, 0)
@@ -2553,10 +2547,10 @@ class TrainingGUI(QtWidgets.QWidget):
     def _toggle_loss_widgets(self):
         loss_type = self.widgets["LOSS_TYPE"].currentText()
         
-        # Show Semantic controls only if Semantic is selected
+       
         self.semantic_loss_container.setVisible(loss_type == "Semantic")
         
-        # Show Huber controls only if Huber_Adaptive is selected
+       
         self.huber_loss_container.setVisible(loss_type == "Huber_Adaptive")
 
     def _add_slider_row(self, layout, label_text, min_val, max_val, default_val, divider):
@@ -2578,21 +2572,21 @@ class TrainingGUI(QtWidgets.QWidget):
             spin.setSingleStep(0.1)
             spin.setValue(default_val)
             spin.setDecimals(2)
-            # CHANGED: Increased width from 70 to 120 to fix "skinny" look
+          
             spin.setFixedWidth(120)
 
-            # Sync Logic
+      
             def on_slider_change(val):
                 new_float = val / divider
                 if abs(spin.value() - new_float) > (0.5 / divider):
                     spin.setValue(new_float)
-                self._update_timestep_distribution() # Trigger update
+                self._update_timestep_distribution() 
 
             def on_spin_change(val):
                 new_int = int(val * divider)
                 if abs(slider.value() - new_int) > 1:
                     slider.setValue(new_int)
-                self._update_timestep_distribution() # Trigger update
+                self._update_timestep_distribution() 
 
             slider.valueChanged.connect(on_slider_change)
             spin.valueChanged.connect(on_spin_change)
@@ -2621,7 +2615,7 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(group)
         layout.setSpacing(10)
 
-        # 1. Histogram Visualization (Top)
+   
         self.timestep_histogram = TimestepHistogramWidget()
         self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
         layout.addWidget(self.timestep_histogram)
@@ -2633,7 +2627,7 @@ class TrainingGUI(QtWidgets.QWidget):
         controls_layout = QtWidgets.QVBoxLayout()
         controls_layout.setContentsMargins(5, 5, 5, 5)
 
-        # 2. Bin Size and Mode Dropdown
+     
         row1 = QtWidgets.QHBoxLayout()
         row1.addWidget(QtWidgets.QLabel("Bin Size:"))
         self.bin_size_combo = NoScrollComboBox()
@@ -2647,10 +2641,10 @@ class TrainingGUI(QtWidgets.QWidget):
         row1.addWidget(self.ts_mode_combo, 1)
         controls_layout.addLayout(row1)
 
-        # 3. Stacked Widget for Mode-Specific Sliders
+      
         self.ts_slider_stack = QtWidgets.QStackedWidget()
         
-        # --- Wave Mode Page (Page 0) ---
+      
         wave_page = QtWidgets.QWidget()
         wave_layout = QtWidgets.QFormLayout(wave_page)
         wave_layout.setContentsMargins(0, 0, 0, 0)
@@ -2666,7 +2660,7 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         self.ts_slider_stack.addWidget(wave_page)
 
-        # --- Logit-Normal Mode Page (Page 1) ---
+      
         logit_page = QtWidgets.QWidget()
         logit_layout = QtWidgets.QFormLayout(logit_page)
         logit_layout.setContentsMargins(0, 0, 0, 0)
@@ -2679,7 +2673,7 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         self.ts_slider_stack.addWidget(logit_page)
 
-        # --- Beta Mode Page (Page 2) ---
+      
         beta_page = QtWidgets.QWidget()
         beta_layout = QtWidgets.QFormLayout(beta_page)
         beta_layout.setContentsMargins(0, 0, 0, 0)
@@ -2694,7 +2688,7 @@ class TrainingGUI(QtWidgets.QWidget):
         
         controls_layout.addWidget(self.ts_slider_stack)
 
-        # 4. Stacked Widget for Presets Buttons
+      
         self.ts_button_stack = QtWidgets.QStackedWidget()
         
         def create_preset_btn(text, callback):
@@ -2703,7 +2697,7 @@ class TrainingGUI(QtWidgets.QWidget):
             btn.setStyleSheet("padding: 4px; font-size: 11px;")
             return btn
 
-        # --- Wave Presets ---
+       
         wave_btn_page = QtWidgets.QWidget()
         wave_btn_layout = QtWidgets.QGridLayout(wave_btn_page)
         wave_btn_layout.setSpacing(8)
@@ -2713,7 +2707,7 @@ class TrainingGUI(QtWidgets.QWidget):
         wave_btn_layout.addWidget(create_preset_btn("Peak Middle", lambda: self._apply_timestep_preset("Peak Middle")), 0, 2)
         self.ts_button_stack.addWidget(wave_btn_page)
 
-        # --- Logit-Normal Presets ---
+     
         ln_btn_page = QtWidgets.QWidget()
         ln_btn_layout = QtWidgets.QGridLayout(ln_btn_page)
         ln_btn_layout.setSpacing(8)
@@ -2724,7 +2718,7 @@ class TrainingGUI(QtWidgets.QWidget):
         ln_btn_layout.addWidget(create_preset_btn("Logit-Normal (RF/SD3 Recommended)", lambda: self._apply_timestep_preset("Logit-Normal (RF/SD3 Recommended)")), 1, 0)
         self.ts_button_stack.addWidget(ln_btn_page)
 
-        # --- Beta Presets ---
+      
         beta_btn_page = QtWidgets.QWidget()
         beta_btn_layout = QtWidgets.QGridLayout(beta_btn_page)
         beta_btn_layout.setSpacing(8)
@@ -2738,10 +2732,10 @@ class TrainingGUI(QtWidgets.QWidget):
         controls_layout.addWidget(self.ts_button_stack)
         layout.addLayout(controls_layout)
 
-        # --- Signal Connections ---
+     
         self.bin_size_combo.currentTextChanged.connect(lambda txt: self.timestep_histogram.set_bin_size(int(txt)))
         
-        # Mode switching (Link both Slider Stack and Button Stack)
+    
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self._update_timestep_distribution)
@@ -2750,7 +2744,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _apply_timestep_preset(self, name):
         """Sets spinbox values to replicate a preset configuration. SpinBox changes trigger updates."""
-        # Block signals briefly? No, we want the signals to fire to update the slider and the graph.
+       
         
         if name == "Uniform":
             self.ts_mode_combo.setCurrentText("Wave")
@@ -2822,8 +2816,7 @@ class TrainingGUI(QtWidgets.QWidget):
             phase = self.spin_wave_phase.value()
             amp = self.spin_wave_amp.value()
             
-            # W(t) = 1 + A * cos(2*pi*f*t + p)
-            # t is normalized 0 to 1
+    
             for i in range(num_bins):
                 t = i / max(1, num_bins - 1)
                 val = 1.0 + amp * math.cos(2 * math.pi * freq * t + phase)
@@ -2840,7 +2833,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
             
             for i in range(num_bins):
-                # Calculate bin boundaries in normalized [0, 1] space
+           
                 t_start = i * bin_size
                 t_end = min((i + 1) * bin_size, 1000)
                 
@@ -2848,7 +2841,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 x_start = max(t_start / 1000.0, eps)
                 x_end = min(t_end / 1000.0, 1.0 - eps)
                 
-                # CDF(end) - CDF(start) = Probability mass in bin
+             
                 prob_start = normal_cdf((logit(x_start) - mu) / sigma)
                 prob_end = normal_cdf((logit(x_end) - mu) / sigma)
                 
@@ -2886,14 +2879,14 @@ class TrainingGUI(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(vae_group)
         layout.setSpacing(10)
         
-        # Inputs
+       
         form_layout = QtWidgets.QFormLayout()
         self._add_widget_to_form(form_layout, "VAE_LATENT_CHANNELS")
         self._add_widget_to_form(form_layout, "VAE_SHIFT_FACTOR")
         self._add_widget_to_form(form_layout, "VAE_SCALING_FACTOR")
         layout.addLayout(form_layout)
         
-        # Presets Buttons
+      
         presets_label = QtWidgets.QLabel("Presets:")
         presets_label.setStyleSheet("color: #ab97e6; font-weight: bold;")
         layout.addWidget(presets_label)
@@ -2911,7 +2904,7 @@ class TrainingGUI(QtWidgets.QWidget):
         btn_layout.addWidget(btn_eq)
         layout.addLayout(btn_layout)
         
-        # Auto Detect Button
+       
         separator = QtWidgets.QFrame()
         separator.setFrameShape(QtWidgets.QFrame.Shape.HLine)
         separator.setStyleSheet("border: 1px solid #4a4668; margin: 5px 0;")
@@ -2936,7 +2929,7 @@ class TrainingGUI(QtWidgets.QWidget):
         """
         Launches the external VAE detection script, passing the current config path.
         """
-        # --- GET CURRENT CONFIG PATH ---
+      
         index = self.config_dropdown.currentIndex()
         if index < 0:
             QtWidgets.QMessageBox.warning(self, "No Config Selected", "Please select a configuration from the dropdown first.")
@@ -2949,7 +2942,7 @@ class TrainingGUI(QtWidgets.QWidget):
             QtWidgets.QMessageBox.critical(self, "Config Not Found", f"The configuration file could not be found:\n{config_path}\n\nPlease save the configuration first.")
             return
 
-        # --- FIND THE SCRIPT ---
+       
         script_dir = os.path.dirname(os.path.abspath(__file__))
         possible_paths = [
             os.path.join(script_dir, "vae_diagnostics.py"),
@@ -2967,7 +2960,7 @@ class TrainingGUI(QtWidgets.QWidget):
             QtWidgets.QMessageBox.warning(self, "Tool Not Found", "Could not find 'vae_diagnostics.py'.")
             return
 
-        # --- LAUNCH THE SCRIPT WITH ARGUMENT ---
+  
         try:
             command = [sys.executable, target_script, "--config", os.path.abspath(config_path)]
             
@@ -3033,7 +3026,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _apply_config_to_widgets(self):
         for widget in self.widgets.values(): widget.blockSignals(True)
         try:
-            # ... (Standard Loading Logic) ...
+       
             mode = self.current_config.get("TRAINING_MODE", "Standard (SDXL)")
             self.training_mode_combo.setCurrentText(mode)
             self._on_training_mode_changed(mode) 
@@ -3042,7 +3035,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
                 self.toggle_resume_widgets(1 if is_resuming else 0)
             
-            # Exclude special keys handled manually
+          
             special_keys = [
                 "OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION", "TIMESTEP_MODE"
             ] + [k for k in self.widgets.keys() if k.startswith(("RAVEN_", "TITAN_", "VELORMS_", "SEMANTIC_LOSS_", "LOSS_HUBER_", "LOSS_ADAPTIVE_", "NOISE_OFFSET"))]
@@ -3057,13 +3050,13 @@ class TrainingGUI(QtWidgets.QWidget):
                 elif isinstance(widget, QtWidgets.QComboBox): widget.setCurrentText(str(value))
                 elif isinstance(widget, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): widget.setValue(float(value) if isinstance(widget, QtWidgets.QDoubleSpinBox) else int(value))
             
-            # --- OPTIMIZER LOADING ---
+      
             optimizer_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE).lower()
             index = self.widgets["OPTIMIZER_TYPE"].findData(optimizer_type)
             if index >= 0: self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(index)
             else: self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(0)
             
-            # Load RAVEN Params
+      
             r_params = {**default_config.RAVEN_PARAMS, **self.current_config.get("RAVEN_PARAMS", {})}
             self.widgets["RAVEN_betas"].setText(', '.join(map(str, r_params.get("betas", [0.9, 0.999]))))
             self.widgets["RAVEN_eps"].setText(str(r_params.get("eps", 1e-8)))
@@ -3073,7 +3066,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["RAVEN_gc_alpha"].setValue(r_params.get("gc_alpha", 1.0))
             self.widgets["RAVEN_gc_alpha"].setEnabled(r_params.get("use_grad_centralization", False))
 
-            # Load TITAN Params
+        
             t_defaults = getattr(default_config, "TITAN_PARAMS", default_config.RAVEN_PARAMS)
             t_params = {**t_defaults, **self.current_config.get("TITAN_PARAMS", {})}
             self.widgets["TITAN_betas"].setText(', '.join(map(str, t_params.get("betas", [0.9, 0.999]))))
@@ -3084,7 +3077,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["TITAN_gc_alpha"].setValue(t_params.get("gc_alpha", 1.0))
             self.widgets["TITAN_gc_alpha"].setEnabled(t_params.get("use_grad_centralization", False))
 
-            # Load VELORMS Params
+        
             v_defaults = getattr(default_config, "VELORMS_PARAMS", {"momentum": 0.86, "leak": 0.16, "weight_decay": 0.01, "eps": 1e-8})
             v_params = {**v_defaults, **self.current_config.get("VELORMS_PARAMS", {})}
             self.widgets["VELORMS_momentum"].setValue(v_params.get("momentum", 0.86))
@@ -3094,7 +3087,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
             self._toggle_optimizer_widgets()
             
-            # --- MANUAL TOGGLE UPDATES ---
+       
             noise_type = self.current_config.get("NOISE_TYPE", "Default")
             self.widgets["NOISE_TYPE"].setCurrentText(noise_type)
             self.widgets["NOISE_OFFSET"].setValue(self.current_config.get("NOISE_OFFSET", 0.0))
@@ -3103,11 +3096,11 @@ class TrainingGUI(QtWidgets.QWidget):
             loss_type = self.current_config.get("LOSS_TYPE", "MSE")
             self.widgets["LOSS_TYPE"].setCurrentText(loss_type)
             
-            # Semantic Params
+  
             self.widgets["SEMANTIC_CHAR_WEIGHT"].setValue(self.current_config.get("SEMANTIC_CHAR_WEIGHT", 0.5))
             self.widgets["SEMANTIC_DETAIL_WEIGHT"].setValue(self.current_config.get("SEMANTIC_DETAIL_WEIGHT", 0.8))
             
-            # Huber Params
+
             self.widgets["LOSS_HUBER_BETA"].setValue(self.current_config.get("LOSS_HUBER_BETA", 0.5))
             self.widgets["LOSS_ADAPTIVE_DAMPING"].setValue(self.current_config.get("LOSS_ADAPTIVE_DAMPING", 0.1))
             self._toggle_loss_widgets()
@@ -3131,19 +3124,19 @@ class TrainingGUI(QtWidgets.QWidget):
                         self.bin_size_combo.blockSignals(False)
                     self.timestep_histogram.set_allocation(allocation)
                 
-                # Load saved mode (default to Wave if missing)
+  
                 ts_mode = self.current_config.get("TIMESTEP_MODE", "Wave")
                 
-                # Temporarily disconnect the automatic distribution generation
+
                 self.ts_mode_combo.currentIndexChanged.disconnect(self._update_timestep_distribution)
                 
-                # Set the mode (this will still switch the slider/button stacks because those connections remain active)
+
                 self.ts_mode_combo.setCurrentText(ts_mode)
                 
-                # Re-connect the generation trigger
+
                 self.ts_mode_combo.currentIndexChanged.connect(self._update_timestep_distribution)
                 
-                # Reset sliders to their default values for the loaded mode (so we don't accidentally keep old tweaks)
+
                 self._reset_timestep_sliders()
             if ts_mode and hasattr(self, 'ts_mode_combo'):
                 self.ts_mode_combo.setCurrentText(ts_mode)
@@ -3387,7 +3380,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
     def _format_caption_for_display(self, text, max_chars=50):
         """Force wrap long strings by inserting manual line breaks"""
         import textwrap
-        # Break long words, preserve existing newlines
         wrapped = textwrap.fill(text, width=max_chars, 
                             break_long_words=True,
                             replace_whitespace=False,
