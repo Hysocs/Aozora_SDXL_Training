@@ -2151,14 +2151,14 @@ class TrainingGUI(QtWidgets.QWidget):
         r2.addWidget(right_col, 1)
         lay.addLayout(r2)
 
-        # Row 3: Optimizer | Loss | Miscellaneous  <-- MODIFIED
+
         r3 = QtWidgets.QHBoxLayout(); r3.setSpacing(20)
         r3.addWidget(self._build_optimizer_group(), 1)
         r3.addWidget(self._build_loss_group(), 1)
-        r3.addWidget(self._build_advanced_group(), 1) # <-- MOVED: Misc group added here
+        r3.addWidget(self._build_advanced_group(), 1)
         lay.addLayout(r3)
 
-        # Row 4: Advanced <-- REMOVED
+
         # The entire layout for Row 4 has been removed since its contents were moved to Row 3.
 
         # Wire up recalculation
