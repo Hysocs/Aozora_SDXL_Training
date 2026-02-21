@@ -39,7 +39,7 @@ from diffusers.models.attention_processor import (
         AttnProcessor2_0, 
         FusedAttnProcessor2_0
     )
-from tools.semantic import generate_semantic_map_batch_softmax
+from tools.semantic import generate_latent_semantic_map_batch
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
@@ -124,7 +124,7 @@ class TrainingConfig:
             if path.exists():
                 print(f"INFO: Loading configuration from {path}")
                 try:
-                    with open(path, 'r') as f:
+                    with open(path, 'r', encoding='utf-8') as f:
                         user_config = json.load(f)
                     for key, value in user_config.items():
                         setattr(self, key, value)
@@ -413,7 +413,8 @@ def validate_and_assign_resolution(args):
             if w <= 0 or h <= 0: return None
         cp = ip.with_suffix('.txt')
         if cp.exists():
-            with open(cp, 'r', encoding='utf-8') as f: caption = f.read().strip()
+            with open(cp, 'r', encoding='utf-8') as f: 
+                caption = f.read().strip()
             if not caption: return None
         else: caption = ip.stem.replace('_', ' ')
         return {"ip": ip, "caption": caption, "target_resolution": calculator.calculate_resolution(w, h), "original_size": (w, h)}
@@ -807,25 +808,26 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             
             semantic_maps = None
             if use_semantic_loss and original_images_for_semantic:
-                char_weight = getattr(config, "SEMANTIC_CHAR_WEIGHT", 1.0)
+                sep_weight = getattr(config, "SEMANTIC_SEP_WEIGHT", 1.0)
                 detail_weight = getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0)
+                entropy_weight = getattr(config, "SEMANTIC_ENTROPY_WEIGHT", 0.0)
                 
-                latent_w, latent_h = w // 8, h // 8
+                from tools.semantic import generate_latent_semantic_map_batch
                 
-                semantic_maps = generate_semantic_map_batch_softmax(
+                semantic_maps = generate_latent_semantic_map_batch(
+                    latents=latents_global,
                     images=original_images_for_semantic,
-                    char_weight=char_weight,
+                    sep_weight=sep_weight,
                     detail_weight=detail_weight,
-                    target_size=(latent_w, latent_h),
+                    entropy_weight=entropy_weight,
                     device="cpu",  
-                    dtype=torch.float32,
-                    num_channels=latents_global.shape[1]  
+                    dtype=torch.float32
                 )
                 semantic_maps = semantic_maps.cpu()
                 
                 if batch_idx == 0:
                     print(f"\nDEBUG: Semantic map shape: {semantic_maps.shape}")
-                    print(f"DEBUG: Semantic map range: [{semantic_maps.min():.4f}, {semantic_maps.max():.4f}]")
+                    print(f"DEBUG: Semantic map range:")
             
             for j, m in enumerate(valid_meta_final):
                 relative_path = m['ip'].relative_to(root)
@@ -1909,13 +1911,26 @@ def main():
                 pred = unet(noisy_latents, timesteps_conditioning, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
             loss_type = getattr(config, "LOSS_TYPE", "MSE")
+            
             if loss_type == "Semantic":
                 per_pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
                 semantic_maps = batch.get("semantic_map")
                 if semantic_maps is not None:
+                    # The semantic_maps tensor already contains char + detail + entropy combined!
                     loss = (per_pixel_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
                 else:
                     loss = per_pixel_loss.mean()
+                    
+            elif loss_type == "Huber_Adaptive":
+                huber_beta = getattr(config, "LOSS_HUBER_BETA", 0.5)
+                damping = getattr(config, "LOSS_ADAPTIVE_DAMPING", 0.1)
+                
+                # 1. Calculate base Huber Loss (smooth L1)
+                raw_loss = F.huber_loss(pred.float(), target.float(), delta=huber_beta, reduction="none")
+                
+                adaptive_weights = 1.0 / (raw_loss.detach().mean(dim=(1, 2, 3), keepdim=True) + damping)
+                loss = (raw_loss * adaptive_weights).mean()
+                
             else:
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 

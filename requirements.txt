@@ -20,6 +20,7 @@ psutil>=6.1.0
 scipy>=1.15.0
 pandas>=2.2.0
 matplotlib>=3.10.0
+scikit-image
 
 # SD-specific optimizations
 tomesd>=0.1.3

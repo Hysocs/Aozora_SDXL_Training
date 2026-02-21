@@ -32,7 +32,6 @@ TARGET_PIXEL_AREA = 1048576  # 1024*1024
 MAX_AREA_TOLERANCE = 1.1
 
 # --- Core Training Parameters ---
-NOISE_SCHEDULER = "DDPMScheduler"
 PREDICTION_TYPE = "v_prediction"
 BETA_SCHEDULE = "scaled_linear"
 MAX_TRAIN_STEPS = 10000
@@ -90,14 +89,11 @@ VELORMS_PARAMS = {
     "weight_decay": 0.01,
     "eps": 1e-8
 }
-# --- Noise Configuration ---
-NOISE_TYPE = "Default"
-NOISE_OFFSET = 0.05
-
 # --- Loss Configuration ---
 LOSS_TYPE = "Default"
-SEMANTIC_CHAR_WEIGHT = 1.0
+SEMANTIC_SEP_WEIGHT = 1.0
 SEMANTIC_DETAIL_WEIGHT = 1.0
+SEMANTIC_ENTROPY_WEIGHT = 0.0
 LOSS_HUBER_BETA = 0.5
 LOSS_ADAPTIVE_DAMPING= 0.1
 # --- Advanced & Miscellaneous ---
