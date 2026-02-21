@@ -2159,8 +2159,6 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addLayout(r3)
 
 
-        # The entire layout for Row 4 has been removed since its contents were moved to Row 3.
-
         # Wire up recalculation
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
