@@ -1754,7 +1754,7 @@ UI_DEFS = {
     "USE_ZERO_TERMINAL_SNR":       ("Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.", "check"),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "Structural_Flow", "Fourier_Flow"]),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic"]),
     "SEMANTIC_SEP_WEIGHT":         ("Separation Region Weight", "Weight for blob/color separation regions.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_DETAIL_WEIGHT":      ("Lineart/Detail Weight", "Weight for fine details, edges, and lineart.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_ENTROPY_WEIGHT":     ("Entropy/Texture Weight", "Weight for texture complexity. Requires scikit-image.", "dspin", 0.0, 2.0, 0.05, 2),
@@ -2268,7 +2268,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_loss_group(self):
         gb, lay = group_box("Loss Configuration")
         form = QtWidgets.QFormLayout()
-        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "Structural_Flow", "Fourier_Flow"])
+        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
         lay.addLayout(form)

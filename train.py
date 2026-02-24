@@ -1099,8 +1099,6 @@ class TimestepSampler:
         self.config = config
         self.device = device
         
-        # FIXED: Removed the multiplication by config.GRADIENT_ACCUMULATION_STEPS
-        # MAX_TRAIN_STEPS is already the total number of forward passes / micro steps.
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         
         self.seed = config.SEED if config.SEED else 42
@@ -1908,69 +1906,6 @@ def main():
                     loss = (base_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
                 else:
                     loss = base_loss.mean()
-
-            elif loss_type == "Structural_Flow":
-                # 1. Base Velocity Loss: Keeps the overall flow trajectory accurate
-                loss_v = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                
-                if config.is_rectified_flow:
-                    t_val = t_expanded.float()
-                    
-                    # 2. Derive the implied x0 (the "destination" image the model is aiming for)
-                    pred_x0 = noisy_latents.float() - t_val * pred.float()
-                    
-                    # True x0 is just your clean latents
-                    target_x0 = latents.float() 
-                    
-                    # 3. SPATIAL GRADIENT LOSS (The Anti-Melting Mechanism)
-                    # We calculate the difference between adjacent pixels horizontally (dx) and vertically (dy).
-                    # This isolates the EDGES and LINES in the latent space.
-                    pred_dx = pred_x0[:, :, :, 1:] - pred_x0[:, :, :, :-1]
-                    pred_dy = pred_x0[:, :, 1:, :] - pred_x0[:, :, :-1, :]
-                    
-                    targ_dx = target_x0[:, :, :, 1:] - target_x0[:, :, :, :-1]
-                    targ_dy = target_x0[:, :, 1:, :] - target_x0[:, :, :-1, :]
-                    
-                    # We use L1 loss (Absolute Error) for edges because L1 encourages sparse, 
-                    # perfectly sharp transitions, whereas L2 (MSE) encourages soft blurs.
-                    loss_edges = F.l1_loss(pred_dx, targ_dx) + F.l1_loss(pred_dy, targ_dy)
-                    
-                    # You can tune this weight. 0.1 to 0.2 is usually enough to stop melting.
-                    edge_weight = getattr(config, "FLOW_EDGE_WEIGHT", 0.75)
-                    
-                    # Optional: Add a subtle weight curve so it cares more about edges at low noise (t ~ 0)
-                    # edge_weight_t = edge_weight * (1.0 - t_val).mean() 
-                    
-                    loss = loss_v + (edge_weight * loss_edges)
-                else:
-                    loss = loss_v
-
-            elif loss_type == "Fourier_Flow":
-                loss_v = F.mse_loss(pred.float(), target.float(), reduction="mean")
-                
-                if config.is_rectified_flow:
-                    t_val = t_expanded.float()
-                    pred_x0 = noisy_latents.float() - t_val * pred.float()
-                    target_x0 = latents.float()
-                    
-                    pred_fft = torch.fft.rfft2(pred_x0.float())
-                    targ_fft = torch.fft.rfft2(target_x0.float())
-                    
-                    pred_amp = torch.abs(pred_fft)
-                    targ_amp = torch.abs(targ_fft)
-                    
-                    # Original amplitude loss - this is what gives clarity and haze removal, keep it
-                    loss_freq = F.l1_loss(pred_amp, targ_amp)
-                    
-                    # Thick lines have too much mid-frequency energy relative to high frequency.
-                    # Penalize pred having MORE amplitude than target at any frequency.
-                    # This is asymmetric - we only punish overshoot, not undershoot.
-                    # A thick line overshoots mid frequencies, a thin line does not.
-                    loss_thickness = F.relu(pred_amp - targ_amp).mean()
-                    
-                    loss = loss_v + (0.1 * loss_freq) + (0.1 * loss_thickness)
-                else:
-                    loss = loss_v
 
             else:  # Default MSE
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")

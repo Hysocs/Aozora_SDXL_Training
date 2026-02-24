@@ -68,7 +68,7 @@
         }
     ],
     "OPTIMIZER_TYPE": "raven",
-    "LOSS_TYPE": "Fourier_Flow",
+    "LOSS_TYPE": "Structural_Flow",
     "SEMANTIC_SEP_WEIGHT": 0.0,
     "SEMANTIC_DETAIL_WEIGHT": 0.0,
     "SEMANTIC_ENTROPY_WEIGHT": 2.0,
