@@ -551,10 +551,10 @@ def check_if_caching_needed(config):
 def load_unet_robust(path, compute_dtype, target_channels=4):
     print(f"INFO: Loading UNet from: {Path(path).name}")
     
-    
     load_kwargs = {
         "torch_dtype": compute_dtype,
-        "low_cpu_mem_usage": True,
+        # Set to False to prevent the "meta tensor" bug when reshaping channels
+        "low_cpu_mem_usage": False, 
     }
 
     if target_channels is not None and target_channels != 4:
@@ -574,59 +574,50 @@ def load_unet_robust(path, compute_dtype, target_channels=4):
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to load UNet with target_channels={target_channels}.")
         print(f"Error Details: {e}")
-        
         raise e
 
+
 def load_vae_robust(path, device, target_channels=None):
-    """
-    Safely loads a VAE. If target_channels is set in config, it forces that configuration.
-    Otherwise, it attempts auto-detection.
-    """
     print(f"INFO: Attempting to load VAE from: {path}")
     
-    
-    if target_channels is not None:
-        print(f"INFO: Config requests VAE with {target_channels} channels.")
+    # Auto-detect from file if no config override is provided
+    if target_channels is None:
         try:
+            from safetensors.torch import load_file
+            tensors = load_file(path, device="cpu")
+            for k in ["first_stage_model.quant_conv.weight", "quant_conv.weight"]:
+                if k in tensors:
+                    target_channels = tensors[k].shape[0] // 2
+                    break
+        except Exception:
+            pass
+            
+    target_channels = target_channels or 4
+    
+    try:
+        if target_channels != 4:
+            print(f"INFO: Loading VAE with {target_channels} channels...")
             vae = AutoencoderKL.from_single_file(
                 path, 
                 torch_dtype=torch.float32,
                 latent_channels=target_channels,
-                ignore_mismatched_sizes=True 
+                ignore_mismatched_sizes=True,
+                # Set to False to prevent the "meta tensor" bug when reshaping channels
+                low_cpu_mem_usage=False
             )
-            print(f"INFO: Successfully loaded VAE with {target_channels} channels (forced by config).")
-            return vae.to(device)
-        except Exception as e:
-            print(f"WARNING: Failed to force load VAE with {target_channels} channels: {e}")
-            print("INFO: Falling back to auto-detection...")
-
-    
-    try:
-        
-        vae = AutoencoderKL.from_single_file(path, torch_dtype=torch.float32)
-        print("INFO: Loaded standard SDXL VAE (4 channels).")
+        else:
+            vae = AutoencoderKL.from_single_file(
+                path, 
+                torch_dtype=torch.float32,
+                low_cpu_mem_usage=True
+            )
+            
+        print(f"INFO: Successfully loaded VAE with {target_channels} channels.")
+        return vae.to(device)
         
     except Exception as e:
-        
-        err_str = str(e)
-        if "conv_out.weight" in err_str and "but got torch.Size([64" in err_str:
-            print("INFO: Detected Flux/SDXL-Modified VAE (32 channels). Switching configuration...")
-            try:
-                
-                vae = AutoencoderKL.from_single_file(
-                    path, 
-                    torch_dtype=torch.float32,
-                    latent_channels=32,
-                    ignore_mismatched_sizes=True
-                )
-                print("INFO: Successfully loaded 32-channel VAE.")
-            except Exception as e2:
-                print(f"CRITICAL ERROR: Failed to load VAE with 32-channel config: {e2}")
-                raise e2
-        else:
-            raise e
-            
-    return vae.to(device)
+        print(f"CRITICAL ERROR: Failed to load VAE with {target_channels}-channel config: {e}")
+        raise e
 
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     if not check_if_caching_needed(config):
@@ -1108,19 +1099,17 @@ class TimestepSampler:
         self.config = config
         self.device = device
         
-
-        total_micro_steps = config.MAX_TRAIN_STEPS * config.GRADIENT_ACCUMULATION_STEPS
-        self.total_tickets_needed = total_micro_steps * config.BATCH_SIZE
+        # FIXED: Removed the multiplication by config.GRADIENT_ACCUMULATION_STEPS
+        # MAX_TRAIN_STEPS is already the total number of forward passes / micro steps.
+        self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         
         self.seed = config.SEED if config.SEED else 42
         
-
         self.is_rectified_flow = getattr(config, "is_rectified_flow", False)
         self.shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
         self.use_dynamic_shift = getattr(config, "RF_USE_DYNAMIC_SHIFT", False)
         self.base_pixels = getattr(config, "RF_BASE_PIXELS", 1048576)
         
-
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
@@ -1913,25 +1902,77 @@ def main():
             loss_type = getattr(config, "LOSS_TYPE", "MSE")
             
             if loss_type == "Semantic":
-                per_pixel_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+                base_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
                 semantic_maps = batch.get("semantic_map")
                 if semantic_maps is not None:
-                    # The semantic_maps tensor already contains char + detail + entropy combined!
-                    loss = (per_pixel_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
+                    loss = (base_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
                 else:
-                    loss = per_pixel_loss.mean()
+                    loss = base_loss.mean()
+
+            elif loss_type == "Structural_Flow":
+                # 1. Base Velocity Loss: Keeps the overall flow trajectory accurate
+                loss_v = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                
+                if config.is_rectified_flow:
+                    t_val = t_expanded.float()
                     
-            elif loss_type == "Huber_Adaptive":
-                huber_beta = getattr(config, "LOSS_HUBER_BETA", 0.5)
-                damping = getattr(config, "LOSS_ADAPTIVE_DAMPING", 0.1)
+                    # 2. Derive the implied x0 (the "destination" image the model is aiming for)
+                    pred_x0 = noisy_latents.float() - t_val * pred.float()
+                    
+                    # True x0 is just your clean latents
+                    target_x0 = latents.float() 
+                    
+                    # 3. SPATIAL GRADIENT LOSS (The Anti-Melting Mechanism)
+                    # We calculate the difference between adjacent pixels horizontally (dx) and vertically (dy).
+                    # This isolates the EDGES and LINES in the latent space.
+                    pred_dx = pred_x0[:, :, :, 1:] - pred_x0[:, :, :, :-1]
+                    pred_dy = pred_x0[:, :, 1:, :] - pred_x0[:, :, :-1, :]
+                    
+                    targ_dx = target_x0[:, :, :, 1:] - target_x0[:, :, :, :-1]
+                    targ_dy = target_x0[:, :, 1:, :] - target_x0[:, :, :-1, :]
+                    
+                    # We use L1 loss (Absolute Error) for edges because L1 encourages sparse, 
+                    # perfectly sharp transitions, whereas L2 (MSE) encourages soft blurs.
+                    loss_edges = F.l1_loss(pred_dx, targ_dx) + F.l1_loss(pred_dy, targ_dy)
+                    
+                    # You can tune this weight. 0.1 to 0.2 is usually enough to stop melting.
+                    edge_weight = getattr(config, "FLOW_EDGE_WEIGHT", 0.75)
+                    
+                    # Optional: Add a subtle weight curve so it cares more about edges at low noise (t ~ 0)
+                    # edge_weight_t = edge_weight * (1.0 - t_val).mean() 
+                    
+                    loss = loss_v + (edge_weight * loss_edges)
+                else:
+                    loss = loss_v
+
+            elif loss_type == "Fourier_Flow":
+                loss_v = F.mse_loss(pred.float(), target.float(), reduction="mean")
                 
-                # 1. Calculate base Huber Loss (smooth L1)
-                raw_loss = F.huber_loss(pred.float(), target.float(), delta=huber_beta, reduction="none")
-                
-                adaptive_weights = 1.0 / (raw_loss.detach().mean(dim=(1, 2, 3), keepdim=True) + damping)
-                loss = (raw_loss * adaptive_weights).mean()
-                
-            else:
+                if config.is_rectified_flow:
+                    t_val = t_expanded.float()
+                    pred_x0 = noisy_latents.float() - t_val * pred.float()
+                    target_x0 = latents.float()
+                    
+                    pred_fft = torch.fft.rfft2(pred_x0.float())
+                    targ_fft = torch.fft.rfft2(target_x0.float())
+                    
+                    pred_amp = torch.abs(pred_fft)
+                    targ_amp = torch.abs(targ_fft)
+                    
+                    # Original amplitude loss - this is what gives clarity and haze removal, keep it
+                    loss_freq = F.l1_loss(pred_amp, targ_amp)
+                    
+                    # Thick lines have too much mid-frequency energy relative to high frequency.
+                    # Penalize pred having MORE amplitude than target at any frequency.
+                    # This is asymmetric - we only punish overshoot, not undershoot.
+                    # A thick line overshoots mid frequencies, a thin line does not.
+                    loss_thickness = F.relu(pred_amp - targ_amp).mean()
+                    
+                    loss = loss_v + (0.1 * loss_freq) + (0.1 * loss_thickness)
+                else:
+                    loss = loss_v
+
+            else:  # Default MSE
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
             raw_loss_value = loss.detach().item()

@@ -1754,12 +1754,10 @@ UI_DEFS = {
     "USE_ZERO_TERMINAL_SNR":       ("Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.", "check"),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "Huber_Adaptive"]),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "Structural_Flow", "Fourier_Flow"]),
     "SEMANTIC_SEP_WEIGHT":         ("Separation Region Weight", "Weight for blob/color separation regions.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_DETAIL_WEIGHT":      ("Lineart/Detail Weight", "Weight for fine details, edges, and lineart.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_ENTROPY_WEIGHT":     ("Entropy/Texture Weight", "Weight for texture complexity. Requires scikit-image.", "dspin", 0.0, 2.0, 0.05, 2),
-    "LOSS_HUBER_BETA":             ("Huber Beta", "Threshold where quadratic loss turns linear (0.5 standard).", "dspin", 0.01, 1.0, 0.05, 2),
-    "LOSS_ADAPTIVE_DAMPING":       ("Adaptive Damping", "Controls sensitivity to magnitude.", "dspin", 0.001, 1.0, 0.01, 3),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
     "VAE_LATENT_CHANNELS":         ("Latent Channels", "4 for Standard/EQ, 32 for Flux/NoobAI.", "spin", 4, 128),
@@ -2270,7 +2268,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_loss_group(self):
         gb, lay = group_box("Loss Configuration")
         form = QtWidgets.QFormLayout()
-        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "Huber_Adaptive"])
+        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "Structural_Flow", "Fourier_Flow"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
         lay.addLayout(form)
@@ -2280,19 +2278,12 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in ["SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT"]:
             self._add_to_form(sl, key)
         lay.addWidget(self.semantic_loss_container)
-
-        self.huber_loss_container = QtWidgets.QWidget()
-        hl = QtWidgets.QFormLayout(self.huber_loss_container); hl.setContentsMargins(0, 0, 0, 0)
-        for key in ["LOSS_HUBER_BETA", "LOSS_ADAPTIVE_DAMPING"]:
-            self._add_to_form(hl, key)
-        lay.addWidget(self.huber_loss_container)
         lay.addStretch(1)
         return gb
 
     def _toggle_loss_widgets(self):
         lt = self.widgets["LOSS_TYPE"].currentText()
         self.semantic_loss_container.setVisible(lt == "Semantic")
-        self.huber_loss_container.setVisible(lt == "Huber_Adaptive")
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -2642,7 +2633,7 @@ class TrainingGUI(QtWidgets.QWidget):
             # Loss
             self.widgets["LOSS_TYPE"].setCurrentText(self.current_config.get("LOSS_TYPE", "MSE"))
             for key, default in [("SEMANTIC_SEP_WEIGHT", 0.5), ("SEMANTIC_DETAIL_WEIGHT", 0.8),
-                                  ("SEMANTIC_ENTROPY_WEIGHT", 0.8), ("LOSS_HUBER_BETA", 0.5), ("LOSS_ADAPTIVE_DAMPING", 0.1)]:
+                                  ("SEMANTIC_ENTROPY_WEIGHT", 0.8)]:
                 self.widgets[key].setValue(self.current_config.get(key, default))
             self._toggle_loss_widgets()
 
@@ -2680,8 +2671,7 @@ class TrainingGUI(QtWidgets.QWidget):
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
                      "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE",
-                     "SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT",
-                     "LOSS_HUBER_BETA", "LOSS_ADAPTIVE_DAMPING", "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
+                     "SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT", "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
 
         for key, val in self.current_config.items():
             if key in skip_keys: continue
@@ -2693,8 +2683,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
         cfg["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
-        for key in ["SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT",
-                    "LOSS_HUBER_BETA", "LOSS_ADAPTIVE_DAMPING"]:
+        for key in ["SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT"]:
             cfg[key] = self.widgets[key].value()
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()

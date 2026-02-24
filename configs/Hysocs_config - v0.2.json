@@ -13,9 +13,9 @@
     "MAX_AREA_TOLERANCE": "1.0",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "2000",
+    "MAX_TRAIN_STEPS": "9000",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "16",
+    "GRADIENT_ACCUMULATION_STEPS": "8",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "8.0",
     "SEED": 64,
@@ -28,11 +28,11 @@
         ],
         [
             0.07589286,
-            7e-05
+            5e-05
         ],
         [
             0.94196429,
-            7e-05
+            5e-05
         ],
         [
             1.0,
@@ -40,7 +40,7 @@
         ]
     ],
     "LR_GRAPH_MIN": "2e-07",
-    "LR_GRAPH_MAX": "7e-05",
+    "LR_GRAPH_MAX": "5e-05",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -54,48 +54,52 @@
     "RF_BASE_PIXELS": 1048576,
     "NOISE_SCHEDULER": "DDPMScheduler",
     "TRAINING_MODE": "Rectified Flow (SDXL)",
+    "LOSS_HUBER_BETA": 0.5,
+    "LOSS_ADAPTIVE_DAMPING": 0.1,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by quilm",
+            "path": "C:/Users/Administrator/Pictures/Scrapes/rnsfw",
+            "repeats": 1
+        },
+        {
+            "path": "C:/Users/Administrator/Pictures/Scrapes/umamusume",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
-    "LOSS_TYPE": "Semantic",
+    "LOSS_TYPE": "Fourier_Flow",
     "SEMANTIC_SEP_WEIGHT": 0.0,
     "SEMANTIC_DETAIL_WEIGHT": 0.0,
     "SEMANTIC_ENTROPY_WEIGHT": 2.0,
-    "LOSS_HUBER_BETA": 0.5,
-    "LOSS_ADAPTIVE_DAMPING": 0.1,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80,
-            80
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360,
+            360
         ]
     },
     "RAVEN_PARAMS": {

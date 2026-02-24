@@ -132,43 +132,78 @@ _entropy_import_ok = None
 
 def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weight, entropy_weight, device, dtype):
     """
-    Generates per-pixel loss weight maps from VAE latents.
-    All maps are at native latent resolution (H, W).
+    Computes semantic maps in PIXEL space, then downsamples to latent resolution.
+    This preserves fine detail that is lost when computing directly from latents.
     """
-    global _entropy_import_ok
-
     batch_maps = []
-    B, C, H, W = latents.shape
+    B, C, H, W = latents.shape  # latent dims
 
     for i in range(B):
-        latent_tensor = latents[i]
-        latent_np = latent_tensor.permute(1, 2, 0).float().cpu().numpy()  # HWC
+        pil_img = images[i]
+        if pil_img.mode != "RGB":
+            pil_img = pil_img.convert("RGB")
 
-        sep_map    = generate_latent_seperation_map(latent_np)
-        detail_map = generate_latent_detail_map(latent_np)
+        # Work at a higher intermediate resolution — 4x latent size
+        # This is still cheaper than full res but preserves far more signal
+        proc_w = W * 4
+        proc_h = H * 4
+        img_resized = pil_img.resize((proc_w, proc_h), Image.Resampling.LANCZOS)
+        img_np = np.array(img_resized).astype(np.float32) / 255.0
 
-        combined = (sep_map * sep_weight) + (detail_map * detail_weight)
+        combined = np.zeros((proc_h, proc_w), dtype=np.float32)
 
-        if entropy_weight > 0.0 and images is not None:
+        # Detail map: Sobel on luminance in pixel space
+        if detail_weight > 0.0:
+            gray = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float64)
+            sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
+            sy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
+            detail_map = np.sqrt(sx**2 + sy**2).astype(np.float32)
+            mx = detail_map.max()
+            if mx > 1e-6:
+                detail_map /= mx
+            detail_map = cv2.GaussianBlur(detail_map, (3, 3), 0)
+            combined += detail_map * detail_weight
+
+        # Separation map: colour variance / saturation as proxy for subject vs background
+        if sep_weight > 0.0:
+            # Use HSV saturation — subjects tend to have more saturated colours
+            # than plain backgrounds; works well for anime style
+            img_bgr = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
+            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
+            sat = hsv[:, :, 1] / 255.0
+            # Also add local variance as a texture signal
+            gray_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
+            local_var = cv2.blur(gray_f**2, (5, 5)) - cv2.blur(gray_f, (5, 5))**2
+            local_var = np.clip(local_var * 10.0, 0.0, 1.0)
+            sep_map = np.clip(sat * 0.6 + local_var * 0.4, 0.0, 1.0)
+            sep_map = cv2.GaussianBlur(sep_map, (5, 5), 0)
+            mx = sep_map.max()
+            if mx > 1e-6:
+                sep_map /= mx
+            combined += sep_map * sep_weight
+
+        # Entropy map: still valid in pixel space
+        if entropy_weight > 0.0:
             try:
-                # Pass exact latent dims — generate_entropy_map handles the resize
-                # and returns an array already at (H, W), no second resize needed
-                entropy_np = generate_entropy_map(images[i], target_w=W, target_h=H)
+                entropy_np = generate_entropy_map(pil_img, target_w=proc_w, target_h=proc_h)
                 combined += entropy_np * entropy_weight
-                _entropy_import_ok = True
-            except ImportError:
-                if _entropy_import_ok is not False:
-                    print("WARNING: entropy_weight > 0 but scikit-image is not installed. "
-                          "Entropy map skipped. Install with: pip install scikit-image")
-                _entropy_import_ok = False
             except Exception as e:
                 print(f"WARNING: entropy map failed: {e}")
 
+        # Normalize combined map
+        mx = combined.max()
+        if mx > 1e-6:
+            combined /= mx
         combined = np.clip(combined, 0.0, 10.0)
-        batch_maps.append(torch.from_numpy(combined).to(dtype))
+
+        # Downsample from pixel space to latent space using area averaging
+        # INTER_AREA is the correct interpolation for downsampling — it averages
+        # rather than sampling, preserving the weight distribution properly
+        combined_latent = cv2.resize(combined, (W, H), interpolation=cv2.INTER_AREA)
+
+        batch_maps.append(torch.from_numpy(combined_latent).to(dtype))
 
     final_map_batch = torch.stack(batch_maps).to(device)
-    # Expand across latent channels: (B, H, W) -> (B, C, H, W)
     final_map_batch = final_map_batch.unsqueeze(1).expand(-1, C, -1, -1)
 
     return final_map_batch
