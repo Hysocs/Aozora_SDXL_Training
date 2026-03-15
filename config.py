@@ -107,3 +107,4 @@ VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
 RF_SHIFT_FACTOR = 2.5  # Shift strength for applicable modes
 RF_USE_DYNAMIC_SHIFT = True  # bool
 RF_BASE_PIXELS = 1048576  # 1024*1024 = 1048576
+TEXT_ENCODER_MAX_CHUNKS = 3

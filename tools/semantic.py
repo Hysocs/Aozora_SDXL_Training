@@ -11,7 +11,7 @@ import cv2
 import numpy as np
 import torch
 from PIL import Image
-
+import torch.nn.functional as F
 
 def generate_latent_seperation_map(latent_np: np.ndarray) -> np.ndarray:
     """Derives saliency by measuring per-pixel deviation from the mean across latent channels."""
@@ -131,28 +131,21 @@ _entropy_import_ok = None
 
 
 def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weight, entropy_weight, device, dtype):
-    """
-    Computes semantic maps in PIXEL space, then downsamples to latent resolution.
-    This preserves fine detail that is lost when computing directly from latents.
-    """
     batch_maps = []
-    B, C, H, W = latents.shape  # latent dims
+    B, C, H, W = latents.shape  # latent dims — this is our target size
 
     for i in range(B):
         pil_img = images[i]
         if pil_img.mode != "RGB":
             pil_img = pil_img.convert("RGB")
 
-        # Work at a higher intermediate resolution — 4x latent size
-        # This is still cheaper than full res but preserves far more signal
-        proc_w = W * 4
-        proc_h = H * 4
-        img_resized = pil_img.resize((proc_w, proc_h), Image.Resampling.LANCZOS)
-        img_np = np.array(img_resized).astype(np.float32) / 255.0
+        # Compute at full native resolution — no downscale before processing
+        # This preserves thin lines that would vanish at latent resolution
+        img_np = np.array(pil_img).astype(np.float32) / 255.0
+        proc_h, proc_w = img_np.shape[:2]
 
         combined = np.zeros((proc_h, proc_w), dtype=np.float32)
 
-        # Detail map: Sobel on luminance in pixel space
         if detail_weight > 0.0:
             gray = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float64)
             sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
@@ -164,14 +157,10 @@ def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weigh
             detail_map = cv2.GaussianBlur(detail_map, (3, 3), 0)
             combined += detail_map * detail_weight
 
-        # Separation map: colour variance / saturation as proxy for subject vs background
         if sep_weight > 0.0:
-            # Use HSV saturation — subjects tend to have more saturated colours
-            # than plain backgrounds; works well for anime style
             img_bgr = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
             hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
             sat = hsv[:, :, 1] / 255.0
-            # Also add local variance as a texture signal
             gray_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
             local_var = cv2.blur(gray_f**2, (5, 5)) - cv2.blur(gray_f, (5, 5))**2
             local_var = np.clip(local_var * 10.0, 0.0, 1.0)
@@ -182,7 +171,6 @@ def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weigh
                 sep_map /= mx
             combined += sep_map * sep_weight
 
-        # Entropy map: still valid in pixel space
         if entropy_weight > 0.0:
             try:
                 entropy_np = generate_entropy_map(pil_img, target_w=proc_w, target_h=proc_h)
@@ -190,18 +178,35 @@ def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weigh
             except Exception as e:
                 print(f"WARNING: entropy map failed: {e}")
 
-        # Normalize combined map
         mx = combined.max()
         if mx > 1e-6:
             combined /= mx
-        combined = np.clip(combined, 0.0, 10.0)
+        combined = np.clip(combined, 0.0, 1.0)
 
-        # Downsample from pixel space to latent space using area averaging
-        # INTER_AREA is the correct interpolation for downsampling — it averages
-        # rather than sampling, preserving the weight distribution properly
-        combined_latent = cv2.resize(combined, (W, H), interpolation=cv2.INTER_AREA)
+        # Downsample using max pooling via torch to preserve thin feature signal
+        # A 1px line at full res must survive as a nonzero weight at latent res
+        # Area averaging would dilute it to near zero — max pooling keeps it alive
+        combined_tensor = torch.from_numpy(combined).unsqueeze(0).unsqueeze(0)  # 1,1,H,W
+        
+        # Calculate the exact kernel size needed to go from image res to latent res
+        scale_h = proc_h / H
+        scale_w = proc_w / W
+        kernel_h = int(np.ceil(scale_h))
+        kernel_w = int(np.ceil(scale_w))
+        
+        # Max pool preserves any nonzero signal within each latent cell
+        combined_latent = F.max_pool2d(
+            combined_tensor,
+            kernel_size=(kernel_h, kernel_w),
+            stride=(kernel_h, kernel_w),
+            padding=0
+        )
+        
+        # Crop to exact latent size in case of rounding
+        combined_latent = combined_latent[:, :, :H, :W]
+        combined_latent = combined_latent.squeeze(0).squeeze(0)
 
-        batch_maps.append(torch.from_numpy(combined_latent).to(dtype))
+        batch_maps.append(combined_latent.to(dtype))
 
     final_map_batch = torch.stack(batch_maps).to(device)
     final_map_batch = final_map_batch.unsqueeze(1).expand(-1, C, -1, -1)

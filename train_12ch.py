@@ -30,7 +30,6 @@ from multiprocessing import Pool, cpu_count
 import config as default_config
 import threading
 import queue
-import tomesd
 from optimizer.raven import RavenAdamW
 from optimizer.titan import TitanAdamW
 from optimizer.velorms import VeloRMS
@@ -40,6 +39,7 @@ from diffusers.models.attention_processor import (
         FusedAttnProcessor2_0
     )
 from tools.semantic import generate_latent_semantic_map_batch
+
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
@@ -70,7 +70,6 @@ def set_attention_processor(unet, attention_mode="flash_attn"):
             print("WARNING: CuDNN SDPA requires PyTorch 2.5+, falling back to standard SDPA")
             unet.set_attn_processor(AttnProcessor2_0())
             
-            
     elif attention_mode == "xformers (Only if no Flash)":
         unet.enable_xformers_memory_efficient_attention()
         print("INFO: Using xFormers")
@@ -99,10 +98,8 @@ def fix_alpha_channel(img):
 
 def generate_train_noise(latents, config, step, seed):
     g = torch.Generator(device=latents.device)
-
     step_seed = (seed + step) % (2**32 - 1)
     g.manual_seed(step_seed)
-    
     return torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=g)
 
 class TrainingConfig:
@@ -114,6 +111,7 @@ class TrainingConfig:
         self._type_check_and_correct()
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
         self.is_rectified_flow = getattr(self, "TRAINING_MODE", "Standard (SDXL)") == "Rectified Flow (SDXL)"
+        self.REF_MODE = getattr(self, "REF_MODE", "Full") # "Full"
 
     def _load_from_user_config(self):
         parser = argparse.ArgumentParser(description="Load a specific training configuration.")
@@ -138,12 +136,12 @@ class TrainingConfig:
     def _type_check_and_correct(self):
         print("INFO: Checking and correcting configuration types...")
         for key, value in list(self.__dict__.items()):
-            if key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"] and getattr(self, "RESUME_TRAINING", False):
+            if key in["RESUME_MODEL_PATH", "RESUME_STATE_PATH"] and getattr(self, "RESUME_TRAINING", False):
                 if not value or not Path(value).exists():
                     raise FileNotFoundError(f"RESUME_TRAINING is enabled, but {key}='{value}' is not a valid file path.")
             if key == "UNET_EXCLUDE_TARGETS":
                 if isinstance(value, str):
-                    setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
+                    setattr(self, key,[item.strip() for item in value.split(',') if item.strip()])
                 elif isinstance(value, list):
                     setattr(self, key, [item for item in value if item])
                 continue
@@ -173,7 +171,7 @@ class CustomCurveLRScheduler:
         if not self.curve_points:
             raise ValueError("LR_CUSTOM_CURVE cannot be empty")
         if self.curve_points[0][0] != 0.0:
-            self.curve_points.insert(0, [0.0, self.curve_points[0][1]])
+            self.curve_points.insert(0,[0.0, self.curve_points[0][1]])
         if self.curve_points[-1][0] != 1.0:
             self.curve_points.append([1.0, self.curve_points[-1][1]])
         self._update_lr()
@@ -194,7 +192,8 @@ class CustomCurveLRScheduler:
         normalized_position = self.current_micro_step / max(self.total_micro_steps - 1, 1)
         lr = self._interpolate_lr(normalized_position)
         for param_group in self.optimizer.param_groups:
-            param_group['lr'] = lr
+            scale = param_group.get('lr_scale', 1.0)
+            param_group['lr'] = lr * scale
 
     def step(self, micro_step):
         self.current_micro_step = micro_step
@@ -246,9 +245,9 @@ class AsyncReporter:
         eta_str = self._format_time(timing_data.get('eta'))
         loss_val = timing_data.get('loss', 0.0)
         timestep_val = timing_data.get('timestep', 'N/A')
-        progress_bar = f'Training |{bar}| {current_step + 1}/{self.total_steps} [{percentage:.2%}]'
-        step_info = f" [Loss: {loss_val:.4f}, Timestep: {timestep_val}]"
-        timing_info = f" [{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]"
+        progress_bar = f'Training |{bar}| {current_step + 1}/{self.total_steps}[{percentage:.2%}]'
+        step_info = f"[Loss: {loss_val:.4f}, Timestep: {timestep_val}]"
+        timing_info = f"[{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]"
         return progress_bar + step_info + timing_info
 
     def _worker(self):
@@ -259,7 +258,12 @@ class AsyncReporter:
                 elif task_type == 'anomaly': self._handle_anomaly(**data)
                 self.task_queue.task_done()
             except queue.Empty: continue
-
+            
+    def _format_metric(self, value, threshold=100.0):
+        if abs(value) > threshold:
+            return f"[HIGH]"
+        return f"{value:.4f}"
+    
     def _handle_log_step(self, global_step, timing_data, diag_data):
         progress_str = self._generate_progress_string(global_step, timing_data)
         print(progress_str, end='\r')
@@ -268,10 +272,11 @@ class AsyncReporter:
             update_status = "[OK]" if diag_data['update_delta'] > 1e-12 else "[NO UPDATE!]"
             vram_reserved_gb = torch.cuda.memory_reserved() / 1e9
             vram_allocated_gb = torch.cuda.memory_allocated() / 1e9
+            
             report_str = (
                 f"--- Optimizer Step: {diag_data['optim_step']:<5} | Loss: {diag_data['avg_loss']:<8.5f} | LR: {diag_data['current_lr']:.2e} ---\n"
                 f"  Time: {diag_data['optim_step_time']:.2f}s/step | Avg Speed: {diag_data['avg_optim_step_time']:.2f}s/step\n"
-                f"  Grad Norm (Raw/Clipped): {diag_data['raw_grad_norm']:<8.4f} / {diag_data['clipped_grad_norm']:<8.4f}\n"
+                f"  Grad Norm (Raw/Clipped): {self._format_metric(diag_data['raw_grad_norm'])} / {self._format_metric(diag_data['clipped_grad_norm'])}\n"
                 f"  VRAM: Training={vram_reserved_gb:.2f}GB | Model={vram_allocated_gb:.2f}GB\n"
                 f"  Test Param: {self.test_param_name}\n"
                 f"  |- Update Magnitude : {diag_data['update_delta']:.4e} {update_status}"
@@ -334,7 +339,7 @@ class BucketBatchSampler(Sampler):
             for idx in indices:
                 key = self.dataset.bucket_keys[idx]
                 buckets[key].append(idx)
-            batches = []
+            batches =[]
             for key in buckets:
                 bucket_indices = buckets[key]
                 for i in range(0, len(bucket_indices), self.batch_size):
@@ -342,7 +347,7 @@ class BucketBatchSampler(Sampler):
                     batches.append(batch)
             if self.shuffle:
                 batch_indices = torch.randperm(len(batches), generator=g).tolist()
-                batches = [batches[i] for i in batch_indices]
+                batches =[batches[i] for i in batch_indices]
         self.epoch += 1
         yield from batches
 
@@ -351,77 +356,46 @@ class BucketBatchSampler(Sampler):
     
 class ResolutionCalculator:
     def __init__(self, target_area, stride=64, should_upscale=True, max_area_tolerance=1.0):
-        """
-        target_area: Target pixel budget (e.g., 1048576 for 1024x1024)
-        stride: VAE requires multiples of this (usually 64)
-        should_upscale: If False, small images stay small (not recommended for quality)
-        max_area_tolerance: Not used - we always stay UNDER target_area
-        """
         self.target_area = target_area
         self.stride = stride
         self.should_upscale = should_upscale
 
     def calculate_resolution(self, width, height):
-        """
-        Scale image to get as close to target_area as possible WITHOUT exceeding it.
-        Always preserves aspect ratio. Never crops. Never goes over budget.
-        """
         current_area = width * height
-        
-        # If we're already at or under target and not upscaling, just quantize to stride
         if not self.should_upscale and current_area <= self.target_area:
             return self._quantize_to_stride(width, height)
-        
-        # Calculate scale to hit target_area exactly
         exact_scale = math.sqrt(self.target_area / current_area)
-        
-        # Apply scale
         scaled_w = width * exact_scale
         scaled_h = height * exact_scale
-        
-        # Quantize to stride (this may put us slightly under target, which is fine)
         final_w, final_h = self._quantize_to_stride(scaled_w, scaled_h)
-        
-        # Verify we're not over budget (safety check)
         final_area = final_w * final_h
         if final_area > self.target_area:
-            # We went slightly over due to stride rounding, scale down a bit more
-            adjustment = math.sqrt(self.target_area / final_area) * 0.999  # Small safety margin
+            adjustment = math.sqrt(self.target_area / final_area) * 0.999 
             final_w, final_h = self._quantize_to_stride(scaled_w * adjustment, scaled_h * adjustment)
-        
         return final_w, final_h
     
+    def _quantize_to_stride(self, w, h):
+        return int(round(w / self.stride) * self.stride), int(round(h / self.stride) * self.stride)
+
 def smart_resize(image, target_w, target_h):
-    """
-    Pure resize to exact target dimensions. No cropping. No padding.
-    Aspect ratio of target_w/target_h should already match source from calculate_resolution.
-    """
-    # Just resize directly - aspect ratio is preserved by calculate_resolution
     return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
 
 def validate_and_assign_resolution(args):
-    ip, target_area, stride, should_upscale = args  # Unpack primitives instead of class
-    
+    ip, target_area, stride, should_upscale = args 
     try:
         with Image.open(ip) as img: 
             img.verify()
-        
         with Image.open(ip) as img:
             img.load()
             w, h = img.size
             if w <= 0 or h <= 0: 
                 return None
-        
-        # Inline the resolution calculation logic
         current_area = w * h
-        
         if not should_upscale and current_area < target_area:
-            # Keep original size, just quantize to stride
             target_w = int(w // stride) * stride
             target_h = int(h // stride) * stride
             target_w, target_h = max(target_w, stride), max(target_h, stride)
         else:
-            # Scale to target area while preserving aspect ratio
             scale = math.sqrt(target_area / current_area)
             scaled_w = w * scale
             scaled_h = h * scale
@@ -429,7 +403,6 @@ def validate_and_assign_resolution(args):
             target_h = int(round(scaled_h / stride) * stride)
             target_w, target_h = max(target_w, stride), max(target_h, stride)
         
-        # Get caption
         cp = ip.with_suffix('.txt')
         if cp.exists():
             with open(cp, 'r', encoding='utf-8', errors='ignore') as f: 
@@ -447,83 +420,49 @@ def validate_and_assign_resolution(args):
             "original_area": w * h,
             "target_area": target_w * target_h
         }
-        
     except Exception as e:
         print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
         import traceback
         traceback.print_exc()
         return None
 
-
-def validate_all_images_sequential(image_paths, calculator):
-    """Fallback sequential processing with detailed error reporting"""
-    print(f"[FALLBACK] Running sequential validation for {len(image_paths)} images...")
-    results = []
-    for i, p in enumerate(image_paths):
-        if i % 10 == 0:
-            print(f"[FALLBACK] Processing {i}/{len(image_paths)}...")
-        result = validate_and_assign_resolution((p, calculator))
-        results.append(result)
-    return results
-
 def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
-    """
-    Standard SDXL text embedding computation.
-    Returns properly sized embeddings for SDXL UNet.
-    """
-    prompt_embeds_list = []
-    pooled_prompt_embeds_list = []
+    prompt_embeds_list =[]
+    pooled_prompt_embeds_list =[]
     
     for caption in captions:
         with torch.no_grad():
-            # Tokenize with proper truncation/padding to 77 tokens
             tokens_1 = t1(
-                caption,
-                padding="max_length",
-                max_length=t1.model_max_length,
-                truncation=True,
-                return_tensors="pt"
+                caption, padding="max_length", max_length=t1.model_max_length,
+                truncation=True, return_tensors="pt"
             ).input_ids.to(device)
             
             tokens_2 = t2(
-                caption,
-                padding="max_length",
-                max_length=t2.model_max_length,
-                truncation=True,
-                return_tensors="pt"
+                caption, padding="max_length", max_length=t2.model_max_length,
+                truncation=True, return_tensors="pt"
             ).input_ids.to(device)
             
-            # Get embeddings from text encoders
-            # Use penultimate layer for CLIP ViT-L
             enc_1_output = te1(tokens_1, output_hidden_states=True)
-            prompt_embeds_1 = enc_1_output.hidden_states[-2]  # [1, 77, 768]
+            prompt_embeds_1 = enc_1_output.hidden_states[-2]  
             
-            # Use penultimate layer for OpenCLIP ViT-G  
             enc_2_output = te2(tokens_2, output_hidden_states=True)
-            prompt_embeds_2 = enc_2_output.hidden_states[-2]  # [1, 77, 1280]
+            prompt_embeds_2 = enc_2_output.hidden_states[-2]  
             
-            # Concatenate along feature dimension
-            prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)  # [1, 77, 2048]
-            
-            # Pooled embeddings from second encoder (for time embeddings)
-            pooled_prompt_embeds = enc_2_output[0]  # [1, 1280]
+            prompt_embeds = torch.cat([prompt_embeds_1, prompt_embeds_2], dim=-1)  
+            pooled_prompt_embeds = enc_2_output[0]  
             
             prompt_embeds_list.append(prompt_embeds)
             pooled_prompt_embeds_list.append(pooled_prompt_embeds)
     
-    
-    prompt_embeds = torch.cat(prompt_embeds_list, dim=0)  # [B, 77, 2048]
-    pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=0)  # [B, 1280]
-    
+    prompt_embeds = torch.cat(prompt_embeds_list, dim=0)  
+    pooled_prompt_embeds = torch.cat(pooled_prompt_embeds_list, dim=0)  
     return prompt_embeds, pooled_prompt_embeds
 
 def check_if_caching_needed(config):
     needs_caching = False
-    
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     semantic_cache_folder_name = ".semantic_maps_cache"
     use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
-    
     
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
         if config.INSTANCE_DATASETS:
@@ -534,131 +473,106 @@ def check_if_caching_needed(config):
 
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
-        
         if not root.exists():
             print(f"WARNING: Dataset path {root} does not exist, skipping.")
             continue
             
-        image_paths = [
-            p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
-            for p in root.rglob(f"*{ext}")
-        ]
-        
+        image_paths = [p for ext in['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
         if not image_paths:
             print(f"INFO: No images found in {root}, skipping.")
             continue
             
         cache_dir = root / cache_folder_name
-        
         if not cache_dir.exists():
             print(f"INFO: Cache directory doesn't exist for {root}, caching needed.")
             needs_caching = True
             continue
         
-        
         if use_semantic_loss:
             semantic_cache_dir = root / semantic_cache_folder_name
-            
             if not semantic_cache_dir.exists():
                 print(f"INFO: Semantic cache directory doesn't exist for {root}, caching needed.")
                 needs_caching = True
                 continue
         
         cached_te_files = list(cache_dir.glob("*_te.pt"))
-        
         if len(cached_te_files) < len(image_paths):
             print(f"INFO: Found {len(image_paths)} images but only {len(cached_te_files)} cached files in {root}")
             needs_caching = True
         else:
-            
             if use_semantic_loss:
                 semantic_cache_dir = root / semantic_cache_folder_name
                 missing_semantic = 0
-                
                 for te_file in cached_te_files:
                     safe_name = te_file.stem.replace('_te', '')
                     sem_path = semantic_cache_dir / f"{safe_name}_sem.pt"
-                    
-                    if not sem_path.exists():
-                        missing_semantic += 1
+                    if not sem_path.exists(): missing_semantic += 1
                 
                 if missing_semantic > 0:
                     print(f"INFO: {missing_semantic} semantic maps missing in {root}")
                     needs_caching = True
-                else:
-                    print(f"INFO: All {len(image_paths)} images and semantic maps cached in {root}")
+                else: print(f"INFO: All {len(image_paths)} images and semantic maps cached in {root}")
             else:
                 print(f"INFO: All {len(image_paths)} images appear to be cached in {root}")
             
     return needs_caching
 
-def load_unet_robust(path, compute_dtype, target_channels=4):
+def load_unet_robust(path, compute_dtype):
     print(f"INFO: Loading UNet from: {Path(path).name}")
-    
+    try:
+        from safetensors.torch import load_file
+        sd = load_file(str(path), device="cpu")
+        detected_channels = None
+        for k in["conv_in.weight", "model.diffusion_model.input_blocks.0.0.weight"]:
+            if k in sd:
+                detected_channels = sd[k].shape[1]
+                break
+        del sd
+        if detected_channels is None: detected_channels = 4
+    except Exception:
+        detected_channels = 4
+
+    print(f"INFO: Detected UNet input channels: {detected_channels}")
+
     load_kwargs = {
         "torch_dtype": compute_dtype,
-        # Set to False to prevent the "meta tensor" bug when reshaping channels
-        "low_cpu_mem_usage": False, 
+        "low_cpu_mem_usage": False,
     }
 
-    if target_channels is not None and target_channels != 4:
-        print(f"INFO: Config requests {target_channels} channels. Forcing UNet input/output dimensions...")
-        load_kwargs["in_channels"] = target_channels
-        load_kwargs["out_channels"] = target_channels
+    if detected_channels != 4:
+        load_kwargs["in_channels"] = detected_channels
         load_kwargs["ignore_mismatched_sizes"] = True
 
-    try:
-        unet = UNet2DConditionModel.from_single_file(path, **load_kwargs)
-        
-        print(f"INFO: Loaded UNet (Channels: In={unet.config.in_channels} / Out={unet.config.out_channels})")
-        print(f"INFO: UNet attention implementation: {unet.config.attention_type if hasattr(unet.config, 'attention_type') else 'flash_attention_2'}")
-        
-        return unet
-
-    except Exception as e:
-        print(f"CRITICAL ERROR: Failed to load UNet with target_channels={target_channels}.")
-        print(f"Error Details: {e}")
-        raise e
-
+    unet = UNet2DConditionModel.from_single_file(str(path), **load_kwargs)
+    print(f"INFO: Loaded UNet (in_channels={unet.config.in_channels})")
+    return unet
 
 def load_vae_robust(path, device, target_channels=None):
     print(f"INFO: Attempting to load VAE from: {path}")
-    
-    # Auto-detect from file if no config override is provided
     if target_channels is None:
         try:
             from safetensors.torch import load_file
             tensors = load_file(path, device="cpu")
-            for k in ["first_stage_model.quant_conv.weight", "quant_conv.weight"]:
+            for k in["first_stage_model.quant_conv.weight", "quant_conv.weight"]:
                 if k in tensors:
                     target_channels = tensors[k].shape[0] // 2
                     break
-        except Exception:
-            pass
+        except Exception: pass
             
     target_channels = target_channels or 4
-    
     try:
         if target_channels != 4:
             print(f"INFO: Loading VAE with {target_channels} channels...")
             vae = AutoencoderKL.from_single_file(
-                path, 
-                torch_dtype=torch.float32,
-                latent_channels=target_channels,
-                ignore_mismatched_sizes=True,
-                # Set to False to prevent the "meta tensor" bug when reshaping channels
-                low_cpu_mem_usage=False
+                path, torch_dtype=torch.float32, latent_channels=target_channels,
+                ignore_mismatched_sizes=True, low_cpu_mem_usage=False
             )
         else:
             vae = AutoencoderKL.from_single_file(
-                path, 
-                torch_dtype=torch.float32,
-                low_cpu_mem_usage=True
+                path, torch_dtype=torch.float32, low_cpu_mem_usage=True
             )
-            
         print(f"INFO: Successfully loaded VAE with {target_channels} channels.")
         return vae.to(device)
-        
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to load VAE with {target_channels}-channel config: {e}")
         raise e
@@ -671,36 +585,25 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         return
     
     cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-    
-   
     use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
     semantic_cache_folder_name = ".semantic_maps_cache"
     
     print("\n" + "="*60)
     print(f"STARTING VRAM-OPTIMIZED CACHING FOR: {config.TRAINING_MODE}")
     print(f"Using cache folder: {cache_folder_name}")
-    if use_semantic_loss:
-        print(f"Semantic maps will be cached to: {semantic_cache_folder_name}")
+    if use_semantic_loss: print(f"Semantic maps will be cached to: {semantic_cache_folder_name}")
     print(f"VAE Channels: {vae.config.latent_channels}")
     print("="*60 + "\n")
-    
-    calc = ResolutionCalculator(
-        config.TARGET_PIXEL_AREA, 
-        stride=64, 
-        should_upscale=config.SHOULD_UPSCALE
-    )
     
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
     vae.enable_slicing()
-    
     te1.to(device)
     te2.to(device)
     
     print("INFO: Computing Null Embeddings for Unconditional Dropout...")
     with torch.no_grad():
         null_embeds, null_pooled = compute_text_embeddings_sdxl([""], t1, t2, te1, te2, device)
-    
     null_embeds = null_embeds.cpu()
     null_pooled = null_pooled.cpu()
     
@@ -714,19 +617,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
         
-        
         semantic_cache_dir = root / semantic_cache_folder_name if use_semantic_loss else None
-        if use_semantic_loss:
-            semantic_cache_dir.mkdir(exist_ok=True)
+        if use_semantic_loss: semantic_cache_dir.mkdir(exist_ok=True)
         
         torch.save({"embeds": null_embeds, "pooled": null_pooled}, cache_dir / "null_embeds.pt")
         
-        paths = [
-            p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] 
-            for p in root.rglob(f"*{ext}")
-        ]
+        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
         
-        to_process = []
+        to_process =[]
         for p in paths:
             relative_path = p.relative_to(root)
             safe_stem = str(relative_path.with_suffix('')).replace(os.sep, '_').replace('/', '_').replace('\\', '_')
@@ -742,158 +640,33 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             print(f"INFO: All images in {root.name} are already cached (including semantic maps).")
             continue
             
-        
         print(f"INFO: Validating and Bucketing {len(to_process)} images from {root.name}...")
-        
 
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
-                pool.imap(
-                    validate_and_assign_resolution, 
-                    [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process]
-                ), 
+                pool.imap(validate_and_assign_resolution,[(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process]), 
                 total=len(to_process)
             ))
         metadata = [r for r in results if r]
         
-        # --- ENHANCED DEBUG LOGGING START ---
-        print(f"\n{'='*70}")
-        print(f"RESOLUTION ANALYSIS FOR: {root.name}")
-        print(f"Target Pixel Budget: {config.TARGET_PIXEL_AREA:,} px (~{math.sqrt(config.TARGET_PIXEL_AREA):.0f}^2)")
-        print(f"{'='*70}")
-        
-        # Group by resolution and calculate stats
         grouped = defaultdict(list)
-        aspect_ratios = defaultdict(int)
-        area_distribution = {"under_50%": 0, "50_75%": 0, "75_95%": 0, "95_100%": 0, "over_budget": 0}
+        for m in metadata: grouped[m["target_resolution"]].append(m)
         
-        for m in metadata:
-            grouped[m["target_resolution"]].append(m)
-            
-            # Track aspect ratios
-            orig_w, orig_h = m["original_size"]
-            ar = orig_w / orig_h
-            ar_bucket = f"{ar:.2f}" if 0.8 < ar < 1.25 else ("landscape" if ar > 1 else "portrait")
-            aspect_ratios[ar_bucket] += 1
-            
-            # Track area utilization
-            util = m["target_area"] / config.TARGET_PIXEL_AREA
-            if m["target_area"] > config.TARGET_PIXEL_AREA:
-                area_distribution["over_budget"] += 1
-            elif util < 0.5:
-                area_distribution["under_50%"] += 1
-            elif util < 0.75:
-                area_distribution["50_75%"] += 1
-            elif util < 0.95:
-                area_distribution["75_95%"] += 1
-            else:
-                area_distribution["95_100%"] += 1
-        
-        # Print resolution table
-        print(f"\n{'Resolution':<15} | {'Count':<6} | {'Area':<12} | {'% of Budget':<12} | {'Status'}")
-        print("-" * 70)
-        
-        total_images = len(metadata)
-        for res in sorted(grouped.keys(), key=lambda x: x[0]*x[1], reverse=True):
-            count = len(grouped[res])
-            area = res[0] * res[1]
-            pct = (area / config.TARGET_PIXEL_AREA) * 100
-            if pct >= 95:
-                status = "[OK] OPTIMAL"
-            elif pct >= 75:
-                status = "[OK] GOOD"
-            elif pct >= 50:
-                status = "[OK] FAIR"
-            else:
-                status = "[!] POOR"
-            over_marker = " <-- OVER BUDGET!" if area > config.TARGET_PIXEL_AREA else ""
-            print(f"{res[0]}x{res[1]:<6} | {count:<6} | {area:<12,} | {pct:>6.1f}%      | {status}{over_marker}")
-        
-        # Print summary statistics
-        print(f"\n{'SUMMARY STATISTICS':=^70}")
-        print(f"Total images processed: {total_images}")
-        print(f"Unique resolutions: {len(grouped)}")
-        
-        print(f"\nAspect Ratio Distribution:")
-        for ar, count in sorted(aspect_ratios.items(), key=lambda x: x[1], reverse=True)[:5]:
-            pct = (count / total_images) * 100
-            print(f"  {ar:<12}: {count:>4} images ({pct:>5.1f}%)")
-        
-        print(f"\nArea Budget Utilization:")
-        print(f"  95-100% (Optimal):  {area_distribution['95_100%']:>4} images ({area_distribution['95_100%']/total_images*100:>5.1f}%)")
-        print(f"  75-95%  (Good):     {area_distribution['75_95%']:>4} images ({area_distribution['75_95%']/total_images*100:>5.1f}%)")
-        print(f"  50-75%  (Fair):     {area_distribution['50_75%']:>4} images ({area_distribution['50_75%']/total_images*100:>5.1f}%)")
-        print(f"  <50%    (Poor):     {area_distribution['under_50%']:>4} images ({area_distribution['under_50%']/total_images*100:>5.1f}%)")
-        
-        if area_distribution["over_budget"] > 0:
-            print(f"\n  [!][!][!] OVER BUDGET:   {area_distribution['over_budget']:<4} images ({area_distribution['over_budget']/total_images*100:>5.1f}%) [!][!][!]")
-            print(f"      This should NEVER happen - check ResolutionCalculator!")
-        
-        # Show examples of different scaling scenarios
-        print(f"\n{'SCALING EXAMPLES':=^70}")
-        examples = {
-            "upscaled_small": None,      # Small image upscaled
-            "native_large": None,        # Large image at native
-            "downscaled_large": None,    # Large image downscaled
-            "extreme_portrait": None,    # Very tall image
-            "extreme_landscape": None,   # Very wide image
-        }
-        
-        for m in metadata:
-            orig_w, orig_h = m["original_size"]
-            targ_w, targ_h = m["target_resolution"]
-            orig_area = orig_w * orig_h
-            targ_area = targ_w * targ_h
-            
-            # Find examples
-            if orig_area < config.TARGET_PIXEL_AREA * 0.5 and targ_area > orig_area * 1.5 and not examples["upscaled_small"]:
-                examples["upscaled_small"] = m
-            elif orig_area == config.TARGET_PIXEL_AREA and not examples["native_large"]:
-                examples["native_large"] = m
-            elif orig_area > config.TARGET_PIXEL_AREA * 2 and not examples["downscaled_large"]:
-                examples["downscaled_large"] = m
-            elif orig_h > orig_w * 2 and not examples["extreme_portrait"]:
-                examples["extreme_portrait"] = m
-            elif orig_w > orig_h * 2 and not examples["extreme_landscape"]:
-                examples["extreme_landscape"] = m
-        
-        for name, m in examples.items():
-            if m:
-                ow, oh = m["original_size"]
-                tw, th = m["target_resolution"]
-                scale = math.sqrt((tw*th) / (ow*oh))
-                if scale > 1.2:
-                    action = "UPSCALED"
-                elif scale < 0.8:
-                    action = "DOWNSCALED"
-                else:
-                    action = "PRESERVED"
-                print(f"\n  [{name.replace('_', ' ').upper()}]")
-                print(f"    Original:  {ow}x{oh} ({ow*oh:,} px)")
-                print(f"    Target:    {tw}x{th} ({tw*th:,} px)")
-                print(f"    Scale:     {scale:.2f}x ({action})")
-                print(f"    File:      {m['ip'].name[:50]}...")
-        
-        print(f"\n{'='*70}\n")
-        # --- ENHANCED DEBUG LOGGING END ---
-        
-        batches = []
+        batches =[]
         for res in grouped:
             for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE):
                 batches.append((res, grouped[res][i:i + config.CACHING_BATCH_SIZE]))
-        
         random.shuffle(batches)
         
         for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc=f"Encoding {root.name}")):
             captions = [m['caption'] for m in batch_meta]
-            
             embeds, pooled = compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device)
             embeds = embeds.to(dtype=torch.float32)
             pooled = pooled.to(dtype=torch.float32)
             
             images_global = []
-            valid_meta_final = []
-            original_images_for_semantic = [] if use_semantic_loss else None
+            valid_meta_final =[]
+            original_images_for_semantic =[] if use_semantic_loss else None
             
             for m in batch_meta:
                 try:
@@ -902,58 +675,21 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         img_resized = smart_resize(img, w, h)
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
-                        
-                        if use_semantic_loss:
-                            original_images_for_semantic.append(img_resized.copy())
-                                
-                except Exception as e:
-                    print(f"Skipping {m['ip']}: {e}")
+                        if use_semantic_loss: original_images_for_semantic.append(img_resized.copy())
+                except Exception as e: print(f"Skipping {m['ip']}: {e}")
             
-            if not images_global:
-                continue
-            
+            if not images_global: continue
             pixel_values_global = torch.stack(images_global).to(device, dtype=torch.float32)
 
             with torch.no_grad():
                 dist = vae.encode(pixel_values_global).latent_dist
                 latents_global = dist.mean
-                
-                if batch_idx == 0:
-                    print(f"\nDEBUG - RAW VAE OUTPUT (before normalization):")
-                    print(f"  Raw latent mean: {latents_global.mean().item():.4f}")
-                    print(f"  Raw latent std: {latents_global.std().item():.4f}")
-                
                 if hasattr(vae.config, 'shift_factor') and vae.config.shift_factor is not None:
                     latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
                 else:
                     latents_global = latents_global * vae.config.scaling_factor
                 
-                if batch_idx == 0:
-                    print(f"\nDEBUG - NORMALIZED LATENTS (after normalization):")
-                    print(f"  Normalized mean: {latents_global.mean().item():.4f} (target: ~0.0)")
-                    print(f"  Normalized std: {latents_global.std().item():.4f} (target: ~1.0)")
-                    print(f"  VAE shift_factor: {vae.config.shift_factor}")
-                    print(f"  VAE scaling_factor: {vae.config.scaling_factor}")
-                    print("-" * 60)
-                    
-                if batch_idx == 0:
-                    print("\n=== VAE CHANNEL BALANCE DIAGNOSTIC ===")
-                    for i in range(latents_global.shape[1]):
-                        ch_mean = latents_global[:, i].mean().item()
-                        ch_std = latents_global[:, i].std().item()
-                        print(f"Channel {i}: mean={ch_mean:.4f}, std={ch_std:.4f}")
-                    print("=" * 50 + "\n")
-
-                if batch_idx == 0:
-                    print(f"DEBUG: Caching Latent Shape: {latents_global.shape} (Channels: {latents_global.shape[1]})")
-                    print(f"DEBUG: Latent mean: {latents_global.mean().item():.4f}")
-                    print(f"DEBUG: Latent std: {latents_global.std().item():.4f}")
-
-                if batch_idx % 10 == 0:
-                    print(f"Batch {batch_idx}: mean={latents_global.mean().item():.4f}, std={latents_global.std().item():.4f}")
-                
             latents_global = latents_global.cpu()
-            
             
             semantic_maps = None
             if use_semantic_loss and original_images_for_semantic:
@@ -961,22 +697,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 detail_weight = getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0)
                 entropy_weight = getattr(config, "SEMANTIC_ENTROPY_WEIGHT", 0.0)
                 
-                from tools.semantic import generate_latent_semantic_map_batch
-                
                 semantic_maps = generate_latent_semantic_map_batch(
-                    latents=latents_global,
-                    images=original_images_for_semantic,
-                    sep_weight=sep_weight,
-                    detail_weight=detail_weight,
-                    entropy_weight=entropy_weight,
-                    device="cpu",  
-                    dtype=torch.float32
+                    latents=latents_global, images=original_images_for_semantic,
+                    sep_weight=sep_weight, detail_weight=detail_weight,
+                    entropy_weight=entropy_weight, device="cpu", dtype=torch.float32
                 )
                 semantic_maps = semantic_maps.cpu()
-                
-                if batch_idx == 0:
-                    print(f"\nDEBUG: Semantic map shape: {semantic_maps.shape}")
-                    print(f"DEBUG: Semantic map range:")
             
             for j, m in enumerate(valid_meta_final):
                 relative_path = m['ip'].relative_to(root)
@@ -998,19 +724,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 }, path_te)
                 
                 torch.save(latents_global[j], path_lat)
-                
-          
-                if semantic_maps is not None:
-                    torch.save(semantic_maps[j], path_sem)
+                if semantic_maps is not None: torch.save(semantic_maps[j], path_sem)
             
             del pixel_values_global, latents_global, embeds, pooled
-            if semantic_maps is not None:
-                del semantic_maps
-            if original_images_for_semantic:
-                del original_images_for_semantic
-            
-            if batch_idx % 20 == 0:
-                torch.cuda.empty_cache()
+            if semantic_maps is not None: del semantic_maps
+            if original_images_for_semantic: del original_images_for_semantic
+            if batch_idx % 20 == 0: torch.cuda.empty_cache()
 
     print("\nINFO: Caching Complete. Cleaning up...")
     te1.cpu()
@@ -1020,7 +739,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
 class ImageTextLatentDataset(Dataset):
     def __init__(self, config):
-        self.te_files = []
+        self.te_files =[]
         self.dataset_roots = {} 
         self.is_rectified_flow = config.is_rectified_flow
         self.seed = config.SEED if config.SEED else 42
@@ -1032,30 +751,21 @@ class ImageTextLatentDataset(Dataset):
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             cache_dir = root / cache_folder_name
-            if not cache_dir.exists(): 
-                continue
-            
+            if not cache_dir.exists(): continue
             files = list(cache_dir.glob("*_te.pt"))
-            for f in files:
-                self.dataset_roots[str(f)] = root
-                
+            for f in files: self.dataset_roots[str(f)] = root
             self.te_files.extend(files * int(ds.get("repeats", 1)))
 
-        if not self.te_files: 
-            raise ValueError("No cached files found.")
-        
+        if not self.te_files: raise ValueError("No cached files found.")
         random.shuffle(self.te_files)
-        
-        self.bucket_keys = []
+        self.bucket_keys =[]
         
         for f in tqdm(self.te_files, desc="Loading Cache Headers"):
             try:
                 header = torch.load(f, map_location='cpu')
                 res = header.get('target_size')
-                if res:
-                    self.bucket_keys.append(tuple(res))
-                else:
-                    self.bucket_keys.append(None)
+                if res: self.bucket_keys.append(tuple(res))
+                else: self.bucket_keys.append(None)
             except Exception as e:
                 print(f"Error reading cache header for {f}: {e}")
                 self.bucket_keys.append(None)
@@ -1063,47 +773,22 @@ class ImageTextLatentDataset(Dataset):
         self.dropout_prob = getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) if getattr(config, "UNCONDITIONAL_DROPOUT", False) else 0.0
         self.null_embeds = None
         self.null_pooled = None
-
         self.target_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
         self.target_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
-        
- 
         self.use_semantic_loss = (getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic")
         self.semantic_cache_roots = {}  
         
         if self.use_semantic_loss:
             print("INFO: Semantic loss is ENABLED. Loading from cached semantic maps.")
-   
             for ds in config.INSTANCE_DATASETS:
                 root = Path(ds["path"])
                 semantic_cache_dir = root / semantic_cache_folder_name
                 cache_dir = root / cache_folder_name
-                
                 if not semantic_cache_dir.exists():
                     print(f"WARNING: Semantic cache directory not found: {semantic_cache_dir}")
-                    print(f"         Please run caching first with LOSS_TYPE='Semantic' in config.")
                     continue
-                
-          
                 for f in cache_dir.glob("*_te.pt"):
                     self.semantic_cache_roots[str(f)] = semantic_cache_dir
-            
-
-            missing_semantic = []
-            for te_file in self.te_files:
-                semantic_dir = self.semantic_cache_roots.get(str(te_file))
-                if semantic_dir:
-                    safe_name = Path(te_file).stem.replace('_te', '')
-                    sem_path = semantic_dir / f"{safe_name}_sem.pt"
-                    if not sem_path.exists():
-                        missing_semantic.append(te_file)
-                else:
-                    missing_semantic.append(te_file)
-            
-            if missing_semantic:
-                print(f"WARNING: {len(missing_semantic)} files missing semantic maps.")
-                print(f"         First few: {[str(p) for p in missing_semantic[:3]]}")
- 
 
         if self.dropout_prob > 0:
             found_null = False
@@ -1115,11 +800,9 @@ class ImageTextLatentDataset(Dataset):
                     try:
                         null_data = torch.load(null_path, map_location="cpu")
                         self.null_embeds = null_data["embeds"]
-                        if self.null_embeds.dim() == 3:
-                            self.null_embeds = self.null_embeds.squeeze(0)
+                        if self.null_embeds.dim() == 3: self.null_embeds = self.null_embeds.squeeze(0)
                         self.null_pooled = null_data["pooled"]
-                        if self.null_pooled.dim() == 2:
-                            self.null_pooled = self.null_pooled.squeeze(0)
+                        if self.null_pooled.dim() == 2: self.null_pooled = self.null_pooled.squeeze(0)
                         found_null = True
                         break
                     except Exception as e:
@@ -1131,88 +814,25 @@ class ImageTextLatentDataset(Dataset):
                 
         print(f"INFO: Dataset initialized with {len(self.te_files)} samples.")
 
-    def _validate_cache_compatibility(self):
-        """Check first few cache files match expected VAE config. Halts if mismatch detected."""
-        print("INFO: Validating cache VAE compatibility...")
-        incompatible_count = 0
-        checked = 0
-        first_mismatch = None
-        
-        for f in self.te_files[:20]:  
-            try:
-                data_te = torch.load(f, map_location="cpu")
-                cached_shift = data_te.get("vae_shift", 0.0) or 0.0
-                cached_scale = data_te.get("vae_scale", 0.0) or 0.13025
-                
-                scale_match = abs(cached_scale - self.target_scale) < 1e-4
-                shift_match = (self.target_shift is None or 
-                              abs(cached_shift - self.target_shift) < 1e-4)
-                
-                if not scale_match or not shift_match:
-                    incompatible_count += 1
-                    if first_mismatch is None:
-                        first_mismatch = {
-                            'file': f,
-                            'cached_shift': cached_shift,
-                            'cached_scale': cached_scale,
-                            'expected_shift': self.target_shift,
-                            'expected_scale': self.target_scale
-                        }
-                        
-                checked += 1
-            except Exception as e:
-                print(f"WARNING: Could not check cache file {f}: {e}")
-        
-        if incompatible_count > 0:
-            dataset_paths = list(set(self.dataset_roots.values()))
-            
-            print(f"\n{'='*70}")
-            print("CRITICAL: CACHE VAE MISMATCH DETECTED")
-            print(f"{'='*70}")
-            print(f"Checked {checked} files, found {incompatible_count} incompatible.")
-            print(f"\nFirst mismatch:")
-            print(f"  File: {first_mismatch['file']}")
-            print(f"  Cached:  shift={first_mismatch['cached_shift']}, scale={first_mismatch['cached_scale']}")
-            print(f"  Expected: shift={first_mismatch['expected_shift']}, scale={first_mismatch['expected_scale']}")
-            print(f"\nSOLUTION:")
-            print(f"  1. Delete cache folder(s): {dataset_paths}")
-            print(f"  2. Re-run training to regenerate cache with correct VAE settings")
-            print(f"  3. Or adjust VAE_SHIFT_FACTOR/VAE_SCALING_FACTOR to match cache")
-            print(f"{'='*70}\n")
-            raise ValueError(f"Cache VAE config mismatch. {incompatible_count}/{checked} files incompatible. Please delete cache and regenerate.")
-        else:
-            print(f"INFO: Cache VAE config validated ({checked} samples checked).")
-            
-    def __len__(self): 
-        return len(self.te_files)
-
     def _init_worker_rng(self):
         worker_info = torch.utils.data.get_worker_info()
-        if worker_info is None:
-            self.worker_rng = random.Random(self.seed)
-        else:
-            self.worker_rng = random.Random(self.seed + worker_info.id)
+        if worker_info is None: self.worker_rng = random.Random(self.seed)
+        else: self.worker_rng = random.Random(self.seed + worker_info.id)
+
+    def __len__(self): return len(self.te_files)
 
     def __getitem__(self, i):
         try:
-            if self.worker_rng is None:
-                self._init_worker_rng()
-                
+            if self.worker_rng is None: self._init_worker_rng()
             path_te = self.te_files[i]
             data_te = torch.load(path_te, map_location="cpu")
-            
             path_str = str(path_te)
             path_lat = Path(path_str.replace("_te.pt", "_lat.pt"))
-            
             latents = torch.load(path_lat, map_location="cpu")
-            
-            if torch.isnan(latents).any() or torch.isinf(latents).any(): 
-                return None
+            if torch.isnan(latents).any() or torch.isinf(latents).any(): return None
 
-            final_latents = latents
-            
             item_data = {
-                "latents": final_latents,
+                "latents": latents,
                 "embeds": data_te["embeds"].squeeze(0) if data_te["embeds"].dim() == 3 else data_te["embeds"],
                 "pooled": data_te["pooled"].squeeze(0) if data_te["pooled"].dim() == 2 else data_te["pooled"],
                 "original_sizes": data_te["original_size"],
@@ -1225,29 +845,21 @@ class ImageTextLatentDataset(Dataset):
                 item_data["embeds"] = self.null_embeds
                 item_data["pooled"] = self.null_pooled
 
-
             if self.use_semantic_loss:
                 semantic_dir = self.semantic_cache_roots.get(str(path_te))
                 if semantic_dir:
                     safe_name = Path(path_te).stem.replace('_te', '')
                     sem_path = semantic_dir / f"{safe_name}_sem.pt"
-                    
                     if sem_path.exists():
-                        semantic_map = torch.load(sem_path, map_location="cpu")
-                        item_data["semantic_map"] = semantic_map
+                        item_data["semantic_map"] = torch.load(sem_path, map_location="cpu")
                     else:
-                        print(f"WARNING: Semantic map not found: {sem_path}")
-
-                        c, h, w = final_latents.shape
+                        c, h, w = latents.shape
                         item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
                 else:
-
-                    c, h, w = final_latents.shape
+                    c, h, w = latents.shape
                     item_data["semantic_map"] = torch.ones((c, h, w), dtype=torch.float32)
 
-
             return item_data
-            
         except Exception as e:
             print(f"WARNING: Skipping {self.te_files[i]}: {e}")
             return None
@@ -1256,11 +868,8 @@ class TimestepSampler:
     def __init__(self, config, device):
         self.config = config
         self.device = device
-        
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
-        
         self.seed = config.SEED if config.SEED else 42
-        
         self.is_rectified_flow = getattr(config, "is_rectified_flow", False)
         self.shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
         self.use_dynamic_shift = getattr(config, "RF_USE_DYNAMIC_SHIFT", False)
@@ -1269,33 +878,18 @@ class TimestepSampler:
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
-        
-        print(f"INFO: Initialized Ticket Pool Timestep Sampler")
-        print(f"      Total tickets: {len(self.ticket_pool)}, Seed: {self.seed}")
-        if self.is_rectified_flow:
-            print(f"      RF Shift: {self.shift_factor}")
-            if self.use_dynamic_shift:
-                print(f"      Dynamic Shift: Enabled (Base: {self.base_pixels}px)")
-        self._print_sampling_distribution()
 
     def _build_ticket_pool(self, allocation):
-
         use_fallback = False
-        if not allocation or "counts" not in allocation or "bin_size" not in allocation:
-            print("WARNING: TIMESTEP_ALLOCATION missing. Fallback to Uniform.")
-            use_fallback = True
-        elif sum(allocation["counts"]) == 0:
-            print("WARNING: TIMESTEP_ALLOCATION sum is 0. Fallback to Uniform.")
-            use_fallback = True
+        if not allocation or "counts" not in allocation or "bin_size" not in allocation: use_fallback = True
+        elif sum(allocation["counts"]) == 0: use_fallback = True
 
         if use_fallback:
             self.bin_size = 100 
             num_bins = 1000 // self.bin_size
-
             base = self.total_tickets_needed // num_bins // self.config.BATCH_SIZE
             counts = [base] * num_bins
-            for i in range((self.total_tickets_needed // self.config.BATCH_SIZE) % num_bins):
-                counts[i] += 1
+            for i in range((self.total_tickets_needed // self.config.BATCH_SIZE) % num_bins): counts[i] += 1
         else:
             self.bin_size = allocation["bin_size"] 
             counts = allocation["counts"]
@@ -1304,256 +898,106 @@ class TimestepSampler:
         total_counts = sum(counts)
         scale_factor = (self.total_tickets_needed / multiplier) / total_counts if total_counts > 0 else 1.0
         
-        pool = []
+        pool =[]
         rng = np.random.Generator(np.random.PCG64(self.seed))
         
         for i, count in enumerate(counts):
-            if count <= 0: 
-                continue
+            if count <= 0: continue
             start_t = i * self.bin_size
             end_t = min(1000, (i + 1) * self.bin_size)
-            if start_t >= 1000: 
-                break
-            
+            if start_t >= 1000: break
             num_tickets = int(count * scale_factor * multiplier)
             if num_tickets <= 0: num_tickets = 1
-
             bin_samples = rng.integers(start_t, end_t, size=num_tickets).tolist()
             pool.extend(bin_samples)
             
         random.seed(self.seed)
         random.shuffle(pool)
-        
-        if len(pool) == 0:
-            print("CRITICAL: Pool generation failed. Using random pool.")
-            pool = [random.randint(0, 999) for _ in range(self.total_tickets_needed)]
-        elif len(pool) < self.total_tickets_needed:
-            print(f"WARNING: Ticket pool ({len(pool)}) < Required ({self.total_tickets_needed}). Recycling tickets.")
-            while len(pool) < self.total_tickets_needed:
-                needed = self.total_tickets_needed - len(pool)
-                pool.extend(pool[:needed])
+        if len(pool) < self.total_tickets_needed:
+            while len(pool) < self.total_tickets_needed: pool.extend(pool[:self.total_tickets_needed - len(pool)])
         elif len(pool) > self.total_tickets_needed:
             pool = pool[:self.total_tickets_needed]
-            
         return pool
 
     def get_dynamic_shift(self, height, width):
-        """Calculate dynamic shift based on image resolution"""
-        if not self.use_dynamic_shift:
-            return self.shift_factor
-        
+        if not self.use_dynamic_shift: return self.shift_factor
         current_pixels = height * width
         ratio = current_pixels / self.base_pixels
-        dynamic_shift = self.shift_factor * math.sqrt(ratio)
-        
-        return dynamic_shift
+        return self.shift_factor * math.sqrt(ratio)
 
     def apply_flow_shift(self, t_normalized, shift_factor):
-        """
-        SD3/Flux schedule warping equation.
-        t_normalized: [0, 1] tensor
-        shift_factor: float (1.0 = no shift, 3.0 = SD3/Flux standard)
-        
-        Returns: shifted t in [0, 1]
-        """
-        if shift_factor == 1.0 or shift_factor is None:
-            return t_normalized
-        # The SD3/Flux equation
+        if shift_factor == 1.0 or shift_factor is None: return t_normalized
         return (shift_factor * t_normalized) / (1.0 + (shift_factor - 1.0) * t_normalized)
 
     def set_current_step(self, micro_step):
         consumed_tickets = micro_step * self.config.BATCH_SIZE
         self.pool_index = consumed_tickets % len(self.ticket_pool)
-        print(f"INFO: Timestep Sampler resumed at index {self.pool_index} (Micro Step {micro_step})")
 
     def sample(self, batch_size):
-        indices = []
+        indices =[]
         for _ in range(batch_size):
-            if self.pool_index >= len(self.ticket_pool):
-                self.pool_index = 0 
+            if self.pool_index >= len(self.ticket_pool): self.pool_index = 0 
             indices.append(self.ticket_pool[self.pool_index])
             self.pool_index += 1
         return torch.tensor(indices, dtype=torch.long, device=self.device)
 
-    def _print_sampling_distribution(self):
-        print("\n" + "="*80)
-        print("TIMESTEP TICKET POOL DISTRIBUTION")
-        print(f"Total Pool Size: {len(self.ticket_pool):,} | Seed: {self.seed}")
-        print("="*80)
-        
-        timesteps = torch.tensor(self.ticket_pool, dtype=torch.long)
-        vis_bin_size = self.bin_size 
-        num_bins = math.ceil(1000 / vis_bin_size)
-        
-        print(f"\n{'Range':<10} | {'Count':<10} | {'%':<6} | Bar")
-        print("-" * 80)
-        
-        max_count = 0
-        counts = []
-        for i in range(num_bins):
-            start = i * vis_bin_size
-            end = min(1000, start + vis_bin_size)
-            c = ((timesteps >= start) & (timesteps < end)).sum().item()
-            counts.append((f"{start}-{end}", c))
-            if c > max_count: 
-                max_count = c
-            
-        for label, count in counts:
-            pct = (count / len(self.ticket_pool)) * 100
-            bar_len = int((count / max(1, max_count)) * 40)
-            print(f"{label:<10} | {count:<10,d} | {pct:<6.1f}% | {'#' * bar_len}")
-        print("="*80 + "\n")
-        
-    def update(self, raw_grad_norm):
-        pass
-
+    def update(self, raw_grad_norm): pass
 
 def custom_collate_fn(batch):
     batch = list(filter(None, batch))
-    if not batch: 
-        return {}
-    
+    if not batch: return {}
     output = {}
     for k in batch[0]:
-        if k == "original_image":
-            output[k] = [item[k] for item in batch]
-        elif isinstance(batch[0][k], torch.Tensor):
-            output[k] = torch.stack([item[k] for item in batch])
-        else:
-            output[k] = [item[k] for item in batch]
-    
+        if k == "original_image": output[k] = [item[k] for item in batch]
+        elif isinstance(batch[0][k], torch.Tensor): output[k] = torch.stack([item[k] for item in batch])
+        else: output[k] = [item[k] for item in batch]
     return output
 
 def create_optimizer(config, params_to_optimize):
     optimizer_type = config.OPTIMIZER_TYPE.lower()
 
-    def print_lr_graph(curve_points, max_steps):
-        print("--- Custom Learning Rate Schedule ---")
-        if not curve_points:
-            print("No custom curve points provided.")
-            return
-
-        print("Step Percentage -> Learning Rate")
-        for point in curve_points:
-            print(f"{point[0]*100:5.1f}% -> {point[1]:.2e}")
-
-        graph_width = 50
-        graph_height = 10
-        graph = [[' ' for _ in range(graph_width)] for _ in range(graph_height)]
-        
-        min_lr = min(p[1] for p in curve_points)
-        max_lr = max(p[1] for p in curve_points)
-
-        def interpolate(x, x0, y0, x1, y1):
-            if x1 == x0:
-                return y0
-            return y0 + (x - x0) * (y1 - y0) / (x1 - x0)
-
-        for i in range(graph_width):
-            step_percent = i / (graph_width -1)
-            
-            lr = 0
-            for j in range(len(curve_points) - 1):
-                if curve_points[j][0] <= step_percent <= curve_points[j+1][0]:
-                    lr = interpolate(step_percent, curve_points[j][0], curve_points[j][1], curve_points[j+1][0], curve_points[j+1][1])
-                    break
-            
-            if max_lr > min_lr:
-                y = int(((lr - min_lr) / (max_lr - min_lr)) * (graph_height - 1))
-                graph[graph_height - 1 - y][i] = '*'
-            else:
-                graph[graph_height -1][i] = '*'
-
-
-        print("\nLearning Rate Schedule:")
-        for i, row in enumerate(graph):
-            lr_label = max_lr - i * (max_lr-min_lr)/(graph_height-1) if graph_height > 1 and max_lr > min_lr else max_lr
-            print(f"{lr_label:.2e} |{''.join(row)}|")
-        print("       " + "-" * (graph_width+2))
-        print("       0%" + " " * (graph_width - 5) + "100%")
-        print("---")
-
-
     if optimizer_type == "titan":
-        print("\n--- Initializing Titan Optimizer (Sync Offloading) ---")
         curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
-        if curve_points:
-            initial_lr = max(point[1] for point in curve_points)
-            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
-        else:
-            initial_lr = config.LEARNING_RATE
-
+        initial_lr = max(point[1] for point in curve_points) if curve_points else config.LEARNING_RATE
         titan_params = getattr(config, 'TITAN_PARAMS', {})
         defaults = default_config.TITAN_PARAMS
         final_params = {**defaults, **titan_params}
-
         return TitanAdamW(
-            params_to_optimize,
-            lr=initial_lr,
-            betas=tuple(final_params.get('betas', [0.9, 0.999])),
-            eps=final_params.get('eps', 1e-8),
-            weight_decay=final_params.get('weight_decay', 0.01),
+            params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas',[0.9, 0.999])),
+            eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01),
             debias_strength=final_params.get('debias_strength', 1.0),
             use_grad_centralization=final_params.get('use_grad_centralization', False),
             gc_alpha=final_params.get('gc_alpha', 1.0)
         )
-
     elif optimizer_type == "raven":
-        print("\n--- Initializing Raven Optimizer ---")
-        curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
-        if curve_points:
-            initial_lr = max(point[1] for point in curve_points)
-            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
-        else:
-            initial_lr = config.LEARNING_RATE
+        curve_points = getattr(config, 'LR_CUSTOM_CURVE',[])
+        initial_lr = max(point[1] for point in curve_points) if curve_points else config.LEARNING_RATE
         raven_params = getattr(config, 'RAVEN_PARAMS', {})
         defaults = getattr(default_config, 'RAVEN_PARAMS', {})
         final_params = {**defaults, **raven_params}
-
         return RavenAdamW(
-            params_to_optimize,
-            lr=initial_lr,
-            betas=tuple(final_params.get('betas', [0.9, 0.999])),
-            eps=final_params.get('eps', 1e-8),
-            weight_decay=final_params.get('weight_decay', 0.01),
+            params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas',[0.9, 0.999])),
+            eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01),
             debias_strength=final_params.get('debias_strength', 1.0),
             use_grad_centralization=final_params.get('use_grad_centralization', False),
             gc_alpha=final_params.get('gc_alpha', 1.0)
         )
-
     elif optimizer_type == "velorms":
-        print("\n--- Initializing VeloRMS Optimizer ---")
-        curve_points = getattr(config, 'LR_CUSTOM_CURVE', [])
-        if curve_points:
-            initial_lr = max(point[1] for point in curve_points)
-            print_lr_graph(curve_points, config.MAX_TRAIN_STEPS)
-        else:
-            initial_lr = config.LEARNING_RATE
-        
+        curve_points = getattr(config, 'LR_CUSTOM_CURVE',[])
+        initial_lr = max(point[1] for point in curve_points) if curve_points else config.LEARNING_RATE
         velorms_params = getattr(config, 'VELORMS_PARAMS', {})
         defaults = getattr(default_config, 'VELORMS_PARAMS', {})
         final_params = {**defaults, **velorms_params}
-
         return VeloRMS(
-            params_to_optimize, 
-            lr=initial_lr,
-            momentum=final_params.get('momentum', 0.86),
-            leak=final_params.get('leak', 0.16),
-            weight_decay=final_params.get('weight_decay', 0.01),
-            eps=final_params.get('eps', 1e-8),
-            verbose=False
+            params_to_optimize, lr=initial_lr, momentum=final_params.get('momentum', 0.86),
+            leak=final_params.get('leak', 0.16), weight_decay=final_params.get('weight_decay', 0.01),
+            eps=final_params.get('eps', 1e-8), verbose=False
         )
-    
     else: 
         raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
 def _get_sdxl_unet_conversion_map():
-    """
-    Builds the specific string replacement map for SDXL UNets.
-    Matches the logic of the official conversion scripts.
-    """
-    unet_conversion_map = [
-        # (stable-diffusion key, HF Diffusers key)
+    unet_conversion_map =[
         ("time_embed.0.weight", "time_embedding.linear_1.weight"),
         ("time_embed.0.bias", "time_embedding.linear_1.bias"),
         ("time_embed.2.weight", "time_embedding.linear_2.weight"),
@@ -1564,61 +1008,44 @@ def _get_sdxl_unet_conversion_map():
         ("out.0.bias", "conv_norm_out.bias"),
         ("out.2.weight", "conv_out.weight"),
         ("out.2.bias", "conv_out.bias"),
-        # SDXL Specific
         ("label_emb.0.0.weight", "add_embedding.linear_1.weight"),
         ("label_emb.0.0.bias", "add_embedding.linear_1.bias"),
         ("label_emb.0.2.weight", "add_embedding.linear_2.weight"),
         ("label_emb.0.2.bias", "add_embedding.linear_2.bias"),
     ]
-
-    unet_conversion_map_resnet = [
-        ("in_layers.0", "norm1"),
-        ("in_layers.2", "conv1"),
-        ("out_layers.0", "norm2"),
-        ("out_layers.3", "conv2"),
-        ("emb_layers.1", "time_emb_proj"),
-        ("skip_connection", "conv_shortcut"),
+    unet_conversion_map_resnet =[
+        ("in_layers.0", "norm1"), ("in_layers.2", "conv1"),
+        ("out_layers.0", "norm2"), ("out_layers.3", "conv2"),
+        ("emb_layers.1", "time_emb_proj"), ("skip_connection", "conv_shortcut"),
     ]
-
-    unet_conversion_map_layer = []
-
+    unet_conversion_map_layer =[]
     
     for i in range(3): 
         for j in range(2): 
             hf_down_res_prefix = f"down_blocks.{i}.resnets.{j}."
             sd_down_res_prefix = f"input_blocks.{3 * i + j + 1}.0."
             unet_conversion_map_layer.append((sd_down_res_prefix, hf_down_res_prefix))
-
             if i > 0: 
                 hf_down_atn_prefix = f"down_blocks.{i}.attentions.{j}."
                 sd_down_atn_prefix = f"input_blocks.{3 * i + j + 1}.1."
                 unet_conversion_map_layer.append((sd_down_atn_prefix, hf_down_atn_prefix))
-
         for j in range(3): 
             hf_up_res_prefix = f"up_blocks.{i}.resnets.{j}."
             sd_up_res_prefix = f"output_blocks.{3 * i + j}.0."
             unet_conversion_map_layer.append((sd_up_res_prefix, hf_up_res_prefix))
-
             if i < 2: 
                 hf_up_atn_prefix = f"up_blocks.{i}.attentions.{j}."
                 sd_up_atn_prefix = f"output_blocks.{3 * i + j}.1."
                 unet_conversion_map_layer.append((sd_up_atn_prefix, hf_up_atn_prefix))
-
         if i < 3:
-            
             hf_downsample_prefix = f"down_blocks.{i}.downsamplers.0.conv."
             sd_downsample_prefix = f"input_blocks.{3 * (i + 1)}.0.op."
             unet_conversion_map_layer.append((sd_downsample_prefix, hf_downsample_prefix))
-
-            
             hf_upsample_prefix = f"up_blocks.{i}.upsamplers.0."
             sd_upsample_prefix = f"output_blocks.{3 * i + 2}.{1 if i == 0 else 2}."
             unet_conversion_map_layer.append((sd_upsample_prefix, hf_upsample_prefix))
-
-    
+            
     unet_conversion_map_layer.append(("output_blocks.2.2.conv.", "output_blocks.2.1.conv."))
-
-    
     hf_mid_atn_prefix = "mid_block.attentions.0."
     sd_mid_atn_prefix = "middle_block.1."
     unet_conversion_map_layer.append((sd_mid_atn_prefix, hf_mid_atn_prefix))
@@ -1631,185 +1058,73 @@ def _get_sdxl_unet_conversion_map():
     return unet_conversion_map, unet_conversion_map_resnet, unet_conversion_map_layer
 
 def get_unet_key_mapping(current_keys):
-    """
-    Generates a dictionary mapping {HuggingFace_Key: SDXL_Key}.
-    Does NOT handle tensors, only strings.
-    """
     map_static, map_resnet, map_layer = _get_sdxl_unet_conversion_map()
-    
-    
     mapping = {k: k for k in current_keys}
     
-    
     for sd_name, hf_name in map_static:
-        if hf_name in mapping:
-            mapping[hf_name] = sd_name
+        if hf_name in mapping: mapping[hf_name] = sd_name
             
-    
     for k, v in mapping.items():
         if "resnets" in k:
-            for sd_part, hf_part in map_resnet:
-                v = v.replace(hf_part, sd_part)
+            for sd_part, hf_part in map_resnet: v = v.replace(hf_part, sd_part)
             mapping[k] = v
             
-    
     for k, v in mapping.items():
         for sd_part, hf_part in map_layer:
-            if hf_part in v:
-                v = v.replace(hf_part, sd_part)
+            if hf_part in v: v = v.replace(hf_part, sd_part)
         mapping[k] = v
         
-    
     final_mapping = {}
     for hf_name, sd_name in mapping.items():
-        if not sd_name.startswith("model.diffusion_model."):
-            final_key = f"model.diffusion_model.{sd_name}"
-        else:
-            final_key = sd_name
+        if not sd_name.startswith("model.diffusion_model."): final_key = f"model.diffusion_model.{sd_name}"
+        else: final_key = sd_name
         final_mapping[hf_name] = final_key
         
     return final_mapping
 
 def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
-    """
-    Memory Optimized Save with Dtype Preservation:
-    1. Loads Base Checkpoint.
-    2. Converts ALL base tensors to training dtype (bfloat16/float16).
-    3. Moves trained weights from GPU -> CPU one by one.
-    4. Updates Base Checkpoint dict IN-PLACE.
-    5. Saves unified checkpoint in training dtype.
-    """
     from safetensors.torch import load_file, save_file
     import gc
     from pathlib import Path
-    from collections import defaultdict
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     
-    print(f"\nINFO: Saving complete checkpoint to: {output_path}")
-    print(f"   -> Target dtype: {compute_dtype}")
-
-    print("   -> Generating Key Map...")
     hf_keys = list(unet.state_dict().keys())
     key_map = get_unet_key_mapping(hf_keys)
 
-    print("   -> Loading base checkpoint dictionary...")
-    try:
-        base_tensors = load_file(str(base_checkpoint_path), device="cpu")
+    try: base_tensors = load_file(str(base_checkpoint_path), device="cpu")
     except Exception as e:
         print(f"ERROR: Could not load base checkpoint: {e}")
         return
 
-    # --- Key Diagnostics ---
-    # Group base checkpoint keys by their top-level prefix so we can see
-    # exactly which components the checkpoint contains and confirm which
-    # ones the UNet merge will and won't touch.
-    print("\n   -> Base Checkpoint Key Groups (first 3 examples each):")
-    base_key_groups = defaultdict(list)
-    for k in base_tensors.keys():
-        prefix = k.split(".")[0]
-        base_key_groups[prefix].append(k)
-
-    for prefix, keys in sorted(base_key_groups.items()):
-        examples = ", ".join(keys[:3])
-        print(f"      [{prefix}] ({len(keys)} tensors)  e.g. {examples}")
-
-    # Show which HF keys the map will try to write and whether the target
-    # already exists in the checkpoint (missing = new key, present = update).
     unet_state = unet.state_dict()
-    mapped_present  = []   # target key already in base checkpoint  → update
-    mapped_missing  = []   # target key NOT in base checkpoint       → new entry (warn)
-    hf_unmapped     = []   # HF key not found in unet state at all   → skip
-
-    for hf_key, target_key in key_map.items():
-        if hf_key not in unet_state:
-            hf_unmapped.append(hf_key)
-        elif target_key in base_tensors:
-            mapped_present.append((hf_key, target_key))
-        else:
-            mapped_missing.append((hf_key, target_key))
-
-    print(f"\n   -> Key Mapping Diagnostic:")
-    print(f"      Will UPDATE  : {len(mapped_present)} keys already present in checkpoint")
-    print(f"      Will ADD NEW : {len(mapped_missing)} keys not found in checkpoint (unexpected)")
-    print(f"      HF Skipped   : {len(hf_unmapped)} HF keys not in UNet state (normal)")
-
-    if mapped_missing:
-        print(f"      WARNING — first 3 new/unmatched keys (check your key map):")
-        for hf_k, tgt_k in mapped_missing[:3]:
-            print(f"        HF:  {hf_k}")
-            print(f"        SD:  {tgt_k}")
-
-    # Keys in the base checkpoint that no UNet key maps to — these are the
-    # encoder, VAE, CLIP etc. blocks we deliberately leave untouched.
-    all_target_keys = set(key_map.values())
-    untouched_keys  = [k for k in base_tensors if k not in all_target_keys]
-    untouched_groups = defaultdict(list)
-    for k in untouched_keys:
-        untouched_groups[k.split(".")[0]].append(k)
-
-    print(f"\n   -> Checkpoint keys left UNTOUCHED: {len(untouched_keys)} "
-          f"(encoders, VAE, etc. — first 3 per group):")
-    for prefix, keys in sorted(untouched_groups.items()):
-        examples = ", ".join(keys[:3])
-        print(f"      [{prefix}] ({len(keys)} tensors)  e.g. {examples}")
-    print()
-
-    print(f"   -> Converting base checkpoint to {compute_dtype}...")
-    converted_count = 0
     for key in base_tensors.keys():
-        if base_tensors[key].dtype in [torch.float32, torch.float16, torch.bfloat16]:
+        if base_tensors[key].dtype in[torch.float32, torch.float16, torch.bfloat16]:
             base_tensors[key] = base_tensors[key].to(dtype=compute_dtype)
-            converted_count += 1
-    print(f"   -> Converted {converted_count} tensors to {compute_dtype}")
 
-    print("   -> Merging ALL UNet weights (frozen + trainable)...")
-    update_count = 0
     for hf_key, target_key in key_map.items():
         if hf_key in unet_state:
             tensor_cpu = unet_state[hf_key].detach().to("cpu", dtype=compute_dtype)
             base_tensors[target_key] = tensor_cpu
-            update_count += 1
             del tensor_cpu
 
-    print(f"   -> Copied {update_count} layers (trainable + frozen in {compute_dtype})")
-
-    print("   -> Saving to disk (SAFETENSORS)...")
     save_file(base_tensors, str(output_path))
-    print(f"   -> Save Complete in {compute_dtype}")
-
     del base_tensors
     del unet_state
     del key_map
     gc.collect()
-    if torch.cuda.is_available():
-        torch.cuda.empty_cache()
+    if torch.cuda.is_available(): torch.cuda.empty_cache()
 
 def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
-    """
-    Save checkpoint including model and training state.
-    global_step = Optimizer Steps
-    micro_step = Total Forward Passes
-    """
     output_dir = Path(config.OUTPUT_DIR)
     model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
     state_filename = f"training_state_step_{global_step}.pt"
     
+    save_model(output_dir / model_filename, unet, base_checkpoint_path, config.compute_dtype)
     
-    save_model(
-        output_dir / model_filename,
-        unet,
-        base_checkpoint_path,
-        config.compute_dtype
-    )
-    
-    
-    
-    if hasattr(optimizer, 'save_cpu_state'):
-        optim_state = optimizer.save_cpu_state()
-    else:
-        optim_state = optimizer.state_dict()
+    if hasattr(optimizer, 'save_cpu_state'): optim_state = optimizer.save_cpu_state()
+    else: optim_state = optimizer.state_dict()
 
     training_state = {
         'global_step': global_step,    
@@ -1823,59 +1138,63 @@ def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, opti
         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
     
-    if scaler is not None:
-        training_state['scaler_state_dict'] = scaler.state_dict()
-    
+    if scaler is not None: training_state['scaler_state_dict'] = scaler.state_dict()
     torch.save(training_state, output_dir / state_filename)
     print(f"Successfully saved training state: {state_filename}")
+
+def zero_grad_channels(conv_in_weight, channel_slice):
+    """
+    Hook to zero out gradients for specific input channel groups
+    so the loss cannot flow back through those conv_in weights.
+    Slice example: slice(0, 4) zeros grad for ch 0-3 input weights.
+    """
+    def hook(grad):
+        grad = grad.clone()
+        grad[:, channel_slice, :, :] = 0.0
+        return grad
+        
+    return conv_in_weight.register_hook(hook)
 
 
 def main():
     config = TrainingConfig()
-    
+
     if config.SEED:
         set_seed(config.SEED)
-    
+
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
- 
-    global_step = 0 
-    micro_step = 0
+    device     = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+    micro_step     = 0
     optimizer_step = 0
-    
-    model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
+
+    model_to_load        = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed = config.SEED
-    optimizer_state = None
-    initial_epoch = 0 
+    optimizer_state      = None
+    initial_epoch        = 0
 
     if config.RESUME_TRAINING:
         print("\n" + "="*50)
         print("--- RESUMING TRAINING SESSION ---")
-        state_path = Path(config.RESUME_STATE_PATH)
+        state_path     = Path(config.RESUME_STATE_PATH)
         training_state = torch.load(state_path, map_location="cpu", weights_only=False)
-        
-        global_step_saved = training_state.get('global_step', 0)
-        micro_step = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
-        optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
-        
+
+        global_step_saved    = training_state.get('global_step', 0)
+        micro_step           = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
+        optimizer_step       = micro_step // config.GRADIENT_ACCUMULATION_STEPS
         initial_sampler_seed = training_state['sampler_seed']
-        initial_epoch = training_state.get('sampler_epoch', 0)
-        optimizer_state = training_state['optimizer_state']
-        model_to_load = Path(config.RESUME_MODEL_PATH)
+        initial_epoch        = training_state.get('sampler_epoch', 0)
+        optimizer_state      = training_state['optimizer_state']
+        model_to_load        = Path(config.RESUME_MODEL_PATH)
 
         print("INFO: Restoring Random Number Generator States...")
-        if 'random_state' in training_state:
-            random.setstate(training_state['random_state'])
-        if 'numpy_state' in training_state:
-            np.random.set_state(training_state['numpy_state'])
-        if 'torch_cpu_state' in training_state:
-            torch.set_rng_state(training_state['torch_cpu_state'])
+        if 'random_state'     in training_state: random.setstate(training_state['random_state'])
+        if 'numpy_state'      in training_state: np.random.set_state(training_state['numpy_state'])
+        if 'torch_cpu_state'  in training_state: torch.set_rng_state(training_state['torch_cpu_state'])
         if 'torch_cuda_state' in training_state and training_state['torch_cuda_state'] is not None:
             torch.cuda.set_rng_state(training_state['torch_cuda_state'])
 
-        print(f"INFO: Resuming from Micro Step (Batch): {micro_step}")
-        print(f"INFO: Corresponding Optimizer Step: {optimizer_step}")
-        print(f"INFO: Resuming from Epoch: {initial_epoch}")
+        print(f"INFO: Resuming from Micro Step: {micro_step} | Optimizer Step: {optimizer_step} | Epoch: {initial_epoch}")
         print("="*50 + "\n")
     else:
         print("\n" + "="*50)
@@ -1883,130 +1202,93 @@ def main():
         print("="*50 + "\n")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    
+
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
-        
-        # --- Always use config values; never hardcode shift/scale/channels ---
-        target_channels  = getattr(config, 'VAE_LATENT_CHANNELS', 4)
-        conf_shift       = getattr(config, 'VAE_SHIFT_FACTOR', None)
-        conf_scale       = getattr(config, 'VAE_SCALING_FACTOR', None)
 
-        vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
+        target_channels = getattr(config, 'VAE_LATENT_CHANNELS', 4)
+        conf_shift      = getattr(config, 'VAE_SHIFT_FACTOR', None)
+        conf_scale      = getattr(config, 'VAE_SCALING_FACTOR', None)
+        vae_source      = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
         vae_for_caching = load_vae_robust(vae_source, device, target_channels=target_channels)
 
-        # Read whatever the VAE file itself advertises, then let config win if provided
         file_shift = getattr(vae_for_caching.config, 'shift_factor',   None)
         file_scale = getattr(vae_for_caching.config, 'scaling_factor', None)
-
-        final_shift = conf_shift if conf_shift is not None else file_shift
-        final_scale = conf_scale if conf_scale is not None else file_scale
-
-        if final_shift is None or final_scale is None:
-            raise ValueError(
-                "Could not determine VAE shift/scale factors. "
-                "Please set VAE_SHIFT_FACTOR and VAE_SCALING_FACTOR explicitly in your config."
-            )
-
-        vae_for_caching.config.shift_factor   = final_shift
-        vae_for_caching.config.scaling_factor = final_scale
-
-        print(f"INFO: VAE Latent Channels : {vae_for_caching.config.latent_channels}")
-        print(f"INFO: VAE shift_factor    : {final_shift}  (source: {'config' if conf_shift is not None else 'vae file'})")
-        print(f"INFO: VAE scaling_factor  : {final_scale}  (source: {'config' if conf_scale is not None else 'vae file'})")
-
+        vae_for_caching.config.shift_factor   = conf_shift if conf_shift is not None else file_shift
+        vae_for_caching.config.scaling_factor = conf_scale if conf_scale is not None else file_scale
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
 
         base_pipe = StableDiffusionXLPipeline.from_single_file(
             config.SINGLE_FILE_CHECKPOINT_PATH,
-            vae=vae_for_caching, 
-            unet=None, 
+            vae=vae_for_caching,
+            unet=None,
             torch_dtype=torch.float32,
             low_cpu_mem_usage=True
         )
-        
         precompute_and_cache_latents(
             config,
-            base_pipe.tokenizer,
-            base_pipe.tokenizer_2,
-            base_pipe.text_encoder,
-            base_pipe.text_encoder_2,
-            vae_for_caching,
-            device
+            base_pipe.tokenizer, base_pipe.tokenizer_2,
+            base_pipe.text_encoder, base_pipe.text_encoder_2,
+            vae_for_caching, device
         )
         del base_pipe, vae_for_caching
         gc.collect()
         torch.cuda.empty_cache()
 
     print(f"\n--- Loading Model ---")
-    print(f"INFO: Loading UNet for training from: {model_to_load.name}")
-    
-    target_channels = getattr(config, 'VAE_LATENT_CHANNELS', 4)
-    unet = load_unet_robust(model_to_load, config.compute_dtype, target_channels)
-    
+    print(f"INFO: Loading UNet from: {model_to_load.name}")
+    unet = load_unet_robust(model_to_load, config.compute_dtype)
+
+    if unet.config.in_channels != 12:
+        print(f"WARNING: UNet has {unet.config.in_channels} channels. Expected 12.")
+
+    print(f"\nINFO: 12-channel UNet Architecture")
+    print("INFO: Ch 0-3  = Noisy latents at current t")
+    print("INFO: Ch 4-7  = Blind x0 guess at t_curr  — 'what is fully clean?'")
+    print("INFO: Ch 8-11 = Blind x0 guess at t_mid   — 'what is halfway to clean?'")
+    print("INFO: Blind pass outputs decoded OUTSIDE no_grad — full gradient to conv_in")
+    print("INFO: Loss terms use live tensors — direct gradient to anchor channels")
+
     gc.collect()
     torch.cuda.empty_cache()
 
     print("\n--- Initializing Dataset ---")
     dataset = ImageTextLatentDataset(config)
-    print(f"INFO: Initializing BucketBatchSampler with seed: {initial_sampler_seed}")
-    sampler = BucketBatchSampler(
-        dataset,
-        config.BATCH_SIZE,
-        initial_sampler_seed,
-        shuffle=True
-    )
-    
+    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
     sampler.set_epoch(initial_epoch)
-
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=sampler,
-        collate_fn=custom_collate_fn,
-        num_workers=config.NUM_WORKERS
-    )
+    dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
     unet.enable_gradient_checkpointing()
     unet.to(device)
-    set_attention_processor(unet, config.MEMORY_EFFICIENT_ATTENTION)
-    
-    print("\n--- UNet Layer Selection Report ---")
-    exclusion_keywords = config.UNET_EXCLUDE_TARGETS
-    trainable_layer_names = []
-    frozen_layer_names = []
-    
+    set_attention_processor(unet, getattr(config, "MEMORY_EFFICIENT_ATTENTION", "sdpa"))
+
+    print("\n--- UNet Layer Selection ---")
+    exclusion_keywords = getattr(config, "UNET_EXCLUDE_TARGETS", [])
     for name, param in unet.named_parameters():
-        should_exclude = False
-        for keyword in exclusion_keywords:
-            pattern = keyword if '*' in keyword else f"*{keyword}*"
-            if fnmatch.fnmatch(name, pattern):
-                should_exclude = True
-                break
-        if should_exclude:
-            param.requires_grad = False
-            frozen_layer_names.append(name)
-        else:
-            param.requires_grad = True
-            trainable_layer_names.append(name)
+        should_exclude = any(fnmatch.fnmatch(name, kw if '*' in kw else f"*{kw}*") for kw in exclusion_keywords)
+        param.requires_grad = not should_exclude
 
-    params_to_optimize = [p for p in unet.parameters() if p.requires_grad]
-    total_params = sum(p.numel() for p in unet.parameters())
-    trainable_params = sum(p.numel() for p in params_to_optimize)
-    frozen_params = total_params - trainable_params
-    percentage_trainable = (trainable_params / total_params) * 100 if total_params > 0 else 0
+    total_params     = sum(p.numel() for p in unet.parameters())
+    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    print(f"  Trainable: {trainable_params/1e6:.2f}M ({trainable_params/total_params*100:.2f}%) | Frozen: {(total_params-trainable_params)/1e6:.2f}M")
 
-    print(f"  - Exclusion Keywords: {exclusion_keywords}")
-    print(f"  - Trainable: {trainable_params / 1e6:.2f}M params ({percentage_trainable:.2f}%)")
-    print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
-    
-    optimizer = create_optimizer(config, params_to_optimize)
+    conv_in_params        = list(unet.conv_in.parameters())
+    conv_in_ids           = {id(p) for p in conv_in_params}
+    other_params          = [p for p in unet.parameters() if p.requires_grad and id(p) not in conv_in_ids]
+    conv_in_lr_multiplier = getattr(config, "CONV_IN_LR_MULTIPLIER", 5)
+    curve_points          = getattr(config, 'LR_CUSTOM_CURVE', [])
+    base_lr               = max(p[1] for p in curve_points) if curve_points else 1e-5
+    conv_in_lr            = base_lr * conv_in_lr_multiplier
 
-    lr_scheduler = CustomCurveLRScheduler(
-        optimizer=optimizer,
-        curve_points=config.LR_CUSTOM_CURVE,
-        total_micro_steps=config.MAX_TRAIN_STEPS
-    )
+    params_to_optimize = [
+        {"params": conv_in_params, "lr": conv_in_lr, "lr_scale": conv_in_lr_multiplier},
+        {"params": other_params,   "lr_scale": 1.0},
+    ]
+    print(f"\n  conv_in: {conv_in_lr_multiplier}x LR boost | Base: {base_lr:.2e} | conv_in: {conv_in_lr:.2e}")
+
+    optimizer    = create_optimizer(config, params_to_optimize)
+    lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, total_micro_steps=config.MAX_TRAIN_STEPS)
 
     if config.RESUME_TRAINING:
         print("\n--- Restoring Training States ---")
@@ -2015,47 +1297,47 @@ def main():
                 if hasattr(optimizer, 'load_cpu_state'): optimizer.load_cpu_state(optimizer_state)
                 else: optimizer.load_state_dict(optimizer_state)
             except Exception as e:
-                print(f"WARNING: Optimizer load failed ({e}). Starting optimizer fresh.")
-
+                print(f"WARNING: Optimizer load failed ({e}). Starting fresh.")
         lr_scheduler.step(micro_step)
-        print("--- Resume setup complete. Starting training loop. ---")
+        print("--- Resume complete. Starting training. ---")
     else:
-        print("\n--- Fresh start setup complete. Starting training loop. ---")
+        print("\n--- Fresh start. Starting training. ---")
 
     unet.train()
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
+    reporter    = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="Gradient Check")
 
-    reporter = AsyncReporter(
-        total_steps=config.MAX_TRAIN_STEPS,
-        test_param_name="Gradient Check"
-    )
-    
     timestep_sampler = TimestepSampler(config, device)
     if config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
 
     scheduler = None
     if config.is_rectified_flow:
-        print(f"\n--- Using Loss: SDXL Rectified Flow (Velocity Matching) ---")
+        print(f"\n--- Loss: SDXL Rectified Flow (Velocity Matching) ---")
     else:
         prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
-        print(f"\n--- Using Loss: Standard SDXL ({prediction_type}) ---")
+        print(f"\n--- Loss: Standard SDXL ({prediction_type}) ---")
         scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", subfolder="scheduler")
         scheduler.config.prediction_type = prediction_type if prediction_type == "v_prediction" else "epsilon"
 
+    loss_type = getattr(config, "LOSS_TYPE", "MSE")
+    print(f"--- Loss Type: {loss_type} ---\n")
+
     accumulated_latent_paths = []
-    training_start_time = time.time()
-    global_step_times = deque(maxlen=50)
-    optim_step_times = deque(maxlen=20)
-    last_step_time = time.time()
+    training_start_time      = time.time()
+    global_step_times        = deque(maxlen=50)
+    optim_step_times         = deque(maxlen=20)
+    last_step_time           = time.time()
     last_optim_step_log_time = time.time()
-    done = False
+    done                     = False
+
+    conv_in_diag     = {"ch_0_3_norm": 0.0, "ch_4_7_norm": 0.0, "ch_8_11_norm": 0.0, "adaptive_mult": float(conv_in_lr_multiplier), "t_mid": 0}
+    contrastive_diag = None
 
     batches_to_skip = 0
     if config.RESUME_TRAINING:
-        batches_in_epoch = len(dataloader)
-        batches_to_skip = micro_step % batches_in_epoch
-        print(f"INFO: Skipping {batches_to_skip} batches in current epoch to align states.")
+        batches_to_skip = micro_step % len(dataloader)
+        print(f"INFO: Skipping {batches_to_skip} batches to align state.")
 
     while not done:
         for batch in dataloader:
@@ -2066,16 +1348,16 @@ def main():
             if micro_step >= config.MAX_TRAIN_STEPS:
                 done = True
                 break
-                
+
             if not batch: continue
 
             micro_step += 1
-            
+
             if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
-            
-            latents = batch["latents"].to(device, non_blocking=True)
-            embeds = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
-            pooled = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
+
+            latents           = batch["latents"].to(device, non_blocking=True).detach()
+            embeds            = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
+            pooled            = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
@@ -2084,118 +1366,234 @@ def main():
                     time_ids_list.append(torch.tensor([s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]], dtype=torch.float32).unsqueeze(0))
                 time_ids = torch.cat(time_ids_list, dim=0).to(device, dtype=config.compute_dtype)
 
-                noise = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
+                noise     = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
                 timesteps = timestep_sampler.sample(latents.shape[0])
-                
-                target, noisy_latents, timesteps_conditioning = None, None, None
 
                 if config.is_rectified_flow:
-                    t_normalized = timesteps.float() / 1000.0
-                    shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
+                    t_normalized  = timesteps.float() / 1000.0
+                    shift_factor  = getattr(config, "RF_SHIFT_FACTOR", 3.0)
                     current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else shift_factor
-                    t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
-                    t_expanded = t_shifted.view(-1, 1, 1, 1)
+                    t_shifted     = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
+                    t_expanded    = t_shifted.view(-1, 1, 1, 1)
                     noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                    target = noise - latents
+                    target        = noise - latents
                     timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
                 else:
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                    target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
+                    target        = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
                     timesteps_conditioning = timesteps
+                    t_shifted  = timesteps.float() / 1000.0
+                    t_expanded = t_shifted.view(-1, 1, 1, 1)
 
-                pred = unet(noisy_latents, timesteps_conditioning, embeds, added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
+                B, C, H, W = noisy_latents.shape
 
-            loss_type = getattr(config, "LOSS_TYPE", "MSE")
-            
-            if loss_type == "Semantic":
-                base_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
+                # ── In-distribution placeholders for blind passes ─────────────────
+                blind_input = torch.cat([noisy_latents.detach(), noisy_latents.detach(), noisy_latents.detach()], dim=1)
+
+                # ── t_mid: random fraction of t_curr ─────────────────────────────
+                t_curr_val = t_shifted.mean().item()
+                t_mid_val  = t_curr_val * random.uniform(0.3, 0.7)
+                t_mid_ts   = torch.full_like(t_shifted, t_mid_val * 1000).long().clamp(0, 999)
+                conv_in_diag["t_mid"] = int(t_mid_val * 1000)
+
+                # ── Blind passes — UNet inside no_grad, decode OUTSIDE ────────────
+                unet.disable_gradient_checkpointing()
+                with torch.no_grad():
+
+                    blind_pred_curr = unet(
+                        blind_input,
+                        timesteps_conditioning.detach(), embeds.detach(),
+                        added_cond_kwargs={"text_embeds": pooled.detach(), "time_ids": time_ids.detach()}
+                    ).sample
+
+                    blind_pred_mid = unet(
+                        blind_input,
+                        t_mid_ts.detach(), embeds.detach(),
+                        added_cond_kwargs={"text_embeds": pooled.detach(), "time_ids": time_ids.detach()}
+                    ).sample
+
+                    del blind_input
+
+                # ── Decode outside no_grad — gradient graph alive ─────────────────
+                t_mid_exp   = t_mid_ts.float().view(-1, 1, 1, 1) / 1000.0
+                current_ref = (noisy_latents.detach().float() - t_expanded.detach().float() * blind_pred_curr.float()).to(config.compute_dtype)
+                mid_ref     = (noisy_latents.detach().float() - t_mid_exp.float() * blind_pred_mid.float()).to(config.compute_dtype)
+                del blind_pred_curr, blind_pred_mid, t_mid_exp, t_mid_ts
+
+                unet.enable_gradient_checkpointing()
+
+                # ── Conv_in norm tracking ─────────────────────────────────────────
+                conv_in_weight = unet.conv_in.weight
+                ch_0_3_norm   = conv_in_weight[:, :4,  :, :].norm().item()
+                ch_4_7_norm   = conv_in_weight[:, 4:8, :, :].norm().item()
+                ch_8_11_norm  = conv_in_weight[:, 8:,  :, :].norm().item()
+
+                # Adaptive LR: drive ch 4-11 toward 70% of ch 0-3 norm
+                ratio         = (min(ch_4_7_norm, ch_8_11_norm) / ch_0_3_norm) if ch_0_3_norm > 1e-6 else 0.0
+                target_ratio  = 0.70
+                adaptive_mult = conv_in_lr_multiplier * (max(0.1, target_ratio - ratio) / target_ratio)
+                adaptive_mult = max(1.0, adaptive_mult)
+
+                for pg in optimizer.param_groups:
+                    if any(id(p) in conv_in_ids for p in pg['params']):
+                        pg['lr_scale'] = adaptive_mult
+                        break
+
+                conv_in_diag.update({
+                    "ch_0_3_norm":   ch_0_3_norm,
+                    "ch_4_7_norm":   ch_4_7_norm,
+                    "ch_8_11_norm":  ch_8_11_norm,
+                    "adaptive_mult": adaptive_mult
+                })
+
+                # ── Guided pass — full gradient flow ─────────────────────────────
+                model_input = torch.cat([noisy_latents, current_ref, mid_ref], dim=1)
+
+                pred = unet(
+                    model_input, timesteps_conditioning, embeds,
+                    added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}
+                ).sample
+
+            # ── Loss ─────────────────────────────────────────────────────────────
+            if loss_type == "DestinationLoss":
+                clean        = latents.float()
+                guided_x0    = noisy_latents.float() - t_expanded.float() * pred.float()
+                guided_dist  = F.mse_loss(guided_x0, clean, reduction="mean")
+
+                # Anchor-forcing loss: register hook to zero ch 0-3 gradients
+                # so this loss CANNOT be satisfied via the base channels.
+                # The only path to minimize destination_dist + midpoint_dist
+                # is to strengthen conv_in ch 4-11.
+                anchor_hook      = zero_grad_channels(unet.conv_in.weight, slice(0, 4))
+                destination_dist = F.mse_loss(current_ref.float(), clean, reduction="mean")
+                midpoint_dist    = F.mse_loss(mid_ref.float(),     clean, reduction="mean")
+                anchor_hook.remove()
+
+                anchor_weight = getattr(config, "ANCHOR_LOSS_WEIGHT", 3.0)
+                loss = guided_dist + anchor_weight * (destination_dist + midpoint_dist)
+
+                contrastive_diag = {
+                    "mode":             "DestinationLoss",
+                    "guided_dist":      guided_dist.item(),
+                    "destination_dist": destination_dist.item(),
+                    "midpoint_dist":    midpoint_dist.item(),
+                    "loss":             loss.item(),
+                }
+                del clean, guided_x0, guided_dist, destination_dist, midpoint_dist
+
+            elif loss_type == "Semantic":
+                base_loss     = F.mse_loss(pred.float(), target.float(), reduction="none")
                 semantic_maps = batch.get("semantic_map")
-                if semantic_maps is not None:
-                    loss = (base_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
-                else:
-                    loss = base_loss.mean()
+                loss          = (base_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean() if semantic_maps is not None else base_loss.mean()
+                contrastive_diag = None
 
             elif loss_type == "MSE_Perturb":
-                #Implicit Hard-Mining Velocity Loss
                 value_weight = 1.0 + torch.abs(target.float()) * 0.5
+                loss         = ((pred.float() - target.float()) ** 2 * value_weight).mean()
+                contrastive_diag = None
 
-                # dont use this its the opposite (value_weight = 1.0 + torch.abs(latents.float()) * 0.5 )
-                base_loss = (pred.float() - target.float()) ** 2 * value_weight
-                loss = base_loss.mean()
-             
-            elif loss_type == "DestinationLoss":
-                pred_final = noisy_latents.float() - t_expanded.float() * pred.float()
-                loss = F.mse_loss(pred_final, latents.float())
-            else:
+            else:  # MSE fallback
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                contrastive_diag = None
+
+            del current_ref, mid_ref
 
             raw_loss_value = loss.detach().item()
-            scaled_loss = loss / config.GRADIENT_ACCUMULATION_STEPS
+            scaled_loss    = loss / config.GRADIENT_ACCUMULATION_STEPS
             scaled_loss.backward()
-    
-            diagnostics.step(raw_loss_value)
 
+            del scaled_loss, loss, pred, noise
+            if micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                torch.cuda.empty_cache()
+
+            diagnostics.step(raw_loss_value)
             lr_scheduler.step(micro_step)
 
-            is_accumulation_step = (micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0)
-            diag_data_to_log = None
-            
-            if is_accumulation_step:
-                if isinstance(optimizer, TitanAdamW): raw_grad_norm = optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
-                else: raw_grad_norm = torch.nn.utils.clip_grad_norm_(params_to_optimize, config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
+            if micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
+                if isinstance(optimizer, TitanAdamW):
+                    raw_grad_norm = optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
+                else:
+                    all_params    = [p for group in params_to_optimize for p in (group["params"] if isinstance(group, dict) else [group])]
+                    raw_grad_norm = torch.nn.utils.clip_grad_norm_(all_params, config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
+
                 if isinstance(raw_grad_norm, torch.Tensor): raw_grad_norm = raw_grad_norm.item()
                 clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
                 timestep_sampler.update(raw_grad_norm)
 
                 optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
-                
                 optimizer_step += 1
-                
+
                 optim_step_time = time.time() - last_optim_step_log_time
                 optim_step_times.append(optim_step_time)
                 last_optim_step_log_time = time.time()
 
+                ch_0_3         = conv_in_diag["ch_0_3_norm"]
+                ch_4_7         = conv_in_diag["ch_4_7_norm"]
+                ch_8_11        = conv_in_diag["ch_8_11_norm"]
+                ratio_4_7_pct  = (ch_4_7  / ch_0_3 * 100) if ch_0_3 > 1e-6 else 0.0
+                ratio_8_11_pct = (ch_8_11 / ch_0_3 * 100) if ch_0_3 > 1e-6 else 0.0
+
+                print(
+                    f"\n[12ch conv_in] Optimizer Step {optimizer_step} | "
+                    f"Ch 0-3: {ch_0_3:.4f} | "
+                    f"Ch 4-7: {ch_4_7:.4f} ({ratio_4_7_pct:.1f}%) | "
+                    f"Ch 8-11: {ch_8_11:.4f} ({ratio_8_11_pct:.1f}%) | "
+                    f"LR mult: {conv_in_diag['adaptive_mult']:.1f}x | "
+                    f"t_mid: {conv_in_diag['t_mid']}"
+                )
+
+                if contrastive_diag is not None and contrastive_diag.get("mode") == "DestinationLoss":
+                    print(
+                        f"[DestinationLoss] Step {optimizer_step}\n"
+                        f"  Guided dist     : {contrastive_diag['guided_dist']:.4f}  (want lowest)\n"
+                        f"  Destination dist: {contrastive_diag['destination_dist']:.4f}\n"
+                        f"  Midpoint dist   : {contrastive_diag['midpoint_dist']:.4f}\n"
+                        f"  Loss            : {contrastive_diag['loss']:.4f}"
+                    )
+
                 diag_data_to_log = {
-                    'optim_step': optimizer_step,
-                    'avg_loss': diagnostics.get_average_loss(),
-                    'current_lr': optimizer.param_groups[0]['lr'],
-                    'raw_grad_norm': raw_grad_norm,
-                    'clipped_grad_norm': clipped_grad_norm,
-                    'update_delta': 1.0 if raw_grad_norm > 0 else 0.0,
-                    'optim_step_time': optim_step_time,
+                    'optim_step':          optimizer_step,
+                    'avg_loss':            diagnostics.get_average_loss(),
+                    'current_lr':          optimizer.param_groups[-1]['lr'],
+                    'raw_grad_norm':       raw_grad_norm,
+                    'clipped_grad_norm':   clipped_grad_norm,
+                    'update_delta':        1.0 if raw_grad_norm > 0 else 0.0,
+                    'optim_step_time':     optim_step_time,
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times)
                 }
-                
+
                 reporter.check_and_report_anomaly(optimizer_step, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
-                if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and (optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
-                    print(f"\n--- Saving checkpoint at optimizer step {optimizer_step} (Micro Step {micro_step}) ---")
+                if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and optimizer_step % config.SAVE_EVERY_N_STEPS == 0:
+                    print(f"\n--- Saving checkpoint at optimizer step {optimizer_step} ---")
                     save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
+            else:
+                diag_data_to_log = None
 
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)
             last_step_time = time.time()
-            elapsed_time = time.time() - training_start_time
-            eta_seconds = (config.MAX_TRAIN_STEPS - micro_step) * (sum(global_step_times) / len(global_step_times)) if global_step_times else 0
-            
-            timing_data = {
+            elapsed_time   = time.time() - training_start_time
+            eta_seconds    = (config.MAX_TRAIN_STEPS - micro_step) * (sum(global_step_times) / len(global_step_times)) if global_step_times else 0
+
+            reporter.log_step(micro_step, timing_data={
                 'raw_step_time': step_duration,
-                'elapsed_time': elapsed_time,
-                'eta': eta_seconds,
-                'loss': raw_loss_value,
-                'timestep': timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
-            }
-            
-            reporter.log_step(micro_step, timing_data=timing_data, diag_data=diag_data_to_log)
+                'elapsed_time':  elapsed_time,
+                'eta':           eta_seconds,
+                'loss':          raw_loss_value,
+                'timestep':      timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
+            }, diag_data=diag_data_to_log)
 
     print("\nTraining complete.")
     reporter.shutdown()
     output_path = OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_unified_{str(uuid.uuid4())[:4]}.safetensors"
     save_model(output_path, unet, model_to_load, config.compute_dtype)
     print("All tasks complete. Final model saved.")
+
+
 
 if __name__ == "__main__":
     try: multiprocessing.set_start_method('spawn', force=True)

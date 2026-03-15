@@ -350,77 +350,121 @@ class BucketBatchSampler(Sampler):
         return (self.total_images + self.batch_size - 1) // self.batch_size
     
 class ResolutionCalculator:
-    def __init__(self, target_area, stride=64, should_upscale=False, max_area_tolerance=1.1):
+    def __init__(self, target_area, stride=64, should_upscale=True, max_area_tolerance=1.0):
+        """
+        target_area: Target pixel budget (e.g., 1048576 for 1024x1024)
+        stride: VAE requires multiples of this (usually 64)
+        should_upscale: If False, small images stay small (not recommended for quality)
+        max_area_tolerance: Not used - we always stay UNDER target_area
+        """
         self.target_area = target_area
         self.stride = stride
         self.should_upscale = should_upscale
-        self.max_area = target_area * max_area_tolerance
 
     def calculate_resolution(self, width, height):
+        """
+        Scale image to get as close to target_area as possible WITHOUT exceeding it.
+        Always preserves aspect ratio. Never crops. Never goes over budget.
+        """
         current_area = width * height
         
-   
-        if not self.should_upscale and current_area < self.target_area:
-            w = int(width // self.stride) * self.stride
-            h = int(height // self.stride) * self.stride
-            return max(w, self.stride), max(h, self.stride)
-
-       
-        scale = math.sqrt(self.target_area / current_area)
+        # If we're already at or under target and not upscaling, just quantize to stride
+        if not self.should_upscale and current_area <= self.target_area:
+            return self._quantize_to_stride(width, height)
         
-       
-        scaled_w = width * scale
-        scaled_h = height * scale
+        # Calculate scale to hit target_area exactly
+        exact_scale = math.sqrt(self.target_area / current_area)
         
-        target_w = int(round(scaled_w / self.stride) * self.stride)
-        target_h = int(round(scaled_h / self.stride) * self.stride)
+        # Apply scale
+        scaled_w = width * exact_scale
+        scaled_h = height * exact_scale
         
-        return max(target_w, self.stride), max(target_h, self.stride)
-
+        # Quantize to stride (this may put us slightly under target, which is fine)
+        final_w, final_h = self._quantize_to_stride(scaled_w, scaled_h)
+        
+        # Verify we're not over budget (safety check)
+        final_area = final_w * final_h
+        if final_area > self.target_area:
+            # We went slightly over due to stride rounding, scale down a bit more
+            adjustment = math.sqrt(self.target_area / final_area) * 0.999  # Small safety margin
+            final_w, final_h = self._quantize_to_stride(scaled_w * adjustment, scaled_h * adjustment)
+        
+        return final_w, final_h
+    
 def smart_resize(image, target_w, target_h):
-
-    
-    src_w, src_h = image.size
-    
-    target_aspect = target_w / target_h
-    src_aspect = src_w / src_h
-    
-    if src_aspect > target_aspect:
-        # Source is wider than target -> Crop width, keep full height
-        crop_w = src_h * target_aspect
-        crop_h = src_h
-        x_offset = (src_w - crop_w) / 2.0
-        y_offset = 0.0
-    else:
-        # Source is taller than target -> Crop height, keep full width
-        crop_w = src_w
-        crop_h = src_w / target_aspect
-        x_offset = 0.0
-        y_offset = (src_h - crop_h) / 2.0
-        
-    
-    box = (x_offset, y_offset, x_offset + crop_w, y_offset + crop_h)
-    
-    return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS, box=box)
+    """
+    Pure resize to exact target dimensions. No cropping. No padding.
+    Aspect ratio of target_w/target_h should already match source from calculate_resolution.
+    """
+    # Just resize directly - aspect ratio is preserved by calculate_resolution
+    return image.resize((target_w, target_h), resample=Image.Resampling.LANCZOS)
 
 def validate_and_assign_resolution(args):
-    ip, calculator = args
+    ip, target_area, stride, should_upscale = args  # Unpack primitives instead of class
+    
     try:
-        with Image.open(ip) as img: img.verify()
+        with Image.open(ip) as img: 
+            img.verify()
+        
         with Image.open(ip) as img:
             img.load()
             w, h = img.size
-            if w <= 0 or h <= 0: return None
+            if w <= 0 or h <= 0: 
+                return None
+        
+        # Inline the resolution calculation logic
+        current_area = w * h
+        
+        if not should_upscale and current_area < target_area:
+            # Keep original size, just quantize to stride
+            target_w = int(w // stride) * stride
+            target_h = int(h // stride) * stride
+            target_w, target_h = max(target_w, stride), max(target_h, stride)
+        else:
+            # Scale to target area while preserving aspect ratio
+            scale = math.sqrt(target_area / current_area)
+            scaled_w = w * scale
+            scaled_h = h * scale
+            target_w = int(round(scaled_w / stride) * stride)
+            target_h = int(round(scaled_h / stride) * stride)
+            target_w, target_h = max(target_w, stride), max(target_h, stride)
+        
+        # Get caption
         cp = ip.with_suffix('.txt')
         if cp.exists():
-            with open(cp, 'r', encoding='utf-8') as f: 
+            with open(cp, 'r', encoding='utf-8', errors='ignore') as f: 
                 caption = f.read().strip()
-            if not caption: return None
-        else: caption = ip.stem.replace('_', ' ')
-        return {"ip": ip, "caption": caption, "target_resolution": calculator.calculate_resolution(w, h), "original_size": (w, h)}
+            if not caption: 
+                caption = ip.stem.replace('_', ' ')
+        else: 
+            caption = ip.stem.replace('_', ' ')
+        
+        return {
+            "ip": ip, 
+            "caption": caption, 
+            "target_resolution": (target_w, target_h),
+            "original_size": (w, h),
+            "original_area": w * h,
+            "target_area": target_w * target_h
+        }
+        
     except Exception as e:
         print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
+        import traceback
+        traceback.print_exc()
         return None
+
+
+def validate_all_images_sequential(image_paths, calculator):
+    """Fallback sequential processing with detailed error reporting"""
+    print(f"[FALLBACK] Running sequential validation for {len(image_paths)} images...")
+    results = []
+    for i, p in enumerate(image_paths):
+        if i % 10 == 0:
+            print(f"[FALLBACK] Processing {i}/{len(image_paths)}...")
+        result = validate_and_assign_resolution((p, calculator))
+        results.append(result)
+    return results
 
 def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
     """
@@ -698,22 +742,140 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             print(f"INFO: All images in {root.name} are already cached (including semantic maps).")
             continue
             
+        
         print(f"INFO: Validating and Bucketing {len(to_process)} images from {root.name}...")
         
+
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
                 pool.imap(
                     validate_and_assign_resolution, 
-                    [(p, calc) for p in to_process]
+                    [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process]
                 ), 
                 total=len(to_process)
             ))
-        
         metadata = [r for r in results if r]
         
+        # --- ENHANCED DEBUG LOGGING START ---
+        print(f"\n{'='*70}")
+        print(f"RESOLUTION ANALYSIS FOR: {root.name}")
+        print(f"Target Pixel Budget: {config.TARGET_PIXEL_AREA:,} px (~{math.sqrt(config.TARGET_PIXEL_AREA):.0f}^2)")
+        print(f"{'='*70}")
+        
+        # Group by resolution and calculate stats
         grouped = defaultdict(list)
+        aspect_ratios = defaultdict(int)
+        area_distribution = {"under_50%": 0, "50_75%": 0, "75_95%": 0, "95_100%": 0, "over_budget": 0}
+        
         for m in metadata:
             grouped[m["target_resolution"]].append(m)
+            
+            # Track aspect ratios
+            orig_w, orig_h = m["original_size"]
+            ar = orig_w / orig_h
+            ar_bucket = f"{ar:.2f}" if 0.8 < ar < 1.25 else ("landscape" if ar > 1 else "portrait")
+            aspect_ratios[ar_bucket] += 1
+            
+            # Track area utilization
+            util = m["target_area"] / config.TARGET_PIXEL_AREA
+            if m["target_area"] > config.TARGET_PIXEL_AREA:
+                area_distribution["over_budget"] += 1
+            elif util < 0.5:
+                area_distribution["under_50%"] += 1
+            elif util < 0.75:
+                area_distribution["50_75%"] += 1
+            elif util < 0.95:
+                area_distribution["75_95%"] += 1
+            else:
+                area_distribution["95_100%"] += 1
+        
+        # Print resolution table
+        print(f"\n{'Resolution':<15} | {'Count':<6} | {'Area':<12} | {'% of Budget':<12} | {'Status'}")
+        print("-" * 70)
+        
+        total_images = len(metadata)
+        for res in sorted(grouped.keys(), key=lambda x: x[0]*x[1], reverse=True):
+            count = len(grouped[res])
+            area = res[0] * res[1]
+            pct = (area / config.TARGET_PIXEL_AREA) * 100
+            if pct >= 95:
+                status = "[OK] OPTIMAL"
+            elif pct >= 75:
+                status = "[OK] GOOD"
+            elif pct >= 50:
+                status = "[OK] FAIR"
+            else:
+                status = "[!] POOR"
+            over_marker = " <-- OVER BUDGET!" if area > config.TARGET_PIXEL_AREA else ""
+            print(f"{res[0]}x{res[1]:<6} | {count:<6} | {area:<12,} | {pct:>6.1f}%      | {status}{over_marker}")
+        
+        # Print summary statistics
+        print(f"\n{'SUMMARY STATISTICS':=^70}")
+        print(f"Total images processed: {total_images}")
+        print(f"Unique resolutions: {len(grouped)}")
+        
+        print(f"\nAspect Ratio Distribution:")
+        for ar, count in sorted(aspect_ratios.items(), key=lambda x: x[1], reverse=True)[:5]:
+            pct = (count / total_images) * 100
+            print(f"  {ar:<12}: {count:>4} images ({pct:>5.1f}%)")
+        
+        print(f"\nArea Budget Utilization:")
+        print(f"  95-100% (Optimal):  {area_distribution['95_100%']:>4} images ({area_distribution['95_100%']/total_images*100:>5.1f}%)")
+        print(f"  75-95%  (Good):     {area_distribution['75_95%']:>4} images ({area_distribution['75_95%']/total_images*100:>5.1f}%)")
+        print(f"  50-75%  (Fair):     {area_distribution['50_75%']:>4} images ({area_distribution['50_75%']/total_images*100:>5.1f}%)")
+        print(f"  <50%    (Poor):     {area_distribution['under_50%']:>4} images ({area_distribution['under_50%']/total_images*100:>5.1f}%)")
+        
+        if area_distribution["over_budget"] > 0:
+            print(f"\n  [!][!][!] OVER BUDGET:   {area_distribution['over_budget']:<4} images ({area_distribution['over_budget']/total_images*100:>5.1f}%) [!][!][!]")
+            print(f"      This should NEVER happen - check ResolutionCalculator!")
+        
+        # Show examples of different scaling scenarios
+        print(f"\n{'SCALING EXAMPLES':=^70}")
+        examples = {
+            "upscaled_small": None,      # Small image upscaled
+            "native_large": None,        # Large image at native
+            "downscaled_large": None,    # Large image downscaled
+            "extreme_portrait": None,    # Very tall image
+            "extreme_landscape": None,   # Very wide image
+        }
+        
+        for m in metadata:
+            orig_w, orig_h = m["original_size"]
+            targ_w, targ_h = m["target_resolution"]
+            orig_area = orig_w * orig_h
+            targ_area = targ_w * targ_h
+            
+            # Find examples
+            if orig_area < config.TARGET_PIXEL_AREA * 0.5 and targ_area > orig_area * 1.5 and not examples["upscaled_small"]:
+                examples["upscaled_small"] = m
+            elif orig_area == config.TARGET_PIXEL_AREA and not examples["native_large"]:
+                examples["native_large"] = m
+            elif orig_area > config.TARGET_PIXEL_AREA * 2 and not examples["downscaled_large"]:
+                examples["downscaled_large"] = m
+            elif orig_h > orig_w * 2 and not examples["extreme_portrait"]:
+                examples["extreme_portrait"] = m
+            elif orig_w > orig_h * 2 and not examples["extreme_landscape"]:
+                examples["extreme_landscape"] = m
+        
+        for name, m in examples.items():
+            if m:
+                ow, oh = m["original_size"]
+                tw, th = m["target_resolution"]
+                scale = math.sqrt((tw*th) / (ow*oh))
+                if scale > 1.2:
+                    action = "UPSCALED"
+                elif scale < 0.8:
+                    action = "DOWNSCALED"
+                else:
+                    action = "PRESERVED"
+                print(f"\n  [{name.replace('_', ' ').upper()}]")
+                print(f"    Original:  {ow}x{oh} ({ow*oh:,} px)")
+                print(f"    Target:    {tw}x{th} ({tw*th:,} px)")
+                print(f"    Scale:     {scale:.2f}x ({action})")
+                print(f"    File:      {m['ip'].name[:50]}...")
+        
+        print(f"\n{'='*70}\n")
+        # --- ENHANCED DEBUG LOGGING END ---
         
         batches = []
         for res in grouped:
@@ -741,12 +903,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
                         
-                       
                         if use_semantic_loss:
-                            
-                            with Image.open(m['ip']) as orig_img:
-                                orig_img = fix_alpha_channel(orig_img)
-                                original_images_for_semantic.append(orig_img)
+                            original_images_for_semantic.append(img_resized.copy())
                                 
                 except Exception as e:
                     print(f"Skipping {m['ip']}: {e}")
@@ -1524,6 +1682,7 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     from safetensors.torch import load_file, save_file
     import gc
     from pathlib import Path
+    from collections import defaultdict
 
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -1531,12 +1690,10 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     print(f"\nINFO: Saving complete checkpoint to: {output_path}")
     print(f"   -> Target dtype: {compute_dtype}")
 
-    
     print("   -> Generating Key Map...")
     hf_keys = list(unet.state_dict().keys())
     key_map = get_unet_key_mapping(hf_keys)
 
-    
     print("   -> Loading base checkpoint dictionary...")
     try:
         base_tensors = load_file(str(base_checkpoint_path), device="cpu")
@@ -1544,7 +1701,61 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
         print(f"ERROR: Could not load base checkpoint: {e}")
         return
 
-    
+    # --- Key Diagnostics ---
+    # Group base checkpoint keys by their top-level prefix so we can see
+    # exactly which components the checkpoint contains and confirm which
+    # ones the UNet merge will and won't touch.
+    print("\n   -> Base Checkpoint Key Groups (first 3 examples each):")
+    base_key_groups = defaultdict(list)
+    for k in base_tensors.keys():
+        prefix = k.split(".")[0]
+        base_key_groups[prefix].append(k)
+
+    for prefix, keys in sorted(base_key_groups.items()):
+        examples = ", ".join(keys[:3])
+        print(f"      [{prefix}] ({len(keys)} tensors)  e.g. {examples}")
+
+    # Show which HF keys the map will try to write and whether the target
+    # already exists in the checkpoint (missing = new key, present = update).
+    unet_state = unet.state_dict()
+    mapped_present  = []   # target key already in base checkpoint  → update
+    mapped_missing  = []   # target key NOT in base checkpoint       → new entry (warn)
+    hf_unmapped     = []   # HF key not found in unet state at all   → skip
+
+    for hf_key, target_key in key_map.items():
+        if hf_key not in unet_state:
+            hf_unmapped.append(hf_key)
+        elif target_key in base_tensors:
+            mapped_present.append((hf_key, target_key))
+        else:
+            mapped_missing.append((hf_key, target_key))
+
+    print(f"\n   -> Key Mapping Diagnostic:")
+    print(f"      Will UPDATE  : {len(mapped_present)} keys already present in checkpoint")
+    print(f"      Will ADD NEW : {len(mapped_missing)} keys not found in checkpoint (unexpected)")
+    print(f"      HF Skipped   : {len(hf_unmapped)} HF keys not in UNet state (normal)")
+
+    if mapped_missing:
+        print(f"      WARNING — first 3 new/unmatched keys (check your key map):")
+        for hf_k, tgt_k in mapped_missing[:3]:
+            print(f"        HF:  {hf_k}")
+            print(f"        SD:  {tgt_k}")
+
+    # Keys in the base checkpoint that no UNet key maps to — these are the
+    # encoder, VAE, CLIP etc. blocks we deliberately leave untouched.
+    all_target_keys = set(key_map.values())
+    untouched_keys  = [k for k in base_tensors if k not in all_target_keys]
+    untouched_groups = defaultdict(list)
+    for k in untouched_keys:
+        untouched_groups[k.split(".")[0]].append(k)
+
+    print(f"\n   -> Checkpoint keys left UNTOUCHED: {len(untouched_keys)} "
+          f"(encoders, VAE, etc. — first 3 per group):")
+    for prefix, keys in sorted(untouched_groups.items()):
+        examples = ", ".join(keys[:3])
+        print(f"      [{prefix}] ({len(keys)} tensors)  e.g. {examples}")
+    print()
+
     print(f"   -> Converting base checkpoint to {compute_dtype}...")
     converted_count = 0
     for key in base_tensors.keys():
@@ -1553,34 +1764,21 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
             converted_count += 1
     print(f"   -> Converted {converted_count} tensors to {compute_dtype}")
 
-    
     print("   -> Merging ALL UNet weights (frozen + trainable)...")
-    
     update_count = 0
-    unet_state = unet.state_dict()
-    
     for hf_key, target_key in key_map.items():
         if hf_key in unet_state:
-            
-            
-            tensor_gpu = unet_state[hf_key]
-            tensor_cpu = tensor_gpu.detach().to("cpu", dtype=compute_dtype)
-            
-            
+            tensor_cpu = unet_state[hf_key].detach().to("cpu", dtype=compute_dtype)
             base_tensors[target_key] = tensor_cpu
             update_count += 1
-            
             del tensor_cpu
 
     print(f"   -> Copied {update_count} layers (trainable + frozen in {compute_dtype})")
 
-    
     print("   -> Saving to disk (SAFETENSORS)...")
     save_file(base_tensors, str(output_path))
-    
     print(f"   -> Save Complete in {compute_dtype}")
 
-    
     del base_tensors
     del unet_state
     del key_map
@@ -1588,7 +1786,7 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-def save_checkpoint(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
+def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
     """
     Save checkpoint including model and training state.
     global_step = Optimizer Steps
@@ -1656,7 +1854,6 @@ def main():
         state_path = Path(config.RESUME_STATE_PATH)
         training_state = torch.load(state_path, map_location="cpu", weights_only=False)
         
-
         global_step_saved = training_state.get('global_step', 0)
         micro_step = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
         optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
@@ -1689,18 +1886,35 @@ def main():
     
     if check_if_caching_needed(config):
         print("Loading base model components for caching...")
+        
+        # --- Always use config values; never hardcode shift/scale/channels ---
+        target_channels  = getattr(config, 'VAE_LATENT_CHANNELS', 4)
+        conf_shift       = getattr(config, 'VAE_SHIFT_FACTOR', None)
+        conf_scale       = getattr(config, 'VAE_SCALING_FACTOR', None)
+
         vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
-        target_channels = getattr(config, 'VAE_LATENT_CHANNELS', None)
         vae_for_caching = load_vae_robust(vae_source, device, target_channels=target_channels)
 
-        is_32_ch = vae_for_caching.config.latent_channels == 32
-        detected_shift = 0.0760 if is_32_ch else 0.0
-        detected_scale = 0.6043 if is_32_ch else 0.13025
-        conf_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
-        conf_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
-        vae_for_caching.config.shift_factor = conf_shift if conf_shift is not None else detected_shift
-        vae_for_caching.config.scaling_factor = conf_scale if conf_scale is not None else detected_scale
-        
+        # Read whatever the VAE file itself advertises, then let config win if provided
+        file_shift = getattr(vae_for_caching.config, 'shift_factor',   None)
+        file_scale = getattr(vae_for_caching.config, 'scaling_factor', None)
+
+        final_shift = conf_shift if conf_shift is not None else file_shift
+        final_scale = conf_scale if conf_scale is not None else file_scale
+
+        if final_shift is None or final_scale is None:
+            raise ValueError(
+                "Could not determine VAE shift/scale factors. "
+                "Please set VAE_SHIFT_FACTOR and VAE_SCALING_FACTOR explicitly in your config."
+            )
+
+        vae_for_caching.config.shift_factor   = final_shift
+        vae_for_caching.config.scaling_factor = final_scale
+
+        print(f"INFO: VAE Latent Channels : {vae_for_caching.config.latent_channels}")
+        print(f"INFO: VAE shift_factor    : {final_shift}  (source: {'config' if conf_shift is not None else 'vae file'})")
+        print(f"INFO: VAE scaling_factor  : {final_scale}  (source: {'config' if conf_scale is not None else 'vae file'})")
+
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
 
@@ -1787,7 +2001,6 @@ def main():
     print(f"  - Frozen:    {frozen_params / 1e6:.2f}M params")
     
     optimizer = create_optimizer(config, params_to_optimize)
-    
 
     lr_scheduler = CustomCurveLRScheduler(
         optimizer=optimizer,
@@ -1804,7 +2017,6 @@ def main():
             except Exception as e:
                 print(f"WARNING: Optimizer load failed ({e}). Starting optimizer fresh.")
 
-
         lr_scheduler.step(micro_step)
         print("--- Resume setup complete. Starting training loop. ---")
     else:
@@ -1812,7 +2024,6 @@ def main():
 
     unet.train()
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
-    
 
     reporter = AsyncReporter(
         total_steps=config.MAX_TRAIN_STEPS,
@@ -1839,7 +2050,6 @@ def main():
     last_step_time = time.time()
     last_optim_step_log_time = time.time()
     done = False
-    
 
     batches_to_skip = 0
     if config.RESUME_TRAINING:
@@ -1853,13 +2063,11 @@ def main():
                 batches_to_skip -= 1
                 continue
 
-
             if micro_step >= config.MAX_TRAIN_STEPS:
                 done = True
                 break
                 
             if not batch: continue
-
 
             micro_step += 1
             
@@ -1907,7 +2115,16 @@ def main():
                 else:
                     loss = base_loss.mean()
 
-            else:  # Default MSE
+            elif loss_type == "MSE_Perturb":
+                value_weight = 1.0 + torch.abs(target.float()) * 0.5
+                base_loss = (pred.float() - target.float()) ** 2 * value_weight
+                loss = base_loss.mean()
+             
+            elif loss_type == "DestinationLoss":
+                pred_final = noisy_latents.float() - t_expanded.float() * pred.float()
+                loss = F.mse_loss(pred_final, latents.float())
+
+            else:
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
             raw_loss_value = loss.detach().item()
@@ -1915,10 +2132,8 @@ def main():
             scaled_loss.backward()
     
             diagnostics.step(raw_loss_value)
-            
 
             lr_scheduler.step(micro_step)
-            
 
             is_accumulation_step = (micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0)
             diag_data_to_log = None
@@ -1956,7 +2171,7 @@ def main():
 
                 if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and (optimizer_step % config.SAVE_EVERY_N_STEPS == 0):
                     print(f"\n--- Saving checkpoint at optimizer step {optimizer_step} (Micro Step {micro_step}) ---")
-                    save_checkpoint(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
+                    save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
 
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)
