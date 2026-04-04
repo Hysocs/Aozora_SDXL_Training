@@ -1754,7 +1754,7 @@ UI_DEFS = {
     "USE_ZERO_TERMINAL_SNR":       ("Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.", "check"),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "MSE_Perturb", "DestinationLoss"]),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "DestinationLoss"]),
     "SEMANTIC_SEP_WEIGHT":         ("Separation Region Weight", "Weight for blob/color separation regions.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_DETAIL_WEIGHT":      ("Lineart/Detail Weight", "Weight for fine details, edges, and lineart.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_ENTROPY_WEIGHT":     ("Entropy/Texture Weight", "Weight for texture complexity. Requires scikit-image.", "dspin", 0.0, 2.0, 0.05, 2),
@@ -2081,11 +2081,22 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.start_button = make_btn("Start Training", self.start_training)
         self.start_button.setObjectName("StartButton")
+        
+        # --- EMERGENCY SAVE BUTTON ---
+        self.force_save_button = make_btn("Emergency Checkpoint", self.force_save_checkpoint)
+        self.force_save_button.setObjectName("ForceSaveButton")
+        self.force_save_button.setVisible(False)
+        self.force_save_button.setStyleSheet(f"background: {WARN}; color: {DARK_BG}; font-weight: bold; border-color: {WARN};")
+        
         self.stop_button = make_btn("Stop Training", self.stop_training)
         self.stop_button.setObjectName("StopButton")
         self.stop_button.setVisible(False)
+        
+        # Add all 3 buttons to the layout in order
         lay.addWidget(self.start_button)
+        lay.addWidget(self.force_save_button)
         lay.addWidget(self.stop_button)
+        
         self.layout().addLayout(lay)
 
     # ── Dataset Tab ───────────────────────────────────────────────
@@ -2268,7 +2279,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_loss_group(self):
         gb, lay = group_box("Loss Configuration")
         form = QtWidgets.QFormLayout()
-        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "MSE_Perturb", "DestinationLoss"])
+        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "DestinationLoss"])
         self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
         form.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
         lay.addLayout(form)
@@ -2766,9 +2777,14 @@ class TrainingGUI(QtWidgets.QWidget):
 
     # ── Training Control ──────────────────────────────────────────
     def get_current_cache_folder_name(self):
-        return (".precomputed_embeddings_cache_rf_noobai"
-                if "Rectified Flow" in self.training_mode_combo.currentText()
-                else ".precomputed_embeddings_cache")
+        if "Rectified Flow" in self.training_mode_combo.currentText():
+            return ".precomputed_embeddings_cache_rf_noobai"
+        # Return whichever standard cache exists, preferring the current name
+        for ds in self.dataset_manager.datasets:
+            for name in [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache"]:
+                if (Path(ds["path"]) / name).exists():
+                    return name
+        return ".precomputed_embeddings_cache_standard_sdxl"
 
     def start_training(self):
         self.save_config()
@@ -2779,7 +2795,7 @@ class TrainingGUI(QtWidgets.QWidget):
         train_py_path = os.path.abspath("train.py")
         if not os.path.exists(train_py_path): self.log(f"CRITICAL: train.py not found."); return
 
-        self.start_button.setVisible(False); self.stop_button.setVisible(True)
+        self.start_button.setVisible(False); self.stop_button.setVisible(True); self.force_save_button.setVisible(True)
         self.live_metrics_widget.clear_data()
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -2805,11 +2821,23 @@ class TrainingGUI(QtWidgets.QWidget):
         if self.process_runner and self.process_runner.isRunning(): self.process_runner.stop()
         else: self.log("No active training process to stop.")
 
+    def force_save_checkpoint(self):
+        if self.process_runner and self.process_runner.isRunning():
+            flag_path = os.path.abspath("force_save.flag")
+            try:
+                with open(flag_path, 'w') as f:
+                    f.write("1")
+                self.log("INFO: Requested emergency checkpoint. Will save at the end of the current optimizer step.")
+            except Exception as e:
+                self.log(f"ERROR: Could not create save flag: {e}")
+        else:
+            self.log("No active training process to save.")
+
     def training_finished(self, exit_code=0):
         if self.process_runner: self.process_runner.quit(); self.process_runner.wait(); self.process_runner = None
         status = "successfully" if exit_code == 0 else f"with error (Code: {exit_code})"
         self.log("\n" + "=" * 50 + f"\nTraining finished {status}.\n" + "=" * 50)
-        self.start_button.setVisible(True); self.stop_button.setVisible(False)
+        self.start_button.setVisible(True); self.stop_button.setVisible(False); self.force_save_button.setVisible(False)
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
         if os.name == 'nt': prevent_sleep(False)
 

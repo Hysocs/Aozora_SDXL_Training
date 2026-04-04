@@ -393,7 +393,15 @@ def get_optimal_bucket(orig_w, orig_h, target_area, stride=64):
     return w, h
 
 def smart_resize(image, target_w, target_h):
-    return ImageOps.fit(image, (target_w, target_h), method=Image.Resampling.LANCZOS, centering=(0.5, 0.5))
+    scale = min(target_w / image.width, target_h / image.height)
+    new_w = int(round(image.width * scale))
+    new_h = int(round(image.height * scale))
+    resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
+    canvas = Image.new("RGB", (target_w, target_h), (255, 255, 255))
+    paste_x = (target_w - new_w) // 2
+    paste_y = (target_h - new_h) // 2
+    canvas.paste(resized, (paste_x, paste_y))
+    return canvas
 
 def validate_and_assign_resolution(args):
     ip, target_area, stride, should_upscale = args
@@ -409,11 +417,20 @@ def validate_and_assign_resolution(args):
         else:
             target_w, target_h = get_optimal_bucket(w, h, target_area, stride)
 
-        scale = max(target_w / w, target_h / h)
-        scaled_w = int(round(w * scale))
-        scaled_h = int(round(h * scale))
-        crop_left = max(0, (scaled_w - target_w) // 2)
-        crop_top = max(0, (scaled_h - target_h) // 2)
+        while target_w * target_h > target_area:
+            if target_w >= target_h and target_w > stride:
+                target_w -= stride
+            elif target_h > stride:
+                target_h -= stride
+            else:
+                break
+
+        # Compute where actual content lands inside the bucket after padding
+        content_scale = min(target_w / w, target_h / h)
+        content_w = int(round(w * content_scale))
+        content_h = int(round(h * content_scale))
+        paste_x = (target_w - content_w) // 2
+        paste_y = (target_h - content_h) // 2
 
         cp = ip.with_suffix('.txt')
         caption = ip.stem.replace('_', ' ')
@@ -424,9 +441,9 @@ def validate_and_assign_resolution(args):
 
         return {
             "ip": ip, "caption": caption, "target_resolution": (target_w, target_h),
-            "original_size": (w, h), "scaled_size": (scaled_w, scaled_h),
-            "crop_coords": (crop_top, crop_left),
-            "original_area": w * h, "target_area": target_w * target_h
+            "original_size": (w, h), "crop_coords": (0, 0),
+            "original_area": w * h, "target_area": target_w * target_h,
+            "content_bounds": (paste_x, paste_y, content_w, content_h)
         }
     except Exception as e:
         print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
@@ -478,18 +495,79 @@ def check_if_caching_needed(config):
 
 def load_unet_robust(path, compute_dtype):
     print(f"INFO: Loading UNet from: {Path(path).name}")
-    try:
-        unet = UNet2DConditionModel.from_single_file(
-            path,
-            torch_dtype=compute_dtype,
-            low_cpu_mem_usage=True
+
+    raw = load_file(str(path), device="cpu")
+
+    conv_in_key     = next(
+        (k for k in raw if k.endswith("conv_in.weight") or k.endswith("input_blocks.0.0.weight")),
+        None
+    )
+    target_channels = raw[conv_in_key].shape[1] if conv_in_key else 4
+    print(f"INFO: Detected {target_channels} input channels from checkpoint")
+
+    time_linear_key = next(
+        (k for k in raw if k in (
+            "model.diffusion_model.time_embed.0.weight",
+            "time_embedding.linear_1.weight",
+        )),
+        None
+    )
+    if time_linear_key is None or raw[time_linear_key].shape[1] != 640:
+        raise RuntimeError(
+            "Expected a surgically expanded time_embedding (640d input) but got "
+            f"shape {raw[time_linear_key].shape if time_linear_key else 'key not found'}. "
+            "Run surgery_tool.py on the base model first."
         )
-        print(f"INFO: Loaded UNet (Channels: In={unet.config.in_channels} / Out={unet.config.out_channels})")
-        return unet
+
+    expanded_w = raw[time_linear_key].to(dtype=compute_dtype)
+    bias_key   = time_linear_key.replace(".weight", ".bias")
+    expanded_b = raw[bias_key].to(dtype=compute_dtype) if bias_key in raw else None
+    del raw
+
+    print(f"INFO: Detected expanded time_embedding (640d) -- dual-endpoint mode active")
+
+    load_kwargs = {
+        "torch_dtype":             compute_dtype,
+        "low_cpu_mem_usage":       False,
+        "in_channels":             target_channels,
+        "out_channels":            target_channels,
+        "ignore_mismatched_sizes": True,
+    }
+
+    _orig_load = torch.nn.Module.load_state_dict
+
+    def _skip_size_mismatches(self, state_dict, strict=True, **kw):
+        own      = self.state_dict()
+        filtered = {k: v for k, v in state_dict.items()
+                    if k not in own or v.shape == own[k].shape}
+        return _orig_load(self, filtered, strict=False, **kw)
+
+    torch.nn.Module.load_state_dict = _skip_size_mismatches
+    try:
+        unet = UNet2DConditionModel.from_single_file(path, **load_kwargs)
     except Exception as e:
         print(f"CRITICAL ERROR: Failed to load UNet. {e}")
-        raise e
+        raise
+    finally:
+        torch.nn.Module.load_state_dict = _orig_load
 
+    old      = unet.time_embedding.linear_1
+    has_bias = old.bias is not None
+
+    new_lin        = torch.nn.Linear(640, 1280, bias=has_bias, device=old.weight.device, dtype=compute_dtype)
+    new_lin.weight = torch.nn.Parameter(expanded_w.to(device=old.weight.device))
+    if has_bias:
+        new_lin.bias = torch.nn.Parameter(old.bias.data.clone())
+    elif expanded_b is not None:
+        new_lin.bias = torch.nn.Parameter(expanded_b.to(device=old.weight.device))
+
+    unet.time_embedding.linear_1 = new_lin
+    del old
+
+    print(f"INFO: time_embedding.linear_1 restored: (1280, 320) -> (1280, 640)")
+    print(f"INFO: Loaded UNet (In={unet.config.in_channels} / Out={unet.config.out_channels})")
+    return unet
+    
 def load_vae_robust(path, device, target_channels=None):
     print(f"INFO: Attempting to load VAE from: {path}")
     if target_channels is None:
@@ -571,11 +649,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         images_global.append(transform(img_resized))
                         valid_meta_final.append(m)
                         if use_semantic_loss: original_images_for_semantic.append(img_resized.copy())
-                except Exception as e:
-                    tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
+                except: pass
 
             if not images_global: continue
 
+            # Compute embeddings ONLY for images that actually loaded successfully
+            # so indices always match valid_meta_final exactly
             embeds, pooled = compute_text_embeddings_sdxl([m['caption'] for m in valid_meta_final], t1, t2, te1, te2, device)
 
             with torch.no_grad():
@@ -602,13 +681,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     device="cpu", dtype=torch.float32
                 ).cpu()
 
+
             for j, m in enumerate(valid_meta_final):
                 safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_')
                 torch.save({
                     "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
-                    "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
-                    "target_size": (w, h),
-                    "crop_coords": m.get("crop_coords", (0, 0)),
+                    "original_size": m["original_size"], "target_size": (w, h),
+                    "crop_coords": (0, 0),
+                    "content_bounds": m.get("content_bounds", (0, 0, w, h)),
                     "embeds": embeds[j].to(dtype=torch.float32).cpu(), "pooled": pooled[j].to(dtype=torch.float32).cpu(),
                     "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
                 }, cache_dir / f"{safe_filename}_te.pt")
@@ -680,7 +760,9 @@ class ImageTextLatentDataset(Dataset):
                 "embeds": data_te["embeds"].squeeze(0) if data_te["embeds"].dim() == 3 else data_te["embeds"],
                 "pooled": data_te["pooled"].squeeze(0) if data_te["pooled"].dim() == 2 else data_te["pooled"],
                 "original_sizes": data_te["original_size"], "target_sizes": data_te["target_size"],
-                "crop_coords": data_te.get("crop_coords", (0, 0)), "latent_path": str(path_te)
+                "crop_coords": data_te.get("crop_coords", (0, 0)),
+                "content_bounds": data_te.get("content_bounds", None),
+                "latent_path": str(path_te)
             }
 
             if self.use_semantic_loss:
@@ -693,10 +775,7 @@ class ImageTextLatentDataset(Dataset):
                 item["embeds"], item["pooled"] = self.null_embeds, self.null_pooled
 
             return item
-        
-        except Exception as e:
-            print(f"[DATASET] Failed to load item {i}: {e}")
-            return None
+        except: return None
 
 
 class TimestepSampler:
@@ -758,7 +837,38 @@ class TimestepSampler:
             indices.append(self.ticket_pool[self.pool_index])
             self.pool_index += 1
         return torch.tensor(indices, dtype=torch.long, device=self.device)
+    
+    def sample_continuous_rf(self, batch_size, height=None, width=None):
+        """
+        Ticket-pool-driven continuous timestep sampling for RF training.
+        Each draw takes a discrete bin from the pool, then adds uniform jitter
+        within that bin so the distribution stays controlled but t is continuous.
+        SD3/Flux-style shift (default 2.5) is applied after.
+        """
+        raw_indices = []
+        for _ in range(batch_size):
+            if self.pool_index >= len(self.ticket_pool):
+                self.pool_index = 0
+            raw_indices.append(self.ticket_pool[self.pool_index])
+            self.pool_index += 1
 
+        idx_t = torch.tensor(raw_indices, dtype=torch.float32, device=self.device)
+
+        # Jitter uniformly within the bin so output is continuous in [0, 1]
+        bin_width = self.bin_size / 1000.0
+        jitter    = torch.rand(batch_size, device=self.device) * bin_width
+        t         = (idx_t / 1000.0 + jitter).clamp(0.0, 1.0)
+
+        # SD3/Flux-style shift: s*t / (1 + (s-1)*t)
+        shift = (
+            self.get_dynamic_shift(height, width)
+            if (self.use_dynamic_shift and height and width)
+            else self.shift_factor
+        )
+        t_shifted = self.apply_flow_shift(t, shift)
+
+        return t_shifted.clamp(0.0, 1.0)
+    
     def update(self, raw_grad_norm): pass
 
 
@@ -766,10 +876,14 @@ def custom_collate_fn(batch):
     batch = list(filter(None, batch))
     if not batch: return {}
     output = {}
+    list_keys = {"original_image", "content_bounds"}
     for k in batch[0]:
-        if k == "original_image": output[k] = [item[k] for item in batch]
-        elif isinstance(batch[0][k], torch.Tensor): output[k] = torch.stack([item[k] for item in batch])
-        else: output[k] = [item[k] for item in batch]
+        if k in list_keys:
+            output[k] = [item[k] for item in batch]
+        elif isinstance(batch[0][k], torch.Tensor):
+            output[k] = torch.stack([item[k] for item in batch])
+        else:
+            output[k] = [item[k] for item in batch]
     return output
 
 def create_optimizer(config, params_to_optimize):
@@ -876,7 +990,19 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
         for k in missing[:5]: print(f"  -> {k}")
         if len(missing) > 5: print(f"  ... and {len(missing) - 5} more")
 
+# Save target_t_proj if it exists
+    if hasattr(unet, 'target_t_proj'):
+        proj_tensors = 0
+        for name, param in unet.target_t_proj.named_parameters():
+            key = f"target_t_proj.{name}"
+            base_tensors[key] = param.detach().cpu().to(dtype=compute_dtype)
+            proj_tensors += 1
+        print(f"INFO: Saved target_t_proj ({proj_tensors} tensors)")
+    else:
+        print("INFO: No target_t_proj found on unet, skipping")
+
     print(f"INFO: Saving to disk...")
+    base_tensors["__aozora_delta__"] = torch.tensor([1.0], dtype=torch.float32)
     save_file(base_tensors, str(output_path))
     print(f"INFO: Save complete -> {output_path.name}")
 
@@ -891,14 +1017,60 @@ def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, opti
     save_model(output_dir / model_filename, unet, base_checkpoint_path, config.compute_dtype)
 
     optim_state = optimizer.save_cpu_state() if hasattr(optimizer, 'save_cpu_state') else optimizer.state_dict()
+    
+    # Safely handle standard PyTorch samplers that don't have .seed or .epoch
+    sampler_seed = getattr(sampler, 'seed', getattr(config, 'SEED', 42))
+    sampler_epoch = getattr(sampler, 'epoch', 0)
+    
     training_state = {
         'global_step': global_step, 'micro_step': micro_step, 'optimizer_state': optim_state,
-        'sampler_seed': sampler.seed, 'sampler_epoch': sampler.epoch,
+        'sampler_seed': sampler_seed, 'sampler_epoch': sampler_epoch,
         'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
         'torch_cpu_state': torch.get_rng_state(),
         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
     }
     torch.save(training_state, output_dir / state_filename)
+
+
+
+
+def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
+    output_dir = Path(config.OUTPUT_DIR)
+    model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
+    state_filename = f"training_state_step_{global_step}.pt"
+    save_model(output_dir / model_filename, unet, base_checkpoint_path, config.compute_dtype)
+
+    optim_state = optimizer.save_cpu_state() if hasattr(optimizer, 'save_cpu_state') else optimizer.state_dict()
+    
+    # Safely handle standard PyTorch samplers that don't have .seed or .epoch
+    sampler_seed = getattr(sampler, 'seed', getattr(config, 'SEED', 42))
+    sampler_epoch = getattr(sampler, 'epoch', 0)
+    
+    training_state = {
+        'global_step': global_step, 'micro_step': micro_step, 'optimizer_state': optim_state,
+        'sampler_seed': sampler_seed, 'sampler_epoch': sampler_epoch,
+        'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
+        'torch_cpu_state': torch.get_rng_state(),
+        'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+    }
+    torch.save(training_state, output_dir / state_filename)
+
+def make_content_mask(content_bounds_batch, latent_shape, device):
+    B, C, H, W = latent_shape
+    mask = torch.zeros(B, 1, H, W, device=device, dtype=torch.float32)
+    for i, bounds in enumerate(content_bounds_batch):
+        if bounds is None:
+            mask[i] = 1.0
+            continue
+        px, py, cw, ch = bounds
+        lx  = px // 8
+        ly  = py // 8
+        lw  = max(1, cw // 8)
+        lh  = max(1, ch // 8)
+        lx2 = min(W, lx + lw)
+        ly2 = min(H, ly + lh)
+        mask[i, 0, ly:ly2, lx:lx2] = 1.0
+    return mask
 
 
 def main():
@@ -908,91 +1080,137 @@ def main():
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    global_step, micro_step, optimizer_step = 0, 0, 0
+    micro_step, optimizer_step = 0, 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed, optimizer_state, initial_epoch = config.SEED, None, 0
 
     if config.RESUME_TRAINING:
         print("\n" + "="*50 + "\n--- RESUMING TRAINING SESSION ---\n")
-        training_state = torch.load(Path(config.RESUME_STATE_PATH), map_location="cpu", weights_only=False)
+        training_state   = torch.load(Path(config.RESUME_STATE_PATH), map_location="cpu", weights_only=False)
+        micro_step       = training_state.get('micro_step', 0)
+        optimizer_step   = micro_step // config.GRADIENT_ACCUMULATION_STEPS
+        initial_sampler_seed = training_state.get('sampler_seed', config.SEED)
+        initial_epoch    = training_state.get('sampler_epoch', 0)
+        optimizer_state  = training_state['optimizer_state']
+        model_to_load    = Path(config.RESUME_MODEL_PATH)
 
-        global_step_saved = training_state.get('global_step', 0)
-        micro_step = training_state.get('micro_step', global_step_saved * config.GRADIENT_ACCUMULATION_STEPS)
-        optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
-
-        initial_sampler_seed = training_state['sampler_seed']
-        initial_epoch = training_state.get('sampler_epoch', 0)
-        optimizer_state = training_state['optimizer_state']
-        model_to_load = Path(config.RESUME_MODEL_PATH)
-
-        if 'random_state' in training_state: random.setstate(training_state['random_state'])
-        if 'numpy_state' in training_state: np.random.set_state(training_state['numpy_state'])
-        if 'torch_cpu_state' in training_state: torch.set_rng_state(training_state['torch_cpu_state'])
-        if 'torch_cuda_state' in training_state and training_state['torch_cuda_state'] is not None: torch.cuda.set_rng_state(training_state['torch_cuda_state'])
+        if 'random_state'     in training_state: random.setstate(training_state['random_state'])
+        if 'numpy_state'      in training_state: np.random.set_state(training_state['numpy_state'])
+        if 'torch_cpu_state'  in training_state: torch.set_rng_state(training_state['torch_cpu_state'])
+        if 'torch_cuda_state' in training_state and training_state['torch_cuda_state'] is not None:
+            torch.cuda.set_rng_state(training_state['torch_cuda_state'])
     else:
-        mode_str = "RECTIFIED FLOW" if config.is_rectified_flow else "STANDARD SDXL"
-        print("\n" + "="*50 + f"\n--- STARTING {mode_str} TRAINING ---\n" + "="*50 + "\n")
+        print("\n" + "="*50 + "\n--- STARTING RECTIFIED FLOW TRAINING ---\n" + "="*50 + "\n")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
+    # ------------------------------------------------------------------
+    # Caching
+    # ------------------------------------------------------------------
     if check_if_caching_needed(config):
         target_channels = getattr(config, 'VAE_LATENT_CHANNELS', 4)
-        conf_shift = getattr(config, 'VAE_SHIFT_FACTOR', None)
-        conf_scale = getattr(config, 'VAE_SCALING_FACTOR', None)
+        conf_shift      = getattr(config, 'VAE_SHIFT_FACTOR', None)
+        conf_scale      = getattr(config, 'VAE_SCALING_FACTOR', None)
 
         vae_source = config.VAE_PATH if (config.VAE_PATH and Path(config.VAE_PATH).exists()) else config.SINGLE_FILE_CHECKPOINT_PATH
         vae_for_caching = load_vae_robust(vae_source, device, target_channels=target_channels)
-
-        vae_for_caching.config.shift_factor = conf_shift if conf_shift is not None else getattr(vae_for_caching.config, 'shift_factor', None)
+        vae_for_caching.config.shift_factor   = conf_shift if conf_shift is not None else getattr(vae_for_caching.config, 'shift_factor', None)
         vae_for_caching.config.scaling_factor = conf_scale if conf_scale is not None else getattr(vae_for_caching.config, 'scaling_factor', None)
-        print(f"INFO: VAE shift={vae_for_caching.config.shift_factor}, scale={vae_for_caching.config.scaling_factor}, channels={vae_for_caching.config.latent_channels}")
+        print(f"INFO: VAE shift={vae_for_caching.config.shift_factor}, scale={vae_for_caching.config.scaling_factor}")
         vae_for_caching.enable_tiling()
         vae_for_caching.enable_slicing()
 
-        base_pipe = StableDiffusionXLPipeline.from_single_file(config.SINGLE_FILE_CHECKPOINT_PATH, vae=vae_for_caching, unet=None, torch_dtype=torch.float32, low_cpu_mem_usage=True)
-        precompute_and_cache_latents(config, base_pipe.tokenizer, base_pipe.tokenizer_2, base_pipe.text_encoder, base_pipe.text_encoder_2, vae_for_caching, device)
+        base_pipe = StableDiffusionXLPipeline.from_single_file(
+            config.SINGLE_FILE_CHECKPOINT_PATH, vae=vae_for_caching, unet=None,
+            torch_dtype=torch.float32, low_cpu_mem_usage=True
+        )
+        precompute_and_cache_latents(
+            config, base_pipe.tokenizer, base_pipe.tokenizer_2,
+            base_pipe.text_encoder, base_pipe.text_encoder_2, vae_for_caching, device
+        )
         del base_pipe, vae_for_caching
-        gc.collect()
-        torch.cuda.empty_cache()
+        gc.collect(); torch.cuda.empty_cache()
 
-    print(f"\n--- Loading Model ---")
+    # ------------------------------------------------------------------
+    # Load UNet
+    # ------------------------------------------------------------------
+    print("\n--- Loading Model ---")
     unet = load_unet_robust(model_to_load, config.compute_dtype)
     gc.collect(); torch.cuda.empty_cache()
 
-    # Set up DDPM scheduler for eps/vpred modes
-    scheduler = None
-    if not config.is_rectified_flow:
-        prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
-        print(f"\n--- Using Standard SDXL ({prediction_type}) ---")
-        scheduler = DDPMScheduler.from_pretrained("stabilityai/stable-diffusion-xl-base-1.0", subfolder="scheduler")
-        scheduler.config.prediction_type = prediction_type if prediction_type == "v_prediction" else "epsilon"
-    else:
-        print(f"\n--- Using Rectified Flow (shift={getattr(config, 'RF_SHIFT_FACTOR', 3.0)}) ---")
+    # ------------------------------------------------------------------
+    # Detect surgery
+    # ------------------------------------------------------------------
+    _MODEL_CHANNELS = unet.config.block_out_channels[0]
+    _linear1_in     = unet.time_embedding.linear_1.weight.shape[1]
+    _IS_EXPANDED    = (_linear1_in == _MODEL_CHANNELS * 2)
 
-    print("\n--- Initializing Dataset ---")
-    dataset = ImageTextLatentDataset(config)
-    sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
+    print(f"\n--- Time Embedding ---")
+    print(f"  linear_1 shape : {tuple(unet.time_embedding.linear_1.weight.shape)}")
+    print(f"  mode           : {'DUAL ENDPOINT (surgery active)' if _IS_EXPANDED else 'SINGLE (surgery not run)'}")
+
+    if _IS_EXPANDED:
+        with torch.no_grad():
+            w  = unet.time_embedding.linear_1.weight.float()
+            w1 = w[:, :_MODEL_CHANNELS]
+            w2 = w[:, _MODEL_CHANNELS:]
+            cos_init = torch.nn.functional.cosine_similarity(
+                w1.flatten().unsqueeze(0), w2.flatten().unsqueeze(0)
+            ).item()
+            l2_init  = (w1 - w2).norm().item()
+        print(f"  baseline half cos_sim : {cos_init:.8f}  (should fall over training)")
+        print(f"  baseline half L2_diff : {l2_init:.6f}   (should rise over training)")
+    else:
+        print(f"  WARNING: run surgery_tool.py on base model first")
+
+    # ------------------------------------------------------------------
+    # dt sampling constants
+    # ------------------------------------------------------------------
+    RF_MIN_DELTA = getattr(config, "RF_MIN_DELTA", 0.02)
+    RF_MAX_DELTA = getattr(config, "RF_MAX_DELTA", 0.60)
+    LOG_MIN      = math.log(RF_MIN_DELTA)
+    LOG_MAX      = math.log(RF_MAX_DELTA)
+
+    print(f"\n--- Rectified Flow ---")
+    print(f"  dt range (log-uniform) : [{RF_MIN_DELTA:.3f}, {RF_MAX_DELTA:.3f}]")
+
+    from diffusers.models.embeddings import get_timestep_embedding as _get_t_emb
+
+    # ------------------------------------------------------------------
+    # Dataset / Sampler / DataLoader
+    # ------------------------------------------------------------------
+    print("\n--- Initialising Dataset ---")
+    dataset    = ImageTextLatentDataset(config)
+    sampler    = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
     sampler.set_epoch(initial_epoch)
-    dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
+    dataloader = DataLoader(
+        dataset, batch_sampler=sampler,
+        collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS
+    )
 
     unet.enable_gradient_checkpointing()
     unet.to(device)
     set_attention_processor(unet, getattr(config, "MEMORY_EFFICIENT_ATTENTION", "sdpa"))
 
+    # ------------------------------------------------------------------
+    # Freeze / unfreeze
+    # ------------------------------------------------------------------
     exclusion_keywords = getattr(config, "UNET_EXCLUDE_TARGETS", [])
     for name, param in unet.named_parameters():
-        should_exclude = any(fnmatch.fnmatch(name, kw if '*' in kw else f"*{kw}*") for kw in exclusion_keywords)
+        should_exclude = any(
+            fnmatch.fnmatch(name, kw if '*' in kw else f"*{kw}*")
+            for kw in exclusion_keywords
+        )
         param.requires_grad = not should_exclude
 
     total_params     = sum(p.numel() for p in unet.parameters())
     frozen_params    = sum(p.numel() for p in unet.parameters() if not p.requires_grad)
-    trainable_params = sum(p.numel() for p in unet.parameters() if p.requires_grad)
+    trainable_params = total_params - frozen_params
     print(f"\n{'='*50}")
     print(f"INFO: UNet Parameter Statistics:")
-    print(f"  - Total Parameters:     {total_params:,}")
-    print(f"  - Frozen Parameters:    {frozen_params:,}")
-    print(f"  - Trainable Parameters: {trainable_params:,}")
-    print(f"  - Percentage Frozen:    {(frozen_params/total_params)*100:.2f}%")
+    print(f"  Total:     {total_params:,}")
+    print(f"  Frozen:    {frozen_params:,}")
+    print(f"  Trainable: {trainable_params:,}  ({trainable_params / total_params * 100:.2f}%)")
     print("="*50 + "\n")
 
     params_to_optimize = [
@@ -1000,104 +1218,147 @@ def main():
     ]
 
     optimizer    = create_optimizer(config, params_to_optimize)
-    lr_scheduler = CustomCurveLRScheduler(optimizer=optimizer, curve_points=config.LR_CUSTOM_CURVE, total_micro_steps=config.MAX_TRAIN_STEPS)
+    lr_scheduler = CustomCurveLRScheduler(
+        optimizer=optimizer,
+        curve_points=config.LR_CUSTOM_CURVE,
+        total_micro_steps=config.MAX_TRAIN_STEPS
+    )
 
-    if config.RESUME_TRAINING:
-        if optimizer_state:
-            try: optimizer.load_cpu_state(optimizer_state) if hasattr(optimizer, 'load_cpu_state') else optimizer.load_state_dict(optimizer_state)
-            except: pass
+    if config.RESUME_TRAINING and optimizer_state:
+        try:
+            optimizer.load_cpu_state(optimizer_state) if hasattr(optimizer, 'load_cpu_state') \
+                else optimizer.load_state_dict(optimizer_state)
+        except Exception as e:
+            print(f"WARNING: Could not restore optimizer state: {e}")
         lr_scheduler.step(micro_step)
 
     unet.train()
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
-    reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param")
+    reporter    = AsyncReporter(
+        total_steps=config.MAX_TRAIN_STEPS,
+        test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param"
+    )
 
-    timestep_sampler = TimestepSampler(config, device)
-    if config.RESUME_TRAINING and micro_step > 0: timestep_sampler.set_current_step(micro_step)
-
-    loss_type = getattr(config, "LOSS_TYPE", "MSE")
-    accumulated_latent_paths, global_step_times, optim_step_times = [], deque(maxlen=50), deque(maxlen=20)
-    training_start_time = time.time()
-    last_step_time, last_optim_step_log_time = time.time(), time.time()
-    done = False
-
+    accumulated_latent_paths = []
+    global_step_times        = deque(maxlen=50)
+    optim_step_times         = deque(maxlen=20)
+    training_start_time      = time.time()
+    last_step_time           = time.time()
+    last_optim_step_log_time = time.time()
+    done            = False
     batches_to_skip = micro_step % len(dataloader) if config.RESUME_TRAINING else 0
 
+    # ------------------------------------------------------------------
+    # Training loop
+    # ------------------------------------------------------------------
     while not done:
         for batch in dataloader:
-            if batches_to_skip > 0: batches_to_skip -= 1; continue
-            if micro_step >= config.MAX_TRAIN_STEPS: done = True; break
-            if not batch: continue
+            if batches_to_skip > 0:
+                batches_to_skip -= 1
+                continue
+            if micro_step >= config.MAX_TRAIN_STEPS:
+                done = True
+                break
+            if not batch:
+                continue
 
             micro_step += 1
 
-            # Diagnostic on first 5 steps
             if micro_step <= 5:
                 orig_w, orig_h = batch["original_sizes"][0]
                 targ_w, targ_h = batch["target_sizes"][0]
                 orig_ar = orig_w / orig_h if orig_h != 0 else 1.0
                 targ_ar = targ_w / targ_h if targ_h != 0 else 1.0
-                ar_error = abs(orig_ar - targ_ar)
-                ar_error_pct = (ar_error / orig_ar) * 100 if orig_ar != 0 else 0
-                stem = Path(batch['latent_path'][0]).stem
-                reporter.log_diagnostic(micro_step, orig_w, orig_h, targ_w, targ_h, orig_ar, targ_ar, ar_error_pct, stem, batch["latents"].shape[0])
+                ar_pct  = abs(orig_ar - targ_ar) / orig_ar * 100 if orig_ar != 0 else 0
+                reporter.log_diagnostic(
+                    micro_step, orig_w, orig_h, targ_w, targ_h,
+                    orig_ar, targ_ar, ar_pct,
+                    Path(batch['latent_path'][0]).stem, batch["latents"].shape[0]
+                )
 
-            if "latent_path" in batch: accumulated_latent_paths.extend(batch["latent_path"])
+            if "latent_path" in batch:
+                accumulated_latent_paths.extend(batch["latent_path"])
 
-            latents           = batch["latents"].to(device, non_blocking=True).detach()
-            embeds            = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
-            pooled            = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
-            batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
+            latents = batch["latents"].to(device, non_blocking=True).detach()
+            embeds  = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
+            pooled  = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
 
-                scaled_sizes = batch.get("scaled_sizes", batch["original_sizes"])
                 time_ids = torch.cat([
-                    torch.tensor([s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]], dtype=torch.float32).unsqueeze(0)
-                    for s1, crop, s2 in zip(scaled_sizes, batch_crop_coords, batch["target_sizes"])
+                    torch.tensor(
+                        [s2[1], s2[0], 0, 0, s2[1], s2[0]], dtype=torch.float32
+                    ).unsqueeze(0)
+                    for s2 in batch["target_sizes"]
                 ], dim=0).to(device, dtype=config.compute_dtype)
 
-                noise    = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
-                timesteps = timestep_sampler.sample(latents.shape[0])
+                batch_size = latents.shape[0]
+                noise      = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
 
-                if config.is_rectified_flow:
-                    t_normalized = timesteps.float() / 1000.0
-                    current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else getattr(config, "RF_SHIFT_FACTOR", 1.0)
-                    t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
-                    t_expanded = t_shifted.view(-1, 1, 1, 1)
-                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                    target = noise - latents
-                    # --- DIAGNOSTIC: remove after checking ---
-                    if micro_step <= 20:
-                        print(f"\n[LATENT DIAG step={micro_step}]")
-                        print(f"  latent mean: {latents.mean().item():.6f}  std: {latents.std().item():.6f}")
-                        print(f"  noise  mean: {noise.mean().item():.6f}  std: {noise.std().item():.6f}")
-                        print(f"  target mean: {target.mean().item():.6f}  std: {target.std().item():.6f}")
-                        print(f"Latent per-channel mean: {latents.mean(dim=[0,2,3])}")
-                        print(f"Latent per-channel std:  {latents.std(dim=[0,2,3])}")
-                    # -----------------------------------------
-                    timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
+                # sample dt and endpoints
+                log_dt      = LOG_MIN + torch.rand(batch_size, device=device) * (LOG_MAX - LOG_MIN)
+                dt_vals     = torch.exp(log_dt)
+                t_high_vals = dt_vals + torch.rand(batch_size, device=device) * (1.0 - dt_vals)
+                t_high_vals = t_high_vals.clamp(0.0, 1.0)
+                t_low_vals  = (t_high_vals - dt_vals).clamp(min=0.0)
+
+                # noisy latents
+                t_high_exp    = t_high_vals.view(-1, 1, 1, 1)
+                t_low_exp     = t_low_vals.view(-1, 1, 1, 1)
+                x_t_high      = (1.0 - t_high_exp) * latents.float() + t_high_exp * noise.float()
+                x_t_low       = (1.0 - t_low_exp)  * latents.float() + t_low_exp  * noise.float()
+                noisy_latents = x_t_high.to(config.compute_dtype)
+                dt_f          = dt_vals.view(-1, 1, 1, 1).float() * -1.0
+                x_t_low_f     = x_t_low.float()
+
+                # build timestep embedding
+                t_high_ms = (t_high_vals * 1000.0).float()
+                t_low_ms  = (t_low_vals  * 1000.0).float()
+
+                if _IS_EXPANDED:
+                    emb_high = _get_t_emb(
+                        t_high_ms, _MODEL_CHANNELS,
+                        flip_sin_to_cos=True, downscale_freq_shift=0
+                    ).to(device=device, dtype=config.compute_dtype)
+                    emb_low = _get_t_emb(
+                        t_low_ms, _MODEL_CHANNELS,
+                        flip_sin_to_cos=True, downscale_freq_shift=0
+                    ).to(device=device, dtype=config.compute_dtype)
+                    combined_t_emb = torch.cat([emb_high, emb_low], dim=-1)
                 else:
-                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                    target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
-                    timesteps_conditioning = timesteps
+                    emb_high       = _get_t_emb(
+                        t_high_ms, _MODEL_CHANNELS,
+                        flip_sin_to_cos=True, downscale_freq_shift=0
+                    ).to(device=device, dtype=config.compute_dtype)
+                    emb_low        = emb_high
+                    combined_t_emb = emb_high
 
-                pred = unet(noisy_latents, timesteps_conditioning, embeds,
-                            added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
+                dummy_ts = torch.zeros(batch_size, dtype=torch.long, device=device)
 
-                # ── Loss ──────────────────────────────────────────────────────
-                if loss_type == "Semantic":
-                    base_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
-                    semantic_maps = batch.get("semantic_map")
-                    if semantic_maps is not None:
-                        loss = (base_loss * (1.0 + semantic_maps.to(device, dtype=torch.float32))).mean()
-                    else:
-                        loss = base_loss.mean()
-                elif loss_type == "DestinationLoss" and config.is_rectified_flow:
-                    pred_final = noisy_latents.float() - t_expanded.float() * pred.float()
-                    loss = F.mse_loss(pred_final, latents.float())
-                else:
-                    loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
+                current_timestep_display = (
+                    f"t_hi={t_high_vals[0].item():.3f} "
+                    f"t_lo={t_low_vals[0].item():.3f} "
+                    f"dt={dt_vals[0].item():.4f}"
+                )
+
+                # forward
+                _t_hook = unet.time_embedding.register_forward_pre_hook(
+                    lambda m, args: (combined_t_emb,)
+                )
+                try:
+                    pred = unet(
+                        noisy_latents, dummy_ts, embeds,
+                        added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}
+                    ).sample
+                finally:
+                    _t_hook.remove()
+
+                # loss
+                content_bounds_batch = batch.get("content_bounds", [None] * batch_size)
+                loss_mask    = make_content_mask(content_bounds_batch, pred.shape, device)
+                x_t_low_pred = noisy_latents.float() + dt_f * pred.float()
+                per_element  = F.mse_loss(x_t_low_pred, x_t_low_f, reduction="none")
+                loss         = (per_element * loss_mask).sum() / loss_mask.sum().clamp(min=1)
 
                 (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 
@@ -1105,6 +1366,45 @@ def main():
             diagnostics.step(raw_loss_value)
             lr_scheduler.step(micro_step)
 
+            # ----------------------------------------------------------
+            # Diagnostics every 25 steps — raw numbers only
+            # ----------------------------------------------------------
+            if micro_step % 25 == 1:
+                with torch.no_grad():
+                    eh = emb_high[0].float()
+                    el = emb_low[0].float()
+                    emb_cos = torch.nn.functional.cosine_similarity(
+                        eh.unsqueeze(0), el.unsqueeze(0)
+                    ).item()
+                    emb_l2  = (eh - el).norm().item()
+
+                    p   = pred.float().detach()
+                    err = (x_t_low_pred - x_t_low_f).float().detach()
+
+                    w  = unet.time_embedding.linear_1.weight.float().detach()
+                    w1 = w[:, :_MODEL_CHANNELS]
+                    w2 = w[:, _MODEL_CHANNELS:]
+                    w_cos  = torch.nn.functional.cosine_similarity(
+                        w1.flatten().unsqueeze(0), w2.flatten().unsqueeze(0)
+                    ).item() if _IS_EXPANDED else float('nan')
+                    w_l2   = (w1 - w2).norm().item() if _IS_EXPANDED else float('nan')
+
+                reporter.log_message(
+                    f"\n--- DIAG step={micro_step} ---\n"
+                    f"  t_high  {t_high_vals.min().item():.4f} / {t_high_vals.mean().item():.4f} / {t_high_vals.max().item():.4f}  (min/mean/max)\n"
+                    f"  t_low   {t_low_vals.min().item():.4f} / {t_low_vals.mean().item():.4f} / {t_low_vals.max().item():.4f}\n"
+                    f"  dt      {dt_vals.min().item():.4f} / {dt_vals.mean().item():.4f} / {dt_vals.max().item():.4f}\n"
+                    f"  emb_cos={emb_cos:.6f}  emb_l2={emb_l2:.4f}\n"
+                    f"  w_cos={w_cos:.8f}  w_l2diff={w_l2:.6f}\n"
+                    f"  w1_norm={w1.norm().item():.4f}  w2_norm={w2.norm().item():.4f}\n"
+                    f"  pred  mean={p.mean().item():+.5f}  std={p.std().item():.5f}  min={p.min().item():+.5f}  max={p.max().item():+.5f}\n"
+                    f"  err   mean={err.mean().item():+.6f}  std={err.std().item():.6f}  abs_mean={err.abs().mean().item():.6f}\n"
+                    f"  loss={raw_loss_value:.6f}\n"
+                )
+
+            # ----------------------------------------------------------
+            # Optimizer step
+            # ----------------------------------------------------------
             if micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 raw_grad_norm = (
                     optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
@@ -1114,7 +1414,8 @@ def main():
                         config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
                     )
                 )
-                if isinstance(raw_grad_norm, torch.Tensor): raw_grad_norm = raw_grad_norm.item()
+                if isinstance(raw_grad_norm, torch.Tensor):
+                    raw_grad_norm = raw_grad_norm.item()
                 clipped_grad_norm = min(raw_grad_norm, config.CLIP_GRAD_NORM) if config.CLIP_GRAD_NORM > 0 else raw_grad_norm
 
                 optimizer.step()
@@ -1125,6 +1426,12 @@ def main():
                 optim_step_times.append(optim_step_time)
                 last_optim_step_log_time = time.time()
 
+                with torch.no_grad():
+                    w  = unet.time_embedding.linear_1.weight.float()
+                    w1 = w[:, :_MODEL_CHANNELS]
+                    w2 = w[:, _MODEL_CHANNELS:]
+                    snap_w_l2diff = (w1 - w2).norm().item() if _IS_EXPANDED else float('nan')
+
                 diag_data_to_log = {
                     'optim_step':          optimizer_step,
                     'avg_loss':            diagnostics.get_average_loss(),
@@ -1134,15 +1441,40 @@ def main():
                     'update_delta':        1.0 if raw_grad_norm > 0 else 0.0,
                     'optim_step_time':     optim_step_time,
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times),
+                    'w1_norm':             w1.norm().item(),
+                    'w2_norm':             w2.norm().item(),
+                    'w_l2diff':            snap_w_l2diff,
                 }
 
-                reporter.check_and_report_anomaly(optimizer_step, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
+                reporter.check_and_report_anomaly(
+                    optimizer_step, raw_grad_norm, clipped_grad_norm,
+                    config, accumulated_latent_paths
+                )
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
-                if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and optimizer_step % config.SAVE_EVERY_N_STEPS == 0:
-                    reporter.log_message(f"\n--- Saving checkpoint at optimizer step {optimizer_step} ---")
-                    save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load, optimizer, lr_scheduler, None, sampler, config)
+                force_save      = False
+                force_save_flag = Path.cwd() / "force_save.flag"
+                if force_save_flag.exists():
+                    force_save = True
+                    try: force_save_flag.unlink()
+                    except: pass
+
+                is_normal_save = (
+                    config.SAVE_EVERY_N_STEPS > 0
+                    and optimizer_step > 0
+                    and optimizer_step % config.SAVE_EVERY_N_STEPS == 0
+                )
+
+                if force_save or is_normal_save:
+                    msg = ("EMERGENCY SAVE TRIGGERED" if force_save
+                           else f"Saving checkpoint at optimizer step {optimizer_step}")
+                    reporter.log_message(f"\n--- {msg} ---")
+                    save_checkpoint_pt(
+                        optimizer_step, micro_step, unet, model_to_load,
+                        optimizer, lr_scheduler, None, sampler, config
+                    )
+
             else:
                 diag_data_to_log = None
 
@@ -1151,11 +1483,13 @@ def main():
             last_step_time = time.time()
 
             reporter.log_step(micro_step, timing_data={
-                'raw_step_time':  step_duration,
-                'elapsed_time':   time.time() - training_start_time,
-                'eta':            (config.MAX_TRAIN_STEPS - micro_step) * (sum(global_step_times) / len(global_step_times)) if global_step_times else 0,
-                'loss':           raw_loss_value,
-                'timestep':       timesteps_conditioning[0].item() if timesteps_conditioning is not None else 0
+                'raw_step_time': step_duration,
+                'elapsed_time':  time.time() - training_start_time,
+                'eta': (config.MAX_TRAIN_STEPS - micro_step) * (
+                    sum(global_step_times) / len(global_step_times)
+                ) if global_step_times else 0,
+                'loss':     raw_loss_value,
+                'timestep': current_timestep_display,
             }, diag_data=diag_data_to_log)
 
     reporter.log_message("\nTraining complete.")
@@ -1165,7 +1499,6 @@ def main():
         unet, model_to_load, config.compute_dtype
     )
     print("All tasks complete. Final model saved.")
-
 
 if __name__ == "__main__":
     try: multiprocessing.set_start_method('spawn', force=True)
