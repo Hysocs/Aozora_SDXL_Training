@@ -2116,16 +2116,14 @@ def main():
                     loss = base_loss.mean()
 
             elif loss_type == "MSE_Perturb":
-                #Implicit Hard-Mining Velocity Loss
                 value_weight = 1.0 + torch.abs(target.float()) * 0.5
-
-                # dont use this its the opposite (value_weight = 1.0 + torch.abs(latents.float()) * 0.5 )
                 base_loss = (pred.float() - target.float()) ** 2 * value_weight
                 loss = base_loss.mean()
              
             elif loss_type == "DestinationLoss":
                 pred_final = noisy_latents.float() - t_expanded.float() * pred.float()
                 loss = F.mse_loss(pred_final, latents.float())
+
             else:
                 loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 

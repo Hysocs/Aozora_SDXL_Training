@@ -1,9 +1,9 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/MugenDELTA.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Mugen.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
-    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/V1_step_2700.safetensors",
-    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_2700.pt",
+    "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/MugenDELTA_20k_DUAL.safetensors",
+    "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_1625.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
     "UNCONDITIONAL_DROPOUT": false,
@@ -13,13 +13,13 @@
     "MAX_AREA_TOLERANCE": "1.0",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "18500",
+    "MAX_TRAIN_STEPS": "3000",
     "BATCH_SIZE": 1,
-    "GRADIENT_ACCUMULATION_STEPS": "4",
+    "GRADIENT_ACCUMULATION_STEPS": "5",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "10.0",
-    "SEED": "47",
-    "SAVE_EVERY_N_STEPS": "3000",
+    "SEED": "657",
+    "SAVE_EVERY_N_STEPS": "2000",
     "UNET_EXCLUDE_TARGETS": "down_blocks.2.*.transformer_blocks.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
         [
@@ -27,12 +27,12 @@
             9e-08
         ],
         [
-            0.05580357,
-            5e-05
+            0.06026786,
+            6e-05
         ],
         [
-            0.96205357,
-            5e-05
+            0.95758929,
+            6e-05
         ],
         [
             1.0,
@@ -40,7 +40,7 @@
         ]
     ],
     "LR_GRAPH_MIN": "9e-08",
-    "LR_GRAPH_MAX": "5.0e-05",
+    "LR_GRAPH_MAX": "6.0e-05",
     "MEMORY_EFFICIENT_ATTENTION": "xformers (Only if no Flash)",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
@@ -65,47 +65,47 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists",
+            "path": "C:/Users/Administrator/Pictures\\CG",
             "repeats": 1
         },
         {
-            "path": "C:/Users/Administrator/Pictures\\CG",
+            "path": "C:/Users/Administrator/Pictures\\Artists",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
-    "LOSS_TYPE": "MSE",
+    "LOSS_TYPE": "SelfCorrection",
     "SEMANTIC_SEP_WEIGHT": 0.25,
     "SEMANTIC_DETAIL_WEIGHT": 0.15,
     "SEMANTIC_ENTROPY_WEIGHT": 0.05,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740,
-            740
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120,
+            120
         ]
     },
     "RAVEN_PARAMS": {

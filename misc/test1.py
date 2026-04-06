@@ -1102,7 +1102,7 @@ def main():
     # ------------------------------------------------------------------
     RF_MIN_DELTA  = getattr(config, "RF_MIN_DELTA",  0.02)
     RF_MAX_DELTA  = getattr(config, "RF_MAX_DELTA",  0.60)
-    BLEND_STEPS   = getattr(config, "RF_BLEND_STEPS", 200)
+    BLEND_STEPS   = getattr(config, "RF_BLEND_STEPS", 1)
     LOG_MIN       = math.log(RF_MIN_DELTA)
     LOG_MAX       = math.log(RF_MAX_DELTA)
 
@@ -1236,8 +1236,13 @@ def main():
                 # This is the only thing we need to sample explicitly.
                 # Small steps appear as often per decade as large ones.
                 # ------------------------------------------------------
+                DT_MIN = 1.0 / 50.0   # 0.020
+                DT_MAX = 1.0 / 8.0    # 0.125
+
+                LOG_MIN = math.log(DT_MIN)
+                LOG_MAX = math.log(DT_MAX)
                 log_dt  = LOG_MIN + torch.rand(batch_size, device=device) * (LOG_MAX - LOG_MIN)
-                dt_vals = torch.exp(log_dt)   # shape (B,)
+                dt_vals = log_dt.exp()
 
                 # ------------------------------------------------------
                 # Step 2: sample t_high uniformly, just enough room for dt

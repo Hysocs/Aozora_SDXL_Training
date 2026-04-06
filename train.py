@@ -478,11 +478,41 @@ def check_if_caching_needed(config):
 
 def load_unet_robust(path, compute_dtype):
     print(f"INFO: Loading UNet from: {Path(path).name}")
+    
+    # Default standard SDXL values
+    in_channels = 4
+    out_channels = 4
+    
+    # Peek into the safetensors file to dynamically read the true channel counts
     try:
+        from safetensors import safe_open
+        with safe_open(path, framework="pt", device="cpu") as f:
+            key_in = "model.diffusion_model.input_blocks.0.0.weight"
+            key_out = "model.diffusion_model.out.2.weight"
+            
+            # Extract in_channels from the 2nd dimension of the first conv layer
+            if key_in in f.keys():
+                shape_in = f.get_slice(key_in).get_shape()
+                in_channels = shape_in[1]
+                
+            # Extract out_channels from the 1st dimension of the final conv layer
+            if key_out in f.keys():
+                shape_out = f.get_slice(key_out).get_shape()
+                out_channels = shape_out[0]
+                
+    except Exception as e:
+        print(f"WARNING: Could not peek into safetensors for channel sizes, falling back to defaults. Error: {e}")
+
+    print(f"INFO: Detected UNet configuration - in_channels: {in_channels}, out_channels: {out_channels}")
+
+    try:
+        # Pass the detected channels into the kwargs to override the inferred configuration
         unet = UNet2DConditionModel.from_single_file(
             path,
             torch_dtype=compute_dtype,
-            low_cpu_mem_usage=True
+            low_cpu_mem_usage=True,
+            in_channels=in_channels,
+            out_channels=out_channels
         )
         print(f"INFO: Loaded UNet (Channels: In={unet.config.in_channels} / Out={unet.config.out_channels})")
         return unet
@@ -959,7 +989,6 @@ def main():
     unet = load_unet_robust(model_to_load, config.compute_dtype)
     gc.collect(); torch.cuda.empty_cache()
 
-    # Set up DDPM scheduler for eps/vpred modes
     scheduler = None
     if not config.is_rectified_flow:
         prediction_type = getattr(config, "PREDICTION_TYPE", "epsilon")
@@ -1031,7 +1060,6 @@ def main():
 
             micro_step += 1
 
-            # Diagnostic on first 5 steps
             if micro_step <= 5:
                 orig_w, orig_h = batch["original_sizes"][0]
                 targ_w, targ_h = batch["target_sizes"][0]
@@ -1060,32 +1088,92 @@ def main():
                 noise    = generate_train_noise(latents, config, micro_step, initial_sampler_seed)
                 timesteps = timestep_sampler.sample(latents.shape[0])
 
-                if config.is_rectified_flow:
-                    t_normalized = timesteps.float() / 1000.0
-                    current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else getattr(config, "RF_SHIFT_FACTOR", 1.0)
-                    t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
-                    t_expanded = t_shifted.view(-1, 1, 1, 1)
-                    noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
-                    target = noise - latents
-                    # --- DIAGNOSTIC: remove after checking ---
-                    if micro_step <= 20:
-                        print(f"\n[LATENT DIAG step={micro_step}]")
-                        print(f"  latent mean: {latents.mean().item():.6f}  std: {latents.std().item():.6f}")
-                        print(f"  noise  mean: {noise.mean().item():.6f}  std: {noise.std().item():.6f}")
-                        print(f"  target mean: {target.mean().item():.6f}  std: {target.std().item():.6f}")
-                        print(f"Latent per-channel mean: {latents.mean(dim=[0,2,3])}")
-                        print(f"Latent per-channel std:  {latents.std(dim=[0,2,3])}")
-                    # -----------------------------------------
-                    timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
-                else:
-                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
-                    target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
-                    timesteps_conditioning = timesteps
+                # =========================================================================
+                #  SELF-CORRECTION / TRAJECTORY LOSS
+                # =========================================================================
+                if loss_type == "SelfCorrection":
+                    # 1. Step backward to a noisier timestep (delta of 20-100 steps)
+                    delta_t = torch.randint(10, 51, (latents.shape[0],), device=device)
+                    t_noisier = torch.clamp(timesteps + delta_t, 0, 999)
 
+                    if config.is_rectified_flow:
+                        current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else getattr(config, "RF_SHIFT_FACTOR", 1.0)
+                        
+                        # --- Setup Noisier T (Pass 1) ---
+                        t_n_norm = t_noisier.float() / 1000.0
+                        t_n_shifted = timestep_sampler.apply_flow_shift(t_n_norm, current_shift)
+                        t_n_exp = t_n_shifted.view(-1, 1, 1, 1)
+                        noisy_latents_noisier = (1 - t_n_exp) * latents + t_n_exp * noise
+                        cond_noisier = (t_n_shifted * 1000).long().clamp(0, 999)
+
+                        # --- Forward 1 (NO GRAD) ---
+                        with torch.no_grad():
+                            pred_noisier = unet(noisy_latents_noisier, cond_noisier, embeds,
+                                                added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
+
+                        # --- Setup Target T (Pass 2) ---
+                        t_norm = timesteps.float() / 1000.0
+                        t_shifted = timestep_sampler.apply_flow_shift(t_norm, current_shift)
+                        t_exp = t_shifted.view(-1, 1, 1, 1)
+                        timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
+                        
+                        # Simulate step down to the target T: x_target = x_noisier + (t_target - t_noisier) * v_pred
+                        noisy_latents = noisy_latents_noisier + (t_exp - t_n_exp) * pred_noisier
+                        target = noise - latents # Standard RF target (velocity pointing to x0)
+                        t_expanded = t_exp       # For optional destination loss
+
+                    else:
+                        # --- SDXL DDPM / V-Prediction ---
+                        noisy_latents_noisier = scheduler.add_noise(latents, noise, t_noisier)
+                        
+                        # --- Forward 1 (NO GRAD) ---
+                        with torch.no_grad():
+                            pred_noisier = unet(noisy_latents_noisier, t_noisier, embeds,
+                                                added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
+                        
+                        alphas_cumprod = scheduler.alphas_cumprod.to(device)
+                        alpha_noisier = alphas_cumprod[t_noisier].view(-1, 1, 1, 1)
+                        alpha_target = alphas_cumprod[timesteps].view(-1, 1, 1, 1)
+
+                        # Extract implied x0 and eps based on prediction mode
+                        if scheduler.config.prediction_type == "v_prediction":
+                            sigma_n = (1 - alpha_noisier).sqrt()
+                            x0_pred = alpha_noisier.sqrt() * noisy_latents_noisier - sigma_n * pred_noisier
+                            eps_pred = sigma_n * noisy_latents_noisier + alpha_noisier.sqrt() * pred_noisier
+                        else:
+                            eps_pred = pred_noisier
+                            x0_pred = (noisy_latents_noisier - (1 - alpha_noisier).sqrt() * eps_pred) / alpha_noisier.sqrt()
+                            
+                        # Mix down to the target T
+                        noisy_latents = alpha_target.sqrt() * x0_pred + (1 - alpha_target).sqrt() * eps_pred
+                        
+                        target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
+                        timesteps_conditioning = timesteps
+
+                # =========================================================================
+                #  STANDARD (No Self-Correction)
+                # =========================================================================
+                else:
+                    if config.is_rectified_flow:
+                        t_normalized = timesteps.float() / 1000.0
+                        current_shift = timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1]) if timestep_sampler.use_dynamic_shift else getattr(config, "RF_SHIFT_FACTOR", 1.0)
+                        t_shifted = timestep_sampler.apply_flow_shift(t_normalized, current_shift)
+                        t_expanded = t_shifted.view(-1, 1, 1, 1)
+                        noisy_latents = (1 - t_expanded) * latents + t_expanded * noise
+                        target = noise - latents
+                        timesteps_conditioning = (t_shifted * 1000).long().clamp(0, 999)
+                    else:
+                        noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                        target = scheduler.get_velocity(latents, noise, timesteps) if scheduler.config.prediction_type == "v_prediction" else noise
+                        timesteps_conditioning = timesteps
+
+                # =========================================================================
+                #  FORWARD 2 (WITH GRADIENTS)
+                # =========================================================================
                 pred = unet(noisy_latents, timesteps_conditioning, embeds,
                             added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-                # ── Loss ──────────────────────────────────────────────────────
+                # ── Calculate Final Loss ────────────────────────────────────────────────
                 if loss_type == "Semantic":
                     base_loss = F.mse_loss(pred.float(), target.float(), reduction="none")
                     semantic_maps = batch.get("semantic_map")
@@ -1097,6 +1185,7 @@ def main():
                     pred_final = noisy_latents.float() - t_expanded.float() * pred.float()
                     loss = F.mse_loss(pred_final, latents.float())
                 else:
+                    # Works for both base "MSE" and "SelfCorrection" since target remains unchanged
                     loss = F.mse_loss(pred.float(), target.float(), reduction="mean")
 
                 (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
