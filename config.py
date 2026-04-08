@@ -26,10 +26,11 @@ CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
 UNCONDITIONAL_DROPOUT = True
 UNCONDITIONAL_DROPOUT_CHANCE = 0.0
+
 # --- Aspect Ratio Bucketing ---
 SHOULD_UPSCALE = False
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
-MAX_AREA_TOLERANCE = 1.1
+MAX_AREA_TOLERANCE = 1.1     # Note: Present in GUI, but training relies purely on optimal SDXL buckets
 
 # --- Core Training Parameters ---
 PREDICTION_TYPE = "v_prediction"
@@ -89,23 +90,25 @@ VELORMS_PARAMS = {
     "weight_decay": 0.01,
     "eps": 1e-8
 }
+
 # --- Loss Configuration ---
-LOSS_TYPE = "Default"
+LOSS_TYPE = "MSE"
 SEMANTIC_SEP_WEIGHT = 0.7
 SEMANTIC_DETAIL_WEIGHT = 0.5
 SEMANTIC_ENTROPY_WEIGHT = 0.2
+
 # --- Advanced & Miscellaneous ---
-MEMORY_EFFICIENT_ATTENTION = "xformers"
-USE_ZERO_TERMINAL_SNR = True
+MEMORY_EFFICIENT_ATTENTION = "sdpa"
 GRAD_SPIKE_THRESHOLD_HIGH = 75.0
 GRAD_SPIKE_THRESHOLD_LOW = 0.2
 TIMESTEP_MODE = "Wave"
+
 # --- VAE Configuration ---
 VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
-RF_SHIFT_FACTOR = 2.5  # Shift strength for applicable modes
-RF_USE_DYNAMIC_SHIFT = False  # bool
-RF_BASE_PIXELS = 1048576  # 1024*1024 = 1048576
-TEXT_ENCODER_MAX_CHUNKS = 3
-RF_USE_WAYPOINTS = True
+
+# --- Rectified Flow Parameters ---
+RF_SHIFT_FACTOR = 2.5         # Shift strength for applicable modes
+RF_USE_DYNAMIC_SHIFT = False  # Hidden from GUI, uses resolution-based shift
+RF_BASE_PIXELS = 1048576      # 1024*1024 base for dynamic shift calculation

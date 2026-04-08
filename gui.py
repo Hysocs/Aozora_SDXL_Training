@@ -1,3 +1,4 @@
+
 import json
 import os
 import re
@@ -26,13 +27,9 @@ except ImportError:
         OPTIMIZER_TYPE = "Raven"
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
-
-# ──────────────────────────────────────────────────────────────────
-#  COLOUR PALETTE  (matches Semantic Loss Visualizer)
-# ──────────────────────────────────────────────────────────────────
 DARK_BG    = "#0d0f14"
 PANEL_BG   = "#141720"
-GRAPH_BG   = "#0e1016"   # Just subtly darker than the panels, creating a gentle sunken effect without being a void
+GRAPH_BG   = "#0e1016"
 BORDER     = "#252a38"
 ACCENT     = "#7c6af7"
 ACCENT2    = "#3ecfcf"
@@ -42,26 +39,24 @@ DANGER     = "#f74b6a"
 SUCCESS    = "#3ef78e"
 WARN       = "#f7c948"
 
-# "Ghosted" disabled states (blended deeply into DARK_BG)
-TEXT_MUTED   = "#383b4075"  # Extremely faint grey for disabled text
-BORDER_MUTED = "#191c2675"  # Barely visible border for disabled elements
+TEXT_MUTED   = "#383b4075"
+BORDER_MUTED = "#191c2675"
 
 STYLESHEET = f"""
 QWidget {{
     background-color: {DARK_BG};
     color: {TEXT_PRI};
     font-family: 'Consolas', 'Segoe UI', monospace;
-    font-size: 10pt; /* Using pt instead of px fixes QFont warnings */
+    font-size: 10pt;
 }}
 
-/* ── GROUP BOX ── */
 QGroupBox {{
     border: 1px solid {BORDER};
     border-radius: 6px;
     margin-top: 16px;
     padding: 10px 8px 8px 8px;
     color: {TEXT_SEC};
-    font-size: 8pt; /* Using pt instead of px */
+    font-size: 8pt;
 }}
 QGroupBox::title {{
     subcontrol-origin: margin;
@@ -74,7 +69,6 @@ QGroupBox::title {{
 QGroupBox:disabled {{ border: 1px solid {BORDER_MUTED}; background: transparent; }}
 QGroupBox:disabled::title {{ color: {TEXT_MUTED}; }}
 
-/* ── BUTTONS ── */
 QPushButton {{
     background: {PANEL_BG};
     border: 1px solid {BORDER};
@@ -93,7 +87,6 @@ QPushButton:disabled {{ color: {TEXT_MUTED}; background: transparent; border: 1p
 #StopButton {{ background: {DANGER}; color: white; font-weight: bold; border-color: {DANGER}; }}
 #StopButton:hover {{ background: #ff6b85; }}
 
-/* ── TEXT INPUTS & COMBO BOXES ── */
 QLineEdit, QPlainTextEdit, QTextEdit, QComboBox {{
     background: {PANEL_BG};
     border: 1px solid {BORDER};
@@ -112,7 +105,6 @@ QComboBox QAbstractItemView {{
     selection-color: white;
 }}
 
-/* Ghosted Disabled Inputs */
 QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QComboBox:disabled {{
     color: {TEXT_MUTED};
     background: transparent;
@@ -120,7 +112,6 @@ QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QComboBox:disab
 }}
 QComboBox::drop-down:disabled {{ border-left: 1px solid {BORDER_MUTED}; }}
 
-/* ── SPIN BOXES ── */
 QSpinBox, QDoubleSpinBox {{
     background: {PANEL_BG};
     border: 1px solid {BORDER};
@@ -150,7 +141,6 @@ QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
     border-top: 4px solid {TEXT_PRI}; width: 0; height: 0;
 }}
 
-/* Ghosted Disabled Spin Boxes */
 QSpinBox:disabled, QDoubleSpinBox:disabled {{
     color: {TEXT_MUTED};
     background: transparent;
@@ -164,7 +154,6 @@ QSpinBox::down-button:disabled, QDoubleSpinBox::down-button:disabled {{
 QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{ border-bottom-color: {TEXT_MUTED}; }}
 QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{ border-top-color: {TEXT_MUTED}; }}
 
-/* ── CHECKBOXES ── */
 QCheckBox {{ spacing: 8px; color: {TEXT_PRI}; }}
 QCheckBox::indicator {{
     width: 14px; height: 14px;
@@ -174,7 +163,6 @@ QCheckBox::indicator {{
 }}
 QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
 
-/* Ghosted Disabled Checkboxes */
 QCheckBox:disabled {{ color: {TEXT_MUTED}; }}
 QCheckBox::indicator:disabled {{
     background: transparent;
@@ -185,7 +173,6 @@ QCheckBox::indicator:checked:disabled {{
     border: 1px solid {BORDER_MUTED};
 }}
 
-/* ── SLIDERS & MISC ── */
 QSlider::groove:horizontal {{ height: 4px; background: {BORDER}; border-radius: 2px; margin: 2px 0; }}
 QSlider::handle:horizontal {{
     background: {ACCENT}; border: 1px solid {ACCENT};
@@ -201,14 +188,13 @@ QSlider::sub-page:horizontal:disabled {{ background: transparent; }}
 QLabel:disabled {{ color: {TEXT_MUTED}; }}
 #TitleLabel {{
     color: {ACCENT};
-    font-size: 20pt; /* Using pt instead of px */
+    font-size: 20pt;
     font-weight: bold;
     padding: 12px;
     border-bottom: 1px solid {BORDER};
     font-family: 'Consolas', monospace;
 }}
 
-/* ── TABS, SCROLLBARS, TABLES ── */
 QTabWidget::pane {{ border: 1px solid {BORDER}; border-top: none; }}
 QTabBar::tab {{
     background: {DARK_BG};
@@ -240,9 +226,6 @@ QSplitter::handle {{ background: {BORDER}; }}
 """
 
 
-# ──────────────────────────────────────────────────────────────────
-#  UTILITIES
-# ──────────────────────────────────────────────────────────────────
 def prevent_sleep(enable=True):
     try:
         if os.name == 'nt':
@@ -256,7 +239,6 @@ def prevent_sleep(enable=True):
         pass
 
 
-# ── No-scroll wrappers ────────────────────────────────────────────
 class NoScrollSpinBox(QtWidgets.QSpinBox):
     def wheelEvent(self, e): e.ignore()
 
@@ -267,7 +249,6 @@ class NoScrollComboBox(QtWidgets.QComboBox):
     def wheelEvent(self, e): e.ignore()
 
 
-# ── Table items ───────────────────────────────────────────────────
 class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
     def __lt__(self, other):
         try: return float(self.text()) < float(other.text())
@@ -281,9 +262,6 @@ class DateTableWidgetItem(QtWidgets.QTableWidgetItem):
         return self.timestamp < other.timestamp
 
 
-# ──────────────────────────────────────────────────────────────────
-#  WIDGET FACTORY HELPERS
-# ──────────────────────────────────────────────────────────────────
 def make_spin(lo, hi, val=None, *, scroll=False):
     w = QtWidgets.QSpinBox() if scroll else NoScrollSpinBox()
     w.setRange(lo, hi)
@@ -337,7 +315,6 @@ def form_row(layout, label_text, widget, tooltip=None):
     layout.addRow(lbl, widget)
 
 def path_row(layout, label_text, line_edit, browse_callback, tooltip=None):
-    """Stacked label → lineedit → browse button."""
     container = QtWidgets.QWidget()
     vbox = QtWidgets.QVBoxLayout(container)
     vbox.setContentsMargins(0, 0, 0, 0)
@@ -363,9 +340,6 @@ def hbox(*widgets, spacing=8):
     return container, lay
 
 
-# ──────────────────────────────────────────────────────────────────
-#  CUSTOM FOLDER DIALOG
-# ──────────────────────────────────────────────────────────────────
 class CustomFolderDialog(QtWidgets.QDialog):
     def __init__(self, start_path, parent=None):
         super().__init__(parent)
@@ -385,7 +359,6 @@ class CustomFolderDialog(QtWidgets.QDialog):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
 
-        # Nav bar
         nav = QtWidgets.QHBoxLayout()
         nav.setSpacing(5)
         def nav_btn(icon, tip, cb):
@@ -415,7 +388,6 @@ class CustomFolderDialog(QtWidgets.QDialog):
         splitter.setHandleWidth(1)
         splitter.setStyleSheet(f"QSplitter::handle {{ background: {BORDER}; }}")
 
-        # Sidebar
         self.sidebar = QtWidgets.QListWidget()
         self.sidebar.setFixedWidth(220)
         self.sidebar.setIconSize(QtCore.QSize(24, 24))
@@ -429,7 +401,6 @@ class CustomFolderDialog(QtWidgets.QDialog):
         self._populate_sidebar()
         splitter.addWidget(self.sidebar)
 
-        # File table
         self.table = QtWidgets.QTableWidget()
         self.table.setColumnCount(4)
         self.table.setHorizontalHeaderLabels(["Name", "Images", "Date Modified", "HiddenPath"])
@@ -457,7 +428,6 @@ class CustomFolderDialog(QtWidgets.QDialog):
         splitter.setStretchFactor(1, 1)
         layout.addWidget(splitter)
 
-        # Bottom bar
         bottom = QtWidgets.QHBoxLayout()
         self.status_label = make_label("", color=TEXT_SEC)
         cancel_btn = make_btn("Cancel", self.reject)
@@ -567,9 +537,6 @@ class CustomFolderDialog(QtWidgets.QDialog):
         self.accept()
 
 
-# ──────────────────────────────────────────────────────────────────
-#  GRAPH PANEL
-# ──────────────────────────────────────────────────────────────────
 class GraphPanel(QtWidgets.QWidget):
     def __init__(self, title, y_label, parent=None):
         super().__init__(parent)
@@ -746,9 +713,6 @@ class GraphPanel(QtWidgets.QWidget):
         return 0, max(0, total - visible), 1
 
 
-# ──────────────────────────────────────────────────────────────────
-#  LIVE METRICS WIDGET
-# ──────────────────────────────────────────────────────────────────
 class LiveMetricsWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -926,9 +890,6 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.update_timer.stop()
 
 
-# ──────────────────────────────────────────────────────────────────
-#  LR CURVE WIDGET
-# ──────────────────────────────────────────────────────────────────
 class LRCurveWidget(QtWidgets.QWidget):
     pointsChanged = QtCore.pyqtSignal(list)
     selectionChanged = QtCore.pyqtSignal(int)
@@ -947,7 +908,6 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.point_radius = 8
         self._dragging_point_index = -1
         self._selected_point_index = -1
-        # Colors
         self.bg_color = QtGui.QColor(GRAPH_BG)
         self.grid_color = QtGui.QColor(BORDER)
         self.epoch_grid_color = QtGui.QColor(TEXT_SEC)
@@ -1163,7 +1123,6 @@ class LRCurveWidget(QtWidgets.QWidget):
             else:
                 points.append([seg_end, max_lr])
 
-        # Clean and deduplicate
         final, last_x = [], -1.0
         for p in sorted(points, key=lambda p: p[0]):
             x = max(0.0, min(1.0, p[0]))
@@ -1174,9 +1133,6 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.apply_preset(final)
 
 
-# ──────────────────────────────────────────────────────────────────
-#  TIMESTEP HISTOGRAM WIDGET
-# ──────────────────────────────────────────────────────────────────
 class TimestepHistogramWidget(QtWidgets.QWidget):
     allocationChanged = QtCore.pyqtSignal(dict)
 
@@ -1355,9 +1311,6 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         self._dragging_bin_index = -1; self.update()
 
 
-# ──────────────────────────────────────────────────────────────────
-#  PROCESS RUNNER THREAD
-# ──────────────────────────────────────────────────────────────────
 class ProcessRunner(QThread):
     logSignal = pyqtSignal(str)
     paramInfoSignal = pyqtSignal(str)
@@ -1414,9 +1367,6 @@ class ProcessRunner(QThread):
             self.logSignal.emit("Process stopped.")
 
 
-# ──────────────────────────────────────────────────────────────────
-#  DATASET LOADER THREAD
-# ──────────────────────────────────────────────────────────────────
 class DatasetLoaderThread(QThread):
     finished = pyqtSignal(list, str)
 
@@ -1440,9 +1390,6 @@ class DatasetLoaderThread(QThread):
         self.finished.emit(images_data, self.path)
 
 
-# ──────────────────────────────────────────────────────────────────
-#  DATASET MANAGER WIDGET
-# ──────────────────────────────────────────────────────────────────
 class DatasetManagerWidget(QtWidgets.QWidget):
     datasetsChanged = QtCore.pyqtSignal()
 
@@ -1580,7 +1527,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             cl = QtWidgets.QVBoxLayout(card)
             cl.setSpacing(10)
 
-            # Preview + caption
             top_h = QtWidgets.QHBoxLayout()
             top_h.setSpacing(12)
 
@@ -1612,7 +1558,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             preview_sec.addLayout(nav_h)
             top_h.addLayout(preview_sec)
 
-            # Caption
             cap_container = QtWidgets.QWidget()
             cap_container.setStyleSheet(f"QWidget {{ background: {GRAPH_BG}; border: 1px solid {BORDER}; border-radius: 4px; }}")
             cap_container.setMinimumWidth(150)
@@ -1631,7 +1576,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             cl.addLayout(top_h)
             cl.addWidget(make_separator())
 
-            # Info
             path_short = (Path(ds['path']).name[:27] + "...") if len(Path(ds['path']).name) > 30 else Path(ds['path']).name
             path_lbl = make_label(f"<b>Folder:</b> {path_short}")
             path_lbl.setToolTip(ds['path'])
@@ -1640,7 +1584,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             repeats_total_lbl = make_label(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}", color=ACCENT)
             cl.addWidget(repeats_total_lbl)
 
-            # Repeats
             rep_h = QtWidgets.QHBoxLayout()
             rep_h.setContentsMargins(0, 5, 0, 0)
             rep_h.addWidget(make_label("Repeats:"))
@@ -1651,7 +1594,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             rep_h.addWidget(rep_spin, 1)
             cl.addLayout(rep_h)
 
-            # Buttons
             btn_h = QtWidgets.QHBoxLayout()
             btn_h.setSpacing(5)
             rm_btn = make_btn("Remove"); rm_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
@@ -1721,10 +1663,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                 btn.setToolTip("" if exists else "No cache found")
 
 
-# ──────────────────────────────────────────────────────────────────
-#  TRAINING GUI  (main window)
-# ──────────────────────────────────────────────────────────────────
-# Widget definitions: (label, tooltip, widget_type, *extra)
 UI_DEFS = {
     "SINGLE_FILE_CHECKPOINT_PATH": ("Base Model (.safetensors)", "Path to the base SDXL model.", "path", "file_safetensors"),
     "VAE_PATH":                    ("Separate VAE (Optional)", "Leave empty to use the VAE from the base model.", "path", "file_safetensors"),
@@ -1736,7 +1674,7 @@ UI_DEFS = {
     "TARGET_PIXEL_AREA":           ("Target Pixel Area", "e.g., 1024*1024=1048576.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
     "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
-    "PREDICTION_TYPE":             ("Prediction Type", "v_prediction or epsilon. Must match the base model.", "combo", ["v_prediction", "epsilon"]),
+    "PREDICTION_TYPE":             ("Prediction Type", "v_prediction, epsilon, or rectified_flow.", "combo", ["epsilon", "v_prediction", "rectified_flow"]),
     "BETA_SCHEDULE":               ("Beta Schedule", "Noise schedule for the diffuser.", "combo", ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]),
     "MAX_TRAIN_STEPS":             ("Max Training Steps", "Total number of training steps.", "line"),
     "BATCH_SIZE":                  ("Batch Size", "Number of samples per batch.", "spin", 1, 32),
@@ -1750,11 +1688,10 @@ UI_DEFS = {
     "UNET_EXCLUDE_TARGETS":        ("Exclude Layers (Keywords)", "Keywords for layers to exclude (comma-separated).", "textedit", 100),
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
-    "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "flex_attn", "cudnn", "xformers (Only if no Flash)"]),
-    "USE_ZERO_TERMINAL_SNR":       ("Use Zero-Terminal SNR", "Rescales noise schedule for better dynamic range.", "check"),
+    "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "DestinationLoss", "SelfCorrection"]),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "DestinationLoss"]),
     "SEMANTIC_SEP_WEIGHT":         ("Separation Region Weight", "Weight for blob/color separation regions.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_DETAIL_WEIGHT":      ("Lineart/Detail Weight", "Weight for fine details, edges, and lineart.", "dspin", 0.0, 2.0, 0.05, 2),
     "SEMANTIC_ENTROPY_WEIGHT":     ("Entropy/Texture Weight", "Weight for texture complexity. Requires scikit-image.", "dspin", 0.0, 2.0, 0.05, 2),
@@ -1798,7 +1735,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self._load_first_config()
         self.config_dropdown.blockSignals(False)
 
-    # ── Config management ─────────────────────────────────────────
     def _initialize_configs(self):
         os.makedirs(self.config_dir, exist_ok=True)
         if not any(f.endswith(".json") and f != "gui_state.json" for f in os.listdir(self.config_dir)):
@@ -1893,9 +1829,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.save_config(); self.load_selected_config(idx)
             self.log(f"Restored '{key}.json' to defaults.")
 
-    # ── Widget creation helpers ───────────────────────────────────
     def _make_widget(self, key):
-        """Create a widget from UI_DEFS and register it."""
         if key not in UI_DEFS: return None, None
         d = UI_DEFS[key]
         label_text, tooltip, wtype = d[0], d[1], d[2]
@@ -1989,7 +1923,6 @@ class TrainingGUI(QtWidgets.QWidget):
         for k in keys: self._add_to_form(lay, k)
         return gb
 
-    # ── UI Setup ──────────────────────────────────────────────────
     def _setup_ui(self):
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(5, 5, 5, 5)
@@ -2006,7 +1939,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.tab_view = QtWidgets.QTabWidget()
 
-        # Dataset tab
         ds_widget = QtWidgets.QWidget()
         self._build_dataset_tab(ds_widget)
         ds_scroll = QtWidgets.QScrollArea()
@@ -2014,7 +1946,6 @@ class TrainingGUI(QtWidgets.QWidget):
         ds_scroll.setWidget(ds_widget)
         self.tab_view.addTab(ds_scroll, "Dataset")
 
-        # Model & Training tab
         mt_widget = QtWidgets.QWidget()
         self._build_model_training_tab(mt_widget)
         mt_scroll = QtWidgets.QScrollArea()
@@ -2022,11 +1953,9 @@ class TrainingGUI(QtWidgets.QWidget):
         mt_scroll.setWidget(mt_widget)
         self.tab_view.addTab(mt_scroll, "Model && Training Parameters")
 
-        # Live Metrics tab
         self.live_metrics_widget = LiveMetricsWidget()
         self.tab_view.addTab(self.live_metrics_widget, "Live Metrics")
 
-        # Console tab
         console_widget = QtWidgets.QWidget()
         console_layout = QtWidgets.QVBoxLayout(console_widget)
         console_layout.setContentsMargins(15, 15, 15, 15)
@@ -2082,7 +2011,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.start_button = make_btn("Start Training", self.start_training)
         self.start_button.setObjectName("StartButton")
         
-        # --- EMERGENCY SAVE BUTTON ---
         self.force_save_button = make_btn("Emergency Checkpoint", self.force_save_checkpoint)
         self.force_save_button.setObjectName("ForceSaveButton")
         self.force_save_button.setVisible(False)
@@ -2092,14 +2020,12 @@ class TrainingGUI(QtWidgets.QWidget):
         self.stop_button.setObjectName("StopButton")
         self.stop_button.setVisible(False)
         
-        # Add all 3 buttons to the layout in order
         lay.addWidget(self.start_button)
         lay.addWidget(self.force_save_button)
         lay.addWidget(self.stop_button)
         
         self.layout().addLayout(lay)
 
-    # ── Dataset Tab ───────────────────────────────────────────────
     def _build_dataset_tab(self, parent):
         layout = QtWidgets.QVBoxLayout(parent)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -2116,7 +2042,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         layout.addWidget(self.dataset_manager)
 
-        # Conditional enables
         if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
             self.widgets["SHOULD_UPSCALE"].stateChanged.connect(
                 lambda s: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(s)))
@@ -2124,21 +2049,23 @@ class TrainingGUI(QtWidgets.QWidget):
             chk = self.widgets["UNCONDITIONAL_DROPOUT"]
             chk.stateChanged.connect(lambda s: self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(bool(s)))
 
-    # ── Model & Training Tab ──────────────────────────────────────
     def _build_model_training_tab(self, parent):
         lay = QtWidgets.QVBoxLayout(parent)
         lay.setSpacing(15)
         lay.setContentsMargins(15, 5, 15, 15)
 
-        # Row 1: Training Mode + Paths | LR Scheduler | Timestep
         r1 = QtWidgets.QHBoxLayout(); r1.setSpacing(20)
 
         col1 = QtWidgets.QWidget()
         col1_lay = QtWidgets.QVBoxLayout(col1); col1_lay.setContentsMargins(0,0,0,0); col1_lay.setSpacing(10)
-        mode_gb, mode_lay = group_box("Training Mode", QtWidgets.QHBoxLayout)
-        self.training_mode_combo = make_combo(["Standard (SDXL)", "Rectified Flow (SDXL)"])
+        mode_gb, mode_lay = group_box("Architecture & Prediction", QtWidgets.QFormLayout)
+        self.training_mode_combo = make_combo(["Stable Diffusion XL (SDXL)"])
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
-        mode_lay.addWidget(self.training_mode_combo)
+        mode_lay.addRow("Architecture:", self.training_mode_combo)
+        
+        self._add_to_form(mode_lay, "PREDICTION_TYPE")
+        self.widgets["PREDICTION_TYPE"].currentTextChanged.connect(self._on_prediction_type_changed)
+        
         col1_lay.addWidget(mode_gb)
         col1_lay.addWidget(self._build_path_group())
         col1_lay.addStretch()
@@ -2148,7 +2075,6 @@ class TrainingGUI(QtWidgets.QWidget):
         r1.addWidget(self.timestep_group, 2)
         lay.addLayout(r1)
 
-        # Row 2: Core Training | Scheduler Config | VAE + UNet
         r2 = QtWidgets.QHBoxLayout(); r2.setSpacing(20)
         r2.addWidget(self._build_core_training_group(), 1)
         self.scheduler_group = self._build_scheduler_group()
@@ -2160,15 +2086,12 @@ class TrainingGUI(QtWidgets.QWidget):
         r2.addWidget(right_col, 1)
         lay.addLayout(r2)
 
-
         r3 = QtWidgets.QHBoxLayout(); r3.setSpacing(20)
         r3.addWidget(self._build_optimizer_group(), 1)
         r3.addWidget(self._build_loss_group(), 1)
         r3.addWidget(self._build_advanced_group(), 1)
         lay.addLayout(r3)
 
-
-        # Wire up recalculation
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
         self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
@@ -2185,7 +2108,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.path_stacked_widget = QtWidgets.QStackedWidget()
 
-        # Base model page
         base_page = QtWidgets.QWidget()
         bl = QtWidgets.QVBoxLayout(base_page); bl.setContentsMargins(0, 5, 0, 0); bl.setSpacing(10)
         for key in ["SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH"]:
@@ -2193,7 +2115,6 @@ class TrainingGUI(QtWidgets.QWidget):
             if w: bl.addWidget(w)
         self.path_stacked_widget.addWidget(base_page)
 
-        # Resume page
         resume_page = QtWidgets.QWidget()
         rl = QtWidgets.QVBoxLayout(resume_page); rl.setContentsMargins(0, 5, 0, 0); rl.setSpacing(10)
         for key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"]:
@@ -2203,7 +2124,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
         lay.addWidget(self.path_stacked_widget)
 
-        # Output dir
         _, out_w = self._make_widget("OUTPUT_DIR")
         if out_w: lay.addWidget(out_w)
 
@@ -2215,14 +2135,8 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in ["MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "SAVE_EVERY_N_STEPS",
                     "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"]:
             self._add_to_form(lay, key)
-        # RF shift factor container
-        self.rf_params_container = QtWidgets.QWidget()
-        rf_lay = QtWidgets.QFormLayout(self.rf_params_container)
-        rf_lay.setContentsMargins(0, 0, 0, 0)
-        self._add_to_form(rf_lay, "RF_SHIFT_FACTOR")
-        lay.addRow(self.rf_params_container)
         return gb
-
+    
     def _build_lr_scheduler_group(self):
         gb, lay = group_box("Learning Rate Scheduler")
         self.lr_curve_widget = LRCurveWidget()
@@ -2237,7 +2151,6 @@ class TrainingGUI(QtWidgets.QWidget):
         btn_row.addWidget(self.add_point_btn); btn_row.addWidget(self.remove_point_btn); btn_row.addStretch()
         lay.addLayout(btn_row)
 
-        # Presets
         pg = QtWidgets.QWidget()
         pgrid = QtWidgets.QGridLayout(pg); pgrid.setContentsMargins(0,0,0,0); pgrid.setSpacing(8)
         pgrid.addWidget(make_label("Restarts:"), 0, 0)
@@ -2264,16 +2177,29 @@ class TrainingGUI(QtWidgets.QWidget):
         return gb
 
     def _build_scheduler_group(self):
-        gb, lay = group_box("Scheduler Configuration", QtWidgets.QFormLayout)
+        gb, lay = group_box("Scheduler Configuration", QtWidgets.QVBoxLayout)
         
-        # Add a static label instead of the dropdown
+        # --- DDPM (Standard) Container ---
+        self.ddpm_params_container = QtWidgets.QWidget()
+        ddpm_lay = QtWidgets.QFormLayout(self.ddpm_params_container)
+        ddpm_lay.setContentsMargins(0, 0, 0, 0)
         scheduler_label = make_label("DDPMScheduler", color=TEXT_SEC)
-        scheduler_label.setToolTip("Hardcoded in train.py for Standard SDXL mode.")
-        lay.addRow(make_label("Noise Scheduler:"), scheduler_label)
+        scheduler_label.setToolTip("Used for Standard SDXL modes (epsilon, v_prediction).")
+        ddpm_lay.addRow(make_label("Noise Scheduler:"), scheduler_label)
+        self._add_to_form(ddpm_lay, "BETA_SCHEDULE")
+        lay.addWidget(self.ddpm_params_container)
 
-        # Add the remaining widgets
-        for key in ["PREDICTION_TYPE", "BETA_SCHEDULE", "USE_ZERO_TERMINAL_SNR"]:
-            self._add_to_form(lay, key)
+        # --- Rectified Flow Container ---
+        self.rf_params_container = QtWidgets.QWidget()
+        rf_lay = QtWidgets.QFormLayout(self.rf_params_container)
+        rf_lay.setContentsMargins(0, 0, 0, 0)
+        rf_label = make_label("Flow Match Euler", color=TEXT_SEC)
+        rf_label.setToolTip("Used automatically for Rectified Flow.")
+        rf_lay.addRow(make_label("Noise Scheduler:"), rf_label)
+        self._add_to_form(rf_lay, "RF_SHIFT_FACTOR")
+        lay.addWidget(self.rf_params_container)
+        
+        lay.addStretch()
         return gb
 
     def _build_loss_group(self):
@@ -2405,7 +2331,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_LOW")
         return gb
 
-    # ── Timestep Sampling Group ───────────────────────────────────
     def _build_timestep_group(self):
         gb, lay = group_box("Timestep Ticket Allocation")
         self.timestep_histogram = TimestepHistogramWidget()
@@ -2413,7 +2338,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.timestep_histogram.allocationChanged.connect(lambda _: self._sync_widget("TIMESTEP_ALLOCATION"))
         lay.addWidget(self.timestep_histogram)
 
-        # Controls
         r1 = QtWidgets.QHBoxLayout()
         r1.addWidget(make_label("Bin Size:"))
         self.bin_size_combo = make_combo(["30", "40", "50", "100", "200", "250", "500"])
@@ -2425,10 +2349,8 @@ class TrainingGUI(QtWidgets.QWidget):
         r1.addWidget(self.ts_mode_combo, 1)
         lay.addLayout(r1)
 
-        # Slider stack
         self.ts_slider_stack = QtWidgets.QStackedWidget()
 
-        # Wave page
         wave_page = QtWidgets.QWidget()
         wl = QtWidgets.QFormLayout(wave_page); wl.setContentsMargins(0, 0, 0, 0)
         self.slider_wave_freq, self.spin_wave_freq = self._add_slider_row(wl, "Frequency:", 0.0, 5.0, 1.0, 100.0)
@@ -2436,14 +2358,12 @@ class TrainingGUI(QtWidgets.QWidget):
         self.slider_wave_amp, self.spin_wave_amp = self._add_slider_row(wl, "Amplitude:", 0.0, 2.0, 0.0, 100.0)
         self.ts_slider_stack.addWidget(wave_page)
 
-        # Logit-Normal page
         logit_page = QtWidgets.QWidget()
         ll = QtWidgets.QFormLayout(logit_page); ll.setContentsMargins(0, 0, 0, 0)
         self.slider_ln_mu, self.spin_ln_mu = self._add_slider_row(ll, "Center (Mu):", -3.0, 3.0, 0.0, 100.0)
         self.slider_ln_sigma, self.spin_ln_sigma = self._add_slider_row(ll, "Spread (Sigma):", 0.1, 3.0, 1.0, 100.0)
         self.ts_slider_stack.addWidget(logit_page)
 
-        # Beta page
         beta_page = QtWidgets.QWidget()
         bl = QtWidgets.QFormLayout(beta_page); bl.setContentsMargins(0, 0, 0, 0)
         self.slider_beta_alpha, self.spin_beta_alpha = self._add_slider_row(bl, "Alpha:", 0.1, 10.0, 3.0, 100.0)
@@ -2451,7 +2371,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.ts_slider_stack.addWidget(beta_page)
         lay.addWidget(self.ts_slider_stack)
 
-        # Preset buttons stack
         self.ts_button_stack = QtWidgets.QStackedWidget()
         presets_by_mode = [
             [("Uniform (Flat)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
@@ -2494,7 +2413,6 @@ class TrainingGUI(QtWidgets.QWidget):
         return sl, sp
 
     def _apply_timestep_preset(self, name):
-        # Block signals during preset application to avoid partial updates
         self.ts_mode_combo.blockSignals(True)
 
         mode_map = {
@@ -2530,14 +2448,12 @@ class TrainingGUI(QtWidgets.QWidget):
         target_mode = mode_map[name]
         vals = values[name]
 
-        # Set mode index directly
         mode_idx = {"Wave": 0, "Logit-Normal": 1, "Beta": 2}.get(target_mode, 0)
         self.ts_mode_combo.setCurrentIndex(mode_idx)
         self.ts_slider_stack.setCurrentIndex(mode_idx)
         self.ts_button_stack.setCurrentIndex(mode_idx)
         self.ts_mode_combo.blockSignals(False)
 
-        # Apply spin values and sync sliders - block all signals first
         slider_spin_pairs = [
             (self.slider_wave_freq, self.spin_wave_freq, "wave_freq", 100.0),
             (self.slider_wave_phase, self.spin_wave_phase, "wave_phase", 100.0),
@@ -2554,7 +2470,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 sl.setValue(int(vals[key] * divider))
             sl.blockSignals(False); sp.blockSignals(False)
 
-        # Force a single distribution update
         self._update_timestep_distribution()
 
     def _update_timestep_distribution(self):
@@ -2586,43 +2501,43 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.timestep_histogram.generate_from_weights(weights)
 
-    # ── Training Mode ─────────────────────────────────────────────
-    def _on_training_mode_changed(self, text):
-        is_rf = "Rectified Flow" in text
-        # The problematic 'for' loop and 'if' check for noise_group have been removed.
-        if hasattr(self, 'scheduler_group'): 
-            self.scheduler_group.setEnabled(not is_rf)
+    def _on_prediction_type_changed(self, text):
+        is_rf = text == "rectified_flow"
+        
+        # Toggle visibility between standard DDPM settings and RF settings
+        if hasattr(self, 'ddpm_params_container'): 
+            self.ddpm_params_container.setVisible(not is_rf)
         if hasattr(self, 'rf_params_container'): 
             self.rf_params_container.setVisible(is_rf)
+            
         if hasattr(self, 'dataset_manager'): 
             self.dataset_manager.refresh_cache_buttons()
 
-    # ── Config Apply / Collect ────────────────────────────────────
+    def _on_training_mode_changed(self, text):
+        if hasattr(self, 'dataset_manager'): 
+            self.dataset_manager.refresh_cache_buttons()
+
     def _apply_config_to_widgets(self):
         for w in self.widgets.values(): w.blockSignals(True)
         try:
-            mode = self.current_config.get("TRAINING_MODE", "Standard (SDXL)")
+            mode = self.current_config.get("TRAINING_MODE", "SDXL")
             self.training_mode_combo.blockSignals(True)
             self.training_mode_combo.setCurrentText(mode)
             self.training_mode_combo.blockSignals(False)
-            self._on_training_mode_changed(mode)
 
             is_resuming = self.current_config.get("RESUME_TRAINING", False)
             self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
 
-            # Standard widget keys
             skip = {"OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
             skip |= {k for k in self.widgets if k.startswith(("RAVEN_", "TITAN_", "VELORMS_"))}
             for key, w in self.widgets.items():
                 if key in skip: continue
                 self._set_widget(key, self.current_config.get(key))
 
-            # Optimizer
             opt_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE).lower()
             idx = self.widgets["OPTIMIZER_TYPE"].findData(opt_type)
             self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(idx if idx >= 0 else 0)
 
-            # Load adam param groups
             for prefix, def_attr in [("RAVEN", "RAVEN_PARAMS"), ("TITAN", "TITAN_PARAMS")]:
                 defaults = getattr(default_config, def_attr, {})
                 params = {**defaults, **self.current_config.get(def_attr, {})}
@@ -2641,23 +2556,19 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["VELORMS_eps"].setText(str(vp.get("eps", 1e-8)))
             self._toggle_optimizer_widgets()
 
-            # Loss
             self.widgets["LOSS_TYPE"].setCurrentText(self.current_config.get("LOSS_TYPE", "MSE"))
             for key, default in [("SEMANTIC_SEP_WEIGHT", 0.5), ("SEMANTIC_DETAIL_WEIGHT", 0.8),
                                   ("SEMANTIC_ENTROPY_WEIGHT", 0.8)]:
                 self.widgets[key].setValue(self.current_config.get(key, default))
             self._toggle_loss_widgets()
 
-            # Conditional enables
             if "SHOULD_UPSCALE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
 
-            # LR curve
             self._update_and_clamp_lr_graph()
 
-            # Timestep histogram
             alloc = self.current_config.get("TIMESTEP_ALLOCATION")
             if alloc:
                 if "bin_size" in alloc:
@@ -2670,10 +2581,12 @@ class TrainingGUI(QtWidgets.QWidget):
             self.ts_mode_combo.setCurrentText(ts_mode)
             self.ts_mode_combo.blockSignals(False)
 
-            # Datasets
             if hasattr(self, 'dataset_manager'):
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
             self._update_training_calculations()
+
+            if "PREDICTION_TYPE" in self.widgets:
+                self._on_prediction_type_changed(self.widgets["PREDICTION_TYPE"].currentText())
         finally:
             for w in self.widgets.values(): w.blockSignals(False)
 
@@ -2699,7 +2612,6 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
-        # Optimizer params
         for prefix, key in [("RAVEN", "RAVEN_PARAMS"), ("TITAN", "TITAN_PARAMS")]:
             try:
                 betas = [float(x) for x in self.widgets[f"{prefix}_betas"].text().split(',')]
@@ -2727,7 +2639,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if "RF_SHIFT_FACTOR" in self.widgets: cfg["RF_SHIFT_FACTOR"] = self.widgets["RF_SHIFT_FACTOR"].value()
         return cfg
 
-    # ── Calculations & Graph Updates ──────────────────────────────
     def _update_training_calculations(self):
         try:
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
@@ -2775,11 +2686,10 @@ class TrainingGUI(QtWidgets.QWidget):
             removable = 0 < sel_idx < len(self.lr_curve_widget.get_points()) - 1
             self.remove_point_btn.setEnabled(removable)
 
-    # ── Training Control ──────────────────────────────────────────
     def get_current_cache_folder_name(self):
-        if "Rectified Flow" in self.training_mode_combo.currentText():
+        pred_type = self.widgets["PREDICTION_TYPE"].currentText() if "PREDICTION_TYPE" in self.widgets else ""
+        if pred_type == "rectified_flow":
             return ".precomputed_embeddings_cache_rf_noobai"
-        # Return whichever standard cache exists, preferring the current name
         for ds in self.dataset_manager.datasets:
             for name in [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache"]:
                 if (Path(ds["path"]) / name).exists():
@@ -2841,7 +2751,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
         if os.name == 'nt': prevent_sleep(False)
 
-    # ── Logging ───────────────────────────────────────────────────
     def log(self, message): self.append_log(message.strip(), replace=False)
 
     def append_log(self, text, replace=False):
@@ -2864,7 +2773,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def clear_console_log(self): self.log_textbox.clear(); self.log("Console cleared.")
 
-    # ── Window Events ─────────────────────────────────────────────
     def closeEvent(self, event):
         self._save_gui_state()
         if self.process_runner and self.process_runner.isRunning():
@@ -2891,9 +2799,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.style().drawPrimitive(QtWidgets.QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
 
 
-# ──────────────────────────────────────────────────────────────────
-#  ENTRY POINT
-# ──────────────────────────────────────────────────────────────────
 if __name__ == "__main__":
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
