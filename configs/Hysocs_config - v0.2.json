@@ -1,5 +1,5 @@
 {
-    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Mugen.safetensors",
+    "SINGLE_FILE_CHECKPOINT_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/Mugen_trained_unified_5f7a.safetensors",
     "VAE_PATH": "",
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "RESUME_MODEL_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/MugenDELTA_20k_DUAL.safetensors",
@@ -13,12 +13,12 @@
     "MAX_AREA_TOLERANCE": "1.0",
     "PREDICTION_TYPE": "v_prediction",
     "BETA_SCHEDULE": "scaled_linear",
-    "MAX_TRAIN_STEPS": "3000",
+    "MAX_TRAIN_STEPS": "2500",
     "BATCH_SIZE": 1,
     "GRADIENT_ACCUMULATION_STEPS": "5",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "10.0",
-    "SEED": "657",
+    "SEED": "61",
     "SAVE_EVERY_N_STEPS": "2000",
     "UNET_EXCLUDE_TARGETS": "down_blocks.2.*.transformer_blocks.*.ff.net.*",
     "LR_CUSTOM_CURVE": [
@@ -27,12 +27,12 @@
             9e-08
         ],
         [
-            0.06026786,
-            6e-05
+            0.01785714,
+            7e-05
         ],
         [
-            0.95758929,
-            6e-05
+            0.984375,
+            7e-05
         ],
         [
             1.0,
@@ -40,8 +40,8 @@
         ]
     ],
     "LR_GRAPH_MIN": "9e-08",
-    "LR_GRAPH_MAX": "6.0e-05",
-    "MEMORY_EFFICIENT_ATTENTION": "xformers (Only if no Flash)",
+    "LR_GRAPH_MAX": "7.0e-05",
+    "MEMORY_EFFICIENT_ATTENTION": "pytorch29_optimized",
     "USE_ZERO_TERMINAL_SNR": true,
     "GRAD_SPIKE_THRESHOLD_HIGH": 100.0,
     "GRAD_SPIKE_THRESHOLD_LOW": 0.0,
@@ -59,53 +59,49 @@
     "LOSS_WEIGHT_EPS": 0.333,
     "CHANNEL_STATS_SAMPLES": 500,
     "NOISE_SCHEDULER": "DDPMScheduler",
-    "TRAINING_MODE": "Rectified Flow (SDXL)",
+    "TRAINING_MODE": "Standard (SDXL)",
     "LOSS_HUBER_BETA": 0.5,
     "LOSS_ADAPTIVE_DAMPING": 0.1,
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\CG",
-            "repeats": 1
-        },
-        {
-            "path": "C:/Users/Administrator/Pictures\\Artists",
+            "path": "C:/Users/Administrator/Pictures\\overfit",
             "repeats": 1
         }
     ],
     "OPTIMIZER_TYPE": "raven",
-    "LOSS_TYPE": "SelfCorrection",
+    "LOSS_TYPE": "MSE",
     "SEMANTIC_SEP_WEIGHT": 0.25,
     "SEMANTIC_DETAIL_WEIGHT": 0.15,
     "SEMANTIC_ENTROPY_WEIGHT": 0.05,
     "TIMESTEP_ALLOCATION": {
         "bin_size": 40,
         "counts": [
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120,
-            120
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100,
+            100
         ]
     },
     "RAVEN_PARAMS": {
