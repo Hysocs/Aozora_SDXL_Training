@@ -1101,6 +1101,15 @@ def main():
         mode_str = "RECTIFIED FLOW" if config.is_rectified_flow else "STANDARD SDXL"
         print("\n" + "="*50 + f"\n--- STARTING {mode_str} TRAINING ---\n" + "="*50 + "\n")
 
+    noise_mode = getattr(config, "NOISE_MODE", "normal")
+    if semantic_noise_enabled(config):
+        print(
+            "INFO: Semantic noise enabled "
+            f"(noise type: {noise_mode}, strength: {semantic_noise_strength(config):.3g})"
+        )
+    else:
+        print(f"INFO: Semantic noise disabled (noise type: {noise_mode})")
+
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
     if check_if_caching_needed(config):
@@ -1142,7 +1151,7 @@ def main():
             prediction_type if prediction_type == "v_prediction" else "epsilon"
         )
     else:
-        print(f"\n--- Using Rectified Flow (shift={getattr(config, 'RF_SHIFT_FACTOR', 3.0)}) ---")
+        print(f"\n--- Using Rectified Flow ---")
 
     print("\n--- Initializing Dataset ---")
     dataset   = ImageTextLatentDataset(config)
