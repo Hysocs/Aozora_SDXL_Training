@@ -34,7 +34,6 @@ MAX_AREA_TOLERANCE = 1.1     # Note: Present in GUI, but training relies purely 
 
 # --- Core Training Parameters ---
 PREDICTION_TYPE = "v_prediction"
-BETA_SCHEDULE = "scaled_linear"
 MAX_TRAIN_STEPS = 10000
 BATCH_SIZE = 1
 GRADIENT_ACCUMULATION_STEPS = 4
@@ -108,7 +107,6 @@ VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
 
-# --- Rectified Flow Parameters ---
-RF_SHIFT_FACTOR = 2.5         # Shift strength for applicable modes
-RF_USE_DYNAMIC_SHIFT = False  # Hidden from GUI, uses resolution-based shift
-RF_BASE_PIXELS = 1048576      # 1024*1024 base for dynamic shift calculation
+NOISE_MODE = "normal"
+USE_SEMANTIC_NOISE = False
+SEMANTIC_NOISE_STRENGTH = 2.0

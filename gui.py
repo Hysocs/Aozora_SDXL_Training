@@ -7,6 +7,7 @@ import copy
 import sys
 import shutil
 import ctypes
+import zlib
 from pathlib import Path
 from collections import deque
 from datetime import datetime
@@ -338,6 +339,278 @@ def hbox(*widgets, spacing=8):
         if w is None: lay.addStretch()
         else: lay.addWidget(w)
     return container, lay
+
+class CompressedLogBuffer:
+    def __init__(self, block_size=128, compression_level=6, max_active_bytes=64 * 1024):
+        self.block_size = max(16, int(block_size))
+        self.compression_level = max(1, min(9, int(compression_level)))
+        self.max_active_bytes = max(4096, int(max_active_bytes))
+        self.blocks = []
+        self.current_lines = []
+        self.current_bytes = 0
+        self.line_count = 0
+        self.uncompressed_bytes = 0
+        self.compressed_bytes = 0
+
+    def clear(self):
+        self.blocks.clear()
+        self.current_lines.clear()
+        self.current_bytes = 0
+        self.line_count = 0
+        self.uncompressed_bytes = 0
+        self.compressed_bytes = 0
+
+    def append(self, text, replace_last=False):
+        if replace_last:
+            self.remove_last_line()
+        lines = str(text).rstrip('\n').splitlines()
+        if not lines:
+            lines = [""]
+        for line in lines:
+            line_bytes = len(line.encode('utf-8', errors='replace')) + 1
+            self.current_lines.append(line)
+            self.current_bytes += line_bytes
+            self.line_count += 1
+            self.uncompressed_bytes += line_bytes
+            if len(self.current_lines) >= self.block_size or self.current_bytes >= self.max_active_bytes:
+                self._seal_current_block()
+
+    def remove_last_line(self):
+        if self.line_count <= 0:
+            return
+        if self.current_lines:
+            removed = self.current_lines.pop()
+            self.current_bytes = max(0, self.current_bytes - len(removed.encode('utf-8', errors='replace')) - 1)
+            self.line_count -= 1
+            self.uncompressed_bytes = max(0, self.uncompressed_bytes - len(removed.encode('utf-8', errors='replace')) - 1)
+            return
+        if not self.blocks:
+            return
+        lines = self._decode_block(len(self.blocks) - 1)
+        old_payload_size = len(self.blocks[-1][1])
+        if lines:
+            removed = lines.pop()
+            self.line_count -= 1
+            self.uncompressed_bytes = max(0, self.uncompressed_bytes - len(removed.encode('utf-8', errors='replace')) - 1)
+        self.blocks.pop()
+        self.compressed_bytes = max(0, self.compressed_bytes - old_payload_size)
+        if lines:
+            self.current_lines = lines
+            self.current_bytes = sum(len(line.encode('utf-8', errors='replace')) + 1 for line in self.current_lines)
+            if len(self.current_lines) >= self.block_size or self.current_bytes >= self.max_active_bytes:
+                self._seal_current_block()
+
+    def get_lines(self, start_line, count):
+        if count <= 0 or self.line_count <= 0:
+            return []
+        start_line = max(0, min(int(start_line), self.line_count - 1))
+        end_line = min(self.line_count, start_line + int(count))
+        output = []
+        cursor = 0
+        for line_count, payload in self.blocks:
+            block_start = cursor
+            block_end = cursor + line_count
+            if block_end > start_line and block_start < end_line:
+                lines = zlib.decompress(payload).decode('utf-8', errors='replace').split('\n')
+                local_start = max(0, start_line - block_start)
+                local_end = min(line_count, end_line - block_start)
+                output.extend(lines[local_start:local_end])
+            cursor = block_end
+            if cursor >= end_line:
+                break
+        if cursor < end_line and self.current_lines:
+            block_start = cursor
+            block_end = cursor + len(self.current_lines)
+            if block_end > start_line and block_start < end_line:
+                local_start = max(0, start_line - block_start)
+                local_end = min(len(self.current_lines), end_line - block_start)
+                output.extend(self.current_lines[local_start:local_end])
+        return output
+
+    def memory_summary(self):
+        stored = self.compressed_bytes + self.current_bytes
+        ratio = 1.0 if self.uncompressed_bytes <= 0 else stored / self.uncompressed_bytes
+        return stored, self.uncompressed_bytes, ratio
+
+    def _seal_current_block(self):
+        if not self.current_lines:
+            return
+        raw = '\n'.join(self.current_lines).encode('utf-8', errors='replace')
+        payload = zlib.compress(raw, self.compression_level)
+        self.blocks.append((len(self.current_lines), payload))
+        self.compressed_bytes += len(payload)
+        self.current_lines = []
+        self.current_bytes = 0
+
+    def _decode_block(self, index):
+        if not (0 <= index < len(self.blocks)):
+            return []
+        line_count, payload = self.blocks[index]
+        lines = zlib.decompress(payload).decode('utf-8', errors='replace').split('\n')
+        return lines[:line_count]
+
+
+class VirtualConsoleWidget(QtWidgets.QWidget):
+    def __init__(self, parent=None, visible_lines=900):
+        super().__init__(parent)
+        self.visible_lines = max(100, int(visible_lines))
+        self.buffer = CompressedLogBuffer(block_size=128, compression_level=6)
+        self.pending_render = False
+        self.follow_output = True
+        self._internal_scroll_update = False
+        self._internal_text_update = False
+        self._build_ui()
+        self.render_timer = QtCore.QTimer(self)
+        self.render_timer.setSingleShot(True)
+        self.render_timer.timeout.connect(self._render_now)
+
+    def _build_ui(self):
+        root = QtWidgets.QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        root.setSpacing(6)
+
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(4)
+
+        self.textbox = QtWidgets.QPlainTextEdit()
+        self.textbox.setReadOnly(True)
+        self.textbox.setMinimumHeight(200)
+        self.textbox.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
+        self.textbox.setUndoRedoEnabled(False)
+        self.textbox.setStyleSheet(f"background: {DARK_BG}; color: {TEXT_PRI}; font-family: Consolas;")
+        self.textbox.viewport().installEventFilter(self)
+        self.textbox.verticalScrollBar().valueChanged.connect(self._on_inner_scrollbar_changed)
+
+        self.scrollbar = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Vertical)
+        self.scrollbar.valueChanged.connect(self._on_scrollbar_changed)
+
+        row.addWidget(self.textbox, 1)
+        row.addWidget(self.scrollbar)
+        root.addLayout(row, 1)
+
+        footer = QtWidgets.QHBoxLayout()
+        footer.setContentsMargins(0, 0, 0, 0)
+        self.status_label = make_label("Lines: 0 | Buffer: empty", color=TEXT_SEC)
+        self.follow_checkbox = QtWidgets.QCheckBox("Follow output")
+        self.follow_checkbox.setChecked(True)
+        self.follow_checkbox.stateChanged.connect(self._on_follow_changed)
+        footer.addWidget(self.status_label)
+        footer.addStretch()
+        footer.addWidget(self.follow_checkbox)
+        root.addLayout(footer)
+
+    def eventFilter(self, obj, event):
+        if obj is self.textbox.viewport() and event.type() == QtCore.QEvent.Type.Wheel:
+            delta = event.angleDelta().y()
+            if delta:
+                inner_sb = self.textbox.verticalScrollBar()
+                inner_can_scroll = (
+                    (delta > 0 and inner_sb.value() > inner_sb.minimum()) or
+                    (delta < 0 and inner_sb.value() < inner_sb.maximum())
+                )
+                if inner_can_scroll or self.scrollbar.maximum() <= 0:
+                    return False
+                step = max(1, self.scrollbar.singleStep())
+                self.scrollbar.setValue(self.scrollbar.value() - int(delta / 120) * step)
+                self._set_follow_output(self._at_console_bottom())
+                event.accept()
+                return True
+        return super().eventFilter(obj, event)
+
+    def append_line(self, text, replace_last=False):
+        was_at_bottom = self._at_console_bottom()
+        self.buffer.append(text, replace_last=replace_last)
+        if self.follow_output and was_at_bottom:
+            self.follow_output = True
+        self._schedule_render()
+
+    def clear(self):
+        self.buffer.clear()
+        self.textbox.clear()
+        self.scrollbar.setRange(0, 0)
+        self.status_label.setText("Lines: 0 | Buffer: empty")
+        self.follow_output = True
+        self.follow_checkbox.blockSignals(True)
+        self.follow_checkbox.setChecked(True)
+        self.follow_checkbox.blockSignals(False)
+
+    def _schedule_render(self):
+        if not self.pending_render:
+            self.pending_render = True
+            self.render_timer.start(33)
+
+    def _on_follow_changed(self, state):
+        self.follow_output = state == QtCore.Qt.CheckState.Checked.value
+        if self.follow_output:
+            self.scrollbar.setValue(self.scrollbar.maximum())
+            self._schedule_render()
+
+    def _on_scrollbar_changed(self, value):
+        if self._internal_scroll_update:
+            return
+        self._set_follow_output(self._at_console_bottom())
+        self._schedule_render()
+
+    def _on_inner_scrollbar_changed(self, value):
+        if self._internal_text_update:
+            return
+        self._set_follow_output(self._at_console_bottom())
+
+    def _at_console_bottom(self):
+        inner_sb = self.textbox.verticalScrollBar()
+        outer_bottom = self.scrollbar.value() >= self.scrollbar.maximum() - 1
+        inner_bottom = inner_sb.value() >= inner_sb.maximum() - 1
+        return outer_bottom and inner_bottom
+
+    def _set_follow_output(self, follow):
+        self.follow_output = bool(follow)
+        self.follow_checkbox.blockSignals(True)
+        self.follow_checkbox.setChecked(self.follow_output)
+        self.follow_checkbox.blockSignals(False)
+
+    def _render_now(self):
+        self.pending_render = False
+        total = self.buffer.line_count
+        max_start = max(0, total - self.visible_lines)
+        self._internal_scroll_update = True
+        self.scrollbar.setRange(0, max_start)
+        self.scrollbar.setPageStep(self.visible_lines)
+        self.scrollbar.setSingleStep(max(1, self.visible_lines // 20))
+        if self.follow_output:
+            self.scrollbar.setValue(max_start)
+        elif self.scrollbar.value() > max_start:
+            self.scrollbar.setValue(max_start)
+        start = self.scrollbar.value()
+        self._internal_scroll_update = False
+
+        lines = self.buffer.get_lines(start, self.visible_lines)
+        inner_sb = self.textbox.verticalScrollBar()
+        inner_value = inner_sb.value()
+        self._internal_text_update = True
+        self.textbox.setPlainText('\n'.join(lines))
+        if self.follow_output:
+            inner_sb.setValue(inner_sb.maximum())
+        else:
+            inner_sb.setValue(min(inner_value, inner_sb.maximum()))
+        self._internal_text_update = False
+
+        stored, uncompressed, ratio = self.buffer.memory_summary()
+        shown_start = 0 if total == 0 else start + 1
+        shown_end = min(total, start + len(lines))
+        self.status_label.setText(
+            f"Lines: {total:,} | Showing: {shown_start:,}-{shown_end:,} | "
+            f"Memory: {self._fmt_bytes(stored)} compressed from {self._fmt_bytes(uncompressed)} ({ratio:.2%})"
+        )
+
+    def _fmt_bytes(self, value):
+        value = float(value)
+        for unit in ["B", "KB", "MB", "GB"]:
+            if value < 1024.0 or unit == "GB":
+                return f"{value:.1f} {unit}" if unit != "B" else f"{int(value)} B"
+            value /= 1024.0
+
+
 
 
 class CustomFolderDialog(QtWidgets.QDialog):
@@ -794,19 +1067,25 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
         grid = QtWidgets.QGridLayout()
         grid.setSpacing(10)
-        grid.addWidget(self._make_graph_container("step_loss", "Per-Step Loss", "Loss"), 0, 0)
-        grid.addWidget(self._make_graph_container("timestep", "Timestep", "Value"), 0, 1)
-        grid.addWidget(self._make_graph_container("optim_loss", "Optimizer Loss (Avg)", "Loss"), 1, 0)
-        grid.addWidget(self._make_graph_container("lr", "Learning Rate", "LR"), 1, 1)
-        grid.addWidget(self._make_graph_container("grad_norm", "Gradient Norms", "Norm"), 2, 0, 1, 2)
+        for name, title, y_label, row, col, row_span, col_span in [
+            ("step_loss", "Per-Step Loss", "Loss", 0, 0, 1, 1),
+            ("timestep", "Timestep", "Value", 0, 1, 1, 1),
+            ("optim_loss", "Optimizer Loss (Avg)", "Loss", 1, 0, 1, 1),
+            ("lr", "Learning Rate", "LR", 1, 1, 1, 1),
+            ("grad_norm", "Gradient Norms", "Norm", 2, 0, 1, 2),
+        ]:
+            grid.addWidget(self._make_graph_container(name, title, y_label), row, col, row_span, col_span)
         main.addLayout(grid)
 
-        self._add_line("step_loss", "Step Loss", "#4CAF50")
-        self._add_line("timestep", "Timestep", ACCENT2)
-        self._add_line("optim_loss", "Avg Loss", ACCENT)
-        self._add_line("lr", "LR", "#6a48d7")
-        self._add_line("grad_norm", "Raw", DANGER, linewidth=3)
-        self._add_line("grad_norm", "Clipped", WARN, linewidth=2)
+        for graph_name, line_name, color, width in [
+            ("step_loss", "Step Loss", "#4CAF50", 2),
+            ("timestep", "Timestep", ACCENT2, 2),
+            ("optim_loss", "Avg Loss", ACCENT, 2),
+            ("lr", "LR", "#6a48d7", 2),
+            ("grad_norm", "Raw", DANGER, 3),
+            ("grad_norm", "Clipped", WARN, 2),
+        ]:
+            self._add_line(graph_name, line_name, color, width)
 
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
@@ -1675,7 +1954,6 @@ UI_DEFS = {
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
     "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
     "PREDICTION_TYPE":             ("Prediction Type", "v_prediction, epsilon, or rectified_flow.", "combo", ["epsilon", "v_prediction", "rectified_flow"]),
-    "BETA_SCHEDULE":               ("Beta Schedule", "Noise schedule for the diffuser.", "combo", ["scaled_linear", "linear", "squared", "squaredcos_cap_v2"]),
     "MAX_TRAIN_STEPS":             ("Max Training Steps", "Total number of training steps.", "line"),
     "BATCH_SIZE":                  ("Batch Size", "Number of samples per batch.", "spin", 1, 32),
     "SAVE_EVERY_N_STEPS":          ("Save Every N (Optimizer Steps)", "When to save a checkpoint.", "line"),
@@ -1689,16 +1967,23 @@ UI_DEFS = {
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
+    "NOISE_MODE":                  ("Noise Mode", "Base noise algorithm used before optional semantic redistribution.", "combo", ["normal", "hostile", "pyramid_detail"]),
+    "USE_SEMANTIC_NOISE":          ("Semantic Noise", "Use cached semantic maps to redistribute noise toward detail-heavy regions.", "check"),
+    "SEMANTIC_NOISE_STRENGTH":     ("Semantic Strength", "How strongly semantic-map regions reshape the noise distribution. 0 disables the effect.", "dspin", 0.0, 10.0, 0.05, 2),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "Semantic", "DestinationLoss"]),
-    "SEMANTIC_SEP_WEIGHT":         ("Separation Region Weight", "Weight for blob/color separation regions.", "dspin", 0.0, 2.0, 0.05, 2),
-    "SEMANTIC_DETAIL_WEIGHT":      ("Lineart/Detail Weight", "Weight for fine details, edges, and lineart.", "dspin", 0.0, 2.0, 0.05, 2),
-    "SEMANTIC_ENTROPY_WEIGHT":     ("Entropy/Texture Weight", "Weight for texture complexity. Requires scikit-image.", "dspin", 0.0, 2.0, 0.05, 2),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "DestinationLoss"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
     "VAE_LATENT_CHANNELS":         ("Latent Channels", "4 for Standard/EQ, 32 for Flux/NoobAI.", "spin", 4, 128),
-    "RF_SHIFT_FACTOR":             ("RF Shift Factor", "Shift factor for SD3/Flux schedules.", "dspin", 0.0, 100.0, 0.01, 4),
+
+}
+
+_OLD_LOSS_PREFIX = "SE" + "MANTIC"
+REMOVED_CONFIG_KEYS = {
+    f"{_OLD_LOSS_PREFIX}_SEP_WEIGHT",
+    f"{_OLD_LOSS_PREFIX}_DETAIL_WEIGHT",
+    f"{_OLD_LOSS_PREFIX}_ENTROPY_WEIGHT",
 }
 
 
@@ -1715,7 +2000,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner = None
         self.current_config = {}
         self.last_line_is_progress = False
-        self.default_config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__')}
+        self.default_config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__') and k not in REMOVED_CONFIG_KEYS}
+        self.default_config.setdefault("NOISE_MODE", "normal")
+        self.default_config.setdefault("USE_SEMANTIC_NOISE", False)
+        self.default_config.setdefault("SEMANTIC_NOISE_STRENGTH", 2.0)
         self.presets = {}
         self.last_browsed_path = os.getcwd()
 
@@ -1746,7 +2034,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 name = os.path.splitext(fn)[0]
                 try:
                     with open(os.path.join(self.config_dir, fn), 'r') as f:
-                        self.presets[name] = json.load(f)
+                        self.presets[name] = self._sanitize_config(json.load(f))
                 except Exception as e:
                     self.log(f"Warning: Could not load '{fn}': {e}")
 
@@ -1777,7 +2065,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def load_selected_config(self, index):
         key = self.config_dropdown.itemData(index) or self.config_dropdown.itemText(index).replace(" ", "_").lower()
         if key in self.presets:
-            self.current_config = {**copy.deepcopy(self.default_config), **self.presets[key]}
+            self.current_config = self._sanitize_config({**copy.deepcopy(self.default_config), **self.presets[key]})
             self.log(f"Loaded config: '{key}.json'")
         else:
             self.current_config = copy.deepcopy(self.default_config)
@@ -1828,6 +2116,9 @@ class TrainingGUI(QtWidgets.QWidget):
             self.presets[key] = copy.deepcopy(self.default_config)
             self.save_config(); self.load_selected_config(idx)
             self.log(f"Restored '{key}.json' to defaults.")
+
+    def _sanitize_config(self, cfg):
+        return {k: v for k, v in cfg.items() if k not in REMOVED_CONFIG_KEYS}
 
     def _make_widget(self, key):
         if key not in UI_DEFS: return None, None
@@ -1931,27 +2222,18 @@ class TrainingGUI(QtWidgets.QWidget):
         title.setObjectName("TitleLabel")
         title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         main.addWidget(title)
-
-        self.log_textbox = QtWidgets.QTextEdit()
-        self.log_textbox.setReadOnly(True)
-        self.log_textbox.setMinimumHeight(200)
-        self.log_textbox.setStyleSheet(f"background: {DARK_BG}; color: {TEXT_PRI}; font-family: Consolas;")
+        self.log_textbox = VirtualConsoleWidget(visible_lines=900)
 
         self.tab_view = QtWidgets.QTabWidget()
 
-        ds_widget = QtWidgets.QWidget()
-        self._build_dataset_tab(ds_widget)
-        ds_scroll = QtWidgets.QScrollArea()
-        ds_scroll.setWidgetResizable(True)
-        ds_scroll.setWidget(ds_widget)
-        self.tab_view.addTab(ds_scroll, "Dataset")
-
-        mt_widget = QtWidgets.QWidget()
-        self._build_model_training_tab(mt_widget)
-        mt_scroll = QtWidgets.QScrollArea()
-        mt_scroll.setWidgetResizable(True)
-        mt_scroll.setWidget(mt_widget)
-        self.tab_view.addTab(mt_scroll, "Model && Training Parameters")
+        for title_text, builder in [("Dataset", self._build_dataset_tab),
+                                    ("Model && Training Parameters", self._build_model_training_tab)]:
+            page = QtWidgets.QWidget()
+            builder(page)
+            scroll = QtWidgets.QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setWidget(page)
+            self.tab_view.addTab(scroll, title_text)
 
         self.live_metrics_widget = LiveMetricsWidget()
         self.tab_view.addTab(self.live_metrics_widget, "Live Metrics")
@@ -2092,11 +2374,14 @@ class TrainingGUI(QtWidgets.QWidget):
         r3.addWidget(self._build_advanced_group(), 1)
         lay.addLayout(r3)
 
-        self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_and_clamp_lr_graph)
-        self.widgets["MAX_TRAIN_STEPS"].textChanged.connect(self._update_training_calculations)
-        self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_epoch_markers_on_graph)
-        self.widgets["GRADIENT_ACCUMULATION_STEPS"].textChanged.connect(self._update_training_calculations)
-        self.widgets["BATCH_SIZE"].valueChanged.connect(self._update_training_calculations)
+        for key, signal_name, callback in [
+            ("MAX_TRAIN_STEPS", "textChanged", self._update_and_clamp_lr_graph),
+            ("MAX_TRAIN_STEPS", "textChanged", self._update_training_calculations),
+            ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_epoch_markers_on_graph),
+            ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_training_calculations),
+            ("BATCH_SIZE", "valueChanged", self._update_training_calculations),
+        ]:
+            getattr(self.widgets[key], signal_name).connect(callback)
         self._update_lr_button_states(-1)
 
     def _build_path_group(self):
@@ -2186,7 +2471,6 @@ class TrainingGUI(QtWidgets.QWidget):
         scheduler_label = make_label("DDPMScheduler", color=TEXT_SEC)
         scheduler_label.setToolTip("Used for Standard SDXL modes (epsilon, v_prediction).")
         ddpm_lay.addRow(make_label("Noise Scheduler:"), scheduler_label)
-        self._add_to_form(ddpm_lay, "BETA_SCHEDULE")
         lay.addWidget(self.ddpm_params_container)
 
         # --- Rectified Flow Container ---
@@ -2196,31 +2480,15 @@ class TrainingGUI(QtWidgets.QWidget):
         rf_label = make_label("Flow Match Euler", color=TEXT_SEC)
         rf_label.setToolTip("Used automatically for Rectified Flow.")
         rf_lay.addRow(make_label("Noise Scheduler:"), rf_label)
-        self._add_to_form(rf_lay, "RF_SHIFT_FACTOR")
         lay.addWidget(self.rf_params_container)
         
         lay.addStretch()
         return gb
 
     def _build_loss_group(self):
-        gb, lay = group_box("Loss Configuration")
-        form = QtWidgets.QFormLayout()
-        self.widgets["LOSS_TYPE"] = make_combo(["MSE", "Semantic", "DestinationLoss", "SelfCorrection"])
-        self.widgets["LOSS_TYPE"].currentTextChanged.connect(self._toggle_loss_widgets)
-        form.addRow("Loss Type:", self.widgets["LOSS_TYPE"])
-        lay.addLayout(form)
-
-        self.semantic_loss_container = QtWidgets.QWidget()
-        sl = QtWidgets.QFormLayout(self.semantic_loss_container); sl.setContentsMargins(0, 0, 0, 0)
-        for key in ["SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT"]:
-            self._add_to_form(sl, key)
-        lay.addWidget(self.semantic_loss_container)
-        lay.addStretch(1)
+        gb, lay = group_box("Loss Configuration", QtWidgets.QFormLayout)
+        self._add_to_form(lay, "LOSS_TYPE")
         return gb
-
-    def _toggle_loss_widgets(self):
-        lt = self.widgets["LOSS_TYPE"].currentText()
-        self.semantic_loss_container.setVisible(lt == "Semantic")
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -2246,22 +2514,38 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_adam_optimizer_form(self, prefix):
         container = QtWidgets.QWidget()
         lay = QtWidgets.QFormLayout(container); lay.setContentsMargins(0, 5, 0, 0)
+        
         self.widgets[f'{prefix}_betas'] = QtWidgets.QLineEdit()
         self.widgets[f'{prefix}_eps'] = QtWidgets.QLineEdit()
         self.widgets[f'{prefix}_weight_decay'] = make_dspin(0.0, 1.0, step=0.00001, decimals=6)
         self.widgets[f'{prefix}_debias_strength'] = make_dspin(0.0, 1.0, step=0.01, decimals=3)
         self.widgets[f'{prefix}_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
         self.widgets[f'{prefix}_gc_alpha'] = make_dspin(0.0, 1.0, step=0.1, decimals=1)
+        
+  
+        if prefix == "RAVEN":
+            self.widgets[f'{prefix}_momentum_dtype'] = make_combo(["bfloat16", "float32"])
+            # Optional: Set bfloat16 as default
+            self.widgets[f'{prefix}_momentum_dtype'].setCurrentText("bfloat16") 
+        # -------------------------
+
         gc = self.widgets[f'{prefix}_use_grad_centralization']
         gca = self.widgets[f'{prefix}_gc_alpha']
         gc.stateChanged.connect(lambda s: gca.setEnabled(bool(s)))
+        
         for lbl, key in [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
-                          ("Weight Decay:", f'{prefix}_weight_decay'), ("Debias Strength:", f'{prefix}_debias_strength')]:
+                        ("Weight Decay:", f'{prefix}_weight_decay'), ("Debias Strength:", f'{prefix}_debias_strength')]:
             lay.addRow(lbl, self.widgets[key])
+        
+
+        if prefix == "RAVEN":
+            lay.addRow("Momentum Precision:", self.widgets[f'{prefix}_momentum_dtype'])
+        # -------------------------
+
         lay.addRow(gc)
         lay.addRow("GC Alpha:", gca)
         return container
-
+    
     def _build_velorms_form(self):
         container = QtWidgets.QWidget()
         lay = QtWidgets.QFormLayout(container); lay.setContentsMargins(0, 5, 0, 0)
@@ -2325,6 +2609,14 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_advanced_group(self):
         gb, lay = group_box("Miscellaneous", QtWidgets.QFormLayout)
         self._add_to_form(lay, "MEMORY_EFFICIENT_ATTENTION")
+        lay.addRow(make_separator())
+        lay.addRow(make_label("<b>Noise Configuration</b>", color=ACCENT))
+        self._add_to_form(lay, "NOISE_MODE")
+        self._add_to_form(lay, "USE_SEMANTIC_NOISE")
+        self._add_to_form(lay, "SEMANTIC_NOISE_STRENGTH")
+        self.widgets["USE_SEMANTIC_NOISE"].stateChanged.connect(
+            lambda s: self.widgets["SEMANTIC_NOISE_STRENGTH"].setEnabled(bool(s))
+        )
         lay.addRow(make_separator())
         lay.addRow(make_label("<b>Gradient Spike Detection</b>", color=ACCENT))
         self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_HIGH")
@@ -2556,16 +2848,15 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["VELORMS_eps"].setText(str(vp.get("eps", 1e-8)))
             self._toggle_optimizer_widgets()
 
-            self.widgets["LOSS_TYPE"].setCurrentText(self.current_config.get("LOSS_TYPE", "MSE"))
-            for key, default in [("SEMANTIC_SEP_WEIGHT", 0.5), ("SEMANTIC_DETAIL_WEIGHT", 0.8),
-                                  ("SEMANTIC_ENTROPY_WEIGHT", 0.8)]:
-                self.widgets[key].setValue(self.current_config.get(key, default))
-            self._toggle_loss_widgets()
+            loss_type = self.current_config.get("LOSS_TYPE", "MSE")
+            self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "DestinationLoss"} else "MSE")
 
             if "SHOULD_UPSCALE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
+            if "USE_SEMANTIC_NOISE" in self.widgets:
+                self.widgets["SEMANTIC_NOISE_STRENGTH"].setEnabled(self.widgets["USE_SEMANTIC_NOISE"].isChecked())
 
             self._update_and_clamp_lr_graph()
 
@@ -2587,6 +2878,10 @@ class TrainingGUI(QtWidgets.QWidget):
 
             if "PREDICTION_TYPE" in self.widgets:
                 self._on_prediction_type_changed(self.widgets["PREDICTION_TYPE"].currentText())
+
+            if prefix == "RAVEN" and "momentum_dtype" in params:
+                self.widgets[f"{prefix}_momentum_dtype"].setCurrentText(params["momentum_dtype"])
+
         finally:
             for w in self.widgets.values(): w.blockSignals(False)
 
@@ -2595,7 +2890,7 @@ class TrainingGUI(QtWidgets.QWidget):
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
                      "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE",
-                     "SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT", "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
+                     "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE", *REMOVED_CONFIG_KEYS}
 
         for key, val in self.current_config.items():
             if key in skip_keys: continue
@@ -2607,8 +2902,6 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
         cfg["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
-        for key in ["SEMANTIC_SEP_WEIGHT", "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT"]:
-            cfg[key] = self.widgets[key].value()
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 
@@ -2625,6 +2918,11 @@ class TrainingGUI(QtWidgets.QWidget):
                 "use_grad_centralization": self.widgets[f"{prefix}_use_grad_centralization"].isChecked(),
                 "gc_alpha": self.widgets[f"{prefix}_gc_alpha"].value(),
             }
+            
+
+            if prefix == "RAVEN":
+                cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
+
         try: veps = float(self.widgets["VELORMS_eps"].text())
         except: veps = 1e-8
         cfg["VELORMS_PARAMS"] = {
@@ -2636,7 +2934,6 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in ["VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"]:
             cfg[key] = self.widgets[key].value()
         cfg["VAE_LATENT_CHANNELS"] = self.widgets["VAE_LATENT_CHANNELS"].value()
-        if "RF_SHIFT_FACTOR" in self.widgets: cfg["RF_SHIFT_FACTOR"] = self.widgets["RF_SHIFT_FACTOR"].value()
         return cfg
 
     def _update_training_calculations(self):
@@ -2751,28 +3048,23 @@ class TrainingGUI(QtWidgets.QWidget):
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
         if os.name == 'nt': prevent_sleep(False)
 
-    def log(self, message): self.append_log(message.strip(), replace=False)
+    def log(self, message):
+        self.append_log(str(message).strip(), replace=False)
 
     def append_log(self, text, replace=False):
-        sb = self.log_textbox.verticalScrollBar()
-        at_bottom = sb.value() >= sb.maximum() - 4
-        cur = self.log_textbox.textCursor()
-        cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        if replace:
-            cur.select(QtGui.QTextCursor.SelectionType.LineUnderCursor)
-            cur.removeSelectedText()
-            cur.movePosition(QtGui.QTextCursor.MoveOperation.End)
-        self.log_textbox.setTextCursor(cur)
-        self.log_textbox.insertPlainText(text.rstrip() + '\n')
-        if at_bottom: sb.setValue(sb.maximum())
+        if not text:
+            return
+        self.log_textbox.append_line(text.rstrip(), replace_last=replace)
 
     def handle_process_output(self, text, is_progress):
         if text:
             self.append_log(text, replace=is_progress and self.last_line_is_progress)
             self.last_line_is_progress = is_progress
 
-    def clear_console_log(self): self.log_textbox.clear(); self.log("Console cleared.")
-
+    def clear_console_log(self):
+        self.log_textbox.clear()
+        self.last_line_is_progress = False
+        self.log("Console cleared.")
     def closeEvent(self, event):
         self._save_gui_state()
         if self.process_runner and self.process_runner.isRunning():

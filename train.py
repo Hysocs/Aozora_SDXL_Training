@@ -38,7 +38,14 @@ from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     FusedAttnProcessor2_0
 )
-from tools.semantic import generate_latent_semantic_map_batch
+from tools.semantic import (
+    apply_semantic_noise,
+    generate_semantic_noise_maps,
+    get_semantic_noise_cache_dir,
+    semantic_noise_enabled,
+    semantic_noise_map_path,
+    semantic_noise_strength,
+)
 from functools import lru_cache
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
@@ -65,16 +72,11 @@ def set_attention_processor(unet, attention_mode="flash_attn"):
         print("INFO: Using xFormers")
         
     if attention_mode == "pytorch29_optimized":
-        # NEW: Best for PyTorch 2.9 - uses all native optimizations
         try:
-            # Enable all PyTorch 2.9 attention optimizations
-            torch.backends.cuda.enable_flash_sdp(True)      # Flash Attention
-            torch.backends.cuda.enable_mem_efficient_sdp(True)  # Memory Efficient
-            torch.backends.cuda.enable_math_sdp(True)       # Math fallback
-            
-            # Use optimized AttnProcessor2_0 (leverages PyTorch 2.9 SDPA improvements)
+            torch.backends.cuda.enable_flash_sdp(True)
+            torch.backends.cuda.enable_mem_efficient_sdp(True)
+            torch.backends.cuda.enable_math_sdp(True)
             unet.set_attn_processor(AttnProcessor2_0())
-            
             print("INFO: Using PyTorch 2.9 Optimized SDPA (Flash + MemEfficient + Math)")
             print(f"      CUDA Version: {torch.version.cuda}")
             print(f"      PyTorch Version: {torch.__version__}")
@@ -97,26 +99,54 @@ def set_seed(seed):
     print(f"INFO: Set random seed to {seed}")
 
 def fix_alpha_channel(img):
-    """
-    FIXED: Never adds filler/background pixels.
-    - Transparent RGBA/LA images → composite onto BLACK (neutral for diffusion)
-      OR simply strip alpha and keep RGB as-is (no artificial padding)
-    - Palette images with transparency → convert properly
-    """
     if img.mode == 'P' and 'transparency' in img.info:
         img = img.convert('RGBA')
-    
     if img.mode in ('RGBA', 'PA', 'LA'):
-
         rgb_img = img.convert('RGB')
         return rgb_img
-    
     return img.convert("RGB")
 
-def generate_train_noise(latents, step, seed, generator):
-    step_seed = (seed + step) % (2**32 - 1)
-    generator.manual_seed(step_seed)
-    return torch.randn(latents.shape, device=latents.device, dtype=latents.dtype, generator=generator)
+def generate_noise(latents, generator, device, dtype, mode="normal", step=None, seed=None, timesteps=None, detail_boost=1.0):
+    # Optional deterministic step-seeding
+    if step is not None and seed is not None:
+        step_seed = (seed + step) % (2**32 - 1)
+        generator.manual_seed(step_seed)
+
+    # Base standard noise
+    noise = torch.randn(latents.shape, device=device, dtype=dtype, generator=generator)
+
+    # Apply hostile modifications if requested
+    if mode == "hostile":
+        hostile_blobs = -latents
+        hostile_blobs = F.avg_pool2d(hostile_blobs, kernel_size=8, stride=8)
+        hostile_blobs = F.interpolate(hostile_blobs, size=(latents.shape[2], latents.shape[3]), mode='bilinear')
+        noise = noise + (0.2 * hostile_blobs)
+        noise = noise / noise.std()
+
+    elif mode == "pyramid_detail":
+        if timesteps is None:
+            # Fallback to white noise if called without timestep info
+            return noise
+
+        B, C, H, W = latents.shape
+
+        # Normalize integer timesteps (0-999) -> [0, 1]
+        t_norm = timesteps.float().view(-1, 1, 1, 1) / 999.0
+
+        # Extract a high-frequency detail layer (Laplacian-like pyramid)
+        noise_ds = F.avg_pool2d(noise, kernel_size=2, stride=2)
+        noise_us = F.interpolate(noise_ds, size=(H, W), mode='bilinear', align_corners=False)
+        noise_hf = noise - noise_us
+
+        # Blend schedule:
+        #   t ≈ 0  (low noise / near-clean image)  -> mostly HF detail (forces model to learn fine detail)
+        #   t ≈ 1  (high noise / pure destruction) -> standard white noise
+        blended = t_norm * noise + (1.0 - t_norm) * (noise_hf * detail_boost)
+
+        # Renormalize per-sample to unit variance so scheduler/flow math doesn't drift
+        noise = blended / (blended.std(dim=(-2, -1), keepdim=True, unbiased=False) + 1e-6)
+
+    return noise
 
 
 class TrainingConfig:
@@ -126,6 +156,10 @@ class TrainingConfig:
                 setattr(self, key, value)
         self._load_from_user_config()
         self._type_check_and_correct()
+        if not hasattr(self, "USE_SEMANTIC_NOISE"):
+            self.USE_SEMANTIC_NOISE = False
+        if not hasattr(self, "SEMANTIC_NOISE_STRENGTH"):
+            self.SEMANTIC_NOISE_STRENGTH = 2.0
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
         self.is_rectified_flow = getattr(self, "PREDICTION_TYPE", "epsilon") == "rectified_flow"
 
@@ -402,124 +436,56 @@ STANDARD_SDXL_BUCKETS = [
 
 
 def get_optimal_bucket(orig_w, orig_h, target_area=None, stride=64):
-    """
-    Selects the best fixed SDXL bucket for an image.
-    
-    Strategy:
-    1. Compute original aspect ratio
-    2. Find the bucket whose AR is closest to the original
-    3. Among ties, prefer the bucket whose area is closest to target_area
-       (or closest to original area if no target given)
-    
-    NEVER generates new resolutions — always picks from STANDARD_SDXL_BUCKETS.
-    NEVER pads or stretches.
-    
-    Args:
-        orig_w, orig_h: Original image dimensions in pixels
-        target_area: Desired approximate area (default ~1MP for SDXL). 
-                     Used as tiebreaker when multiple buckets have similar AR.
-        stride: Kept for API compatibility but fixed buckets are already stride-aligned.
-    
-    Returns:
-        (bucket_w, bucket_h): The selected fixed bucket dimensions
-    """
     orig_ar = orig_w / max(orig_h, 1)
     orig_area = orig_w * orig_h
     
-    # Default target area to standard SDXL training resolution
     if target_area is None:
         target_area = 1024 * 1024
     
     def bucket_score(bw, bh):
-        """
-        Score a bucket. Lower is better.
-        
-        Combines:
-        - Aspect ratio error (how much we'll distort/crop)
-        - Area error (how far from desired training size)
-        """
         bucket_ar = bw / max(bh, 1)
         bucket_area = bw * bh
-        
-        # Aspect ratio penalty (relative error)
         ar_error = abs(bucket_ar - orig_ar) / max(orig_ar, 0.01)
-        
-        # Area penalty (log-scale so 2x and 0.5x are equally penalized)
         if bucket_area > 0 and target_area > 0:
             area_error = abs(math.log(bucket_area / target_area))
         else:
             area_error = 100.0
-        
-        # Weight: AR fidelity matters more than exact area
         return ar_error * 10.0 + area_error
     
-    # Score all buckets, pick the best
     best_bucket = min(STANDARD_SDXL_BUCKETS, key=lambda b: bucket_score(b[0], b[1]))
-    
     bw, bh = best_bucket
     
-    # Safety clamp: never return a bucket larger than original in both dims
-    # (that would require upscaling a tiny image into a massive bucket)
     if bw > orig_w and bh > orig_h:
-        # Find largest bucket that fits within original dimensions
         fitting_buckets = [(w, h) for w, h in STANDARD_SDXL_BUCKETS 
                           if w <= orig_w and h <= orig_h]
         if fitting_buckets:
             best_bucket = max(fitting_buckets, key=lambda b: b[0] * b[1])
         else:
-            # Fallback: nothing fits, use smallest available
             best_bucket = min(STANDARD_SDXL_BUCKETS, key=lambda b: b[0] * b[1])
     
     return best_bucket
 
 def smart_resize(image, target_w, target_h):
-    """
-    Resize image to exactly (target_w, target_h) using COVER + CENTER-CROP.
-    
-    Algorithm:
-    1. Calculate uniform scale so image COVERS the target box
-       (both dimensions >= target after scaling)
-    2. Resize uniformly (no stretch/distortion)
-    3. Center-crop to exact target size (EQUAL margins on all sides)
-    
-    Guarantees:
-    - No padding/filler added
-    - No stretching/anisotropic scaling
-    - Equal pixels removed from left/right and top/bottom
-    - Output is EXACTLY target_w × target_h
-    
-    This is equivalent to ImageOps.fit() with centering=(0.5, 0.5)
-    but explicit about the guarantees above.
-    """
     orig_w, orig_h = image.size
-    
-    # Step 1: Compute uniform scale to COVER the target
     scale_x = target_w / max(orig_w, 1)
     scale_y = target_h / max(orig_h, 1)
-    scale = max(scale_x, scale_y)  # Cover mode: fill the box
+    scale = max(scale_x, scale_y)
     
-    # Step 2: Apply uniform scale
     new_w = int(round(orig_w * scale))
     new_h = int(round(orig_h * scale))
-    
-    # Guard against zero/negative
     new_w = max(new_w, target_w)
     new_h = max(new_h, target_h)
     
     resized = image.resize((new_w, new_h), Image.Resampling.LANCZOS)
     
-    # Step 3: Center-crop (equal margins from opposite sides)
     crop_left = (new_w - target_w) // 2
     crop_top = (new_h - target_h) // 2
     crop_right = crop_left + target_w
     crop_bottom = crop_top + target_h
     
     cropped = resized.crop((crop_left, crop_top, crop_right, crop_bottom))
-    
-    # Verify output size (catch any rounding errors)
     assert cropped.size == (target_w, target_h), \
         f"smart_resize failed: expected ({target_w},{target_h}), got {cropped.size}"
-    
     return cropped
 
 def validate_and_assign_resolution(args):
@@ -533,23 +499,18 @@ def validate_and_assign_resolution(args):
             if w <= 0 or h <= 0: 
                 return None
 
-        # Determine target bucket
         if not should_upscale and (w * h) < target_area:
-            # Don't upscale small images; use their native area (bucketed)
             target_w, target_h = get_optimal_bucket(w, h, w * h, stride)
         else:
             target_w, target_h = get_optimal_bucket(w, h, target_area, stride)
 
-        # Compute the actual transformation: scale then center-crop
         scale = max(target_w / w, target_h / h)
         scaled_w = int(round(w * scale))
         scaled_h = int(round(h * scale))
         
-        # Crop coordinates (centered)
         crop_left = max(0, (scaled_w - target_w) // 2)
         crop_top = max(0, (scaled_h - target_h) // 2)
 
-        # Load caption
         cp = ip.with_suffix('.txt')
         caption = ip.stem.replace('_', ' ')
         if cp.exists():
@@ -567,7 +528,6 @@ def validate_and_assign_resolution(args):
             "crop_coords": (crop_top, crop_left),
             "original_area": w * h, 
             "target_area": target_w * target_h,
-            # NEW: Flag whether this image was upscaled (useful for diagnostics)
             "was_upscaled": should_upscale and (w * h) < target_area
         }
     except Exception as e:
@@ -588,9 +548,9 @@ def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
 
 def check_if_caching_needed(config):
     needs_caching = False
-    cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-    use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
-    semantic_cache_folder_name = ".semantic_maps_cache"
+    cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+    
+    use_semantic_noise = semantic_noise_enabled(config)
 
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
@@ -610,49 +570,39 @@ def check_if_caching_needed(config):
         if not index_path.exists():
             needs_caching = True; continue
 
-        if use_semantic_loss and not (root / semantic_cache_folder_name).exists():
+        if use_semantic_noise and not get_semantic_noise_cache_dir(root).exists():
             needs_caching = True; continue
 
         cached_te_files = list(cache_dir.glob("*_te.pt"))
         if len(cached_te_files) < len(image_paths):
             needs_caching = True
-        elif use_semantic_loss:
-            semantic_cache_dir = root / semantic_cache_folder_name
+        elif use_semantic_noise:
+            semantic_cache_dir = get_semantic_noise_cache_dir(root)
             if sum(not (semantic_cache_dir / f"{f.stem.replace('_te', '')}_sem.pt").exists() for f in cached_te_files) > 0:
                 needs_caching = True
     return needs_caching
 
 def load_unet_robust(path, compute_dtype):
     print(f"INFO: Loading UNet from: {Path(path).name}")
-    
-    # Default standard SDXL values
     in_channels = 4
     out_channels = 4
-    
-    # Peek into the safetensors file to dynamically read the true channel counts
     try:
         from safetensors import safe_open
         with safe_open(path, framework="pt", device="cpu") as f:
             key_in = "model.diffusion_model.input_blocks.0.0.weight"
             key_out = "model.diffusion_model.out.2.weight"
-            
-            # Extract in_channels from the 2nd dimension of the first conv layer
             if key_in in f.keys():
                 shape_in = f.get_slice(key_in).get_shape()
                 in_channels = shape_in[1]
-                
-            # Extract out_channels from the 1st dimension of the final conv layer
             if key_out in f.keys():
                 shape_out = f.get_slice(key_out).get_shape()
                 out_channels = shape_out[0]
-                
     except Exception as e:
         print(f"WARNING: Could not peek into safetensors for channel sizes, falling back to defaults. Error: {e}")
 
     print(f"INFO: Detected UNet configuration - in_channels: {in_channels}, out_channels: {out_channels}")
 
     try:
-        # Pass the detected channels into the kwargs to override the inferred configuration
         unet = UNet2DConditionModel.from_single_file(
             path,
             torch_dtype=compute_dtype,
@@ -694,9 +644,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         print("\n" + "="*60 + "\nINFO: Datasets already cached.\n" + "="*60 + "\n")
         return
 
-    cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-    use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
-    semantic_cache_folder_name = ".semantic_maps_cache"
+    cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+    
+    use_semantic_noise = semantic_noise_enabled(config)
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
@@ -715,8 +665,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
 
-        semantic_cache_dir = root / semantic_cache_folder_name if use_semantic_loss else None
-        if use_semantic_loss: semantic_cache_dir.mkdir(exist_ok=True)
+        semantic_cache_dir = get_semantic_noise_cache_dir(root) if use_semantic_noise else None
+        if use_semantic_noise: semantic_cache_dir.mkdir(exist_ok=True)
 
         torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
@@ -724,7 +674,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         to_process = []
         for p in paths:
             safe_stem = str(p.relative_to(root).with_suffix('')).replace(os.sep, '_')
-            if not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists() or (use_semantic_loss and not (semantic_cache_dir / f"{safe_stem}_sem.pt").exists()):
+            if not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists() or (use_semantic_noise and not semantic_noise_map_path(semantic_cache_dir, safe_stem).exists()):
                 to_process.append(p)
 
         if to_process:
@@ -738,14 +688,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             random.shuffle(batches)
 
             for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc=f"Encoding {root.name}")):
-                images_global, valid_meta_final, original_images_for_semantic = [], [], [] if use_semantic_loss else None
+                images_global, valid_meta_final, original_images_for_semantic = [], [], [] if use_semantic_noise else None
                 for m in batch_meta:
                     try:
                         with Image.open(m['ip']) as img:
                             img_resized = smart_resize(fix_alpha_channel(img), w, h)
                             images_global.append(transform(img_resized))
                             valid_meta_final.append(m)
-                            if use_semantic_loss: original_images_for_semantic.append(img_resized.copy())
+                            if use_semantic_noise: original_images_for_semantic.append(img_resized.copy())
                     except Exception as e:
                         tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
 
@@ -767,15 +717,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 orig_sizes = [f"{m['original_size'][0]}x{m['original_size'][1]}" for m in valid_meta_final]
                 tqdm.write(f"[Batch {batch_idx}] [{', '.join(orig_sizes)}] -> {w}x{h} | Raw:[{raw_min:.2f}, {raw_max:.2f}] | VAE Scale:{scale_val}, Shift:{shift_val}")
 
-                semantic_maps = None
-                if use_semantic_loss and original_images_for_semantic:
-                    semantic_maps = generate_latent_semantic_map_batch(
-                        latents=latents_global, images=original_images_for_semantic,
-                        sep_weight=getattr(config, "SEMANTIC_SEP_WEIGHT", 1.0),
-                        detail_weight=getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0),
-                        entropy_weight=getattr(config, "SEMANTIC_ENTROPY_WEIGHT", 0.0),
-                        device="cpu", dtype=torch.float32
-                    ).cpu()
+                semantic_maps = generate_semantic_noise_maps(latents_global, original_images_for_semantic, config)
 
                 for j, m in enumerate(valid_meta_final):
                     safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_')
@@ -788,11 +730,10 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
                     }, cache_dir / f"{safe_filename}_te.pt")
                     torch.save(latents_global[j], cache_dir / f"{safe_filename}_lat.pt")
-                    if semantic_maps is not None: torch.save(semantic_maps[j], semantic_cache_dir / f"{safe_filename}_sem.pt")
+                    if semantic_maps is not None: torch.save(semantic_maps[j], semantic_noise_map_path(semantic_cache_dir, safe_filename))
 
                 if batch_idx % 20 == 0: torch.cuda.empty_cache()
                 
-        # Build JSON index after finishing caching for this dataset
         print(f"INFO: Building fast JSON index for {root.name}...")
         index_path = cache_dir / "dataset_index.json"
         index_data = []
@@ -800,7 +741,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         for f in cached_files:
             try:
                 data_te = torch.load(f, map_location='cpu')
-                sem_path = semantic_cache_dir / f"{f.stem.replace('_te', '')}_sem.pt" if use_semantic_loss else None
+                sem_path = semantic_noise_map_path(semantic_cache_dir, f.stem.replace('_te', '')) if use_semantic_noise else None
                 
                 index_data.append({
                     "te_path": str(f),
@@ -826,11 +767,10 @@ class ImageTextLatentDataset(Dataset):
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
         self.worker_rng = None
-        self.use_semantic_loss = getattr(config, 'LOSS_TYPE', 'MSE') == "Semantic"
+        self.use_semantic_noise = semantic_noise_enabled(config)
 
-        cache_folder_name = ".precomputed_embeddings_cache_rf_noobai" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+        cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
 
-        # LOAD FAST JSON INDEX
         print("INFO: Loading dataset index...")
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
@@ -844,14 +784,12 @@ class ImageTextLatentDataset(Dataset):
                 for _ in range(repeats):
                     for item in index_data["files"]:
                         self.items.append(item)
-                        # We get the bucket key instantly without touching the disk!
                         self.bucket_keys.append(tuple(item["target_size"]))
             else:
                 print(f"WARNING: Index missing at {index_path}. Please re-run caching!")
 
         if not self.items: raise ValueError("No cached files found.")
 
-        # Shuffle pairs together to ensure random initial order
         combined = list(zip(self.items, self.bucket_keys))
         random.shuffle(combined)
         self.items, self.bucket_keys = zip(*combined)
@@ -873,7 +811,6 @@ class ImageTextLatentDataset(Dataset):
         worker_info = torch.utils.data.get_worker_info()
         self.worker_rng = random.Random(self.seed + (worker_info.id if worker_info else 0))
 
-    # Cache up to 5,000 items in RAM (~1.2GB per worker). Disk is only touched ONCE per file!
     def _load_tensor(self, path):
         if not path: return None
         return torch.load(path, map_location="cpu", weights_only=True)
@@ -887,7 +824,6 @@ class ImageTextLatentDataset(Dataset):
             path_lat = item_data["lat_path"]
             path_sem = item_data.get("sem_path")
 
-            # Read directly from disk. Workers do this in parallel!
             data_te = self._load_tensor(path_te)
             latents = self._load_tensor(path_lat)
 
@@ -903,11 +839,12 @@ class ImageTextLatentDataset(Dataset):
                 "latent_path": path_te
             }
 
-            if self.use_semantic_loss:
+            if self.use_semantic_noise:
                 if path_sem: 
                     item["semantic_map"] = self._load_tensor(path_sem)
                 else: 
-                    item["semantic_map"] = torch.ones_like(latents, dtype=torch.float32)
+                    # If there's no map found, fallback to 0.0 so we just use 1.0 (standard) normal noise.
+                    item["semantic_map"] = torch.zeros_like(latents, dtype=torch.float32)
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
                 item["embeds"], item["pooled"] = self.null_embeds, self.null_pooled
@@ -976,7 +913,6 @@ class TimestepSampler:
             if self.pool_index >= len(self.ticket_pool): self.pool_index = 0
             indices.append(self.ticket_pool[self.pool_index])
             self.pool_index += 1
-        # Return BOTH the GPU tensor AND the raw python integer!
         return torch.tensor(indices, dtype=torch.long, device=self.device), indices[0]
 
     def update(self, raw_grad_norm): pass
@@ -1001,7 +937,9 @@ def create_optimizer(config, params_to_optimize):
         return TitanAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0))
     elif optimizer_type == "raven":
         final_params = {**getattr(default_config, 'RAVEN_PARAMS', {}), **getattr(config, 'RAVEN_PARAMS', {})}
-        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0))
+        dtype_str = final_params.get('momentum_dtype', 'bfloat16')
+        m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
+        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "velorms":
         final_params = {**getattr(default_config, 'VELORMS_PARAMS', {}), **getattr(config, 'VELORMS_PARAMS', {})}
         return VeloRMS(params_to_optimize, lr=initial_lr, momentum=final_params.get('momentum', 0.86), leak=final_params.get('leak', 0.16), weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
@@ -1233,12 +1171,11 @@ def main():
     unet.train()
     diagnostics  = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     reporter     = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param")
-    loss_type    = getattr(config, "LOSS_TYPE", "MSE")
+    
     timestep_sampler = TimestepSampler(config, device)
     if config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
 
-    # Pre-cache alphas_cumprod on device if needed for SDXL v-prediction
     alphas_cumprod_gpu = None
     if not config.is_rectified_flow and scheduler is not None:
         alphas_cumprod_gpu = scheduler.alphas_cumprod.to(device)
@@ -1260,8 +1197,7 @@ def main():
             if not batch: continue
 
             micro_step += 1
-
-            # ── Data diagnostics for the first 5 steps ──────────────────────────
+            diag_data_to_log = None 
             if micro_step <= 5:
                 orig_w, orig_h = batch["original_sizes"][0]
                 targ_w, targ_h = batch["target_sizes"][0]
@@ -1279,6 +1215,9 @@ def main():
             pooled  = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
 
+            semantic_map = batch.get("semantic_map") if semantic_noise_enabled(config) else None
+            semantic_strength = semantic_noise_strength(config)
+
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
 
                 scaled_sizes = batch.get("scaled_sizes", batch["original_sizes"])
@@ -1286,44 +1225,51 @@ def main():
                     [s1[1], s1[0], crop[0], crop[1], s2[1], s2[0]]
                     for s1, crop, s2 in zip(scaled_sizes, batch_crop_coords, batch["target_sizes"])
                 ]
-                # Instantiate exactly ONE tensor directly on the target device
                 time_ids = torch.tensor(time_ids_data, dtype=config.compute_dtype, device=device)
 
-                noise = generate_train_noise(latents, micro_step, initial_sampler_seed, noise_generator)
+                noise_mode = getattr(config, "NOISE_MODE", "normal") 
+
+                noise = generate_noise(
+                    latents=latents,
+                    generator=noise_generator,
+                    device=device,
+                    dtype=config.compute_dtype,
+                    mode=noise_mode,
+                    step=micro_step,
+                    seed=config.SEED
+                )
+                noise = apply_semantic_noise(
+                    noise=noise,
+                    semantic_map=semantic_map,
+                    device=device,
+                    dtype=config.compute_dtype,
+                    enabled=semantic_noise_enabled(config),
+                    strength=semantic_strength
+                )
+
                 timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0])
                 timestep_str = str(first_timestep_int)
 
-                # ================================================================
-                #  STANDARD NOISE PREDICTION — MSE / Semantic / DestinationLoss
-                #  (SelfCorrection REMOVED — no dual-timestep guide prediction)
-                # ================================================================
                 if config.is_rectified_flow:
-                    shift  = (timestep_sampler.get_dynamic_shift(batch["target_sizes"][0][0], batch["target_sizes"][0][1])
-                              if timestep_sampler.use_dynamic_shift else getattr(config, "RF_SHIFT_FACTOR", 1.0))
-                    t_s    = timestep_sampler.apply_flow_shift(timesteps.float() / 1000.0, shift)
-                    t_exp  = t_s.view(-1, 1, 1, 1)
-                    noisy_latents          = (1 - t_exp) * latents + t_exp * noise
-                    target                 = noise - latents
-                    timesteps_conditioning = (t_s * 1000).long().clamp(0, 999)
+                    jitter = torch.rand(timesteps.shape, device=device, dtype=torch.float32)
+                    t_continuous = ((timesteps.float() + jitter) / 1000.0).clamp(0.0, 1.0)
+                    
+                    t_exp = t_continuous.view(-1, 1, 1, 1).to(config.compute_dtype)
+                    noisy_latents = (1 - t_exp) * latents + t_exp * noise
+                    target = noise - latents
+                    timesteps_conditioning = (t_continuous * 1000.0)
                 else:
-                    noisy_latents          = scheduler.add_noise(latents, noise, timesteps)
-                    target                 = (scheduler.get_velocity(latents, noise, timesteps)
-                                              if scheduler.config.prediction_type == "v_prediction" else noise)
+                    noisy_latents = scheduler.add_noise(latents, noise, timesteps)
+                    target = (scheduler.get_velocity(latents, noise, timesteps)
+                              if scheduler.config.prediction_type == "v_prediction" else noise)
                     timesteps_conditioning = timesteps
 
-                # ── Forward pass (with gradients) ────────────────────────────────
                 pred = unet(noisy_latents, timesteps_conditioning, embeds,
                             added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-                # ── Loss computation (no padding/masking applied) ─────────────────
-                if loss_type == "Semantic":
-                    base_loss    = F.mse_loss(pred.float(), target.float(), reduction="none")
-                    semantic_map = batch.get("semantic_map")
-                    loss = (base_loss * (1.0 + semantic_map.to(device, dtype=torch.float32))).mean() if semantic_map is not None else base_loss.mean()
-                elif loss_type == "DestinationLoss" and config.is_rectified_flow:
+                if getattr(config, "LOSS_TYPE", "MSE") == "DestinationLoss" and config.is_rectified_flow:
                     loss = F.mse_loss(noisy_latents.float() - t_exp.float() * pred.float(), latents.float())
                 else:
-                    # Pure MSE — no masks, no weighting, no filler compensation needed
                     loss = F.mse_loss(pred.float(), target.float())
 
                 (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
@@ -1332,14 +1278,12 @@ def main():
             diagnostics.step(raw_loss_value)
             lr_scheduler.step(micro_step)
 
-            # ── Optimizer step ───────────────────────────────────────────────────
-            diag_data_to_log = None
             if micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
                 raw_grad_norm = (
                     optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf'))
                     if isinstance(optimizer, TitanAdamW)
                     else torch.nn.utils.clip_grad_norm_(
-                        all_trainable_params, # <--- Much faster CPU execution
+                        all_trainable_params,
                         config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float('inf')
                     )
                 )
@@ -1374,7 +1318,6 @@ def main():
                     save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load,
                                        optimizer, lr_scheduler, None, sampler, config)
 
-            # ── Progress bar ─────────────────────────────────────────────────────
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)
             last_step_time = time.time()

@@ -10,8 +10,56 @@ information by working at this scale — and it is far cheaper.
 import cv2
 import numpy as np
 import torch
+from pathlib import Path
 from PIL import Image
 import torch.nn.functional as F
+
+
+SEMANTIC_NOISE_CACHE_FOLDER_NAME = ".semantic_maps_cache"
+
+
+def semantic_noise_enabled(config) -> bool:
+    return bool(getattr(config, "USE_SEMANTIC_NOISE", False))
+
+
+def semantic_noise_strength(config) -> float:
+    return max(0.0, float(getattr(config, "SEMANTIC_NOISE_STRENGTH", 2.0)))
+
+
+def get_semantic_noise_cache_dir(root) -> Path:
+    return Path(root) / SEMANTIC_NOISE_CACHE_FOLDER_NAME
+
+
+def semantic_noise_map_path(semantic_cache_dir, safe_stem: str) -> Path:
+    return Path(semantic_cache_dir) / f"{safe_stem}_sem.pt"
+
+
+def apply_semantic_noise(noise, semantic_map, device, dtype, enabled=False, strength=2.0):
+    if not enabled or semantic_map is None or strength <= 0:
+        return noise
+
+    semantic_map = semantic_map.to(device=device, dtype=dtype)
+
+    original_std = noise.std(dim=(-2, -1), keepdim=True, unbiased=False)
+    weighted_noise = noise * (1.0 + (semantic_map * strength))
+    weighted_std = weighted_noise.std(dim=(-2, -1), keepdim=True, unbiased=False)
+
+    return weighted_noise * (original_std / (weighted_std + 1e-6))
+
+
+def generate_semantic_noise_maps(latents, images, config):
+    if not semantic_noise_enabled(config) or not images:
+        return None
+
+    return generate_latent_semantic_map_batch(
+        latents=latents,
+        images=images,
+        sep_weight=getattr(config, "SEMANTIC_SEP_WEIGHT", 1.0),
+        detail_weight=getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0),
+        entropy_weight=getattr(config, "SEMANTIC_ENTROPY_WEIGHT", 0.0),
+        device="cpu",
+        dtype=torch.float32
+    ).cpu()
 
 def generate_latent_seperation_map(latent_np: np.ndarray) -> np.ndarray:
     """Derives saliency by measuring per-pixel deviation from the mean across latent channels."""
