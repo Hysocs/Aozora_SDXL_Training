@@ -3006,6 +3006,13 @@ class TrainingGUI(QtWidgets.QWidget):
         self.live_metrics_widget.clear_data()
 
         script_dir = os.path.dirname(os.path.abspath(__file__))
+        stale_force_save_flag = os.path.join(script_dir, "force_save.flag")
+        if os.path.exists(stale_force_save_flag):
+            try:
+                os.remove(stale_force_save_flag)
+            except Exception as e:
+                self.log(f"Warning: Could not remove stale emergency checkpoint flag: {e}")
+
         env = os.environ.copy()
         python_dir = os.path.dirname(sys.executable)
         env["PATH"] = f"{python_dir};{os.path.join(python_dir, 'Scripts')};{env.get('PATH', '')}"
@@ -3030,7 +3037,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def force_save_checkpoint(self):
         if self.process_runner and self.process_runner.isRunning():
-            flag_path = os.path.abspath("force_save.flag")
+            flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_save.flag")
             try:
                 with open(flag_path, 'w') as f:
                     f.write("1")

@@ -1059,11 +1059,23 @@ def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, opti
     torch.save(training_state, output_dir / state_filename)
 
 
+def consume_force_save_flag(flag_path):
+    if not flag_path.exists():
+        return False
+    try:
+        flag_path.unlink()
+        return True
+    except OSError as e:
+        print(f"WARNING: Emergency checkpoint flag found but could not be deleted: {e}")
+        return False
+
+
 def main():
     config = TrainingConfig()
     if config.SEED: set_seed(config.SEED)
 
     OUTPUT_DIR = Path(config.OUTPUT_DIR)
+    force_save_flag = Path(__file__).resolve().with_name("force_save.flag")
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     global_step, micro_step, optimizer_step = 0, 0, 0
@@ -1176,10 +1188,6 @@ def main():
     if config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
 
-    alphas_cumprod_gpu = None
-    if not config.is_rectified_flow and scheduler is not None:
-        alphas_cumprod_gpu = scheduler.alphas_cumprod.to(device)
-
     accumulated_latent_paths  = []
     global_step_times         = deque(maxlen=50)
     optim_step_times          = deque(maxlen=20)
@@ -1187,7 +1195,13 @@ def main():
     last_step_time            = time.time()
     last_optim_step_log_time  = time.time()
     done                      = False
-    batches_to_skip           = micro_step % len(dataloader) if config.RESUME_TRAINING else 0
+    dataloader_len            = len(dataloader)
+    if config.RESUME_TRAINING and dataloader_len > 0:
+        batches_to_skip = micro_step % dataloader_len
+    else:
+        if config.RESUME_TRAINING and dataloader_len <= 0:
+            reporter.log_message("WARNING: Resume requested but dataloader is empty; starting without batch skipping.")
+        batches_to_skip = 0
     noise_generator = torch.Generator(device=device)
 
     while not done:
@@ -1313,8 +1327,15 @@ def main():
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
-                if config.SAVE_EVERY_N_STEPS > 0 and optimizer_step > 0 and optimizer_step % config.SAVE_EVERY_N_STEPS == 0:
-                    reporter.log_message(f"\n--- Saving checkpoint at optimizer step {optimizer_step} ---")
+                scheduled_save = (
+                    config.SAVE_EVERY_N_STEPS > 0 and
+                    optimizer_step > 0 and
+                    optimizer_step % config.SAVE_EVERY_N_STEPS == 0
+                )
+                force_save = consume_force_save_flag(force_save_flag)
+                if scheduled_save or force_save:
+                    reason = "Emergency checkpoint requested" if force_save and not scheduled_save else "Saving checkpoint"
+                    reporter.log_message(f"\n--- {reason} at optimizer step {optimizer_step} ---")
                     save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load,
                                        optimizer, lr_scheduler, None, sampler, config)
 
