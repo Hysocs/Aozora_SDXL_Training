@@ -87,6 +87,12 @@ QPushButton:disabled {{ color: {TEXT_MUTED}; background: transparent; border: 1p
 #StartButton:hover {{ background: #9580ff; }}
 #StopButton {{ background: {DANGER}; color: white; font-weight: bold; border-color: {DANGER}; }}
 #StopButton:hover {{ background: #ff6b85; }}
+#FollowOutputButton:checked {{
+    background: {ACCENT};
+    color: white;
+    border-color: {ACCENT};
+}}
+#FollowOutputButton:checked:hover {{ background: #9580ff; color: white; }}
 
 QLineEdit, QPlainTextEdit, QTextEdit, QComboBox {{
     background: {PANEL_BG};
@@ -451,12 +457,13 @@ class CompressedLogBuffer:
 
 
 class VirtualConsoleWidget(QtWidgets.QWidget):
-    def __init__(self, parent=None, visible_lines=900):
+    def __init__(self, parent=None, visible_lines=900, clear_callback=None):
         super().__init__(parent)
         self.visible_lines = max(100, int(visible_lines))
         self.buffer = CompressedLogBuffer(block_size=128, compression_level=6)
         self.pending_render = False
         self.follow_output = True
+        self.clear_callback = clear_callback
         self._internal_scroll_update = False
         self._internal_text_update = False
         self._build_ui()
@@ -492,12 +499,20 @@ class VirtualConsoleWidget(QtWidgets.QWidget):
         footer = QtWidgets.QHBoxLayout()
         footer.setContentsMargins(0, 0, 0, 0)
         self.status_label = make_label("Lines: 0 | Buffer: empty", color=TEXT_SEC)
-        self.follow_checkbox = QtWidgets.QCheckBox("Follow output")
-        self.follow_checkbox.setChecked(True)
-        self.follow_checkbox.stateChanged.connect(self._on_follow_changed)
+        self.follow_button = QtWidgets.QPushButton("Following Output")
+        self.follow_button.setObjectName("FollowOutputButton")
+        self.follow_button.setCheckable(True)
+        self.follow_button.setChecked(True)
+        self.follow_button.setToolTip("Toggle auto-scroll to the latest console output.")
+        self.follow_button.toggled.connect(self._on_follow_toggled)
+        self.clear_button = QtWidgets.QPushButton("Clear Console")
+        self.clear_button.setToolTip("Clear the console output.")
+        if self.clear_callback:
+            self.clear_button.clicked.connect(self.clear_callback)
         footer.addWidget(self.status_label)
         footer.addStretch()
-        footer.addWidget(self.follow_checkbox)
+        footer.addWidget(self.follow_button)
+        footer.addWidget(self.clear_button)
         root.addLayout(footer)
 
     def eventFilter(self, obj, event):
@@ -531,17 +546,16 @@ class VirtualConsoleWidget(QtWidgets.QWidget):
         self.scrollbar.setRange(0, 0)
         self.status_label.setText("Lines: 0 | Buffer: empty")
         self.follow_output = True
-        self.follow_checkbox.blockSignals(True)
-        self.follow_checkbox.setChecked(True)
-        self.follow_checkbox.blockSignals(False)
+        self._sync_follow_button()
 
     def _schedule_render(self):
         if not self.pending_render:
             self.pending_render = True
             self.render_timer.start(33)
 
-    def _on_follow_changed(self, state):
-        self.follow_output = state == QtCore.Qt.CheckState.Checked.value
+    def _on_follow_toggled(self, checked):
+        self.follow_output = bool(checked)
+        self._sync_follow_button()
         if self.follow_output:
             self.scrollbar.setValue(self.scrollbar.maximum())
             self._schedule_render()
@@ -565,9 +579,13 @@ class VirtualConsoleWidget(QtWidgets.QWidget):
 
     def _set_follow_output(self, follow):
         self.follow_output = bool(follow)
-        self.follow_checkbox.blockSignals(True)
-        self.follow_checkbox.setChecked(self.follow_output)
-        self.follow_checkbox.blockSignals(False)
+        self._sync_follow_button()
+
+    def _sync_follow_button(self):
+        self.follow_button.blockSignals(True)
+        self.follow_button.setChecked(self.follow_output)
+        self.follow_button.setText("Following Output" if self.follow_output else "Jump to Bottom")
+        self.follow_button.blockSignals(False)
 
     def _render_now(self):
         self.pending_render = False
@@ -2222,7 +2240,7 @@ class TrainingGUI(QtWidgets.QWidget):
         title.setObjectName("TitleLabel")
         title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
         main.addWidget(title)
-        self.log_textbox = VirtualConsoleWidget(visible_lines=900)
+        self.log_textbox = VirtualConsoleWidget(visible_lines=900, clear_callback=self.clear_console_log)
 
         self.tab_view = QtWidgets.QTabWidget()
 
@@ -2242,7 +2260,6 @@ class TrainingGUI(QtWidgets.QWidget):
         console_layout = QtWidgets.QVBoxLayout(console_widget)
         console_layout.setContentsMargins(15, 15, 15, 15)
         console_layout.addWidget(self.log_textbox, stretch=1)
-        console_layout.addWidget(make_btn("Clear Console", self.clear_console_log), stretch=0)
         self.tab_view.addTab(console_widget, "Training Console")
 
         main.addWidget(self.tab_view)
