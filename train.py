@@ -851,9 +851,6 @@ class TimestepSampler:
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
         self.is_rectified_flow = config.is_rectified_flow
-        self.shift_factor = getattr(config, "RF_SHIFT_FACTOR", 3.0)
-        self.use_dynamic_shift = getattr(config, "RF_USE_DYNAMIC_SHIFT", False)
-        self.base_pixels = getattr(config, "RF_BASE_PIXELS", 1048576)
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
@@ -884,14 +881,6 @@ class TimestepSampler:
         elif len(pool) < self.total_tickets_needed:
             while len(pool) < self.total_tickets_needed: pool.extend(pool[:self.total_tickets_needed - len(pool)])
         return pool[:self.total_tickets_needed]
-
-    def get_dynamic_shift(self, height, width):
-        if not self.use_dynamic_shift: return self.shift_factor
-        return self.shift_factor * math.sqrt((height * width) / self.base_pixels)
-
-    def apply_flow_shift(self, t_normalized, shift_factor):
-        if shift_factor == 1.0 or shift_factor is None: return t_normalized
-        return (shift_factor * t_normalized) / (1.0 + (shift_factor - 1.0) * t_normalized)
 
     def set_current_step(self, micro_step):
         self.pool_index = (micro_step * self.config.BATCH_SIZE) % len(self.ticket_pool)
@@ -944,7 +933,9 @@ def create_optimizer(config, params_to_optimize):
 
     if optimizer_type == "titan":
         final_params = {**default_config.TITAN_PARAMS, **getattr(config, 'TITAN_PARAMS', {})}
-        return TitanAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0))
+        dtype_str = final_params.get('momentum_dtype', 'bfloat16')
+        m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
+        return TitanAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "raven":
         final_params = {**getattr(default_config, 'RAVEN_PARAMS', {}), **getattr(config, 'RAVEN_PARAMS', {})}
         dtype_str = final_params.get('momentum_dtype', 'bfloat16')
@@ -952,7 +943,7 @@ def create_optimizer(config, params_to_optimize):
         return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "velorms":
         final_params = {**getattr(default_config, 'VELORMS_PARAMS', {}), **getattr(config, 'VELORMS_PARAMS', {})}
-        return VeloRMS(params_to_optimize, lr=initial_lr, momentum=final_params.get('momentum', 0.86), leak=final_params.get('leak', 0.16), weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
+        return VeloRMS(params_to_optimize, lr=initial_lr, weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
 def _get_sdxl_unet_conversion_map():

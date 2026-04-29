@@ -22,9 +22,9 @@ try:
     import config as default_config
 except ImportError:
     class default_config:
-        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
-        TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0}
-        VELORMS_PARAMS = {"momentum": 0.86, "leak": 0.16, "weight_decay": 0.01, "eps": 1e-8}
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0, "momentum_dtype": "bfloat16"}
+        TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "use_grad_centralization": False, "gc_alpha": 1.0, "momentum_dtype": "bfloat16"}
+        VELORMS_PARAMS = {"weight_decay": 0.01, "eps": 1e-8}
         OPTIMIZER_TYPE = "Raven"
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
@@ -824,6 +824,11 @@ class GraphPanel(QtWidgets.QWidget):
         self.zoom_level = 1.0
         self.pan_offset = 0
 
+    def _graph_rect(self):
+        return QtCore.QRect(self.padding['left'], self.padding['top'],
+                            self.width() - self.padding['left'] - self.padding['right'],
+                            self.height() - self.padding['top'] - self.padding['bottom'])
+
     def add_line(self, color, label, max_points=2000, linewidth=2):
         self.lines.append({
             'data': deque(maxlen=max_points),
@@ -841,7 +846,6 @@ class GraphPanel(QtWidgets.QWidget):
             line['data'].append((x, y))
             line['smoothing_window'].append(y)
             line['smoothed_data'].append((x, sum(line['smoothing_window']) / len(line['smoothing_window'])))
-            self._update_bounds()
 
     def clear_all_data(self):
         for line in self.lines:
@@ -856,6 +860,35 @@ class GraphPanel(QtWidgets.QWidget):
         visible = max(2, int(total / self.zoom_level))
         end = min(self.pan_offset + visible, total)
         return list(data_deque)[self.pan_offset:end]
+
+    def _sample_visible_pairs(self, raw, smoothed, max_points):
+        count = min(len(raw), len(smoothed))
+        if count <= max_points:
+            return raw[:count], smoothed[:count]
+
+        bucket_count = max(2, max_points // 2)
+        bucket_size = count / bucket_count
+        sampled_raw, sampled_smoothed = [], []
+
+        for bucket in range(bucket_count):
+            start = int(bucket * bucket_size)
+            end = int((bucket + 1) * bucket_size)
+            if bucket == bucket_count - 1:
+                end = count
+            if end <= start:
+                continue
+
+            segment = raw[start:end]
+            if not segment:
+                continue
+            min_i = min(range(len(segment)), key=lambda i: segment[i][1])
+            max_i = max(range(len(segment)), key=lambda i: segment[i][1])
+            for local_i in sorted({min_i, max_i}):
+                idx = start + local_i
+                sampled_raw.append(raw[idx])
+                sampled_smoothed.append(smoothed[idx])
+
+        return sampled_raw, sampled_smoothed
 
     def _update_bounds(self):
         all_y, visible_data = [], []
@@ -890,9 +923,7 @@ class GraphPanel(QtWidgets.QWidget):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), self.bg_color)
-        gr = QtCore.QRect(self.padding['left'], self.padding['top'],
-                          self.width() - self.padding['left'] - self.padding['right'],
-                          self.height() - self.padding['top'] - self.padding['bottom'])
+        gr = self._graph_rect()
         painter.fillRect(gr, self.graph_bg_color)
         self._draw_grid(painter, gr)
         self._draw_lines(painter, gr)
@@ -929,10 +960,12 @@ class GraphPanel(QtWidgets.QWidget):
                          QtCore.Qt.AlignmentFlag.AlignCenter, "Step")
 
     def _draw_lines(self, painter, rect):
+        max_points = max(64, rect.width() * 2)
         for line in self.lines:
             raw = self._get_visible_slice(line['data'])
             smo = self._get_visible_slice(line['smoothed_data'])
             if len(raw) < 2 or len(raw) != len(smo): continue
+            raw, smo = self._sample_visible_pairs(raw, smo, max_points)
             pts = [self._to_screen(raw[i][0], raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level)
                    for i in range(len(raw))]
             if self.fill_enabled:
@@ -988,7 +1021,8 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self._perform_update)
         self.update_interval_ms = 500
-        self.pending_data = []
+        self.pending_data = deque()
+        self.max_pending_per_tick = 2000
         self.graphs = {}
         self._setup_ui()
 
@@ -1118,7 +1152,10 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         if not self.pending_update or not self.pending_data:
             self.update_timer.stop(); return
         last_optim_step = self.latest_optim_step
-        for data in self.pending_data:
+        processed = 0
+        while self.pending_data and processed < self.max_pending_per_tick:
+            data = self.pending_data.popleft()
+            processed += 1
             t = data[0]
             if t == 'progress_step':
                 _, step, loss, ts = data
@@ -1133,14 +1170,16 @@ class LiveMetricsWidget(QtWidgets.QWidget):
                 _, raw, clipped = data
                 self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Raw'], last_optim_step, raw)
                 self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Clipped'], last_optim_step, clipped)
-        self.pending_data.clear()
+        self.latest_optim_step = last_optim_step
         self.stats_label.setText(
             f"Step: {self.latest_global_step} | Loss: {self.latest_step_loss:.4f} | "
             f"Timestep: {self.latest_timestep} | Avg Loss: {self.latest_optim_loss:.4f} | "
             f"LR: {self.latest_lr:.2e} | Grad: {self.latest_grad:.4f}")
         for name, gd in self.graphs.items():
             self._sync_pan(gd['widget'], gd['scrollbar'], gd['zoom_slider'].value())
-        self.pending_update = False
+        self.pending_update = bool(self.pending_data)
+        if not self.pending_update:
+            self.update_timer.stop()
 
     def clear_data(self):
         self.update_timer.stop()
@@ -1160,7 +1199,8 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
     def hideEvent(self, e):
         super().hideEvent(e)
-        self.update_timer.stop()
+        if not self.pending_update:
+            self.update_timer.stop()
 
 
 class LRCurveWidget(QtWidgets.QWidget):
@@ -1177,6 +1217,8 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.min_lr_bound = 0.0
         self.max_lr_bound = 1.0e-6
         self.epoch_data = []
+        self.epoch_step_interval = 0
+        self.epoch_marker_count = 0
         self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
         self.point_radius = 8
         self._dragging_point_index = -1
@@ -1191,7 +1233,17 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.text_color = QtGui.QColor(TEXT_PRI)
         self.setMouseTracking(True)
 
-    def set_epoch_data(self, d): self.epoch_data = d; self.update()
+    def set_epoch_data(self, d):
+        self.epoch_data = d
+        self.epoch_step_interval = 0
+        self.epoch_marker_count = len(d)
+        self.update()
+
+    def set_epoch_interval(self, step_interval, marker_count):
+        self.epoch_data = []
+        self.epoch_step_interval = max(0, int(step_interval))
+        self.epoch_marker_count = max(0, int(marker_count))
+        self.update()
 
     def set_bounds(self, max_steps, min_lr, max_lr):
         self.max_steps = max(max_steps, 1)
@@ -1270,23 +1322,64 @@ class LRCurveWidget(QtWidgets.QWidget):
             painter.drawText(QtCore.QRect(int(x_step - 50), rect.bottom() + 5, 100, 20),
                              QtCore.Qt.AlignmentFlag.AlignCenter, str(int(self.max_steps * i / 4)))
 
-        ep_pen = QtGui.QPen(self.epoch_grid_color)
-        ep_pen.setStyle(QtCore.Qt.PenStyle.DotLine)
-        painter.setPen(ep_pen)
-        f2 = self.font(); f2.setPixelSize(11); painter.setFont(f2)
-        for nx, steps in self.epoch_data:
-            x = rect.left() + nx * rect.width()
-            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
-            painter.setPen(self.text_color)
-            painter.drawText(QtCore.QRect(int(x - 40), rect.bottom() + 25, 80, 15),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, str(steps))
-            painter.setPen(ep_pen)
+        self._draw_epoch_markers(painter, rect)
 
         painter.setPen(self.text_color)
         f3 = self.font(); f3.setBold(True); f3.setPixelSize(13); painter.setFont(f3)
         painter.drawText(self.rect().adjusted(0, 5, 0, 0),
                          QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
                          "Learning Rate Schedule")
+
+    def _draw_epoch_markers(self, painter, rect):
+        marker_count = self.epoch_marker_count or len(self.epoch_data)
+        if marker_count <= 0:
+            return
+
+        ep_pen = QtGui.QPen(self.epoch_grid_color)
+        ep_pen.setStyle(QtCore.Qt.PenStyle.DotLine)
+        painter.setPen(ep_pen)
+
+        label_font = self.font()
+        label_font.setPixelSize(11)
+        painter.setFont(label_font)
+        min_label_px = 78
+
+        if self.epoch_step_interval > 0:
+            spacing_px = rect.width() * self.epoch_step_interval / max(self.max_steps, 1)
+            draw_every = max(1, math.ceil(1.0 / max(spacing_px, 0.001)))
+            label_every = max(draw_every, math.ceil(min_label_px / max(spacing_px, 0.001)))
+
+            lines = []
+            for i in range(draw_every, marker_count + 1, draw_every):
+                step = i * self.epoch_step_interval
+                if step >= self.max_steps:
+                    break
+                x = rect.left() + (step / self.max_steps) * rect.width()
+                ix = int(round(x))
+                lines.append(QtCore.QLine(ix, rect.top(), ix, rect.bottom()))
+            if lines:
+                painter.drawLines(lines)
+
+            painter.setPen(self.text_color)
+            for i in range(label_every, marker_count + 1, label_every):
+                step = i * self.epoch_step_interval
+                if step >= self.max_steps:
+                    break
+                x = rect.left() + (step / self.max_steps) * rect.width()
+                painter.drawText(QtCore.QRect(int(x - 40), rect.bottom() + 25, 80, 15),
+                                 QtCore.Qt.AlignmentFlag.AlignCenter, str(step))
+            return
+
+        previous_label_x = -10_000
+        for nx, steps in self.epoch_data:
+            x = rect.left() + nx * rect.width()
+            painter.setPen(ep_pen)
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
+            if x - previous_label_x >= min_label_px:
+                painter.setPen(self.text_color)
+                painter.drawText(QtCore.QRect(int(x - 40), rect.bottom() + 25, 80, 15),
+                                 QtCore.Qt.AlignmentFlag.AlignCenter, str(steps))
+                previous_label_x = x
 
     def _draw_curve(self, painter):
         if not self._visual_points: return
@@ -1672,6 +1765,12 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.datasets = []
         self.dataset_widgets = []
         self.loader_threads = []
+        self._previews_active = True
+        self._preview_queue = []
+        self._preview_timer = QtCore.QTimer(self)
+        self._preview_timer.setSingleShot(False)
+        self._preview_timer.setInterval(15)
+        self._preview_timer.timeout.connect(self._load_next_queued_preview)
         self._init_ui()
 
     def _init_ui(self):
@@ -1768,10 +1867,42 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         ds["current_preview_idx"] = (ds["current_preview_idx"] + direction) % len(ds["images_data"])
         self._update_preview_for_card(idx)
 
+    def _set_preview_placeholder(self, idx, text=""):
+        if idx >= len(self.dataset_widgets) or idx >= len(self.datasets): return
+        ds = self.datasets[idx]
+        wdg = self.dataset_widgets[idx]
+        wdg["preview_label"].clear()
+        wdg["caption_text"].setPlainText(text)
+        wdg["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+
+    def _queue_preview_refresh(self, indices=None):
+        if not self._previews_active:
+            return
+        if indices is None:
+            indices = range(len(self.dataset_widgets))
+        self._preview_queue = [idx for idx in indices if idx < len(self.dataset_widgets)]
+        for idx in self._preview_queue:
+            self._set_preview_placeholder(idx, "Loading preview...")
+        if self._preview_queue and not self._preview_timer.isActive():
+            self._preview_timer.start()
+
+    def _load_next_queued_preview(self):
+        if not self._previews_active or not self._preview_queue:
+            self._preview_timer.stop()
+            return
+        idx = self._preview_queue.pop(0)
+        if idx < len(self.dataset_widgets):
+            self._update_preview_for_card(idx)
+        if not self._preview_queue:
+            self._preview_timer.stop()
+
     def _update_preview_for_card(self, idx):
         if idx >= len(self.dataset_widgets): return
         ds = self.datasets[idx]
         wdg = self.dataset_widgets[idx]
+        if not self._previews_active:
+            wdg["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+            return
         data = ds["images_data"][ds["current_preview_idx"]]
         if not data["caption_loaded"]:
             if data["caption_path"]:
@@ -1785,6 +1916,29 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         wdg["preview_label"].setPixmap(px)
         wdg["caption_text"].setPlainText(data["caption"])
         wdg["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
+
+    def set_preview_active(self, active):
+        active = bool(active)
+        if self._previews_active == active:
+            return
+        self._previews_active = active
+        if active:
+            QtCore.QTimer.singleShot(0, self._queue_preview_refresh)
+        else:
+            self._preview_timer.stop()
+            self._preview_queue = []
+            self.release_preview_resources(clear_caption_cache=True)
+
+    def release_preview_resources(self, clear_caption_cache=False):
+        for wdg in self.dataset_widgets:
+            wdg["preview_label"].clear()
+            wdg["caption_text"].clear()
+        if clear_caption_cache:
+            for ds in self.datasets:
+                for data in ds["images_data"]:
+                    if data.get("caption_loaded"):
+                        data["caption"] = ""
+                        data["caption_loaded"] = False
 
     def repopulate_dataset_grid(self):
         while self.dataset_grid.count():
@@ -2270,9 +2424,14 @@ class TrainingGUI(QtWidgets.QWidget):
         console_layout.addWidget(self.log_textbox, stretch=1)
         self.tab_view.addTab(console_widget, "Training Console")
 
+        self.tab_view.currentChanged.connect(self._on_tab_changed)
         main.addWidget(self.tab_view)
         self._build_corner_widget()
         self._build_bottom_bar()
+
+    def _on_tab_changed(self, index):
+        if hasattr(self, "dataset_manager"):
+            self.dataset_manager.set_preview_active(index == 0)
 
     def _build_corner_widget(self):
         corner = QtWidgets.QWidget()
@@ -2701,7 +2860,7 @@ class TrainingGUI(QtWidgets.QWidget):
             ("gc_alpha", make_dspin(0.0, 1.0, step=0.1, decimals=1)),
         ]:
             self.widgets[f"{prefix}_{name}"] = widget
-        if prefix == "RAVEN":
+        if prefix in {"RAVEN", "TITAN"}:
             self.widgets[f'{prefix}_momentum_dtype'] = make_combo(["bfloat16", "float32"])
             self.widgets[f'{prefix}_momentum_dtype'].setCurrentText("bfloat16") 
 
@@ -2711,7 +2870,7 @@ class TrainingGUI(QtWidgets.QWidget):
         for lbl, key in [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
                         ("Weight Decay:", f'{prefix}_weight_decay'), ("Debias Strength:", f'{prefix}_debias_strength')]:
             lay.addRow(lbl, self.widgets[key])
-        if prefix == "RAVEN":
+        if prefix in {"RAVEN", "TITAN"}:
             lay.addRow("Momentum Precision:", self.widgets[f'{prefix}_momentum_dtype'])
         lay.addRow(gc)
         lay.addRow("GC Alpha:", gca)
@@ -2720,12 +2879,9 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_velorms_form(self):
         container = QtWidgets.QWidget()
         lay = QtWidgets.QFormLayout(container); lay.setContentsMargins(0, 5, 0, 0)
-        self.widgets["VELORMS_momentum"] = make_dspin(0.0, 0.999, step=0.01, decimals=3)
-        self.widgets["VELORMS_leak"] = make_dspin(0.0, 1.0, step=0.01, decimals=3)
         self.widgets["VELORMS_weight_decay"] = make_dspin(0.0, 1.0, step=0.00001, decimals=6)
         self.widgets["VELORMS_eps"] = QtWidgets.QLineEdit()
-        for lbl, key in [("Momentum:", "VELORMS_momentum"), ("Leak:", "VELORMS_leak"),
-                          ("Weight Decay:", "VELORMS_weight_decay"), ("Epsilon:", "VELORMS_eps")]:
+        for lbl, key in [("Weight Decay:", "VELORMS_weight_decay"), ("Epsilon:", "VELORMS_eps")]:
             lay.addRow(lbl, self.widgets[key])
         return container
 
@@ -2750,7 +2906,7 @@ class TrainingGUI(QtWidgets.QWidget):
             preset_grid.addWidget(make_btn(label, lambda _, a=args: self._apply_vae_preset(*a)), idx // 2, idx % 2)
         lay.addLayout(preset_grid)
         lay.addWidget(make_separator())
-        detect_btn = make_btn("Run Auto-Detect Tool", self.launch_vae_detector)
+        detect_btn = make_btn("Run VAE Diagnostics", self.launch_vae_detector)
         detect_btn.setStyleSheet(f"background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT};")
         lay.addWidget(detect_btn)
         return gb
@@ -2776,7 +2932,7 @@ class TrainingGUI(QtWidgets.QWidget):
             cmd = [sys.executable, target, "--config", os.path.abspath(cfg_path)]
             kw = {"creationflags": subprocess.CREATE_NEW_CONSOLE} if os.name == 'nt' else {}
             subprocess.Popen(cmd, cwd=os.path.dirname(target), **kw)
-            self.log(f"Launched VAE Detector with config: {key}.json")
+            self.log(f"Launched VAE Diagnostics with config: {key}.json")
         except Exception as e: self.log(f"Error launching tool: {e}")
 
     def _build_advanced_group(self):
@@ -2993,8 +3149,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets[f"{prefix}_gc_alpha"].setEnabled(params.get("use_grad_centralization", False))
 
             vp = {**getattr(default_config, "VELORMS_PARAMS", {}), **self.current_config.get("VELORMS_PARAMS", {})}
-            self.widgets["VELORMS_momentum"].setValue(vp.get("momentum", 0.86))
-            self.widgets["VELORMS_leak"].setValue(vp.get("leak", 0.16))
             self.widgets["VELORMS_weight_decay"].setValue(vp.get("weight_decay", 0.01))
             self.widgets["VELORMS_eps"].setText(str(vp.get("eps", 1e-8)))
             self._toggle_optimizer_widgets()
@@ -3032,7 +3186,7 @@ class TrainingGUI(QtWidgets.QWidget):
             if "PREDICTION_TYPE" in self.widgets:
                 self._on_prediction_type_changed(self.widgets["PREDICTION_TYPE"].currentText())
 
-            if prefix == "RAVEN" and "momentum_dtype" in params:
+            if prefix in {"RAVEN", "TITAN"} and "momentum_dtype" in params:
                 self.widgets[f"{prefix}_momentum_dtype"].setCurrentText(params["momentum_dtype"])
 
         finally:
@@ -3075,14 +3229,12 @@ class TrainingGUI(QtWidgets.QWidget):
             }
             
 
-            if prefix == "RAVEN":
+            if prefix in {"RAVEN", "TITAN"}:
                 cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
 
         try: veps = float(self.widgets["VELORMS_eps"].text())
         except: veps = 1e-8
         cfg["VELORMS_PARAMS"] = {
-            "momentum": self.widgets["VELORMS_momentum"].value(),
-            "leak": self.widgets["VELORMS_leak"].value(),
             "weight_decay": self.widgets["VELORMS_weight_decay"].value(),
             "eps": veps,
         }
@@ -3127,11 +3279,10 @@ class TrainingGUI(QtWidgets.QWidget):
             total = self.dataset_manager.get_total_repeats()
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
         except: self.lr_curve_widget.set_epoch_data([]); return
-        data = []
         if total > 0 and max_steps > 0:
-            step = total
-            while step < max_steps: data.append((step / max_steps, int(step))); step += total
-        self.lr_curve_widget.set_epoch_data(data)
+            self.lr_curve_widget.set_epoch_interval(total, (max_steps - 1) // total)
+        else:
+            self.lr_curve_widget.set_epoch_interval(0, 0)
 
     def _update_lr_button_states(self, sel_idx):
         if hasattr(self, 'remove_point_btn'):

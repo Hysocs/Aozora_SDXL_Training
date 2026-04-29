@@ -78,7 +78,8 @@ RAVEN_PARAMS = {
     "weight_decay": 0.01,
     "debias_strength": 0.3,
     "use_grad_centralization": False,
-    "gc_alpha": 1.0
+    "gc_alpha": 1.0,
+    "momentum_dtype": "bfloat16"
 }
 TITAN_PARAMS = {
     "betas": [0.9, 0.999],
@@ -86,11 +87,10 @@ TITAN_PARAMS = {
     "weight_decay": 0.01,
     "debias_strength": 0.3,
     "use_grad_centralization": False,
-    "gc_alpha": 1.0
+    "gc_alpha": 1.0,
+    "momentum_dtype": "bfloat16"
 }
 VELORMS_PARAMS = {
-    "momentum": 0.86,
-    "leak": 0.16,
     "weight_decay": 0.01,
     "eps": 1e-8
 }
