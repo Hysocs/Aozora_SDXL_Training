@@ -107,6 +107,3 @@ VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
 
-NOISE_MODE = "normal"
-USE_SEMANTIC_NOISE = False
-SEMANTIC_NOISE_STRENGTH = 2.0

@@ -1985,9 +1985,6 @@ UI_DEFS = {
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
-    "NOISE_MODE":                  ("Noise Mode", "Base noise algorithm used before optional semantic redistribution.", "combo", ["normal", "hostile", "pyramid_detail"]),
-    "USE_SEMANTIC_NOISE":          ("Semantic Noise", "Use cached semantic maps to redistribute noise toward detail-heavy regions.", "check"),
-    "SEMANTIC_NOISE_STRENGTH":     ("Semantic Strength", "How strongly semantic-map regions reshape the noise distribution. 0 disables the effect.", "dspin", 0.0, 10.0, 0.05, 2),
     "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
     "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "DestinationLoss"]),
@@ -1996,14 +1993,6 @@ UI_DEFS = {
     "VAE_LATENT_CHANNELS":         ("Latent Channels", "4 for Standard/EQ, 32 for Flux/NoobAI.", "spin", 4, 128),
 
 }
-
-_OLD_LOSS_PREFIX = "SE" + "MANTIC"
-REMOVED_CONFIG_KEYS = {
-    f"{_OLD_LOSS_PREFIX}_SEP_WEIGHT",
-    f"{_OLD_LOSS_PREFIX}_DETAIL_WEIGHT",
-    f"{_OLD_LOSS_PREFIX}_ENTROPY_WEIGHT",
-}
-
 
 class TrainingGUI(QtWidgets.QWidget):
     def __init__(self):
@@ -2018,10 +2007,19 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner = None
         self.current_config = {}
         self.last_line_is_progress = False
-        self.default_config = {k: v for k, v in default_config.__dict__.items() if not k.startswith('__') and k not in REMOVED_CONFIG_KEYS}
+        self.default_config = {
+            key: copy.deepcopy(getattr(default_config, key))
+            for key in UI_DEFS
+            if hasattr(default_config, key)
+        }
+        for key in [
+            "RESUME_TRAINING", "INSTANCE_DATASETS", "LR_CUSTOM_CURVE",
+            "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
+            "LOSS_TYPE", "TIMESTEP_MODE", "TIMESTEP_ALLOCATION"
+        ]:
+            if hasattr(default_config, key):
+                self.default_config[key] = copy.deepcopy(getattr(default_config, key))
         self.default_config.setdefault("NOISE_MODE", "normal")
-        self.default_config.setdefault("USE_SEMANTIC_NOISE", False)
-        self.default_config.setdefault("SEMANTIC_NOISE_STRENGTH", 2.0)
         self.presets = {}
         self.last_browsed_path = os.getcwd()
 
@@ -2052,7 +2050,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 name = os.path.splitext(fn)[0]
                 try:
                     with open(os.path.join(self.config_dir, fn), 'r') as f:
-                        self.presets[name] = self._sanitize_config(json.load(f))
+                        self.presets[name] = json.load(f)
                 except Exception as e:
                     self.log(f"Warning: Could not load '{fn}': {e}")
 
@@ -2083,7 +2081,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def load_selected_config(self, index):
         key = self.config_dropdown.itemData(index) or self.config_dropdown.itemText(index).replace(" ", "_").lower()
         if key in self.presets:
-            self.current_config = self._sanitize_config({**copy.deepcopy(self.default_config), **self.presets[key]})
+            self.current_config = {**copy.deepcopy(self.default_config), **self.presets[key]}
             self.log(f"Loaded config: '{key}.json'")
         else:
             self.current_config = copy.deepcopy(self.default_config)
@@ -2134,9 +2132,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.presets[key] = copy.deepcopy(self.default_config)
             self.save_config(); self.load_selected_config(idx)
             self.log(f"Restored '{key}.json' to defaults.")
-
-    def _sanitize_config(self, cfg):
-        return {k: v for k, v in cfg.items() if k not in REMOVED_CONFIG_KEYS}
 
     def _make_widget(self, key):
         if key not in UI_DEFS: return None, None
@@ -2627,14 +2622,6 @@ class TrainingGUI(QtWidgets.QWidget):
         gb, lay = group_box("Miscellaneous", QtWidgets.QFormLayout)
         self._add_to_form(lay, "MEMORY_EFFICIENT_ATTENTION")
         lay.addRow(make_separator())
-        lay.addRow(make_label("<b>Noise Configuration</b>", color=ACCENT))
-        self._add_to_form(lay, "NOISE_MODE")
-        self._add_to_form(lay, "USE_SEMANTIC_NOISE")
-        self._add_to_form(lay, "SEMANTIC_NOISE_STRENGTH")
-        self.widgets["USE_SEMANTIC_NOISE"].stateChanged.connect(
-            lambda s: self.widgets["SEMANTIC_NOISE_STRENGTH"].setEnabled(bool(s))
-        )
-        lay.addRow(make_separator())
         lay.addRow(make_label("<b>Gradient Spike Detection</b>", color=ACCENT))
         self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_HIGH")
         self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_LOW")
@@ -2872,8 +2859,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
-            if "USE_SEMANTIC_NOISE" in self.widgets:
-                self.widgets["SEMANTIC_NOISE_STRENGTH"].setEnabled(self.widgets["USE_SEMANTIC_NOISE"].isChecked())
 
             self._update_and_clamp_lr_graph()
 
@@ -2907,9 +2892,10 @@ class TrainingGUI(QtWidgets.QWidget):
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
                      "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE",
-                     "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE", *REMOVED_CONFIG_KEYS}
+                     "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
 
-        for key, val in self.current_config.items():
+        for key in [*UI_DEFS.keys(), "LR_CUSTOM_CURVE"]:
+            val = self.current_config.get(key)
             if key in skip_keys: continue
             if val is None: continue
             cfg[key] = [[round(p[0], 8), round(p[1], 10)] for p in val] if key == "LR_CUSTOM_CURVE" else val
@@ -2919,6 +2905,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
         cfg["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
+        cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
 

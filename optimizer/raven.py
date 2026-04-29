@@ -147,12 +147,8 @@ class RavenAdamW(Optimizer):
                 buf_p_fp32.addcdiv_(buf_exp_avg, denom, value=-step_size)
                 p.copy_(buf_p_fp32)
 
-                if momentum_dtype == torch.float32:
-                    state["exp_avg"].copy_(buf_exp_avg, non_blocking=True)
-                    state["exp_avg_sq"].copy_(buf_exp_avg_sq, non_blocking=True)
-                else:
-                    state["exp_avg"].copy_(buf_exp_avg.to(momentum_dtype), non_blocking=True)
-                    state["exp_avg_sq"].copy_(buf_exp_avg_sq.to(momentum_dtype), non_blocking=True)
+                state["exp_avg"].copy_(buf_exp_avg, non_blocking=True)
+                state["exp_avg_sq"].copy_(buf_exp_avg_sq, non_blocking=True)
 
         return loss
 

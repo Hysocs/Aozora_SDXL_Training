@@ -23,7 +23,7 @@ def semantic_noise_enabled(config) -> bool:
 
 
 def semantic_noise_strength(config) -> float:
-    return max(0.0, float(getattr(config, "SEMANTIC_NOISE_STRENGTH", 2.0)))
+    return max(0.0, float(getattr(config, "SEMANTIC_NOISE_STRENGTH", 1.0)))
 
 
 def get_semantic_noise_cache_dir(root) -> Path:
@@ -39,12 +39,24 @@ def apply_semantic_noise(noise, semantic_map, device, dtype, enabled=False, stre
         return noise
 
     semantic_map = semantic_map.to(device=device, dtype=dtype)
+    base_std = noise.std(dim=(-3, -2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
 
-    original_std = noise.std(dim=(-2, -1), keepdim=True, unbiased=False)
-    weighted_noise = noise * (1.0 + (semantic_map * strength))
-    weighted_std = weighted_noise.std(dim=(-2, -1), keepdim=True, unbiased=False)
+    # Build a spatial weight map with average 1.0 so we redistribute the same
+    # total noise budget instead of injecting extra noise into the sample.
+    semantic_weights = semantic_map.clamp_min(0.0)
+    semantic_weights = semantic_weights.amax(dim=(-2, -1), keepdim=True) - semantic_weights
+    semantic_weights = semantic_weights / semantic_weights.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
 
-    return weighted_noise * (original_std / (weighted_std + 1e-6))
+    # Strength is a blend from uniform noise (0.0) toward fully semantic-weighted
+    # redistribution (1.0). Values above 1.0 exaggerate the contrast but are
+    # clamped to keep the weights non-negative.
+    redistribution = 1.0 + (semantic_weights - 1.0) * strength
+    redistribution = redistribution.clamp_min(0.0)
+
+    redistributed_noise = noise * redistribution
+    redistributed_std = redistributed_noise.std(dim=(-3, -2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
+
+    return redistributed_noise * (base_std / redistributed_std)
 
 
 def generate_semantic_noise_maps(latents, images, config):

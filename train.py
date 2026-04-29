@@ -38,15 +38,6 @@ from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     FusedAttnProcessor2_0
 )
-from tools.semantic import (
-    apply_semantic_noise,
-    generate_semantic_noise_maps,
-    get_semantic_noise_cache_dir,
-    semantic_noise_enabled,
-    semantic_noise_map_path,
-    semantic_noise_strength,
-)
-from functools import lru_cache
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -106,47 +97,13 @@ def fix_alpha_channel(img):
         return rgb_img
     return img.convert("RGB")
 
-def generate_noise(latents, generator, device, dtype, mode="normal", step=None, seed=None, timesteps=None, detail_boost=1.0):
+def generate_noise(latents, generator, device, dtype=None, step=None, seed=None):
     # Optional deterministic step-seeding
     if step is not None and seed is not None:
         step_seed = (seed + step) % (2**32 - 1)
         generator.manual_seed(step_seed)
 
-    # Base standard noise
-    noise = torch.randn(latents.shape, device=device, dtype=dtype, generator=generator)
-
-    # Apply hostile modifications if requested
-    if mode == "hostile":
-        hostile_blobs = -latents
-        hostile_blobs = F.avg_pool2d(hostile_blobs, kernel_size=8, stride=8)
-        hostile_blobs = F.interpolate(hostile_blobs, size=(latents.shape[2], latents.shape[3]), mode='bilinear')
-        noise = noise + (0.2 * hostile_blobs)
-        noise = noise / noise.std()
-
-    elif mode == "pyramid_detail":
-        if timesteps is None:
-            # Fallback to white noise if called without timestep info
-            return noise
-
-        B, C, H, W = latents.shape
-
-        # Normalize integer timesteps (0-999) -> [0, 1]
-        t_norm = timesteps.float().view(-1, 1, 1, 1) / 999.0
-
-        # Extract a high-frequency detail layer (Laplacian-like pyramid)
-        noise_ds = F.avg_pool2d(noise, kernel_size=2, stride=2)
-        noise_us = F.interpolate(noise_ds, size=(H, W), mode='bilinear', align_corners=False)
-        noise_hf = noise - noise_us
-
-        # Blend schedule:
-        #   t ≈ 0  (low noise / near-clean image)  -> mostly HF detail (forces model to learn fine detail)
-        #   t ≈ 1  (high noise / pure destruction) -> standard white noise
-        blended = t_norm * noise + (1.0 - t_norm) * (noise_hf * detail_boost)
-
-        # Renormalize per-sample to unit variance so scheduler/flow math doesn't drift
-        noise = blended / (blended.std(dim=(-2, -1), keepdim=True, unbiased=False) + 1e-6)
-
-    return noise
+    return torch.randn(latents.shape, device=device, dtype=torch.float32, generator=generator)
 
 
 class TrainingConfig:
@@ -156,10 +113,7 @@ class TrainingConfig:
                 setattr(self, key, value)
         self._load_from_user_config()
         self._type_check_and_correct()
-        if not hasattr(self, "USE_SEMANTIC_NOISE"):
-            self.USE_SEMANTIC_NOISE = False
-        if not hasattr(self, "SEMANTIC_NOISE_STRENGTH"):
-            self.SEMANTIC_NOISE_STRENGTH = 2.0
+        self.NOISE_MODE = "normal"
         self.compute_dtype = torch.bfloat16 if self.MIXED_PRECISION == "bfloat16" else torch.float16
         self.is_rectified_flow = getattr(self, "PREDICTION_TYPE", "epsilon") == "rectified_flow"
 
@@ -288,7 +242,6 @@ class AsyncReporter:
                 task_type, data = self.task_queue.get(timeout=0.05)
                 if task_type == 'log_step': self._handle_log_step(**data)
                 elif task_type == 'anomaly': self._handle_anomaly(**data)
-                elif task_type == 'diagnostic': self._handle_diagnostic(**data)
                 elif task_type == 'grad_check': self._handle_grad_check(**data)
                 elif task_type == 'message': self._handle_message(**data)
                 self.task_queue.task_done()
@@ -319,24 +272,6 @@ class AsyncReporter:
         print('\r' + prog_str, end='', flush=True)
         self._last_line_len = len(prog_str)
 
-    def _handle_diagnostic(self, micro_step, orig_w, orig_h, targ_w, targ_h, orig_ar, targ_ar, ar_error_percent, stem, current_batch_size):
-        self._clear_line()
-        diag_str = (
-            f"\n--- STEP {micro_step} DATA DIAGNOSTICS ---\n"
-            f"  File: {stem}\n"
-            f"  Original: {orig_w}x{orig_h} (AR: {orig_ar:.4f})\n"
-            f"  Target:   {targ_w}x{targ_h} (AR: {targ_ar:.4f})\n"
-        )
-        if ar_error_percent <= 0.001:
-            diag_str += f"  ASPECT RATIO MATCH: PERFECT (0.00%)\n"
-        else:
-            diag_str += (
-                f"  ASPECT RATIO DIFFERENCE: {ar_error_percent:.2f}%\n"
-                f"  -> The image was SAFELY CROPPED, NOT STRETCHED.\n"
-            )
-        diag_str += f"  Current Batch Size: {current_batch_size}\n"
-        print(diag_str)
-
     def _handle_grad_check(self, phase_name, grad_norm):
         self._clear_line()
         print(f"\n[GRADIENT CHECK - {phase_name}] Grad Norm: {grad_norm:.4f}")
@@ -358,10 +293,6 @@ class AsyncReporter:
 
     def log_step(self, global_step, timing_data, diag_data=None):
         self.task_queue.put(('log_step', {'global_step': global_step, 'timing_data': timing_data, 'diag_data': diag_data}))
-
-    def log_diagnostic(self, *args):
-        keys = ['micro_step', 'orig_w', 'orig_h', 'targ_w', 'targ_h', 'orig_ar', 'targ_ar', 'ar_error_percent', 'stem', 'current_batch_size']
-        self.task_queue.put(('diagnostic', dict(zip(keys, args))))
 
     def log_grad_check(self, phase_name, grad_norm):
         self.task_queue.put(('grad_check', {'phase_name': phase_name, 'grad_norm': grad_norm}))
@@ -549,8 +480,6 @@ def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
 def check_if_caching_needed(config):
     needs_caching = False
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-    
-    use_semantic_noise = semantic_noise_enabled(config)
 
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
@@ -569,17 +498,17 @@ def check_if_caching_needed(config):
         index_path = cache_dir / "dataset_index.json"
         if not index_path.exists():
             needs_caching = True; continue
-
-        if use_semantic_noise and not get_semantic_noise_cache_dir(root).exists():
-            needs_caching = True; continue
+        try:
+            with open(index_path, "r", encoding="utf-8") as f:
+                index_data = json.load(f)
+            if any("scaled_size" not in item for item in index_data.get("files", [])):
+                needs_caching = True
+        except Exception:
+            needs_caching = True
 
         cached_te_files = list(cache_dir.glob("*_te.pt"))
         if len(cached_te_files) < len(image_paths):
             needs_caching = True
-        elif use_semantic_noise:
-            semantic_cache_dir = get_semantic_noise_cache_dir(root)
-            if sum(not (semantic_cache_dir / f"{f.stem.replace('_te', '')}_sem.pt").exists() for f in cached_te_files) > 0:
-                needs_caching = True
     return needs_caching
 
 def load_unet_robust(path, compute_dtype):
@@ -645,8 +574,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         return
 
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-    
-    use_semantic_noise = semantic_noise_enabled(config)
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
@@ -665,16 +592,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
 
-        semantic_cache_dir = get_semantic_noise_cache_dir(root) if use_semantic_noise else None
-        if use_semantic_noise: semantic_cache_dir.mkdir(exist_ok=True)
-
         torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
         paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
         to_process = []
         for p in paths:
             safe_stem = str(p.relative_to(root).with_suffix('')).replace(os.sep, '_')
-            if not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists() or (use_semantic_noise and not semantic_noise_map_path(semantic_cache_dir, safe_stem).exists()):
+            if not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists():
                 to_process.append(p)
 
         if to_process:
@@ -688,14 +612,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             random.shuffle(batches)
 
             for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc=f"Encoding {root.name}")):
-                images_global, valid_meta_final, original_images_for_semantic = [], [], [] if use_semantic_noise else None
+                images_global, valid_meta_final = [], []
                 for m in batch_meta:
                     try:
                         with Image.open(m['ip']) as img:
                             img_resized = smart_resize(fix_alpha_channel(img), w, h)
                             images_global.append(transform(img_resized))
                             valid_meta_final.append(m)
-                            if use_semantic_noise: original_images_for_semantic.append(img_resized.copy())
                     except Exception as e:
                         tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
 
@@ -717,8 +640,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 orig_sizes = [f"{m['original_size'][0]}x{m['original_size'][1]}" for m in valid_meta_final]
                 tqdm.write(f"[Batch {batch_idx}] [{', '.join(orig_sizes)}] -> {w}x{h} | Raw:[{raw_min:.2f}, {raw_max:.2f}] | VAE Scale:{scale_val}, Shift:{shift_val}")
 
-                semantic_maps = generate_semantic_noise_maps(latents_global, original_images_for_semantic, config)
-
                 for j, m in enumerate(valid_meta_final):
                     safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_')
                     torch.save({
@@ -729,8 +650,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         "embeds": embeds[j].to(dtype=torch.float32).cpu(), "pooled": pooled[j].to(dtype=torch.float32).cpu(),
                         "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
                     }, cache_dir / f"{safe_filename}_te.pt")
-                    torch.save(latents_global[j], cache_dir / f"{safe_filename}_lat.pt")
-                    if semantic_maps is not None: torch.save(semantic_maps[j], semantic_noise_map_path(semantic_cache_dir, safe_filename))
+                    torch.save(latents_global[j].to(dtype=torch.float32).cpu(), cache_dir / f"{safe_filename}_lat.pt")
 
                 if batch_idx % 20 == 0: torch.cuda.empty_cache()
                 
@@ -741,14 +661,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         for f in cached_files:
             try:
                 data_te = torch.load(f, map_location='cpu')
-                sem_path = semantic_noise_map_path(semantic_cache_dir, f.stem.replace('_te', '')) if use_semantic_noise else None
                 
                 index_data.append({
                     "te_path": str(f),
                     "lat_path": str(f).replace("_te.pt", "_lat.pt"),
-                    "sem_path": str(sem_path) if sem_path and sem_path.exists() else None,
                     "target_size": data_te.get('target_size'),
                     "original_size": data_te.get('original_size'),
+                    "scaled_size": data_te.get('scaled_size', data_te.get('original_size')),
                     "crop_coords": data_te.get('crop_coords', (0,0))
                 })
             except Exception as e:
@@ -767,7 +686,6 @@ class ImageTextLatentDataset(Dataset):
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
         self.worker_rng = None
-        self.use_semantic_noise = semantic_noise_enabled(config)
 
         cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
 
@@ -815,6 +733,12 @@ class ImageTextLatentDataset(Dataset):
         if not path: return None
         return torch.load(path, map_location="cpu", weights_only=True)
 
+    def _load_latent_payload(self, path):
+        payload = self._load_tensor(path)
+        if isinstance(payload, dict):
+            return payload.get("latents")
+        return payload
+
     def __getitem__(self, i):
         try:
             if self.worker_rng is None: self._init_worker_rng()
@@ -822,10 +746,9 @@ class ImageTextLatentDataset(Dataset):
             item_data = self.items[i]
             path_te = item_data["te_path"]
             path_lat = item_data["lat_path"]
-            path_sem = item_data.get("sem_path")
 
             data_te = self._load_tensor(path_te)
-            latents = self._load_tensor(path_lat)
+            latents = self._load_latent_payload(path_lat)
 
             if torch.isnan(latents).any() or torch.isinf(latents).any(): return None
 
@@ -834,17 +757,11 @@ class ImageTextLatentDataset(Dataset):
                 "embeds": data_te["embeds"].squeeze(0) if data_te["embeds"].dim() == 3 else data_te["embeds"],
                 "pooled": data_te["pooled"].squeeze(0) if data_te["pooled"].dim() == 2 else data_te["pooled"],
                 "original_sizes": item_data["original_size"], 
+                "scaled_sizes": item_data.get("scaled_size", item_data["original_size"]),
                 "target_sizes": item_data["target_size"],
                 "crop_coords": item_data.get("crop_coords", (0, 0)), 
                 "latent_path": path_te
             }
-
-            if self.use_semantic_noise:
-                if path_sem: 
-                    item["semantic_map"] = self._load_tensor(path_sem)
-                else: 
-                    # If there's no map found, fallback to 0.0 so we just use 1.0 (standard) normal noise.
-                    item["semantic_map"] = torch.zeros_like(latents, dtype=torch.float32)
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
                 item["embeds"], item["pooled"] = self.null_embeds, self.null_pooled
@@ -927,6 +844,27 @@ def custom_collate_fn(batch):
         elif isinstance(batch[0][k], torch.Tensor): output[k] = torch.stack([item[k] for item in batch])
         else: output[k] = [item[k] for item in batch]
     return output
+
+
+def print_dataset_resolution_sample(dataset, sample_count=5):
+    sample_count = min(sample_count, len(dataset.items))
+    if sample_count <= 0:
+        return
+
+    print(f"INFO: Dataset resolution sample ({sample_count} cached item{'s' if sample_count != 1 else ''}):")
+    for item in dataset.items[:sample_count]:
+        orig_w, orig_h = item["original_size"]
+        targ_w, targ_h = item["target_size"]
+        orig_ar = orig_w / orig_h if orig_h else 1.0
+        targ_ar = targ_w / targ_h if targ_h else 1.0
+        ar_error_pct = (abs(orig_ar - targ_ar) / orig_ar * 100) if orig_ar else 0.0
+        stem = Path(item["te_path"]).stem.replace("_te", "")
+        print(
+            f"INFO:   {stem}: original {orig_w}x{orig_h} (AR {orig_ar:.4f}) -> "
+            f"target {targ_w}x{targ_h} (AR {targ_ar:.4f}), "
+            f"AR diff {ar_error_pct:.2f}%, cropped not stretched"
+        )
+
 
 def create_optimizer(config, params_to_optimize):
     optimizer_type = config.OPTIMIZER_TYPE.lower()
@@ -1101,14 +1039,7 @@ def main():
         mode_str = "RECTIFIED FLOW" if config.is_rectified_flow else "STANDARD SDXL"
         print("\n" + "="*50 + f"\n--- STARTING {mode_str} TRAINING ---\n" + "="*50 + "\n")
 
-    noise_mode = getattr(config, "NOISE_MODE", "normal")
-    if semantic_noise_enabled(config):
-        print(
-            "INFO: Semantic noise enabled "
-            f"(noise type: {noise_mode}, strength: {semantic_noise_strength(config):.3g})"
-        )
-    else:
-        print(f"INFO: Semantic noise disabled (noise type: {noise_mode})")
+    print(f"INFO: Noise type: {getattr(config, 'NOISE_MODE', 'normal')}")
 
     OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -1155,6 +1086,7 @@ def main():
 
     print("\n--- Initializing Dataset ---")
     dataset   = ImageTextLatentDataset(config)
+    print_dataset_resolution_sample(dataset, sample_count=5)
     sampler   = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
     sampler.set_epoch(initial_epoch)
     dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
@@ -1221,14 +1153,6 @@ def main():
 
             micro_step += 1
             diag_data_to_log = None 
-            if micro_step <= 5:
-                orig_w, orig_h = batch["original_sizes"][0]
-                targ_w, targ_h = batch["target_sizes"][0]
-                orig_ar  = orig_w / orig_h if orig_h != 0 else 1.0
-                targ_ar  = targ_w / targ_h if targ_h != 0 else 1.0
-                ar_error_pct = (abs(orig_ar - targ_ar) / orig_ar * 100) if orig_ar != 0 else 0
-                reporter.log_diagnostic(micro_step, orig_w, orig_h, targ_w, targ_h, orig_ar, targ_ar,
-                                        ar_error_pct, Path(batch['latent_path'][0]).stem, batch["latents"].shape[0])
 
             if "latent_path" in batch:
                 accumulated_latent_paths.extend(batch["latent_path"])
@@ -1237,9 +1161,6 @@ def main():
             embeds  = batch["embeds"].to(device, non_blocking=True, dtype=config.compute_dtype)
             pooled  = batch["pooled"].to(device, non_blocking=True, dtype=config.compute_dtype)
             batch_crop_coords = batch.get("crop_coords", [(0, 0)] * len(batch["latents"]))
-
-            semantic_map = batch.get("semantic_map") if semantic_noise_enabled(config) else None
-            semantic_strength = semantic_noise_strength(config)
 
             with torch.autocast(device_type=device.type, dtype=config.compute_dtype, enabled=True):
 
@@ -1250,34 +1171,21 @@ def main():
                 ]
                 time_ids = torch.tensor(time_ids_data, dtype=config.compute_dtype, device=device)
 
-                noise_mode = getattr(config, "NOISE_MODE", "normal") 
-
+                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0])
+                timestep_str = str(first_timestep_int)
                 noise = generate_noise(
                     latents=latents,
                     generator=noise_generator,
                     device=device,
                     dtype=config.compute_dtype,
-                    mode=noise_mode,
                     step=micro_step,
                     seed=config.SEED
                 )
-                noise = apply_semantic_noise(
-                    noise=noise,
-                    semantic_map=semantic_map,
-                    device=device,
-                    dtype=config.compute_dtype,
-                    enabled=semantic_noise_enabled(config),
-                    strength=semantic_strength
-                )
-
-                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0])
-                timestep_str = str(first_timestep_int)
-
                 if config.is_rectified_flow:
                     jitter = torch.rand(timesteps.shape, device=device, dtype=torch.float32)
                     t_continuous = ((timesteps.float() + jitter) / 1000.0).clamp(0.0, 1.0)
-                    
-                    t_exp = t_continuous.view(-1, 1, 1, 1).to(config.compute_dtype)
+
+                    t_exp = t_continuous.view(-1, 1, 1, 1)
                     noisy_latents = (1 - t_exp) * latents + t_exp * noise
                     target = noise - latents
                     timesteps_conditioning = (t_continuous * 1000.0)
@@ -1287,7 +1195,7 @@ def main():
                               if scheduler.config.prediction_type == "v_prediction" else noise)
                     timesteps_conditioning = timesteps
 
-                pred = unet(noisy_latents, timesteps_conditioning, embeds,
+                pred = unet(noisy_latents.to(config.compute_dtype), timesteps_conditioning, embeds,
                             added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
                 if getattr(config, "LOSS_TYPE", "MSE") == "DestinationLoss" and config.is_rectified_flow:
