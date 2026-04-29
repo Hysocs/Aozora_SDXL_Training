@@ -26,6 +26,11 @@ CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
 UNCONDITIONAL_DROPOUT = True
 UNCONDITIONAL_DROPOUT_CHANCE = 0.0
+CAPTION_SHUFFLE_ENABLED = False
+CAPTION_SHUFFLE_VARIANTS = 0
+CAPTION_SHUFFLE_KEEP_FIRST = 1
+CAPTION_TAG_SEPARATOR = ","
+CAPTION_SHUFFLE_CHANCE = 0.0
 
 # --- Aspect Ratio Bucketing ---
 SHOULD_UPSCALE = False
@@ -98,12 +103,9 @@ SEMANTIC_ENTROPY_WEIGHT = 0.2
 
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "sdpa"
-GRAD_SPIKE_THRESHOLD_HIGH = 75.0
-GRAD_SPIKE_THRESHOLD_LOW = 0.2
 TIMESTEP_MODE = "Wave"
 
 # --- VAE Configuration ---
 VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
-

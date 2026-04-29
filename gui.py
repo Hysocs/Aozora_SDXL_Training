@@ -66,6 +66,7 @@ QGroupBox::title {{
     padding: 0 4px;
     color: {ACCENT};
     font-weight: bold;
+    font-size: 10pt;
 }}
 QGroupBox:disabled {{ border: 1px solid {BORDER_MUTED}; background: transparent; }}
 QGroupBox:disabled::title {{ color: {TEXT_MUTED}; }}
@@ -320,31 +321,6 @@ def form_row(layout, label_text, widget, tooltip=None):
         lbl.setToolTip(tooltip)
         widget.setToolTip(tooltip)
     layout.addRow(lbl, widget)
-
-def path_row(layout, label_text, line_edit, browse_callback, tooltip=None):
-    container = QtWidgets.QWidget()
-    vbox = QtWidgets.QVBoxLayout(container)
-    vbox.setContentsMargins(0, 0, 0, 0)
-    vbox.setSpacing(2)
-    lbl = make_label(label_text, color=ACCENT, bold=True)
-    if tooltip: lbl.setToolTip(tooltip)
-    vbox.addWidget(lbl)
-    if tooltip: line_edit.setToolTip(tooltip)
-    vbox.addWidget(line_edit)
-    btn = make_btn("Browse...")
-    btn.clicked.connect(browse_callback)
-    vbox.addWidget(btn)
-    layout.addWidget(container)
-
-def hbox(*widgets, spacing=8):
-    container = QtWidgets.QWidget()
-    lay = QtWidgets.QHBoxLayout(container)
-    lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(spacing)
-    for w in widgets:
-        if w is None: lay.addStretch()
-        else: lay.addWidget(w)
-    return container, lay
 
 class CompressedLogBuffer:
     def __init__(self, block_size=128, compression_level=6, max_active_bytes=64 * 1024):
@@ -1824,9 +1800,6 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             cl = QtWidgets.QVBoxLayout(card)
             cl.setSpacing(10)
 
-            top_h = QtWidgets.QHBoxLayout()
-            top_h.setSpacing(12)
-
             preview_sec = QtWidgets.QVBoxLayout()
             preview_sec.setSpacing(5)
             img_h = QtWidgets.QHBoxLayout()
@@ -1853,7 +1826,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             right_btn.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1))
             nav_h.addWidget(left_btn); nav_h.addWidget(counter_lbl, 1); nav_h.addWidget(right_btn)
             preview_sec.addLayout(nav_h)
-            top_h.addLayout(preview_sec)
+            cl.addLayout(preview_sec)
 
             cap_container = QtWidgets.QWidget()
             cap_container.setStyleSheet(f"QWidget {{ background: {GRAPH_BG}; border: 1px solid {BORDER}; border-radius: 4px; }}")
@@ -1866,11 +1839,10 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             caption_text.setReadOnly(True)
             caption_text.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
             caption_text.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
-            caption_text.setMinimumHeight(183)
+            caption_text.setMinimumHeight(115)
             caption_text.setStyleSheet(f"QTextEdit {{ background: {GRAPH_BG}; color: {TEXT_PRI}; font-size: 9pt; border: none; }}")
             cap_layout.addWidget(caption_text, 1)
-            top_h.addWidget(cap_container, 1)
-            cl.addLayout(top_h)
+            cl.addWidget(cap_container, 1)
             cl.addWidget(make_separator())
 
             path_short = (Path(ds['path']).name[:27] + "...") if len(Path(ds['path']).name) > 30 else Path(ds['path']).name
@@ -1916,9 +1888,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             for ec in range(n % COLS, COLS): self.dataset_grid.setColumnStretch(ec, 1)
 
     def _cache_exists(self, path):
-        name = self.parent_gui.get_current_cache_folder_name()
-        d = Path(path) / name
-        return d.exists() and d.is_dir()
+        return any((Path(path) / name).is_dir() for name in self.parent_gui.get_current_cache_folder_names())
 
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
@@ -1936,20 +1906,26 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.datasetsChanged.emit()
 
     def confirm_clear_cache(self, path):
-        name = self.parent_gui.get_current_cache_folder_name()
-        if QtWidgets.QMessageBox.question(self, "Confirm", f"Delete cached latents in '{name}' for this dataset?",
+        names = self.parent_gui.get_current_cache_folder_names()
+        existing = [name for name in names if (Path(path) / name).is_dir()]
+        target_text = "', '".join(existing or names)
+        if QtWidgets.QMessageBox.question(self, "Confirm", f"Delete cached latents in '{target_text}' for this dataset?",
                                           QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No) == QtWidgets.QMessageBox.StandardButton.Yes:
             self.clear_cached_latents(path)
 
     def clear_cached_latents(self, path):
-        name = self.parent_gui.get_current_cache_folder_name()
+        names = self.parent_gui.get_current_cache_folder_names()
         deleted = False
-        for d in list(Path(path).rglob(name)):
-            if d.is_dir():
-                try: shutil.rmtree(d); self.parent_gui.log(f"Deleted cache: {d}"); deleted = True
-                except Exception as e: self.parent_gui.log(f"Error deleting {d}: {e}")
+        root = Path(path)
+        for name in names:
+            candidates = [root / name]
+            candidates.extend(root.rglob(name))
+            for d in candidates:
+                if d.is_dir():
+                    try: shutil.rmtree(d); self.parent_gui.log(f"Deleted cache: {d}"); deleted = True
+                    except Exception as e: self.parent_gui.log(f"Error deleting {d}: {e}")
         if deleted: self.refresh_cache_buttons()
-        else: self.parent_gui.log(f"No cache directories found matching '{name}'.")
+        else: self.parent_gui.log(f"No cache directories found matching: {', '.join(names)}.")
 
     def refresh_cache_buttons(self):
         for idx, ds in enumerate(self.datasets):
@@ -1966,8 +1942,13 @@ UI_DEFS = {
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
-    "UNCONDITIONAL_DROPOUT":       ("Unconditional Dropout", "Randomly replace captions with empty strings.", "check"),
-    "UNCONDITIONAL_DROPOUT_CHANCE":("Dropout Chance", "Probability (0.0-1.0) of dropping the caption.", "dspin", 0.0, 1.0, 0.05, 2),
+    "UNCONDITIONAL_DROPOUT":       ("Use Null Caption Dropout", "Enable empty-prompt conditioning dropout during training and cache the null embedding.", "check"),
+    "CAPTION_SHUFFLE_ENABLED":     ("Use Caption Shuffling", "Enable cached shuffled-caption variants for tag-order augmentation during training.", "check"),
+    "CAPTION_SHUFFLE_VARIANTS":    ("Shuffle Variants", "Number of cached shuffled full-caption embeddings per image.", "spin", 0, 16),
+    "CAPTION_SHUFFLE_KEEP_FIRST":  ("Keep First Tags", "Number of leading tags to preserve before shuffling the rest.", "spin", 0, 32),
+    "CAPTION_TAG_SEPARATOR":       ("Tag Separator", "Separator used to split captions into tags for cached shuffles.", "line"),
+    "UNCONDITIONAL_DROPOUT_CHANCE":("Null Chance", "Probability (0.0-1.0) of using empty-prompt embeddings for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
+    "CAPTION_SHUFFLE_CHANCE":      ("Shuffle Chance", "Probability (0.0-1.0) of using one cached shuffled-caption embedding when available.", "dspin", 0.0, 1.0, 0.05, 2),
     "TARGET_PIXEL_AREA":           ("Target Pixel Area", "e.g., 1024*1024=1048576.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
     "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
@@ -1985,8 +1966,6 @@ UI_DEFS = {
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
-    "GRAD_SPIKE_THRESHOLD_HIGH":   ("Spike Threshold (High)", "Trigger detector if gradient norm exceeds this.", "line"),
-    "GRAD_SPIKE_THRESHOLD_LOW":    ("Spike Threshold (Low)", "Trigger detector if gradient norm is below this.", "line"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "DestinationLoss"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
@@ -2187,6 +2166,29 @@ class TrainingGUI(QtWidgets.QWidget):
         lbl, w = self._make_widget(key)
         if w: form_layout.addRow(lbl, w) if lbl else form_layout.addRow(w)
 
+    def _add_form_keys(self, form_layout, keys):
+        for key in keys:
+            self._add_to_form(form_layout, key)
+
+    def _connect_widget_signal(self, key, signal_name, callback):
+        if key in self.widgets:
+            getattr(self.widgets[key], signal_name).connect(callback)
+
+    def _add_vertical_field(self, layout, label, widget, tooltip=None):
+        if tooltip:
+            label.setToolTip(tooltip)
+            widget.setToolTip(tooltip)
+        layout.addWidget(label)
+        layout.addWidget(widget)
+
+    def _add_vertical_widget_key(self, layout, key):
+        lbl, widget = self._make_widget(key)
+        if widget:
+            if lbl:
+                self._add_vertical_field(layout, lbl, widget, lbl.toolTip())
+            else:
+                layout.addWidget(widget)
+
     def _sync_widget(self, key):
         w = self.widgets.get(key)
         if not w: return
@@ -2223,18 +2225,29 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _form_group(self, title, keys, layout_cls=QtWidgets.QFormLayout):
         gb, _ = group_box(title, layout_cls)
-        lay = gb.layout()
-        for k in keys: self._add_to_form(lay, k)
+        self._add_form_keys(gb.layout(), keys)
         return gb
+
+    def _vertical_form_group(self, title, keys):
+        gb, lay = group_box(title, QtWidgets.QVBoxLayout)
+        lay.setSpacing(8)
+        for key in keys:
+            self._add_vertical_widget_key(lay, key)
+        return gb
+
+    def _make_scroll_panel(self, widget, min_width=None, max_width=None):
+        scroll = QtWidgets.QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        if min_width: scroll.setMinimumWidth(min_width)
+        if max_width: scroll.setMaximumWidth(max_width)
+        scroll.setWidget(widget)
+        return scroll
 
     def _setup_ui(self):
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(5, 5, 5, 5)
 
-        title = make_label("AOZORA SDXL Trainer", color=ACCENT, bold=True)
-        title.setObjectName("TitleLabel")
-        title.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        main.addWidget(title)
         self.log_textbox = VirtualConsoleWidget(visible_lines=900, clear_callback=self.clear_console_log)
 
         self.tab_view = QtWidgets.QTabWidget()
@@ -2323,115 +2336,287 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_dataset_tab(self, parent):
         layout = QtWidgets.QVBoxLayout(parent)
         layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(12)
 
-        top = QtWidgets.QHBoxLayout()
-        top.setSpacing(20)
-        top.addWidget(self._form_group("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "NUM_WORKERS"]))
-        top.addWidget(self._form_group("Unconditional Dropout", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE"]))
-        top.addWidget(self._form_group("Aspect Ratio Bucketing", ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]))
-        layout.addLayout(top)
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        settings_panel = QtWidgets.QWidget()
+        settings_panel.setMinimumWidth(300)
+        settings_panel.setMaximumWidth(380)
+        settings_lay = QtWidgets.QVBoxLayout(settings_panel)
+        settings_lay.setContentsMargins(0, 0, 10, 0)
+        settings_lay.setSpacing(10)
+        settings_lay.addWidget(make_label("Dataset Settings", color=ACCENT, bold=True, size=12))
+        settings_lay.addWidget(self._build_vae_group())
+        for title, keys in [
+            ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "NUM_WORKERS"]),
+            ("Caption Cache Options", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "CAPTION_SHUFFLE_ENABLED", "CAPTION_SHUFFLE_VARIANTS", "CAPTION_SHUFFLE_CHANCE", "CAPTION_SHUFFLE_KEEP_FIRST", "CAPTION_TAG_SEPARATOR"]),
+            ("Aspect Ratio Bucketing", ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]),
+        ]:
+            settings_lay.addWidget(self._form_group(title, keys))
+        settings_lay.addStretch(1)
+        split.addWidget(self._make_scroll_panel(settings_panel, 320, 400))
 
         self.dataset_manager = DatasetManagerWidget(self)
         self.dataset_manager.datasetsChanged.connect(self._update_training_calculations)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
-        layout.addWidget(self.dataset_manager)
+        split.addWidget(self.dataset_manager)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([340, 980])
+        layout.addWidget(split, 1)
 
-        if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
-            self.widgets["SHOULD_UPSCALE"].stateChanged.connect(
-                lambda s: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(s)))
-        if "UNCONDITIONAL_DROPOUT" in self.widgets and "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
-            chk = self.widgets["UNCONDITIONAL_DROPOUT"]
-            chk.stateChanged.connect(lambda s: self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(bool(s)))
+        if "MAX_AREA_TOLERANCE" in self.widgets:
+            self._connect_widget_signal("SHOULD_UPSCALE", "stateChanged",
+                                        lambda s: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(s)))
+        if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
+            self._connect_widget_signal("UNCONDITIONAL_DROPOUT", "stateChanged",
+                                        lambda s: self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(bool(s)))
+        self._connect_widget_signal("CAPTION_SHUFFLE_ENABLED", "stateChanged", self._update_caption_shuffle_controls)
+        if "CAPTION_SHUFFLE_VARIANTS" in self.widgets and "CAPTION_SHUFFLE_CHANCE" in self.widgets:
+            spin = self.widgets["CAPTION_SHUFFLE_VARIANTS"]
+            spin.valueChanged.connect(self._update_caption_shuffle_controls)
+            if "CAPTION_SHUFFLE_KEEP_FIRST" in self.widgets:
+                spin.valueChanged.connect(lambda _: self._sync_widget("CAPTION_SHUFFLE_KEEP_FIRST"))
+            if "CAPTION_TAG_SEPARATOR" in self.widgets:
+                spin.valueChanged.connect(lambda _: self._sync_widget("CAPTION_TAG_SEPARATOR"))
+            self._update_caption_shuffle_controls()
 
-    def _build_model_training_tab(self, parent):
-        lay = QtWidgets.QVBoxLayout(parent)
-        lay.setSpacing(15)
-        lay.setContentsMargins(15, 5, 15, 15)
+    def _build_architecture_group(self):
+        mode_gb, mode_lay = group_box("Architecture & Prediction", QtWidgets.QVBoxLayout)
+        mode_lay.setSpacing(4)
 
-        r1 = QtWidgets.QHBoxLayout(); r1.setSpacing(20)
+        row = QtWidgets.QHBoxLayout()
+        row.setContentsMargins(0, 0, 0, 0)
+        row.setSpacing(8)
 
-        col1 = QtWidgets.QWidget()
-        col1_lay = QtWidgets.QVBoxLayout(col1); col1_lay.setContentsMargins(0,0,0,0); col1_lay.setSpacing(10)
-        mode_gb, mode_lay = group_box("Architecture & Prediction", QtWidgets.QFormLayout)
         self.training_mode_combo = make_combo(["Stable Diffusion XL (SDXL)"])
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
-        mode_lay.addRow("Architecture:", self.training_mode_combo)
-        
-        self._add_to_form(mode_lay, "PREDICTION_TYPE")
+        arch_col = QtWidgets.QVBoxLayout()
+        arch_col.setContentsMargins(0, 0, 0, 0)
+        arch_col.setSpacing(3)
+        self._add_vertical_field(arch_col, make_label("Architecture:"), self.training_mode_combo)
+        row.addLayout(arch_col, 1)
+
+        pred_col = QtWidgets.QVBoxLayout()
+        pred_col.setContentsMargins(0, 0, 0, 0)
+        pred_col.setSpacing(3)
+        self._add_vertical_widget_key(pred_col, "PREDICTION_TYPE")
+        row.addLayout(pred_col, 1)
+        mode_lay.addLayout(row)
         self.widgets["PREDICTION_TYPE"].currentTextChanged.connect(self._on_prediction_type_changed)
-        
-        col1_lay.addWidget(mode_gb)
-        col1_lay.addWidget(self._build_path_group())
-        col1_lay.addStretch()
-        r1.addWidget(col1, 1)
-        r1.addWidget(self._build_lr_scheduler_group(), 2)
+        return mode_gb
+
+    def _build_model_training_tab(self, parent):
+        layout = QtWidgets.QVBoxLayout(parent)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(12)
+
+        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split.setChildrenCollapsible(False)
+
+        settings_panel = QtWidgets.QWidget()
+        settings_panel.setMinimumWidth(360)
+        settings_panel.setMaximumWidth(480)
+        settings_lay = QtWidgets.QVBoxLayout(settings_panel)
+        settings_lay.setContentsMargins(0, 0, 10, 0)
+        settings_lay.setSpacing(10)
+        settings_lay.addWidget(make_label("Model Setup", color=ACCENT, bold=True, size=12))
+        settings_lay.addWidget(self._build_architecture_group())
+        settings_lay.addWidget(self._build_path_group())
+        settings_lay.addWidget(self._build_training_length_group())
+        settings_lay.addWidget(self._build_batching_group())
+        settings_lay.addWidget(self._build_runtime_group())
+        settings_lay.addWidget(self._vertical_form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"]))
+        settings_lay.addWidget(self._build_loss_group())
+        settings_lay.addWidget(self._build_advanced_group())
+        settings_lay.addStretch(1)
+        split.addWidget(self._make_scroll_panel(settings_panel, 380, 500))
+
+        main_panel = QtWidgets.QWidget()
+        main_lay = QtWidgets.QVBoxLayout(main_panel)
+        main_lay.setContentsMargins(10, 0, 0, 0)
+        main_lay.setSpacing(14)
+        main_lay.addWidget(make_label("Training Parameters", color=ACCENT, bold=True, size=12))
+
+        upper = QtWidgets.QHBoxLayout(); upper.setSpacing(20)
+        upper.addWidget(self._build_lr_scheduler_group(), 3)
         self.timestep_group = self._build_timestep_group()
-        r1.addWidget(self.timestep_group, 2)
-        lay.addLayout(r1)
+        upper.addWidget(self.timestep_group, 2)
+        main_lay.addLayout(upper)
 
-        r2 = QtWidgets.QHBoxLayout(); r2.setSpacing(20)
-        r2.addWidget(self._build_core_training_group(), 1)
-        self.scheduler_group = self._build_scheduler_group()
-        r2.addWidget(self.scheduler_group, 1)
-        right_col = QtWidgets.QWidget()
-        right_lay = QtWidgets.QVBoxLayout(right_col); right_lay.setContentsMargins(0,0,0,0); right_lay.setSpacing(20)
-        right_lay.addWidget(self._build_vae_group())
-        right_lay.addWidget(self._form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"]))
-        r2.addWidget(right_col, 1)
-        lay.addLayout(r2)
+        optimizer_row = QtWidgets.QHBoxLayout()
+        optimizer_row.setSpacing(20)
+        optimizer_row.addWidget(self._build_optimizer_group(), 1)
+        optimizer_row.addStretch(1)
+        main_lay.addLayout(optimizer_row)
+        main_lay.addStretch(1)
+        split.addWidget(main_panel)
+        split.setStretchFactor(0, 0)
+        split.setStretchFactor(1, 1)
+        split.setSizes([460, 1040])
+        layout.addWidget(split, 1)
 
-        r3 = QtWidgets.QHBoxLayout(); r3.setSpacing(20)
-        r3.addWidget(self._build_optimizer_group(), 1)
-        r3.addWidget(self._build_loss_group(), 1)
-        r3.addWidget(self._build_advanced_group(), 1)
-        lay.addLayout(r3)
-
-        for key, signal_name, callback in [
+        for args in [
             ("MAX_TRAIN_STEPS", "textChanged", self._update_and_clamp_lr_graph),
             ("MAX_TRAIN_STEPS", "textChanged", self._update_training_calculations),
             ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_epoch_markers_on_graph),
             ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_training_calculations),
             ("BATCH_SIZE", "valueChanged", self._update_training_calculations),
         ]:
-            getattr(self.widgets[key], signal_name).connect(callback)
+            self._connect_widget_signal(*args)
         self._update_lr_button_states(-1)
+
+    def _update_caption_shuffle_controls(self):
+        enabled = (
+            "CAPTION_SHUFFLE_ENABLED" in self.widgets and
+            self.widgets["CAPTION_SHUFFLE_ENABLED"].isChecked() and
+            "CAPTION_SHUFFLE_VARIANTS" in self.widgets and
+            self.widgets["CAPTION_SHUFFLE_VARIANTS"].value() > 0
+        )
+        for key in ["CAPTION_SHUFFLE_CHANCE", "CAPTION_SHUFFLE_KEEP_FIRST", "CAPTION_TAG_SEPARATOR"]:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(enabled)
+        if "CAPTION_SHUFFLE_VARIANTS" in self.widgets:
+            self.widgets["CAPTION_SHUFFLE_VARIANTS"].setEnabled(
+                "CAPTION_SHUFFLE_ENABLED" in self.widgets and
+                self.widgets["CAPTION_SHUFFLE_ENABLED"].isChecked()
+            )
 
     def _build_path_group(self):
         gb, lay = group_box("File & Directory Paths", QtWidgets.QVBoxLayout)
-        form = QtWidgets.QFormLayout()
+        lay.setContentsMargins(6, 6, 6, 6)
+        lay.setSpacing(3)
         self.model_load_strategy_combo = make_combo(["Load Base Model", "Resume from Checkpoint"])
-        form.addRow("Mode:", self.model_load_strategy_combo)
-        lay.addLayout(form)
+        self._add_vertical_field(lay, make_label("Mode:"), self.model_load_strategy_combo)
 
         self.path_stacked_widget = QtWidgets.QStackedWidget()
-
+        self.path_stacked_widget.setContentsMargins(0, 0, 0, 0)
+        self.path_stacked_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
         base_page = QtWidgets.QWidget()
-        bl = QtWidgets.QVBoxLayout(base_page); bl.setContentsMargins(0, 5, 0, 0); bl.setSpacing(10)
-        for key in ["SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH"]:
-            _, w = self._make_widget(key)
-            if w: bl.addWidget(w)
+        base_lay = QtWidgets.QVBoxLayout(base_page); base_lay.setContentsMargins(0, 0, 0, 0); base_lay.setSpacing(2)
+        self.add_vae_path_btn = make_btn("+ Separate VAE", lambda _=False: self._set_optional_vae_visible(True))
+        self.add_vae_path_btn.setFixedSize(118, 24)
+        self.add_vae_path_btn.setToolTip("Add a separate VAE path")
+        self.remove_vae_path_btn = make_btn("- Separate VAE", lambda _=False: self._set_optional_vae_visible(False))
+        self.remove_vae_path_btn.setFixedSize(118, 24)
+        self._style_optional_vae_buttons()
+        self.remove_vae_path_btn.setToolTip("Hide separate VAE path")
+        self.remove_vae_path_btn.setVisible(False)
+        base_lay.addWidget(self._make_compact_path_row(
+            "SINGLE_FILE_CHECKPOINT_PATH",
+            [self.add_vae_path_btn, self.remove_vae_path_btn]
+        ))
+        self.optional_vae_row = self._make_compact_path_row("VAE_PATH")
+        self.optional_vae_row.setVisible(False)
+        self.optional_vae_row.setMaximumHeight(0)
+        base_lay.addWidget(self.optional_vae_row)
         self.path_stacked_widget.addWidget(base_page)
 
         resume_page = QtWidgets.QWidget()
-        rl = QtWidgets.QVBoxLayout(resume_page); rl.setContentsMargins(0, 5, 0, 0); rl.setSpacing(10)
+        resume_lay = QtWidgets.QVBoxLayout(resume_page); resume_lay.setContentsMargins(0, 0, 0, 0); resume_lay.setSpacing(2)
         for key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"]:
-            _, w = self._make_widget(key)
-            if w: rl.addWidget(w)
+            resume_lay.addWidget(self._make_compact_path_row(key))
         self.path_stacked_widget.addWidget(resume_page)
-
         lay.addWidget(self.path_stacked_widget)
 
-        _, out_w = self._make_widget("OUTPUT_DIR")
-        if out_w: lay.addWidget(out_w)
+        lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
 
         self.model_load_strategy_combo.currentIndexChanged.connect(self.path_stacked_widget.setCurrentIndex)
+        self.path_stacked_widget.currentChanged.connect(lambda _: self._sync_path_stack_height())
+        self._sync_path_stack_height()
         return gb
 
-    def _build_core_training_group(self):
-        gb, lay = group_box("Core Training Parameters", QtWidgets.QFormLayout)
-        for key in ["MAX_TRAIN_STEPS", "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "SAVE_EVERY_N_STEPS",
-                    "MIXED_PRECISION", "CLIP_GRAD_NORM", "SEED"]:
-            self._add_to_form(lay, key)
+    def _set_optional_vae_visible(self, visible):
+        if hasattr(self, "optional_vae_row"):
+            self.optional_vae_row.setMaximumHeight(16777215 if visible else 0)
+            self.optional_vae_row.setVisible(visible)
+        if hasattr(self, "add_vae_path_btn"):
+            self.add_vae_path_btn.setEnabled(not visible)
+            self.add_vae_path_btn.setToolTip("Separate VAE path is shown" if visible else "Add a separate VAE path")
+            self._style_optional_vae_buttons()
+        if hasattr(self, "remove_vae_path_btn"):
+            self.remove_vae_path_btn.setVisible(visible)
+        if hasattr(self, "path_stacked_widget"):
+            self.path_stacked_widget.updateGeometry()
+            self._sync_path_stack_height()
+
+    def _sync_path_stack_height(self):
+        if not hasattr(self, "path_stacked_widget"):
+            return
+        page = self.path_stacked_widget.currentWidget()
+        if page:
+            self.path_stacked_widget.setFixedHeight(page.sizeHint().height())
+
+    def _style_optional_vae_buttons(self):
+        if hasattr(self, "add_vae_path_btn"):
+            self.add_vae_path_btn.setStyleSheet(
+                "padding: 0; "
+                "min-width: 118px; max-width: 118px; "
+                "min-height: 24px; max-height: 24px;"
+            )
+        if hasattr(self, "remove_vae_path_btn"):
+            self.remove_vae_path_btn.setStyleSheet(
+                "padding: 0; "
+                "min-width: 118px; max-width: 118px; "
+                "min-height: 24px; max-height: 24px; font-weight: bold;"
+            )
+
+    def _make_compact_path_row(self, key, label_actions=None):
+        label_text, tooltip, _, file_type = UI_DEFS[key]
+        row = QtWidgets.QWidget()
+        row.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        lay = QtWidgets.QVBoxLayout(row)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(1)
+
+        label = make_label(label_text, color=ACCENT, bold=True)
+        label.setToolTip(tooltip)
+        if label_actions:
+            label_row = QtWidgets.QHBoxLayout()
+            label_row.setContentsMargins(0, 0, 0, 0)
+            label_row.setSpacing(4)
+            label_row.addWidget(label)
+            label_row.addStretch(1)
+            for action in label_actions:
+                label_row.addWidget(action)
+            lay.addLayout(label_row)
+        else:
+            lay.addWidget(label)
+
+        picker = QtWidgets.QWidget()
+        picker_lay = QtWidgets.QHBoxLayout(picker)
+        picker_lay.setContentsMargins(0, 0, 0, 0)
+        picker_lay.setSpacing(4)
+
+        line = QtWidgets.QLineEdit()
+        line.setToolTip(tooltip)
+        line.textChanged.connect(lambda _, k=key: self._sync_widget(k))
+        self.widgets[key] = line
+        picker_lay.addWidget(line, 1)
+
+        browse = make_btn("+", lambda _, ft=file_type, le=line: self._browse_path(le, ft))
+        browse.setFixedSize(24, 24)
+        browse.setStyleSheet("padding: 0; min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px; font-weight: bold;")
+        browse.setToolTip(f"Select {label_text}")
+        picker_lay.addWidget(browse)
+        lay.addWidget(picker)
+        return row
+
+    def _build_training_length_group(self):
+        gb, lay = group_box("Training Length", QtWidgets.QFormLayout)
+        self._add_form_keys(lay, ["MAX_TRAIN_STEPS", "SAVE_EVERY_N_STEPS", "SEED"])
+        return gb
+
+    def _build_batching_group(self):
+        gb, lay = group_box("Batching", QtWidgets.QFormLayout)
+        self._add_form_keys(lay, ["BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS"])
+        return gb
+
+    def _build_runtime_group(self):
+        gb, lay = group_box("Runtime", QtWidgets.QFormLayout)
+        self._add_form_keys(lay, ["MIXED_PRECISION", "CLIP_GRAD_NORM"])
         return gb
     
     def _build_lr_scheduler_group(self):
@@ -2465,42 +2650,22 @@ class TrainingGUI(QtWidgets.QWidget):
             "Linear", restarts_spin.value(), init_warmup.value() / 100, restart_ramp.value() / 100)), 3, 1)
         lay.addWidget(pg)
 
-        bounds_lay = QtWidgets.QFormLayout()
-        self._add_to_form(bounds_lay, "LR_GRAPH_MIN")
-        self._add_to_form(bounds_lay, "LR_GRAPH_MAX")
-        lay.addLayout(bounds_lay)
+        bounds_row = QtWidgets.QHBoxLayout()
+        bounds_row.setContentsMargins(0, 0, 0, 0)
+        bounds_row.setSpacing(10)
+        for key in ["LR_GRAPH_MIN", "LR_GRAPH_MAX"]:
+            col = QtWidgets.QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(3)
+            self._add_vertical_widget_key(col, key)
+            bounds_row.addLayout(col, 1)
+        lay.addLayout(bounds_row)
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return gb
 
-    def _build_scheduler_group(self):
-        gb, lay = group_box("Scheduler Configuration", QtWidgets.QVBoxLayout)
-        
-        # --- DDPM (Standard) Container ---
-        self.ddpm_params_container = QtWidgets.QWidget()
-        ddpm_lay = QtWidgets.QFormLayout(self.ddpm_params_container)
-        ddpm_lay.setContentsMargins(0, 0, 0, 0)
-        scheduler_label = make_label("DDPMScheduler", color=TEXT_SEC)
-        scheduler_label.setToolTip("Used for Standard SDXL modes (epsilon, v_prediction).")
-        ddpm_lay.addRow(make_label("Noise Scheduler:"), scheduler_label)
-        lay.addWidget(self.ddpm_params_container)
-
-        # --- Rectified Flow Container ---
-        self.rf_params_container = QtWidgets.QWidget()
-        rf_lay = QtWidgets.QFormLayout(self.rf_params_container)
-        rf_lay.setContentsMargins(0, 0, 0, 0)
-        rf_label = make_label("Flow Match Euler", color=TEXT_SEC)
-        rf_label.setToolTip("Used automatically for Rectified Flow.")
-        rf_lay.addRow(make_label("Noise Scheduler:"), rf_label)
-        lay.addWidget(self.rf_params_container)
-        
-        lay.addStretch()
-        return gb
-
     def _build_loss_group(self):
-        gb, lay = group_box("Loss Configuration", QtWidgets.QFormLayout)
-        self._add_to_form(lay, "LOSS_TYPE")
-        return gb
+        return self._vertical_form_group("Loss Configuration", ["LOSS_TYPE"])
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -2526,34 +2691,28 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_adam_optimizer_form(self, prefix):
         container = QtWidgets.QWidget()
         lay = QtWidgets.QFormLayout(container); lay.setContentsMargins(0, 5, 0, 0)
-        
-        self.widgets[f'{prefix}_betas'] = QtWidgets.QLineEdit()
-        self.widgets[f'{prefix}_eps'] = QtWidgets.QLineEdit()
-        self.widgets[f'{prefix}_weight_decay'] = make_dspin(0.0, 1.0, step=0.00001, decimals=6)
-        self.widgets[f'{prefix}_debias_strength'] = make_dspin(0.0, 1.0, step=0.01, decimals=3)
-        self.widgets[f'{prefix}_use_grad_centralization'] = QtWidgets.QCheckBox("Enable Gradient Centralization")
-        self.widgets[f'{prefix}_gc_alpha'] = make_dspin(0.0, 1.0, step=0.1, decimals=1)
-        
-  
+
+        for name, widget in [
+            ("betas", QtWidgets.QLineEdit()),
+            ("eps", QtWidgets.QLineEdit()),
+            ("weight_decay", make_dspin(0.0, 1.0, step=0.00001, decimals=6)),
+            ("debias_strength", make_dspin(0.0, 1.0, step=0.01, decimals=3)),
+            ("use_grad_centralization", QtWidgets.QCheckBox("Enable Gradient Centralization")),
+            ("gc_alpha", make_dspin(0.0, 1.0, step=0.1, decimals=1)),
+        ]:
+            self.widgets[f"{prefix}_{name}"] = widget
         if prefix == "RAVEN":
             self.widgets[f'{prefix}_momentum_dtype'] = make_combo(["bfloat16", "float32"])
-            # Optional: Set bfloat16 as default
             self.widgets[f'{prefix}_momentum_dtype'].setCurrentText("bfloat16") 
-        # -------------------------
 
         gc = self.widgets[f'{prefix}_use_grad_centralization']
         gca = self.widgets[f'{prefix}_gc_alpha']
         gc.stateChanged.connect(lambda s: gca.setEnabled(bool(s)))
-        
         for lbl, key in [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
                         ("Weight Decay:", f'{prefix}_weight_decay'), ("Debias Strength:", f'{prefix}_debias_strength')]:
             lay.addRow(lbl, self.widgets[key])
-        
-
         if prefix == "RAVEN":
             lay.addRow("Momentum Precision:", self.widgets[f'{prefix}_momentum_dtype'])
-        # -------------------------
-
         lay.addRow(gc)
         lay.addRow("GC Alpha:", gca)
         return container
@@ -2578,16 +2737,18 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_vae_group(self):
         gb, lay = group_box("VAE Configuration")
         form = QtWidgets.QFormLayout()
-        for key in ["VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"]:
-            self._add_to_form(form, key)
+        self._add_form_keys(form, ["VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"])
         lay.addLayout(form)
         lay.addWidget(make_label("Presets:", color=ACCENT, bold=True))
-        btn_row = QtWidgets.QHBoxLayout()
-        for label, args in [("Standard SDXL", (0.0, 0.13025, 4)),
-                             ("Flux/NoobAI (32ch)", (0.0760, 0.6043, 32)),
-                             ("EQ VAE", (0.1726, 0.1280, 4))]:
-            btn_row.addWidget(make_btn(label, lambda _, a=args: self._apply_vae_preset(*a)))
-        lay.addLayout(btn_row)
+        preset_grid = QtWidgets.QGridLayout()
+        preset_grid.setSpacing(8)
+        for idx, (label, args) in enumerate([
+            ("Standard SDXL", (0.0, 0.13025, 4)),
+            ("Flux/NoobAI (32ch)", (0.0760, 0.6043, 32)),
+            ("EQ VAE", (0.1726, 0.1280, 4)),
+        ]):
+            preset_grid.addWidget(make_btn(label, lambda _, a=args: self._apply_vae_preset(*a)), idx // 2, idx % 2)
+        lay.addLayout(preset_grid)
         lay.addWidget(make_separator())
         detect_btn = make_btn("Run Auto-Detect Tool", self.launch_vae_detector)
         detect_btn.setStyleSheet(f"background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT};")
@@ -2619,13 +2780,7 @@ class TrainingGUI(QtWidgets.QWidget):
         except Exception as e: self.log(f"Error launching tool: {e}")
 
     def _build_advanced_group(self):
-        gb, lay = group_box("Miscellaneous", QtWidgets.QFormLayout)
-        self._add_to_form(lay, "MEMORY_EFFICIENT_ATTENTION")
-        lay.addRow(make_separator())
-        lay.addRow(make_label("<b>Gradient Spike Detection</b>", color=ACCENT))
-        self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_HIGH")
-        self._add_to_form(lay, "GRAD_SPIKE_THRESHOLD_LOW")
-        return gb
+        return self._vertical_form_group("Miscellaneous", ["MEMORY_EFFICIENT_ATTENTION"])
 
     def _build_timestep_group(self):
         gb, lay = group_box("Timestep Ticket Allocation")
@@ -2798,14 +2953,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.timestep_histogram.generate_from_weights(weights)
 
     def _on_prediction_type_changed(self, text):
-        is_rf = text == "rectified_flow"
-        
-        # Toggle visibility between standard DDPM settings and RF settings
-        if hasattr(self, 'ddpm_params_container'): 
-            self.ddpm_params_container.setVisible(not is_rf)
-        if hasattr(self, 'rf_params_container'): 
-            self.rf_params_container.setVisible(is_rf)
-            
         if hasattr(self, 'dataset_manager'): 
             self.dataset_manager.refresh_cache_buttons()
 
@@ -2859,6 +3006,10 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
+            if "CAPTION_SHUFFLE_VARIANTS" in self.widgets:
+                self._update_caption_shuffle_controls()
+            if "VAE_PATH" in self.widgets:
+                self._set_optional_vae_visible(bool(self.widgets["VAE_PATH"].text().strip()))
 
             self._update_and_clamp_lr_graph()
 
@@ -2988,14 +3139,17 @@ class TrainingGUI(QtWidgets.QWidget):
             self.remove_point_btn.setEnabled(removable)
 
     def get_current_cache_folder_name(self):
+        return self.get_current_cache_folder_names()[0]
+
+    def get_current_cache_folder_names(self):
         pred_type = self.widgets["PREDICTION_TYPE"].currentText() if "PREDICTION_TYPE" in self.widgets else ""
         if pred_type == "rectified_flow":
-            return ".precomputed_embeddings_cache_rf_noobai"
+            return [".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
         for ds in self.dataset_manager.datasets:
             for name in [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache"]:
                 if (Path(ds["path"]) / name).exists():
-                    return name
-        return ".precomputed_embeddings_cache_standard_sdxl"
+                    return [name, ".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
+        return [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache", ".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
 
     def start_training(self):
         self.save_config()

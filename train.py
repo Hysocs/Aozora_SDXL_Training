@@ -241,8 +241,6 @@ class AsyncReporter:
             try:
                 task_type, data = self.task_queue.get(timeout=0.05)
                 if task_type == 'log_step': self._handle_log_step(**data)
-                elif task_type == 'anomaly': self._handle_anomaly(**data)
-                elif task_type == 'grad_check': self._handle_grad_check(**data)
                 elif task_type == 'message': self._handle_message(**data)
                 self.task_queue.task_done()
             except queue.Empty: continue
@@ -272,36 +270,12 @@ class AsyncReporter:
         print('\r' + prog_str, end='', flush=True)
         self._last_line_len = len(prog_str)
 
-    def _handle_grad_check(self, phase_name, grad_norm):
-        self._clear_line()
-        print(f"\n[GRADIENT CHECK - {phase_name}] Grad Norm: {grad_norm:.4f}")
-
-    def _handle_anomaly(self, global_step, raw_grad_norm, clipped_grad_norm, low_thresh, high_thresh, paths):
-        self._clear_line()
-        print(
-            f"\n\n{'='*20} GRADIENT ANOMALY DETECTED {'='*20}\n"
-            f"  Step: {global_step}\n"
-            f"  Raw Gradient Norm: {raw_grad_norm:.4f}\n"
-            f"  Clipped Gradient Norm: {clipped_grad_norm:.4f}\n"
-            f"  Images in Accumulated Batch:\n" + "".join([f"    - {Path(p).stem}\n" for p in paths]) +
-            f"{'='*65}\n"
-        )
-
     def _handle_message(self, text):
         self._clear_line()
         print(text)
 
     def log_step(self, global_step, timing_data, diag_data=None):
         self.task_queue.put(('log_step', {'global_step': global_step, 'timing_data': timing_data, 'diag_data': diag_data}))
-
-    def log_grad_check(self, phase_name, grad_norm):
-        self.task_queue.put(('grad_check', {'phase_name': phase_name, 'grad_norm': grad_norm}))
-
-    def check_and_report_anomaly(self, global_step, raw_grad_norm, clipped_grad_norm, config, paths):
-        low = getattr(config, "GRAD_SPIKE_THRESHOLD_LOW", 0.0)
-        high = getattr(config, "GRAD_SPIKE_THRESHOLD_HIGH", 1000.0)
-        if raw_grad_norm > high or raw_grad_norm < low:
-            self.task_queue.put(('anomaly', {'global_step': global_step, 'raw_grad_norm': raw_grad_norm, 'clipped_grad_norm': clipped_grad_norm, 'low_thresh': low, 'high_thresh': high, 'paths': list(paths)}))
 
     def log_message(self, text):
         self.task_queue.put(('message', {'text': text}))
@@ -477,9 +451,40 @@ def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
             pooled_prompt_embeds_list.append(enc_2_output[0])
     return torch.cat(prompt_embeds_list, dim=0), torch.cat(pooled_prompt_embeds_list, dim=0)
 
+def get_caption_cache_options(config):
+    shuffle_enabled = bool(getattr(config, "CAPTION_SHUFFLE_ENABLED", False))
+    return {
+        "version": 3,
+        "unconditional_dropout": bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)),
+        "caption_shuffle_enabled": shuffle_enabled,
+        "caption_shuffle_variants": int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0) if shuffle_enabled else 0,
+        "caption_shuffle_keep_first": int(getattr(config, "CAPTION_SHUFFLE_KEEP_FIRST", 1) or 0),
+        "caption_tag_separator": str(getattr(config, "CAPTION_TAG_SEPARATOR", ",") or ","),
+    }
+
+def build_caption_variants(caption, config, seed_key):
+    variants = [("original", caption)]
+    separator = str(getattr(config, "CAPTION_TAG_SEPARATOR", ",") or ",")
+    parts = [p.strip() for p in caption.split(separator)]
+    parts = [p for p in parts if p]
+
+    shuffle_count = max(0, int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0)) if getattr(config, "CAPTION_SHUFFLE_ENABLED", False) else 0
+    if len(parts) > 1 and shuffle_count > 0:
+        keep_first = max(0, int(getattr(config, "CAPTION_SHUFFLE_KEEP_FIRST", 1) or 0))
+        keep_first = min(keep_first, len(parts))
+        fixed_parts = parts[:keep_first]
+        shuffle_parts = parts[keep_first:]
+        for i in range(shuffle_count):
+            shuffled = shuffle_parts[:]
+            random.Random(f"{getattr(config, 'SEED', 42)}:{seed_key}:{i}").shuffle(shuffled)
+            variants.append((f"shuffle_{i}", f"{separator} ".join(fixed_parts + shuffled)))
+
+    return variants
+
 def check_if_caching_needed(config):
     needs_caching = False
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+    expected_cache_options = get_caption_cache_options(config)
 
     if getattr(config, "UNCONDITIONAL_DROPOUT", False):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
@@ -501,6 +506,8 @@ def check_if_caching_needed(config):
         try:
             with open(index_path, "r", encoding="utf-8") as f:
                 index_data = json.load(f)
+            if index_data.get("cache_options") != expected_cache_options:
+                needs_caching = True
             if any("scaled_size" not in item for item in index_data.get("files", [])):
                 needs_caching = True
         except Exception:
@@ -509,6 +516,17 @@ def check_if_caching_needed(config):
         cached_te_files = list(cache_dir.glob("*_te.pt"))
         if len(cached_te_files) < len(image_paths):
             needs_caching = True
+        else:
+            for f in cached_te_files[: min(len(cached_te_files), 10)]:
+                try:
+                    data_te = torch.load(f, map_location="cpu", weights_only=True)
+                    variants = data_te.get("caption_variants")
+                    if not variants:
+                        needs_caching = True
+                        break
+                except Exception:
+                    needs_caching = True
+                    break
     return needs_caching
 
 def load_unet_robust(path, compute_dtype):
@@ -574,6 +592,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         return
 
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
+    expected_cache_options = get_caption_cache_options(config)
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
@@ -582,8 +601,11 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     te1.to(device)
     te2.to(device)
 
-    with torch.no_grad():
-        null_embeds, null_pooled = compute_text_embeddings_sdxl([""], t1, t2, te1, te2, device)
+    if getattr(config, "UNCONDITIONAL_DROPOUT", False):
+        with torch.no_grad():
+            null_embeds, null_pooled = compute_text_embeddings_sdxl([""], t1, t2, te1, te2, device)
+    else:
+        null_embeds, null_pooled = None, None
 
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
@@ -592,13 +614,23 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
 
-        torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
+        if null_embeds is not None and null_pooled is not None:
+            torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
         paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
+        force_recaching = True
+        index_path = cache_dir / "dataset_index.json"
+        if index_path.exists():
+            try:
+                with open(index_path, "r", encoding="utf-8") as f:
+                    force_recaching = json.load(f).get("cache_options") != expected_cache_options
+            except Exception:
+                force_recaching = True
+
         to_process = []
         for p in paths:
             safe_stem = str(p.relative_to(root).with_suffix('')).replace(os.sep, '_')
-            if not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists():
+            if force_recaching or not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists():
                 to_process.append(p)
 
         if to_process:
@@ -624,7 +656,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
                 if not images_global: continue
 
-                embeds, pooled = compute_text_embeddings_sdxl([m['caption'] for m in valid_meta_final], t1, t2, te1, te2, device)
+                caption_payloads = []
+                all_variant_captions = []
+                for m in valid_meta_final:
+                    variant_defs = build_caption_variants(m["caption"], config, str(m["ip"].relative_to(root)))
+                    caption_payloads.append(variant_defs)
+                    all_variant_captions.extend([caption for _, caption in variant_defs])
+
+                embeds_all, pooled_all = compute_text_embeddings_sdxl(all_variant_captions, t1, t2, te1, te2, device)
 
                 with torch.no_grad():
                     latents_global = vae.encode(torch.stack(images_global).to(device, dtype=torch.float32)).latent_dist.mean
@@ -642,12 +681,24 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
                 for j, m in enumerate(valid_meta_final):
                     safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_')
+                    variant_count_before = sum(len(payload) for payload in caption_payloads[:j])
+                    caption_variants = {}
+                    for k, (variant_name, variant_caption) in enumerate(caption_payloads[j]):
+                        idx = variant_count_before + k
+                        caption_variants[variant_name] = {
+                            "caption": variant_caption,
+                            "embeds": embeds_all[idx].to(dtype=torch.float32).cpu(),
+                            "pooled": pooled_all[idx].to(dtype=torch.float32).cpu(),
+                        }
+
+                    original_variant = caption_variants["original"]
                     torch.save({
                         "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
                         "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
                         "target_size": (w, h),
                         "crop_coords": m.get("crop_coords", (0, 0)),
-                        "embeds": embeds[j].to(dtype=torch.float32).cpu(), "pooled": pooled[j].to(dtype=torch.float32).cpu(),
+                        "embeds": original_variant["embeds"], "pooled": original_variant["pooled"],
+                        "caption_variants": caption_variants,
                         "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
                     }, cache_dir / f"{safe_filename}_te.pt")
                     torch.save(latents_global[j].to(dtype=torch.float32).cpu(), cache_dir / f"{safe_filename}_lat.pt")
@@ -655,7 +706,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 if batch_idx % 20 == 0: torch.cuda.empty_cache()
                 
         print(f"INFO: Building fast JSON index for {root.name}...")
-        index_path = cache_dir / "dataset_index.json"
         index_data = []
         cached_files = list(cache_dir.glob("*_te.pt"))
         for f in cached_files:
@@ -674,7 +724,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 print(f"WARNING: Could not index {f}: {e}")
                 
         with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"version": 1, "files": index_data}, f)
+            json.dump({"version": 3, "cache_options": expected_cache_options, "files": index_data}, f)
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -722,6 +772,11 @@ class ImageTextLatentDataset(Dataset):
                 self.null_pooled = null_data["pooled"].squeeze(0) if null_data["pooled"].dim() == 2 else null_data["pooled"]
             except:
                 self.dropout_prob = 0.0
+        self.shuffle_prob = (
+            getattr(config, "CAPTION_SHUFFLE_CHANCE", 0.0)
+            if getattr(config, "CAPTION_SHUFFLE_ENABLED", False) and int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0) > 0
+            else 0.0
+        )
 
     def __len__(self): return len(self.items)
 
@@ -739,6 +794,22 @@ class ImageTextLatentDataset(Dataset):
             return payload.get("latents")
         return payload
 
+    def _select_caption_variant(self, data_te):
+        variants = data_te.get("caption_variants")
+        if not variants:
+            return data_te["embeds"], data_te["pooled"]
+
+        shuffle_keys = [key for key in variants if str(key).startswith("shuffle_")]
+        shuffle_prob = min(max(self.shuffle_prob, 0.0), 1.0) if shuffle_keys else 0.0
+        if shuffle_prob > 0 and self.worker_rng.random() < shuffle_prob:
+            variant = variants[self.worker_rng.choice(shuffle_keys)]
+            return variant["embeds"], variant["pooled"]
+
+        variant = variants.get("original")
+        if variant:
+            return variant["embeds"], variant["pooled"]
+        return data_te["embeds"], data_te["pooled"]
+
     def __getitem__(self, i):
         try:
             if self.worker_rng is None: self._init_worker_rng()
@@ -749,13 +820,14 @@ class ImageTextLatentDataset(Dataset):
 
             data_te = self._load_tensor(path_te)
             latents = self._load_latent_payload(path_lat)
+            embeds, pooled = self._select_caption_variant(data_te)
 
             if torch.isnan(latents).any() or torch.isinf(latents).any(): return None
 
             item = {
                 "latents": latents,
-                "embeds": data_te["embeds"].squeeze(0) if data_te["embeds"].dim() == 3 else data_te["embeds"],
-                "pooled": data_te["pooled"].squeeze(0) if data_te["pooled"].dim() == 2 else data_te["pooled"],
+                "embeds": embeds.squeeze(0) if embeds.dim() == 3 else embeds,
+                "pooled": pooled.squeeze(0) if pooled.dim() == 2 else pooled,
                 "original_sizes": item_data["original_size"], 
                 "scaled_sizes": item_data.get("scaled_size", item_data["original_size"]),
                 "target_sizes": item_data["target_size"],
@@ -1240,7 +1312,6 @@ def main():
                     'avg_optim_step_time': sum(optim_step_times) / len(optim_step_times),
                 }
 
-                reporter.check_and_report_anomaly(optimizer_step, raw_grad_norm, clipped_grad_norm, config, accumulated_latent_paths)
                 diagnostics.reset()
                 accumulated_latent_paths.clear()
 
