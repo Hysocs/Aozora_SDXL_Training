@@ -28,8 +28,8 @@
     "LR_GRAPH_MIN": "1.0e-7",
     "LR_GRAPH_MAX": "5e-5",
     "MEMORY_EFFICIENT_ATTENTION": "sdpa",
-    "VAE_SHIFT_FACTOR": 0.0,
-    "VAE_SCALING_FACTOR": 1.0,
+    "VAE_SHIFT_FACTOR": 0.03,
+    "VAE_SCALING_FACTOR": 0.6023,
     "VAE_LATENT_CHANNELS": 32,
     "LR_CUSTOM_CURVE": [
         [

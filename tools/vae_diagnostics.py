@@ -138,6 +138,56 @@ def rgb_stats(array):
     return float(luma.mean()), float(sat.mean()), float((luma < 0.04).mean()), float((luma > 0.96).mean())
 
 
+def srgb_to_linear(array):
+    array = np.clip(array.astype(np.float32), 0, 1)
+    return np.where(array <= 0.04045, array / 12.92, ((array + 0.055) / 1.055) ** 2.4)
+
+
+def rgb_to_lab(array):
+    rgb = srgb_to_linear(array)
+    matrix = np.array(
+        [
+            [0.4124564, 0.3575761, 0.1804375],
+            [0.2126729, 0.7151522, 0.0721750],
+            [0.0193339, 0.1191920, 0.9503041],
+        ],
+        dtype=np.float32,
+    )
+    xyz = rgb @ matrix.T
+    white = np.array([0.95047, 1.0, 1.08883], dtype=np.float32)
+    xyz = xyz / white
+    epsilon = 216 / 24389
+    kappa = 24389 / 27
+    f = np.where(xyz > epsilon, np.cbrt(xyz), (kappa * xyz + 16) / 116)
+    lab = np.empty_like(f)
+    lab[:, :, 0] = 116 * f[:, :, 1] - 16
+    lab[:, :, 1] = 500 * (f[:, :, 0] - f[:, :, 1])
+    lab[:, :, 2] = 200 * (f[:, :, 1] - f[:, :, 2])
+    return lab
+
+
+def perceptual_color_metrics(reference, candidate):
+    ref_lab = rgb_to_lab(reference)
+    cand_lab = rgb_to_lab(candidate)
+    delta = cand_lab - ref_lab
+    delta_e = np.sqrt(np.sum(delta * delta, axis=2))
+
+    ref_chroma = np.sqrt(ref_lab[:, :, 1] ** 2 + ref_lab[:, :, 2] ** 2)
+    cand_chroma = np.sqrt(cand_lab[:, :, 1] ** 2 + cand_lab[:, :, 2] ** 2)
+    chroma_err = np.mean(np.abs(cand_chroma - ref_chroma)) / 100.0
+
+    hue_mask = (ref_chroma > 5.0) & (cand_chroma > 5.0)
+    if np.any(hue_mask):
+        ref_hue = np.arctan2(ref_lab[:, :, 2], ref_lab[:, :, 1])
+        cand_hue = np.arctan2(cand_lab[:, :, 2], cand_lab[:, :, 1])
+        hue_delta = np.angle(np.exp(1j * (cand_hue - ref_hue)))
+        hue_err = float(np.mean(np.abs(hue_delta[hue_mask])) / np.pi)
+    else:
+        hue_err = 0.0
+
+    return float(np.mean(delta_e) / 100.0), float(np.percentile(delta_e, 95) / 100.0), float(chroma_err), hue_err
+
+
 def compare_score(reference, candidate):
     ref = np.clip(reference.astype(np.float32), 0, 1)
     cand = np.clip(candidate.astype(np.float32), 0, 1)
@@ -148,8 +198,19 @@ def compare_score(reference, candidate):
     sat_err = abs(cand_sat - ref_sat)
     black_err = abs(cand_black - ref_black)
     white_err = abs(cand_white - ref_white)
-    score = rmse + 1.5 * luma_err + 1.5 * sat_err + 0.75 * black_err + 0.75 * white_err
-    return score, rmse, luma_err, sat_err, black_err, white_err
+    delta_e, delta_e95, chroma_err, hue_err = perceptual_color_metrics(ref, cand)
+    score = (
+        rmse
+        + 1.0 * delta_e
+        + 0.35 * delta_e95
+        + 1.25 * luma_err
+        + 1.25 * sat_err
+        + 1.0 * chroma_err
+        + 0.75 * hue_err
+        + 0.75 * black_err
+        + 0.75 * white_err
+    )
+    return score, rmse, delta_e, delta_e95, luma_err, sat_err, chroma_err, hue_err, black_err, white_err
 
 
 def build_values(start, stop, step):
@@ -158,6 +219,32 @@ def build_values(start, stop, step):
     count = int(round((stop - start) / step)) + 1
     values = [start + i * step for i in range(max(0, count))]
     return [round(v, 6) for v in values if start - 1e-9 <= v <= stop + 1e-9]
+
+
+def format_metric(metric):
+    return (
+        f"score={metric[0]:.6f}, rmse={metric[1]:.6f}, dE={metric[2]:.6f}, "
+        f"dE95={metric[3]:.6f}, luma={metric[4]:.6f}, sat={metric[5]:.6f}, "
+        f"chroma={metric[6]:.6f}, hue={metric[7]:.6f}, black={metric[8]:.6f}, "
+        f"white={metric[9]:.6f}"
+    )
+
+
+def latent_candidate_metric(raw_latents, shift, scale):
+    normalized = (raw_latents - shift) * scale
+    norm_mean = float(normalized.mean().item())
+    norm_std = float(normalized.std().item())
+    abs_mean = abs(norm_mean)
+    std_err = abs(norm_std - 1.0)
+    score = abs_mean + std_err
+    return np.array([score, abs_mean, std_err, norm_mean, norm_std], dtype=np.float64)
+
+
+def format_latent_metric(metric):
+    return (
+        f"score={metric[0]:.6f}, abs_mean={metric[1]:.6f}, std_err={metric[2]:.6f}, "
+        f"norm_mean={metric[3]:.6f}, norm_std={metric[4]:.6f}"
+    )
 
 
 def choose_balanced_random_images(dataset, max_images, seed):
@@ -323,10 +410,15 @@ class ScannerWorker(QtCore.QThread):
                 raise ValueError("No images found in dataset folder.")
             candidates = [(s, c) for s in build_values(opts["shift_min"], opts["shift_max"], opts["shift_step"])
                            for c in build_values(opts["scale_min"], opts["scale_max"], opts["scale_step"])]
+            config_candidate = (round(float(opts["config_shift"]), 6), round(float(opts["config_scale"]), 6))
+            candidates.append(config_candidate)
+            candidates = sorted(set(candidates), key=lambda item: (item[0], item[1]))
+            if not candidates:
+                raise ValueError("No scale/shift candidates found. Check min, max, and step values.")
             transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
-            totals = {candidate: np.zeros(6, dtype=np.float64) for candidate in candidates}
-            raw_totals = np.zeros(6, dtype=np.float64)
-            latent_means, latent_stds, previews, done = [], [], {}, 0
+            totals = {candidate: np.zeros(5, dtype=np.float64) for candidate in candidates}
+            raw_totals = np.zeros(10, dtype=np.float64)
+            latent_means, latent_stds, previews, per_image_best, done = [], [], {}, [], 0
 
             for image_idx, path in enumerate(paths):
                 if self.stop_requested:
@@ -345,17 +437,30 @@ class ScannerWorker(QtCore.QThread):
                         raw_decoded = raw_decoded.sample
                     raw_np = tensor_to_numpy(raw_decoded)[0]
                     raw_totals += np.asarray(compare_score(reference, raw_np), dtype=np.float64)
+                    image_scores = []
                     for start in range(0, len(candidates), opts["decode_batch"]):
                         if self.stop_requested:
                             break
                         chunk = candidates[start:start + opts["decode_batch"]]
-                        batch = torch.cat([(raw_latents - shift) * scale for shift, scale in chunk], dim=0)
-                        decoded = vae.decode(batch)
-                        if hasattr(decoded, "sample"):
-                            decoded = decoded.sample
-                        decoded_np = tensor_to_numpy(decoded)
-                        for idx, candidate in enumerate(chunk):
-                            totals[candidate] += np.asarray(compare_score(reference, decoded_np[idx]), dtype=np.float64)
+                        for candidate in chunk:
+                            shift, scale = candidate
+                            metric = latent_candidate_metric(raw_latents, shift, scale)
+                            totals[candidate] += metric
+                            image_scores.append((float(metric[0]), candidate, metric))
+                    if self.stop_requested and len(image_scores) < len(candidates):
+                        break
+                    if image_scores:
+                        image_scores.sort(key=lambda item: item[0])
+                        score, candidate, metric = image_scores[0]
+                        per_image_best.append(
+                            {
+                                "path": path,
+                                "score": score,
+                                "shift": candidate[0],
+                                "scale": candidate[1],
+                                "metric": metric,
+                            }
+                        )
                 done += 1
                 self.progress.emit(done, len(paths))
                 if image_idx == 0:
@@ -371,40 +476,82 @@ class ScannerWorker(QtCore.QThread):
             averaged.sort(key=lambda item: item[0])
             best_score, best_candidate, best_metric = averaged[0]
 
+            if not per_image_best:
+                raise RuntimeError("Scan finished without any completed image candidate scores.")
+            median_shift = float(np.median([item["shift"] for item in per_image_best]))
+            median_scale = float(np.median([item["scale"] for item in per_image_best]))
+            median_candidate = (round(median_shift, 6), round(median_scale, 6))
+            if median_candidate in totals:
+                median_metric = totals[median_candidate] / done
+            else:
+                closest_candidate = min(
+                    totals,
+                    key=lambda candidate: abs(candidate[0] - median_shift) + abs(candidate[1] - median_scale),
+                )
+                median_candidate = closest_candidate
+                median_shift, median_scale = closest_candidate
+                median_metric = totals[closest_candidate] / done
+
             if "reference" in previews:
                 resized = resize_for_vae(Image.open(paths[0]), opts["max_side"])
                 pixels = transform(resized).unsqueeze(0).to(device=device, dtype=torch.float32)
                 with torch.no_grad():
                     encoded = vae.encode(pixels)
                     raw_latents = encoded.latent_dist.mean if hasattr(encoded, "latent_dist") else encoded
-                    best_decoded = vae.decode((raw_latents - best_candidate[0]) * best_candidate[1])
+                    normalized = (raw_latents - median_shift) * median_scale
+                    restored = normalized / median_scale + median_shift
+                    best_decoded = vae.decode(restored)
                     if hasattr(best_decoded, "sample"):
                         best_decoded = best_decoded.sample
                     previews["best"] = tensor_to_pil(best_decoded)
 
             raw_avg = raw_totals / done
             top_lines = [
-                f"{rank:02d}. shift={shift:.6f}, scale={scale:.6f} | score={score:.6f}, "
-                f"rmse={metric[1]:.6f}, luma_err={metric[2]:.6f}, sat_err={metric[3]:.6f}, "
-                f"black_err={metric[4]:.6f}, white_err={metric[5]:.6f}"
+                f"{rank:02d}. shift={shift:.6f}, scale={scale:.6f} | {format_latent_metric(metric)}"
                 for rank, (score, (shift, scale), metric) in enumerate(averaged[:10], start=1)
+            ]
+            per_image_lines = [
+                f"{idx:02d}. {item['path'].name} | shift={item['shift']:.6f}, "
+                f"scale={item['scale']:.6f} | {format_latent_metric(item['metric'])}"
+                for idx, item in enumerate(per_image_best[: min(30, len(per_image_best))], start=1)
             ]
             config_shift = getattr(vae.config, "shift_factor", None)
             config_scale = getattr(vae.config, "scaling_factor", None)
+            metadata_line = "VAE embedded metadata candidate: unavailable"
+            if config_shift is not None and config_scale is not None:
+                metadata_line = (
+                    f"VAE embedded metadata candidate: shift={float(config_shift):.6f}, scale={float(config_scale):.6f} | "
+                    f"dataset normalized mean={(np.mean(latent_means) - float(config_shift)) * float(config_scale):.6f}, "
+                    f"dataset normalized std={np.mean(latent_stds) * float(config_scale):.6f}"
+                )
+            config_metric = totals[config_candidate] / done
+            config_line = (
+                f"Training config candidate: shift={config_candidate[0]:.6f}, scale={config_candidate[1]:.6f}\n"
+                f"{format_latent_metric(config_metric)}"
+            )
             summary = (
                 f"Images scanned: {done}\n"
                 f"Sampling seed: {opts['seed']} | balanced random sample across subfolders when possible\n"
                 f"VAE config: class={getattr(vae.config, '_class_name', type(vae).__name__)}, "
                 f"channels={getattr(vae.config, 'latent_channels', '?')}, shift={config_shift}, scale={config_scale}\n"
+                f"Training config override: shift={config_candidate[0]:.6f}, scale={config_candidate[1]:.6f}\n"
                 f"Raw latent mean={np.mean(latent_means):.6f}, std={np.mean(latent_stds):.6f}\n\n"
                 f"Raw VAE reconstruction baseline:\n"
-                f"score={raw_avg[0]:.6f}, rmse={raw_avg[1]:.6f}, luma_err={raw_avg[2]:.6f}, "
-                f"sat_err={raw_avg[3]:.6f}, black_err={raw_avg[4]:.6f}, white_err={raw_avg[5]:.6f}\n\n"
-                f"Best direct-latent decode candidate:\n"
+                f"{format_metric(raw_avg)}\n\n"
+                f"{config_line}\n\n"
+                f"Median of per-image winners:\n"
+                f"shift={median_shift:.6f}, scale={median_scale:.6f}\n"
+                f"{format_latent_metric(median_metric)}\n\n"
+                f"Best globally averaged candidate:\n"
                 f"shift={best_candidate[0]:.6f}, scale={best_candidate[1]:.6f}\n"
-                f"score={best_score:.6f}, rmse={best_metric[1]:.6f}, luma_err={best_metric[2]:.6f}, "
-                f"sat_err={best_metric[3]:.6f}, black_err={best_metric[4]:.6f}, white_err={best_metric[5]:.6f}\n\n"
-                "Top candidates:\n" + "\n".join(top_lines)
+                f"{format_latent_metric(best_metric)}\n\n"
+                f"{metadata_line}\n\n"
+                "Important: VAE shift/scale are training latent normalization factors. Direct reconstruction "
+                "quality cannot identify them because the VAE decoder expects raw unnormalized latents.\n"
+                "Latent score targets normalized mean near 0 and normalized std near 1.\n"
+                "Raw reconstruction metrics are shown only to catch broken VAE/image loading.\n\n"
+                "Per-image winners:\n" + "\n".join(per_image_lines) + "\n\n"
+                "Top latent-normalization candidates:\n" + "\n".join(top_lines)
             )
             self.result.emit({"summary": summary, "reference": previews.get("reference"), "raw": previews.get("raw"), "best": previews.get("best")})
         except Exception as exc:
@@ -681,13 +828,15 @@ class ScannerTab(QtWidgets.QWidget):
         self.max_side = self.spin(128, 2048, 256)
         self.decode_batch = self.spin(1, 64, 8)
         self.seed = self.spin(0, 2147483647, 42)
+        self.config_shift = self.dspin(-5, 5, float(config.get("VAE_SHIFT_FACTOR", 0.0) or 0.0), 0.0001, 4)
+        self.config_scale = self.dspin(0.0001, 10, float(config.get("VAE_SCALING_FACTOR", 1.0) or 1.0), 0.0001, 5)
         self.shift_min = self.dspin(-5, 5, -0.10, 0.01, 4)
         self.shift_max = self.dspin(-5, 5, 0.10, 0.01, 4)
         self.shift_step = self.dspin(0.0001, 5, 0.02, 0.005, 4)
         self.scale_min = self.dspin(0.01, 10, 0.50, 0.05, 4)
         self.scale_max = self.dspin(0.01, 10, 1.20, 0.05, 4)
         self.scale_step = self.dspin(0.0001, 5, 0.05, 0.01, 4)
-        fields = [("Channels", self.latent_channels), ("Max images", self.max_images), ("Max side", self.max_side), ("Decode batch", self.decode_batch), ("Seed", self.seed), ("Shift min", self.shift_min), ("Shift max", self.shift_max), ("Shift step", self.shift_step), ("Scale min", self.scale_min), ("Scale max", self.scale_max), ("Scale step", self.scale_step)]
+        fields = [("Channels", self.latent_channels), ("Max images", self.max_images), ("Max side", self.max_side), ("Decode batch", self.decode_batch), ("Seed", self.seed), ("Config shift", self.config_shift), ("Config scale", self.config_scale), ("Shift min", self.shift_min), ("Shift max", self.shift_max), ("Shift step", self.shift_step), ("Scale min", self.scale_min), ("Scale max", self.scale_max), ("Scale step", self.scale_step)]
         for idx, (label, widget) in enumerate(fields):
             row, col = idx // 5, (idx % 5) * 2
             grid.addWidget(QtWidgets.QLabel(label), row, col)
@@ -704,7 +853,7 @@ class ScannerTab(QtWidgets.QWidget):
         preview_row = QtWidgets.QHBoxLayout()
         self.reference_slot = ImageSlot("Reference", 260)
         self.raw_slot = ImageSlot("Raw VAE Reconstruction", 260)
-        self.best_slot = ImageSlot("Best Direct-Latent Candidate", 260)
+        self.best_slot = ImageSlot("Median Per-Image Candidate", 260)
         for slot in [self.reference_slot, self.raw_slot, self.best_slot]:
             preview_row.addWidget(slot, 1)
         root.addLayout(preview_row, 1)
@@ -752,6 +901,8 @@ class ScannerTab(QtWidgets.QWidget):
             "max_side": self.max_side.value(),
             "decode_batch": self.decode_batch.value(),
             "seed": self.seed.value(),
+            "config_shift": self.config_shift.value(),
+            "config_scale": self.config_scale.value(),
             "shift_min": self.shift_min.value(),
             "shift_max": self.shift_max.value(),
             "shift_step": self.shift_step.value(),

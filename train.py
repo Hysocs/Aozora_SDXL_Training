@@ -460,6 +460,10 @@ def get_caption_cache_options(config):
         "caption_shuffle_variants": int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0) if shuffle_enabled else 0,
         "caption_shuffle_keep_first": int(getattr(config, "CAPTION_SHUFFLE_KEEP_FIRST", 1) or 0),
         "caption_tag_separator": str(getattr(config, "CAPTION_TAG_SEPARATOR", ",") or ","),
+        "vae_shift_factor": getattr(config, "VAE_SHIFT_FACTOR", None),
+        "vae_scaling_factor": getattr(config, "VAE_SCALING_FACTOR", None),
+        "vae_latent_channels": getattr(config, "VAE_LATENT_CHANNELS", None),
+        "vae_path": str(getattr(config, "VAE_PATH", "") or ""),
     }
 
 def build_caption_variants(caption, config, seed_key):
