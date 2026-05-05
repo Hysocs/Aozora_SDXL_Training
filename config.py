@@ -24,18 +24,19 @@ INSTANCE_DATASETS = [
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
 NUM_WORKERS = 0
-UNCONDITIONAL_DROPOUT = True
+UNCONDITIONAL_DROPOUT = False
 UNCONDITIONAL_DROPOUT_CHANCE = 0.0
-CAPTION_SHUFFLE_ENABLED = False
-CAPTION_SHUFFLE_VARIANTS = 0
-CAPTION_SHUFFLE_KEEP_FIRST = 1
-CAPTION_TAG_SEPARATOR = ","
-CAPTION_SHUFFLE_CHANCE = 0.0
+TEXT_CONDITIONING_SCALE_ENABLED = False
+TEXT_CONDITIONING_SCALE_MIN = 1.0
+TEXT_CONDITIONING_SCALE_MAX = 1.0
+CAPTION_CHUNKING_ENABLED = False
 
 # --- Aspect Ratio Bucketing ---
 SHOULD_UPSCALE = False
 TARGET_PIXEL_AREA = 1048576  # 1024*1024
 MAX_AREA_TOLERANCE = 1.1     # Note: Present in GUI, but training relies purely on optimal SDXL buckets
+MULTI_BUCKET_ENABLED = False
+MULTI_BUCKET_EXTRA_BUCKETS = 0
 
 # --- Core Training Parameters ---
 PREDICTION_TYPE = "v_prediction"
@@ -106,6 +107,7 @@ MEMORY_EFFICIENT_ATTENTION = "sdpa"
 TIMESTEP_MODE = "Wave"
 
 # --- VAE Configuration ---
+VAE_NORMALIZATION_MODE = "scalar"  # scalar or flux_bn32 (ComfyUI Flux 32ch BN layout)
 VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this

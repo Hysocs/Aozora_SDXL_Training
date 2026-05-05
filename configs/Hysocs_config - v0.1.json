@@ -6,8 +6,6 @@
     "RESUME_STATE_PATH": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained/training_state_step_4150.pt",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 4,
-    "UNCONDITIONAL_DROPOUT": true,
-    "UNCONDITIONAL_DROPOUT_CHANCE": 0.15000000000000002,
     "SHOULD_UPSCALE": true,
     "TARGET_PIXEL_AREA": "1048576",
     "MAX_AREA_TOLERANCE": "1.0",

@@ -11,6 +11,7 @@ import zlib
 from pathlib import Path
 from collections import deque
 from datetime import datetime
+from itertools import islice
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
@@ -823,6 +824,7 @@ class GraphPanel(QtWidgets.QWidget):
         self.fill_enabled = True
         self.zoom_level = 1.0
         self.pan_offset = 0
+        self._dirty_bounds = True
 
     def _graph_rect(self):
         return QtCore.QRect(self.padding['left'], self.padding['top'],
@@ -846,20 +848,27 @@ class GraphPanel(QtWidgets.QWidget):
             line['data'].append((x, y))
             line['smoothing_window'].append(y)
             line['smoothed_data'].append((x, sum(line['smoothing_window']) / len(line['smoothing_window'])))
+            self._dirty_bounds = True
 
     def clear_all_data(self):
         for line in self.lines:
             line['data'].clear(); line['smoothed_data'].clear(); line['smoothing_window'].clear()
         self.pan_offset = 0
+        self._dirty_bounds = True
         self._update_bounds()
         self.update()
 
-    def _get_visible_slice(self, data_deque):
-        if not data_deque: return []
+    def _get_visible_range(self, data_deque):
+        if not data_deque: return 0, 0
         total = len(data_deque)
         visible = max(2, int(total / self.zoom_level))
         end = min(self.pan_offset + visible, total)
-        return list(data_deque)[self.pan_offset:end]
+        return self.pan_offset, end
+
+    def _get_visible_slice(self, data_deque):
+        if not data_deque: return []
+        start, end = self._get_visible_range(data_deque)
+        return list(islice(data_deque, start, end))
 
     def _sample_visible_pairs(self, raw, smoothed, max_points):
         count = min(len(raw), len(smoothed))
@@ -890,16 +899,51 @@ class GraphPanel(QtWidgets.QWidget):
 
         return sampled_raw, sampled_smoothed
 
+    def _make_screen_bins(self, raw, smoothed, rect):
+        count = min(len(raw), len(smoothed))
+        if count < 2:
+            return []
+
+        x_span = self.x_max - self.x_min or 1
+        pixel_bins = {}
+        for i in range(count):
+            x = raw[i][0]
+            y = raw[i][1] * (1 - self.smoothing_level) + smoothed[i][1] * self.smoothing_level
+            px = int(rect.left() + ((x - self.x_min) / x_span) * rect.width())
+            if px < rect.left() or px > rect.right():
+                continue
+            bucket = pixel_bins.get(px)
+            if bucket is None:
+                pixel_bins[px] = [x, y, y, y, 1]
+            else:
+                bucket[0] = x
+                bucket[1] = min(bucket[1], y)
+                bucket[2] = max(bucket[2], y)
+                bucket[3] += y
+                bucket[4] += 1
+
+        mean_points = []
+        for px in sorted(pixel_bins):
+            x, _y_min, _y_max, y_sum, n = pixel_bins[px]
+            x_screen = float(px)
+            mean_points.append(QtCore.QPointF(x_screen, self._to_screen(x, y_sum / n).y()))
+        return mean_points
+
     def _update_bounds(self):
-        all_y, visible_data = [], []
+        all_y, all_x = [], []
         for line in self.lines:
-            vis = self._get_visible_slice(line['data'])
-            if vis:
-                visible_data = vis
-                all_y.extend(y for _, y in vis)
-        if visible_data:
-            self.x_min = visible_data[0][0]
-            self.x_max = visible_data[-1][0]
+            raw = self._get_visible_slice(line['data'])
+            smo = self._get_visible_slice(line['smoothed_data'])
+            count = min(len(raw), len(smo))
+            if count:
+                all_x.extend(raw[i][0] for i in range(count))
+                all_y.extend(
+                    raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level
+                    for i in range(count)
+                )
+        if all_x:
+            self.x_min = min(all_x)
+            self.x_max = max(all_x)
             if all_y:
                 yr = max(all_y) - min(all_y) or 1
                 self.y_min = min(all_y) - yr * 0.05
@@ -909,6 +953,7 @@ class GraphPanel(QtWidgets.QWidget):
         else:
             self.x_min, self.x_max = 0, 100
             self.y_min, self.y_max = 0, 1
+        self._dirty_bounds = False
 
     def _to_screen(self, x, y):
         gw = self.width() - self.padding['left'] - self.padding['right']
@@ -920,6 +965,8 @@ class GraphPanel(QtWidgets.QWidget):
         return QtCore.QPointF(sx, sy)
 
     def paintEvent(self, event):
+        if self._dirty_bounds:
+            self._update_bounds()
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
         painter.fillRect(self.rect(), self.bg_color)
@@ -965,14 +1012,20 @@ class GraphPanel(QtWidgets.QWidget):
             raw = self._get_visible_slice(line['data'])
             smo = self._get_visible_slice(line['smoothed_data'])
             if len(raw) < 2 or len(raw) != len(smo): continue
-            raw, smo = self._sample_visible_pairs(raw, smo, max_points)
-            pts = [self._to_screen(raw[i][0], raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level)
-                   for i in range(len(raw))]
+            dense_view = len(raw) > max_points
+            if dense_view:
+                pts = self._make_screen_bins(raw, smo, rect)
+            else:
+                raw, smo = self._sample_visible_pairs(raw, smo, max_points)
+                pts = [self._to_screen(raw[i][0], raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level)
+                       for i in range(len(raw))]
+            if len(pts) < 2:
+                continue
             if self.fill_enabled:
                 poly = QtGui.QPolygonF(pts)
                 poly.append(QtCore.QPointF(pts[-1].x(), rect.bottom()))
                 poly.append(QtCore.QPointF(pts[0].x(), rect.bottom()))
-                fc = QtGui.QColor(line['color']); fc.setAlpha(40)
+                fc = QtGui.QColor(line['color']); fc.setAlpha(18 if dense_view else 40)
                 painter.setBrush(fc); painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawPolygon(poly)
             painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
@@ -1001,10 +1054,25 @@ class GraphPanel(QtWidgets.QWidget):
         if abs(v) < 1: return f"{v:.4f}"
         return f"{v:.2f}"
 
-    def set_smoothing(self, v): self.smoothing_level = v / 100.0; self.update()
+    def set_smoothing(self, v):
+        self.smoothing_level = v / 100.0
+        self._dirty_bounds = True
+        self.update()
     def set_fill(self, e): self.fill_enabled = e; self.update()
-    def set_zoom(self, v): self.zoom_level = v / 100.0; self._update_bounds(); self.update()
-    def set_pan(self, v): self.pan_offset = v; self._update_bounds(); self.update()
+    def set_zoom(self, v):
+        new_zoom = v / 100.0
+        if math.isclose(self.zoom_level, new_zoom):
+            return
+        self.zoom_level = new_zoom
+        self._dirty_bounds = True
+        self.update()
+
+    def set_pan(self, v):
+        if self.pan_offset == v:
+            return
+        self.pan_offset = v
+        self._dirty_bounds = True
+        self.update()
 
     def get_pan_range(self):
         if not self.lines or not self.lines[0]['data']: return 0, 0, 1
@@ -1016,7 +1084,7 @@ class GraphPanel(QtWidgets.QWidget):
 class LiveMetricsWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_points = 20000
+        self.max_points = 200000
         self.pending_update = False
         self.update_timer = QtCore.QTimer()
         self.update_timer.timeout.connect(self._perform_update)
@@ -1070,6 +1138,8 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         scrollbar.blockSignals(False)
         scrollbar.setVisible(zoom_value > 100)
         graph.set_pan(scrollbar.value())
+        if graph._dirty_bounds:
+            graph.update()
 
     def _add_line(self, graph_name, line_name, color, linewidth=2):
         g = self.graphs[graph_name]
@@ -2096,16 +2166,17 @@ UI_DEFS = {
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
-    "UNCONDITIONAL_DROPOUT":       ("Use Null Caption Dropout", "Enable empty-prompt conditioning dropout during training and cache the null embedding.", "check"),
-    "CAPTION_SHUFFLE_ENABLED":     ("Use Caption Shuffling", "Enable cached shuffled-caption variants for tag-order augmentation during training.", "check"),
-    "CAPTION_SHUFFLE_VARIANTS":    ("Shuffle Variants", "Number of cached shuffled full-caption embeddings per image.", "spin", 0, 16),
-    "CAPTION_SHUFFLE_KEEP_FIRST":  ("Keep First Tags", "Number of leading tags to preserve before shuffling the rest.", "spin", 0, 32),
-    "CAPTION_TAG_SEPARATOR":       ("Tag Separator", "Separator used to split captions into tags for cached shuffles.", "line"),
-    "UNCONDITIONAL_DROPOUT_CHANCE":("Null Chance", "Probability (0.0-1.0) of using empty-prompt embeddings for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
-    "CAPTION_SHUFFLE_CHANCE":      ("Shuffle Chance", "Probability (0.0-1.0) of using one cached shuffled-caption embedding when available.", "dspin", 0.0, 1.0, 0.05, 2),
+    "UNCONDITIONAL_DROPOUT":       ("Use Null Conditioning Dropout", "At random, train a sample with empty-prompt conditioning instead of its caption.", "check"),
+    "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
+    "TEXT_CONDITIONING_SCALE_ENABLED": ("Use Soft Text Conditioning", "Randomly dull caption conditioning by interpolating caption embeddings toward empty-prompt embeddings.", "check"),
+    "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
+    "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Keep at 1.0 to still include full-strength captions.", "dspin", 0.0, 1.0, 0.05, 2),
+    "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
     "TARGET_PIXEL_AREA":           ("Target Pixel Area", "e.g., 1024*1024=1048576.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
     "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
+    "MULTI_BUCKET_ENABLED":        ("Use Multi-Bucket Cache", "Cache each image into nearby bucket resolutions so concepts are less tied to one aspect ratio.", "check"),
+    "MULTI_BUCKET_EXTRA_BUCKETS":  ("Extra Buckets Per Image", "Maximum number of additional nearby buckets to cache per image. Higher values increase cache time and disk use.", "spin", 0, 8),
     "PREDICTION_TYPE":             ("Prediction Type", "v_prediction, epsilon, or rectified_flow.", "combo", ["epsilon", "v_prediction", "rectified_flow"]),
     "MAX_TRAIN_STEPS":             ("Max Training Steps", "Total number of training steps.", "line"),
     "BATCH_SIZE":                  ("Batch Size", "Number of samples per batch.", "spin", 1, 32),
@@ -2121,6 +2192,7 @@ UI_DEFS = {
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "DestinationLoss"]),
+    "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
     "VAE_LATENT_CHANNELS":         ("Latent Channels", "4 for Standard/EQ, 32 for Flux/NoobAI.", "spin", 4, 128),
@@ -2353,6 +2425,8 @@ class TrainingGUI(QtWidgets.QWidget):
         elif isinstance(w, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = w.value()
         elif isinstance(w, LRCurveWidget): self.current_config[key] = w.get_points()
         elif isinstance(w, TimestepHistogramWidget): self.current_config[key] = w.get_allocation()
+        if key == "VAE_NORMALIZATION_MODE":
+            self._update_vae_normalization_controls()
 
     def _set_widget(self, key, value):
         w = self.widgets.get(key)
@@ -2361,7 +2435,13 @@ class TrainingGUI(QtWidgets.QWidget):
         if isinstance(w, QtWidgets.QLineEdit): w.setText(str(value))
         elif isinstance(w, QtWidgets.QPlainTextEdit): w.setPlainText(str(value))
         elif isinstance(w, QtWidgets.QCheckBox): w.setChecked(bool(value))
-        elif isinstance(w, QtWidgets.QComboBox): w.setCurrentText(str(value))
+        elif isinstance(w, QtWidgets.QComboBox):
+            text = str(value)
+            idx = w.findText(text)
+            if idx < 0:
+                idx = next((i for i in range(w.count()) if w.itemText(i).split()[0] == text), -1)
+            if idx >= 0:
+                w.setCurrentIndex(idx)
         elif isinstance(w, QtWidgets.QDoubleSpinBox): w.setValue(float(value))
         elif isinstance(w, QtWidgets.QSpinBox): w.setValue(int(value))
         w.blockSignals(False)
@@ -2510,8 +2590,9 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_vae_group())
         for title, keys in [
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "NUM_WORKERS"]),
-            ("Caption Cache Options", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "CAPTION_SHUFFLE_ENABLED", "CAPTION_SHUFFLE_VARIANTS", "CAPTION_SHUFFLE_CHANCE", "CAPTION_SHUFFLE_KEEP_FIRST", "CAPTION_TAG_SEPARATOR"]),
-            ("Aspect Ratio Bucketing", ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE"]),
+            ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]),
+            ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
+            ("Aspect Ratio Bucketing", ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
         ]:
             settings_lay.addWidget(self._form_group(title, keys))
         settings_lay.addStretch(1)
@@ -2529,18 +2610,25 @@ class TrainingGUI(QtWidgets.QWidget):
         if "MAX_AREA_TOLERANCE" in self.widgets:
             self._connect_widget_signal("SHOULD_UPSCALE", "stateChanged",
                                         lambda s: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(s)))
+        if "MULTI_BUCKET_EXTRA_BUCKETS" in self.widgets:
+            self._connect_widget_signal("MULTI_BUCKET_ENABLED", "stateChanged",
+                                        lambda s: self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(bool(s)))
         if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
             self._connect_widget_signal("UNCONDITIONAL_DROPOUT", "stateChanged",
                                         lambda s: self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(bool(s)))
-        self._connect_widget_signal("CAPTION_SHUFFLE_ENABLED", "stateChanged", self._update_caption_shuffle_controls)
-        if "CAPTION_SHUFFLE_VARIANTS" in self.widgets and "CAPTION_SHUFFLE_CHANCE" in self.widgets:
-            spin = self.widgets["CAPTION_SHUFFLE_VARIANTS"]
-            spin.valueChanged.connect(self._update_caption_shuffle_controls)
-            if "CAPTION_SHUFFLE_KEEP_FIRST" in self.widgets:
-                spin.valueChanged.connect(lambda _: self._sync_widget("CAPTION_SHUFFLE_KEEP_FIRST"))
-            if "CAPTION_TAG_SEPARATOR" in self.widgets:
-                spin.valueChanged.connect(lambda _: self._sync_widget("CAPTION_TAG_SEPARATOR"))
-            self._update_caption_shuffle_controls()
+        if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
+            self._connect_widget_signal("TEXT_CONDITIONING_SCALE_ENABLED", "stateChanged",
+                                        lambda _: self._update_text_conditioning_scale_controls())
+            self._update_text_conditioning_scale_controls()
+
+    def _update_text_conditioning_scale_controls(self):
+        enabled = (
+            "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets and
+            self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].isChecked()
+        )
+        for key in ["TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(enabled)
 
     def _build_architecture_group(self):
         mode_gb, mode_lay = group_box("Architecture & Prediction", QtWidgets.QVBoxLayout)
@@ -2626,22 +2714,6 @@ class TrainingGUI(QtWidgets.QWidget):
         ]:
             self._connect_widget_signal(*args)
         self._update_lr_button_states(-1)
-
-    def _update_caption_shuffle_controls(self):
-        enabled = (
-            "CAPTION_SHUFFLE_ENABLED" in self.widgets and
-            self.widgets["CAPTION_SHUFFLE_ENABLED"].isChecked() and
-            "CAPTION_SHUFFLE_VARIANTS" in self.widgets and
-            self.widgets["CAPTION_SHUFFLE_VARIANTS"].value() > 0
-        )
-        for key in ["CAPTION_SHUFFLE_CHANCE", "CAPTION_SHUFFLE_KEEP_FIRST", "CAPTION_TAG_SEPARATOR"]:
-            if key in self.widgets:
-                self.widgets[key].setEnabled(enabled)
-        if "CAPTION_SHUFFLE_VARIANTS" in self.widgets:
-            self.widgets["CAPTION_SHUFFLE_VARIANTS"].setEnabled(
-                "CAPTION_SHUFFLE_ENABLED" in self.widgets and
-                self.widgets["CAPTION_SHUFFLE_ENABLED"].isChecked()
-            )
 
     def _build_path_group(self):
         gb, lay = group_box("File & Directory Paths", QtWidgets.QVBoxLayout)
@@ -2893,15 +2965,18 @@ class TrainingGUI(QtWidgets.QWidget):
     def _build_vae_group(self):
         gb, lay = group_box("VAE Configuration")
         form = QtWidgets.QFormLayout()
-        self._add_form_keys(form, ["VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"])
+        self._add_form_keys(form, ["VAE_NORMALIZATION_MODE", "VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"])
+        self.widgets["VAE_NORMALIZATION_MODE"].currentTextChanged.connect(lambda _: self._update_vae_normalization_controls())
+        self._update_vae_normalization_controls()
         lay.addLayout(form)
         lay.addWidget(make_label("Presets:", color=ACCENT, bold=True))
         preset_grid = QtWidgets.QGridLayout()
         preset_grid.setSpacing(8)
         for idx, (label, args) in enumerate([
-            ("Standard SDXL", (0.0, 0.13025, 4)),
-            ("Flux/NoobAI (32ch)", (0.0760, 0.6043, 32)),
-            ("EQ VAE", (0.1726, 0.1280, 4)),
+            ("Standard SDXL", (0.0, 0.13025, 4, "scalar")),
+            ("Flux BN32", (0.0, 1.0, 32, "flux_bn32")),
+            ("Flux/NoobAI Scalar", (0.0760, 0.6043, 32, "scalar")),
+            ("EQ VAE", (0.1726, 0.1280, 4, "scalar")),
         ]):
             preset_grid.addWidget(make_btn(label, lambda _, a=args: self._apply_vae_preset(*a)), idx // 2, idx % 2)
         lay.addLayout(preset_grid)
@@ -2911,11 +2986,26 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addWidget(detect_btn)
         return gb
 
-    def _apply_vae_preset(self, shift, scale, channels):
+    def _apply_vae_preset(self, shift, scale, channels, mode="scalar"):
+        mode_idx = next((i for i in range(self.widgets["VAE_NORMALIZATION_MODE"].count())
+                         if self.widgets["VAE_NORMALIZATION_MODE"].itemText(i).split()[0] == mode), -1)
+        if mode_idx >= 0:
+            self.widgets["VAE_NORMALIZATION_MODE"].setCurrentIndex(mode_idx)
         self.widgets["VAE_SHIFT_FACTOR"].setValue(shift)
         self.widgets["VAE_SCALING_FACTOR"].setValue(scale)
         self.widgets["VAE_LATENT_CHANNELS"].setValue(channels)
-        self.log(f"Applied VAE Preset: Shift={shift}, Scale={scale}, Ch={channels}")
+        self._update_vae_normalization_controls()
+        self.log(f"Applied VAE Preset: Mode={mode}, Shift={shift}, Scale={scale}, Ch={channels}")
+
+    def _update_vae_normalization_controls(self):
+        if not all(key in self.widgets for key in ["VAE_NORMALIZATION_MODE", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"]):
+            return
+        uses_scalar = self.widgets["VAE_NORMALIZATION_MODE"].currentText() == "scalar"
+        for key in ["VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"]:
+            self.widgets[key].setEnabled(uses_scalar)
+            self.widgets[key].setToolTip(
+                UI_DEFS[key][1] if uses_scalar else "Ignored unless VAE normalization is scalar."
+            )
 
     def launch_vae_detector(self):
         idx = self.config_dropdown.currentIndex()
@@ -3158,12 +3248,15 @@ class TrainingGUI(QtWidgets.QWidget):
 
             if "SHOULD_UPSCALE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
+            if "MULTI_BUCKET_ENABLED" in self.widgets:
+                self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(self.widgets["MULTI_BUCKET_ENABLED"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
-            if "CAPTION_SHUFFLE_VARIANTS" in self.widgets:
-                self._update_caption_shuffle_controls()
+            if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
+                self._update_text_conditioning_scale_controls()
             if "VAE_PATH" in self.widgets:
                 self._set_optional_vae_visible(bool(self.widgets["VAE_PATH"].text().strip()))
+            self._update_vae_normalization_controls()
 
             self._update_and_clamp_lr_graph()
 
@@ -3238,8 +3331,10 @@ class TrainingGUI(QtWidgets.QWidget):
             "weight_decay": self.widgets["VELORMS_weight_decay"].value(),
             "eps": veps,
         }
+        vae_norm_mode = self.widgets["VAE_NORMALIZATION_MODE"].currentText().split()[0]
+        cfg["VAE_NORMALIZATION_MODE"] = vae_norm_mode
         for key in ["VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"]:
-            cfg[key] = self.widgets[key].value()
+            cfg[key] = None if vae_norm_mode == "flux_bn32" else self.widgets[key].value()
         cfg["VAE_LATENT_CHANNELS"] = self.widgets["VAE_LATENT_CHANNELS"].value()
         return cfg
 

@@ -15,6 +15,7 @@ from torch.optim import Optimizer
 from torch.utils.data import Dataset, DataLoader, Sampler
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL, FlowMatchEulerDiscreteScheduler, DDPMScheduler, UNet2DConditionModel
 from diffusers.optimization import get_scheduler
+from safetensors import safe_open
 from safetensors.torch import save_file, load_file
 from PIL import Image, TiffImagePlugin, ImageFile, ImageOps
 from torchvision import transforms
@@ -44,6 +45,18 @@ Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+
+FLUX_BN_EPS = 1e-4
+BN_MEAN_SUFFIXES = [
+    "bn.running_mean",
+    "normalize.bn.running_mean",
+    "normalize.running_mean",
+]
+BN_VAR_SUFFIXES = [
+    "bn.running_var",
+    "normalize.bn.running_var",
+    "normalize.running_var",
+]
 
 
 def set_attention_processor(unet, attention_mode="flash_attn"):
@@ -312,14 +325,45 @@ class BucketBatchSampler(Sampler):
             buckets = defaultdict(list)
             for idx in indices:
                 buckets[self.dataset.bucket_keys[idx]].append(idx)
-            batches = []
-            for key in buckets:
+
+            bucket_batches = {}
+            for key in sorted(buckets):
                 bucket_indices = buckets[key]
-                for i in range(0, len(bucket_indices), self.batch_size):
-                    batches.append(bucket_indices[i:i + self.batch_size])
+                chunks = [
+                    bucket_indices[i:i + self.batch_size]
+                    for i in range(0, len(bucket_indices), self.batch_size)
+                ]
+                if self.shuffle and len(chunks) > 1:
+                    chunk_order = torch.randperm(len(chunks), generator=g).tolist()
+                    chunks = [chunks[i] for i in chunk_order]
+                bucket_batches[key] = chunks
+
             if self.shuffle:
-                batch_indices = torch.randperm(len(batches), generator=g).tolist()
-                batches = [batches[i] for i in batch_indices]
+                batches = []
+                last_key = None
+                while bucket_batches:
+                    candidates = [key for key in bucket_batches if key != last_key]
+                    if not candidates:
+                        candidates = list(bucket_batches)
+
+                    max_remaining = max(len(bucket_batches[key]) for key in candidates)
+                    top_candidates = [
+                        key for key in candidates
+                        if len(bucket_batches[key]) == max_remaining
+                    ]
+                    key_index = torch.randint(len(top_candidates), (1,), generator=g).item()
+                    key = top_candidates[key_index]
+
+                    batches.append(bucket_batches[key].pop(0))
+                    last_key = key
+                    if not bucket_batches[key]:
+                        del bucket_batches[key]
+            else:
+                batches = [
+                    batch
+                    for key in sorted(bucket_batches)
+                    for batch in bucket_batches[key]
+                ]
 
         self.epoch += 1
         yield from batches
@@ -370,6 +414,52 @@ def get_optimal_bucket(orig_w, orig_h, target_area=None, stride=64):
     
     return best_bucket
 
+def get_multi_bucket_resolutions(orig_w, orig_h, target_area=None, should_upscale=False, max_extra=0):
+    primary = get_optimal_bucket(orig_w, orig_h, target_area, 64)
+    if max_extra <= 0:
+        return [primary]
+
+    orig_ar = orig_w / max(orig_h, 1)
+    if target_area is None:
+        target_area = 1024 * 1024
+
+    def bucket_score(bucket):
+        bw, bh = bucket
+        bucket_ar = bw / max(bh, 1)
+        bucket_area = bw * bh
+        ar_error = abs(bucket_ar - orig_ar) / max(orig_ar, 0.01)
+        area_error = abs(math.log(bucket_area / target_area)) if bucket_area > 0 and target_area > 0 else 100.0
+        return ar_error * 10.0 + area_error
+
+    candidates = []
+    for bucket in STANDARD_SDXL_BUCKETS:
+        if bucket == primary:
+            continue
+        bw, bh = bucket
+        if not should_upscale and bw > orig_w and bh > orig_h:
+            continue
+        candidates.append(bucket)
+
+    candidates.sort(key=bucket_score)
+    return [primary] + candidates[:max_extra]
+
+def make_bucket_variant_metadata(base_meta, target_w, target_h, variant_index=0):
+    orig_w, orig_h = base_meta["original_size"]
+    scale = max(target_w / max(orig_w, 1), target_h / max(orig_h, 1))
+    scaled_w = int(round(orig_w * scale))
+    scaled_h = int(round(orig_h * scale))
+    crop_left = max(0, (scaled_w - target_w) // 2)
+    crop_top = max(0, (scaled_h - target_h) // 2)
+    meta = dict(base_meta)
+    meta.update({
+        "target_resolution": (target_w, target_h),
+        "scaled_size": (scaled_w, scaled_h),
+        "crop_coords": (crop_top, crop_left),
+        "bucket_variant_index": variant_index,
+        "cache_suffix": "" if variant_index == 0 else f"_mb{variant_index}",
+    })
+    return meta
+
 def smart_resize(image, target_w, target_h):
     orig_w, orig_h = image.size
     scale_x = target_w / max(orig_w, 1)
@@ -416,13 +506,7 @@ def validate_and_assign_resolution(args):
         crop_left = max(0, (scaled_w - target_w) // 2)
         crop_top = max(0, (scaled_h - target_h) // 2)
 
-        cp = ip.with_suffix('.txt')
-        caption = ip.stem.replace('_', ' ')
-        if cp.exists():
-            with open(cp, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read().strip()
-                if content: 
-                    caption = content
+        caption = read_caption_for_image(ip)
 
         return {
             "ip": ip, 
@@ -439,58 +523,165 @@ def validate_and_assign_resolution(args):
         print(f"\n[CORRUPT IMAGE OR READ ERROR] Skipping {ip}, Reason: {e}")
         return None
 
-def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device):
+def caption_chunking_enabled(config):
+    return bool(getattr(config, "CAPTION_CHUNKING_ENABLED", False))
+
+
+def read_caption_for_image(ip):
+    cp = ip.with_suffix('.txt')
+    caption = ip.stem.replace('_', ' ')
+    if cp.exists():
+        with open(cp, 'r', encoding='utf-8', errors='ignore') as f:
+            content = f.read().strip()
+            if content:
+                caption = content
+    return caption
+
+
+def get_tokenizer_max_length(tokenizer):
+    return int(getattr(tokenizer, "model_max_length", 77) or 77)
+
+
+def get_caption_token_ids(tokenizer, caption):
+    tokenized = tokenizer(caption, add_special_tokens=False, truncation=False)
+    input_ids = tokenized.input_ids
+    if input_ids and isinstance(input_ids[0], list):
+        input_ids = input_ids[0]
+    return input_ids
+
+
+def get_caption_chunk_count(caption, tokenizer):
+    max_len = get_tokenizer_max_length(tokenizer)
+    chunk_payload_len = max(1, max_len - 2)
+    return max(1, math.ceil(len(get_caption_token_ids(tokenizer, caption)) / chunk_payload_len))
+
+
+def get_max_caption_chunks_for_config(config, t1, t2):
+    if not caption_chunking_enabled(config):
+        return 1
+
+    max_chunks = 1
+    for dataset in config.INSTANCE_DATASETS:
+        root = Path(dataset["path"])
+        if not root.exists():
+            continue
+        for ip in (p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")):
+            caption = read_caption_for_image(ip)
+            max_chunks = max(
+                max_chunks,
+                get_caption_chunk_count(caption, t1),
+                get_caption_chunk_count(caption, t2),
+            )
+    return max_chunks
+
+
+def build_chunked_token_tensor(tokenizer, caption, total_chunks, device):
+    max_len = get_tokenizer_max_length(tokenizer)
+    payload_len = max(1, max_len - 2)
+    bos = tokenizer.bos_token_id
+    eos = tokenizer.eos_token_id
+    pad = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else eos
+    ids = get_caption_token_ids(tokenizer, caption)
+
+    chunks = []
+    for i in range(max(1, int(total_chunks or 1))):
+        payload = ids[i * payload_len:(i + 1) * payload_len]
+        chunk = [bos] + payload + [eos]
+        chunk += [pad] * (max_len - len(chunk))
+        chunks.append(chunk[:max_len])
+    return torch.tensor(chunks, dtype=torch.long, device=device)
+
+
+def encode_caption_chunks_sdxl(caption, t1, t2, te1, te2, device, total_chunks):
+    tokens_1 = build_chunked_token_tensor(t1, caption, total_chunks, device)
+    tokens_2 = build_chunked_token_tensor(t2, caption, total_chunks, device)
+    enc_1_output = te1(tokens_1, output_hidden_states=True)
+    enc_2_output = te2(tokens_2, output_hidden_states=True)
+    hidden_1 = enc_1_output.hidden_states[-2].reshape(1, -1, enc_1_output.hidden_states[-2].shape[-1])
+    hidden_2 = enc_2_output.hidden_states[-2].reshape(1, -1, enc_2_output.hidden_states[-2].shape[-1])
+    return torch.cat([hidden_1, hidden_2], dim=-1), enc_2_output[0][:1]
+
+
+def compute_text_embeddings_sdxl(captions, t1, t2, te1, te2, device, allow_chunking=False, total_chunks=None):
     prompt_embeds_list, pooled_prompt_embeds_list = [], []
+    if allow_chunking:
+        if total_chunks is None:
+            total_chunks = max(
+                1,
+                *(max(get_caption_chunk_count(caption, t1), get_caption_chunk_count(caption, t2)) for caption in captions),
+            )
+        total_chunks = max(1, int(total_chunks))
     for caption in captions:
         with torch.no_grad():
-            tokens_1 = t1(caption, padding="max_length", max_length=t1.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
-            tokens_2 = t2(caption, padding="max_length", max_length=t2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
-            enc_1_output = te1(tokens_1, output_hidden_states=True)
-            enc_2_output = te2(tokens_2, output_hidden_states=True)
-            prompt_embeds_list.append(torch.cat([enc_1_output.hidden_states[-2], enc_2_output.hidden_states[-2]], dim=-1))
-            pooled_prompt_embeds_list.append(enc_2_output[0])
+            if allow_chunking:
+                prompt_embeds, pooled_prompt_embeds = encode_caption_chunks_sdxl(caption, t1, t2, te1, te2, device, total_chunks)
+            else:
+                tokens_1 = t1(caption, padding="max_length", max_length=t1.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
+                tokens_2 = t2(caption, padding="max_length", max_length=t2.model_max_length, truncation=True, return_tensors="pt").input_ids.to(device)
+                enc_1_output = te1(tokens_1, output_hidden_states=True)
+                enc_2_output = te2(tokens_2, output_hidden_states=True)
+                prompt_embeds = torch.cat([enc_1_output.hidden_states[-2], enc_2_output.hidden_states[-2]], dim=-1)
+                pooled_prompt_embeds = enc_2_output[0]
+            prompt_embeds_list.append(prompt_embeds)
+            pooled_prompt_embeds_list.append(pooled_prompt_embeds)
     return torch.cat(prompt_embeds_list, dim=0), torch.cat(pooled_prompt_embeds_list, dim=0)
 
+def get_text_conditioning_scale_range(config):
+    if not bool(getattr(config, "TEXT_CONDITIONING_SCALE_ENABLED", False)):
+        return 1.0, 1.0
+    min_scale = float(getattr(config, "TEXT_CONDITIONING_SCALE_MIN", 1.0))
+    max_scale = float(getattr(config, "TEXT_CONDITIONING_SCALE_MAX", 1.0))
+    min_scale = min(max(min_scale, 0.0), 1.0)
+    max_scale = min(max(max_scale, 0.0), 1.0)
+    if min_scale > max_scale:
+        min_scale, max_scale = max_scale, min_scale
+    return min_scale, max_scale
+
+def text_conditioning_scale_enabled(config):
+    min_scale, max_scale = get_text_conditioning_scale_range(config)
+    return min_scale < 1.0 or max_scale < 1.0
+
+def null_conditioning_cache_needed(config):
+    return bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)) or text_conditioning_scale_enabled(config)
+
 def get_caption_cache_options(config):
-    shuffle_enabled = bool(getattr(config, "CAPTION_SHUFFLE_ENABLED", False))
+    vae_source = get_vae_source_for_config(config)
+    vae_source_path = ""
+    vae_source_size = None
+    vae_source_mtime_ns = None
+    if vae_source:
+        try:
+            vae_source_resolved = Path(vae_source).resolve()
+            vae_source_path = str(vae_source_resolved)
+            if vae_source_resolved.exists():
+                stat = vae_source_resolved.stat()
+                vae_source_size = stat.st_size
+                vae_source_mtime_ns = stat.st_mtime_ns
+        except OSError:
+            vae_source_path = str(vae_source)
+
     return {
-        "version": 3,
+        "version": 10,
         "unconditional_dropout": bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)),
-        "caption_shuffle_enabled": shuffle_enabled,
-        "caption_shuffle_variants": int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0) if shuffle_enabled else 0,
-        "caption_shuffle_keep_first": int(getattr(config, "CAPTION_SHUFFLE_KEEP_FIRST", 1) or 0),
-        "caption_tag_separator": str(getattr(config, "CAPTION_TAG_SEPARATOR", ",") or ","),
+        "caption_chunking_enabled": caption_chunking_enabled(config),
+        "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
+        "multi_bucket_extra_buckets": int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0) if getattr(config, "MULTI_BUCKET_ENABLED", False) else 0,
+        "vae_normalization_mode": getattr(config, "VAE_NORMALIZATION_MODE", "scalar"),
         "vae_shift_factor": getattr(config, "VAE_SHIFT_FACTOR", None),
         "vae_scaling_factor": getattr(config, "VAE_SCALING_FACTOR", None),
         "vae_latent_channels": getattr(config, "VAE_LATENT_CHANNELS", None),
         "vae_path": str(getattr(config, "VAE_PATH", "") or ""),
+        "vae_source_path": vae_source_path,
+        "vae_source_size": vae_source_size,
+        "vae_source_mtime_ns": vae_source_mtime_ns,
     }
-
-def build_caption_variants(caption, config, seed_key):
-    variants = [("original", caption)]
-    separator = str(getattr(config, "CAPTION_TAG_SEPARATOR", ",") or ",")
-    parts = [p.strip() for p in caption.split(separator)]
-    parts = [p for p in parts if p]
-
-    shuffle_count = max(0, int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0)) if getattr(config, "CAPTION_SHUFFLE_ENABLED", False) else 0
-    if len(parts) > 1 and shuffle_count > 0:
-        keep_first = max(0, int(getattr(config, "CAPTION_SHUFFLE_KEEP_FIRST", 1) or 0))
-        keep_first = min(keep_first, len(parts))
-        fixed_parts = parts[:keep_first]
-        shuffle_parts = parts[keep_first:]
-        for i in range(shuffle_count):
-            shuffled = shuffle_parts[:]
-            random.Random(f"{getattr(config, 'SEED', 42)}:{seed_key}:{i}").shuffle(shuffled)
-            variants.append((f"shuffle_{i}", f"{separator} ".join(fixed_parts + shuffled)))
-
-    return variants
 
 def check_if_caching_needed(config):
     needs_caching = False
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
 
-    if getattr(config, "UNCONDITIONAL_DROPOUT", False):
+    if null_conditioning_cache_needed(config):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
             needs_caching = True
 
@@ -512,8 +703,17 @@ def check_if_caching_needed(config):
                 index_data = json.load(f)
             if index_data.get("cache_options") != expected_cache_options:
                 needs_caching = True
-            if any("scaled_size" not in item for item in index_data.get("files", [])):
+            indexed_files = index_data.get("files", [])
+            if any("scaled_size" not in item for item in indexed_files):
                 needs_caching = True
+            if len(indexed_files) < len(image_paths):
+                needs_caching = True
+            for item in indexed_files[: min(len(indexed_files), 10)]:
+                te_path = item.get("te_path")
+                lat_path = item.get("lat_path")
+                if not te_path or not lat_path or not Path(te_path).exists() or not Path(lat_path).exists():
+                    needs_caching = True
+                    break
         except Exception:
             needs_caching = True
 
@@ -524,8 +724,7 @@ def check_if_caching_needed(config):
             for f in cached_te_files[: min(len(cached_te_files), 10)]:
                 try:
                     data_te = torch.load(f, map_location="cpu", weights_only=True)
-                    variants = data_te.get("caption_variants")
-                    if not variants:
+                    if data_te.get("cache_options") != expected_cache_options:
                         needs_caching = True
                         break
                 except Exception:
@@ -590,6 +789,109 @@ def load_vae_robust(path, device, target_channels=None):
         print(f"CRITICAL ERROR: Failed to load VAE: {e}")
         raise e
 
+def find_tensor_by_suffix(safetensors_path, suffixes):
+    with safe_open(str(safetensors_path), framework="pt", device="cpu") as f:
+        keys = list(f.keys())
+        for suffix in suffixes:
+            matches = [k for k in keys if k == suffix or k.endswith("." + suffix)]
+            if matches:
+                key = sorted(matches, key=len)[0]
+                return f.get_tensor(key).float(), key
+    return None, None
+
+def extract_flux_bn_stats_from_safetensor(safetensors_path):
+    mean, mean_key = find_tensor_by_suffix(safetensors_path, BN_MEAN_SUFFIXES)
+    var, var_key = find_tensor_by_suffix(safetensors_path, BN_VAR_SUFFIXES)
+
+    if mean is None or var is None:
+        raise RuntimeError(
+            f"Could not find Flux BN stats in {safetensors_path}. "
+            "Expected keys ending with bn.running_mean and bn.running_var."
+        )
+    if mean.numel() != 128 or var.numel() != 128:
+        raise RuntimeError(
+            f"Flux BN stats found but wrong shape. "
+            f"mean={tuple(mean.shape)}, var={tuple(var.shape)}. Expected 128 elements."
+        )
+
+    print(
+        f"INFO: Loaded Flux VAE BN stats from {Path(safetensors_path).name}\n"
+        f"      mean key: {mean_key}\n"
+        f"      var key:  {var_key}\n"
+        f"      mean range: [{mean.min().item():+.5f}, {mean.max().item():+.5f}]\n"
+        f"      var  range: [{var.min().item():+.5f}, {var.max().item():+.5f}]"
+    )
+    return mean, var
+
+def flux_bn32_to_bn128_layout(latents):
+    if latents.dim() != 4 or latents.shape[1] != 32:
+        raise RuntimeError(f"flux_bn32 expects [N, 32, H, W] latents before BN, got shape {tuple(latents.shape)}")
+    if latents.shape[2] % 2 != 0 or latents.shape[3] % 2 != 0:
+        raise RuntimeError(f"flux_bn32 requires even latent height/width, got shape {tuple(latents.shape)}")
+
+    n, c, h, w = latents.shape
+    return (
+        latents.view(n, c, h // 2, 2, w // 2, 2)
+        .permute(0, 1, 3, 5, 2, 4)
+        .reshape(n, c * 4, h // 2, w // 2)
+    )
+
+def flux_bn128_to_bn32_layout(latents):
+    if latents.dim() != 4 or latents.shape[1] != 128:
+        raise RuntimeError(f"flux_bn32 decode expects [N, 128, H, W] BN latents, got shape {tuple(latents.shape)}")
+
+    n, c, h, w = latents.shape
+    return (
+        latents.view(n, c // 4, 2, 2, h, w)
+        .permute(0, 1, 4, 2, 5, 3)
+        .reshape(n, c // 4, h * 2, w * 2)
+    )
+
+def apply_flux_bn32_norm(latents, mean_128, var_128):
+    latents_bn128 = flux_bn32_to_bn128_layout(latents)
+    mean_128 = mean_128.to(device=latents_bn128.device, dtype=latents_bn128.dtype)
+    var_128 = var_128.to(device=latents_bn128.device, dtype=latents_bn128.dtype)
+    latents_bn128 = F.batch_norm(latents_bn128, mean_128, var_128, training=False, momentum=0.1, eps=FLUX_BN_EPS)
+    return flux_bn128_to_bn32_layout(latents_bn128)
+
+def invert_flux_bn32_norm(latents, mean_128, var_128):
+    latents_bn128 = flux_bn32_to_bn128_layout(latents)
+    mean_128 = mean_128.to(device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1)
+    sigma_128 = torch.sqrt(var_128.to(device=latents.device, dtype=latents.dtype).view(1, -1, 1, 1) + FLUX_BN_EPS)
+    return flux_bn128_to_bn32_layout(latents_bn128 * sigma_128 + mean_128)
+
+def get_vae_source_for_config(config):
+    vae_path = getattr(config, "VAE_PATH", None)
+    if vae_path and Path(vae_path).exists():
+        return vae_path
+    return getattr(config, "SINGLE_FILE_CHECKPOINT_PATH", None)
+
+def denormalize_latents_for_vae_decode(latents, config, vae=None, bn_mean_128=None, bn_var_128=None):
+    mode = str(getattr(config, "VAE_NORMALIZATION_MODE", "scalar")).lower()
+
+    if mode == "flux_bn32":
+        if bn_mean_128 is None or bn_var_128 is None:
+            vae_source = get_vae_source_for_config(config)
+            if not vae_source or not Path(vae_source).exists():
+                raise RuntimeError("VAE_NORMALIZATION_MODE='flux_bn32' requires VAE_PATH or SINGLE_FILE_CHECKPOINT_PATH.")
+            bn_mean_128, bn_var_128 = extract_flux_bn_stats_from_safetensor(vae_source)
+        return invert_flux_bn32_norm(latents, bn_mean_128, bn_var_128)
+
+    if mode != "scalar":
+        raise RuntimeError(f"Unknown VAE_NORMALIZATION_MODE: {mode}")
+
+    shift = getattr(config, "VAE_SHIFT_FACTOR", None)
+    scale = getattr(config, "VAE_SCALING_FACTOR", None)
+    if scale is None and vae is not None:
+        scale = getattr(vae.config, "scaling_factor", 1.0)
+    if shift is None and vae is not None:
+        shift = getattr(vae.config, "shift_factor", None)
+
+    scale = 1.0 if scale is None else scale
+    if shift is not None:
+        return latents / scale + shift
+    return latents / scale
+
 def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     if not check_if_caching_needed(config):
         print("\n" + "="*60 + "\nINFO: Datasets already cached.\n" + "="*60 + "\n")
@@ -602,12 +904,42 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     vae.enable_tiling()
     vae.enable_slicing()
     print(f"INFO: VAE shift={vae.config.shift_factor}, scale={vae.config.scaling_factor}, channels={vae.config.latent_channels}")
+
+    vae_norm_mode = str(getattr(config, "VAE_NORMALIZATION_MODE", "scalar")).lower()
+    bn_mean_128 = None
+    bn_var_128 = None
+    if vae_norm_mode == "flux_bn32":
+        vae_source = get_vae_source_for_config(config)
+        if not vae_source or not Path(vae_source).exists():
+            raise RuntimeError("VAE_NORMALIZATION_MODE='flux_bn32' requires VAE_PATH or SINGLE_FILE_CHECKPOINT_PATH.")
+        bn_mean_128, bn_var_128 = extract_flux_bn_stats_from_safetensor(vae_source)
+        print(
+            "INFO: Using ComfyUI-style Flux BN32 latent normalization\n"
+            "      applies BN in [N,128,H/2,W/2] layout, then stores [N,32,H,W]\n"
+            f"      mean_128 range: [{bn_mean_128.min().item():+.5f}, {bn_mean_128.max().item():+.5f}]\n"
+            f"      var_128 range:  [{bn_var_128.min().item():+.5f}, {bn_var_128.max().item():+.5f}]"
+        )
+    elif vae_norm_mode != "scalar":
+        raise RuntimeError(f"Unknown VAE_NORMALIZATION_MODE: {vae_norm_mode}")
+
     te1.to(device)
     te2.to(device)
+    allow_caption_chunking = caption_chunking_enabled(config)
+    caption_total_chunks = get_max_caption_chunks_for_config(config, t1, t2) if allow_caption_chunking else 1
+    if allow_caption_chunking:
+        print(
+            f"INFO: Caption chunking enabled for cached text embeddings: "
+            f"{caption_total_chunks} chunk(s), {caption_total_chunks * min(get_tokenizer_max_length(t1), get_tokenizer_max_length(t2))} tokens max."
+        )
 
-    if getattr(config, "UNCONDITIONAL_DROPOUT", False):
+    if null_conditioning_cache_needed(config):
         with torch.no_grad():
-            null_embeds, null_pooled = compute_text_embeddings_sdxl([""], t1, t2, te1, te2, device)
+            null_embeds, null_pooled = compute_text_embeddings_sdxl(
+                [""],
+                t1, t2, te1, te2, device,
+                allow_chunking=allow_caption_chunking,
+                total_chunks=caption_total_chunks,
+            )
     else:
         null_embeds, null_pooled = None, None
 
@@ -622,6 +954,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
         paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
+        multi_bucket_extra = (
+            max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
+            if getattr(config, "MULTI_BUCKET_ENABLED", False)
+            else 0
+        )
+        if multi_bucket_extra > 0:
+            print(f"INFO: Multi-bucket cache enabled: up to {multi_bucket_extra} extra bucket(s) per image.")
         force_recaching = True
         index_path = cache_dir / "dataset_index.json"
         if index_path.exists():
@@ -630,6 +969,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     force_recaching = json.load(f).get("cache_options") != expected_cache_options
             except Exception:
                 force_recaching = True
+
+        if force_recaching:
+            stale_files = list(cache_dir.glob("*_te*.pt")) + list(cache_dir.glob("*_lat.pt"))
+            stale_files += [cache_dir / "null_embeds.pt"]
+            for stale_file in stale_files:
+                if not stale_file.exists():
+                    continue
+                try:
+                    stale_file.unlink()
+                except OSError as e:
+                    print(f"WARNING: Could not remove stale cache file {stale_file}: {e}")
 
         to_process = []
         for p in paths:
@@ -641,73 +991,119 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             with Pool(processes=min(cpu_count(), 8)) as pool:
                 results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process]), total=len(to_process)))
 
+            expanded_results = []
+            for m in (r for r in results if r):
+                target_area = (m["original_area"] if not config.SHOULD_UPSCALE and m["original_area"] < config.TARGET_PIXEL_AREA else config.TARGET_PIXEL_AREA)
+                buckets_for_image = get_multi_bucket_resolutions(
+                    m["original_size"][0],
+                    m["original_size"][1],
+                    target_area,
+                    config.SHOULD_UPSCALE,
+                    multi_bucket_extra,
+                )
+                for variant_index, (target_w, target_h) in enumerate(buckets_for_image):
+                    expanded_results.append(make_bucket_variant_metadata(m, target_w, target_h, variant_index))
+
             grouped = defaultdict(list)
-            for m in (r for r in results if r): grouped[m["target_resolution"]].append(m)
+            for m in expanded_results: grouped[m["target_resolution"]].append(m)
 
             batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE]) for res in grouped for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)]
             random.shuffle(batches)
 
-            for batch_idx, ((w, h), batch_meta) in enumerate(tqdm(batches, desc=f"Encoding {root.name}")):
-                images_global, valid_meta_final = [], []
-                for m in batch_meta:
-                    try:
-                        with Image.open(m['ip']) as img:
-                            img_resized = smart_resize(fix_alpha_channel(img), w, h)
-                            images_global.append(transform(img_resized))
-                            valid_meta_final.append(m)
-                    except Exception as e:
-                        tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
+            variants_total_by_image = defaultdict(int)
+            variants_done_by_image = defaultdict(int)
+            started_images = set()
+            for m in expanded_results:
+                variants_total_by_image[str(m["ip"].relative_to(root))] += 1
 
-                if not images_global: continue
+            touched_images = 0
+            total_images = len(variants_total_by_image)
 
-                caption_payloads = []
-                all_variant_captions = []
-                for m in valid_meta_final:
-                    variant_defs = build_caption_variants(m["caption"], config, str(m["ip"].relative_to(root)))
-                    caption_payloads.append(variant_defs)
-                    all_variant_captions.extend([caption for _, caption in variant_defs])
+            def mark_cache_variant_done(meta, progress_bar):
+                nonlocal touched_images
+                image_key = str(meta["ip"].relative_to(root))
+                total_variants = variants_total_by_image[image_key]
+                if total_variants <= 0 or variants_done_by_image[image_key] >= total_variants:
+                    return
+                if image_key not in started_images:
+                    started_images.add(image_key)
+                    touched_images += 1
+                variants_done_by_image[image_key] += 1
+                progress_bar.set_postfix_str(
+                    f"image_step {variants_done_by_image[image_key]}/{total_variants}, images {touched_images}/{total_images}"
+                )
+                progress_bar.update(1)
 
-                embeds_all, pooled_all = compute_text_embeddings_sdxl(all_variant_captions, t1, t2, te1, te2, device)
+            with tqdm(total=len(expanded_results), desc=f"Encoding {root.name}", unit="step") as encode_pbar:
+                for batch_idx, ((w, h), batch_meta) in enumerate(batches):
+                    images_global, valid_meta_final, skipped_meta = [], [], []
+                    for m in batch_meta:
+                        try:
+                            with Image.open(m['ip']) as img:
+                                img_resized = smart_resize(fix_alpha_channel(img), w, h)
+                                images_global.append(transform(img_resized))
+                                valid_meta_final.append(m)
+                        except Exception as e:
+                            skipped_meta.append(m)
+                            tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
 
-                with torch.no_grad():
-                    latents_global = vae.encode(torch.stack(images_global).to(device, dtype=torch.float32)).latent_dist.mean
-                    raw_min, raw_max = latents_global.min().item(), latents_global.max().item()
-                    if getattr(vae.config, 'shift_factor', None) is not None:
-                        latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
-                    else:
-                        latents_global = latents_global * vae.config.scaling_factor
+                    for m in skipped_meta:
+                        mark_cache_variant_done(m, encode_pbar)
 
-                latents_global = latents_global.cpu()
-                shift_val = getattr(vae.config, 'shift_factor', 0.0) or 0.0
-                scale_val = getattr(vae.config, 'scaling_factor', 1.0)
-                orig_sizes = [f"{m['original_size'][0]}x{m['original_size'][1]}" for m in valid_meta_final]
-                tqdm.write(f"[Batch {batch_idx}] [{', '.join(orig_sizes)}] -> {w}x{h} | Raw:[{raw_min:.2f}, {raw_max:.2f}] | VAE Scale:{scale_val}, Shift:{shift_val}")
+                    if not images_global: continue
 
-                for j, m in enumerate(valid_meta_final):
-                    safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_')
-                    variant_count_before = sum(len(payload) for payload in caption_payloads[:j])
-                    caption_variants = {}
-                    for k, (variant_name, variant_caption) in enumerate(caption_payloads[j]):
-                        idx = variant_count_before + k
-                        caption_variants[variant_name] = {
-                            "caption": variant_caption,
-                            "embeds": embeds_all[idx].to(dtype=torch.float32).cpu(),
-                            "pooled": pooled_all[idx].to(dtype=torch.float32).cpu(),
-                        }
+                    embeds_all, pooled_all = compute_text_embeddings_sdxl(
+                        [m["caption"] for m in valid_meta_final],
+                        t1, t2, te1, te2, device,
+                        allow_chunking=allow_caption_chunking,
+                        total_chunks=caption_total_chunks,
+                    )
 
-                    original_variant = caption_variants["original"]
-                    torch.save({
-                        "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
-                        "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
-                        "target_size": (w, h),
-                        "crop_coords": m.get("crop_coords", (0, 0)),
-                        "embeds": original_variant["embeds"], "pooled": original_variant["pooled"],
-                        "caption_variants": caption_variants,
-                        "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
-                    }, cache_dir / f"{safe_filename}_te.pt")
-                    torch.save(latents_global[j].to(dtype=torch.float32).cpu(), cache_dir / f"{safe_filename}_lat.pt")
+                    with torch.no_grad():
+                        latents_global = vae.encode(torch.stack(images_global).to(device, dtype=torch.float32)).latent_dist.mean
+                        raw_min = latents_global.min().item()
+                        raw_max = latents_global.max().item()
+                        raw_mean = latents_global.mean().item()
+                        raw_std = latents_global.std().item()
 
-                if batch_idx % 20 == 0: torch.cuda.empty_cache()
+                        if vae_norm_mode == "flux_bn32":
+                            if latents_global.shape[1] != 32:
+                                raise RuntimeError(
+                                    f"flux_bn32 expects 32-channel latents, got shape {tuple(latents_global.shape)}"
+                                )
+                            latents_global = apply_flux_bn32_norm(latents_global, bn_mean_128, bn_var_128)
+                        elif getattr(vae.config, 'shift_factor', None) is not None:
+                            latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
+                        else:
+                            latents_global = latents_global * vae.config.scaling_factor
+
+                        norm_min = latents_global.min().item()
+                        norm_max = latents_global.max().item()
+                        norm_mean = latents_global.mean().item()
+                        norm_std = latents_global.std().item()
+
+                    latents_global = latents_global.cpu()
+
+                    for j, m in enumerate(valid_meta_final):
+                        safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_') + m.get("cache_suffix", "")
+                        torch.save({
+                            "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
+                            "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
+                            "target_size": (w, h),
+                            "crop_coords": m.get("crop_coords", (0, 0)),
+                            "bucket_variant_index": m.get("bucket_variant_index", 0),
+                            "caption": m["caption"],
+                            "embeds": embeds_all[j].to(dtype=torch.float32).cpu(),
+                            "pooled": pooled_all[j].to(dtype=torch.float32).cpu(),
+                            "cache_options": expected_cache_options,
+                            "vae_normalization_mode": vae_norm_mode,
+                            "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
+                            "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
+                        }, cache_dir / f"{safe_filename}_te.pt")
+                        torch.save(latents_global[j].to(dtype=torch.float32).cpu(), cache_dir / f"{safe_filename}_lat.pt")
+                        mark_cache_variant_done(m, encode_pbar)
+
+                    if batch_idx % 20 == 0: torch.cuda.empty_cache()
                 
         print(f"INFO: Building fast JSON index for {root.name}...")
         index_data = []
@@ -722,13 +1118,14 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     "target_size": data_te.get('target_size'),
                     "original_size": data_te.get('original_size'),
                     "scaled_size": data_te.get('scaled_size', data_te.get('original_size')),
-                    "crop_coords": data_te.get('crop_coords', (0,0))
+                    "crop_coords": data_te.get('crop_coords', (0,0)),
+                    "bucket_variant_index": data_te.get("bucket_variant_index", 0),
                 })
             except Exception as e:
                 print(f"WARNING: Could not index {f}: {e}")
                 
         with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"version": 3, "cache_options": expected_cache_options, "files": index_data}, f)
+            json.dump({"version": 10, "cache_options": expected_cache_options, "files": index_data}, f)
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -740,14 +1137,10 @@ class ImageTextLatentDataset(Dataset):
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
         self.worker_rng = None
-
         cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
-
-        print("INFO: Loading dataset index...")
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
             index_path = root / cache_folder_name / "dataset_index.json"
-            
             if index_path.exists():
                 with open(index_path, 'r', encoding='utf-8') as f:
                     index_data = json.load(f)
@@ -767,20 +1160,23 @@ class ImageTextLatentDataset(Dataset):
         self.items, self.bucket_keys = zip(*combined)
         self.items = list(self.items)
         self.bucket_keys = list(self.bucket_keys)
-
-        self.dropout_prob = getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) if getattr(config, "UNCONDITIONAL_DROPOUT", False) else 0.0
-        if self.dropout_prob > 0:
-            try:
-                null_data = torch.load(Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt", map_location="cpu")
-                self.null_embeds = null_data["embeds"].squeeze(0) if null_data["embeds"].dim() == 3 else null_data["embeds"]
-                self.null_pooled = null_data["pooled"].squeeze(0) if null_data["pooled"].dim() == 2 else null_data["pooled"]
-            except:
-                self.dropout_prob = 0.0
-        self.shuffle_prob = (
-            getattr(config, "CAPTION_SHUFFLE_CHANCE", 0.0)
-            if getattr(config, "CAPTION_SHUFFLE_ENABLED", False) and int(getattr(config, "CAPTION_SHUFFLE_VARIANTS", 0) or 0) > 0
+        self.null_embeds = None
+        self.null_pooled = None
+        self.cond_scale_min, self.cond_scale_max = get_text_conditioning_scale_range(config)
+        self.cond_scale_enabled = self.cond_scale_min < 1.0 or self.cond_scale_max < 1.0
+        self.dropout_prob = (
+            min(max(float(getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0)), 0.0), 1.0)
+            if getattr(config, "UNCONDITIONAL_DROPOUT", False)
             else 0.0
         )
+        if self.dropout_prob > 0 or self.cond_scale_enabled:
+            try:
+                null_data = torch.load(Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt", map_location="cpu", weights_only=True)
+                self.null_embeds = null_data["embeds"].squeeze(0) if null_data["embeds"].dim() == 3 else null_data["embeds"]
+                self.null_pooled = null_data["pooled"].squeeze(0) if null_data["pooled"].dim() == 2 else null_data["pooled"]
+            except Exception:
+                self.dropout_prob = 0.0
+                self.cond_scale_enabled = False
 
     def __len__(self): return len(self.items)
 
@@ -798,22 +1194,6 @@ class ImageTextLatentDataset(Dataset):
             return payload.get("latents")
         return payload
 
-    def _select_caption_variant(self, data_te):
-        variants = data_te.get("caption_variants")
-        if not variants:
-            return data_te["embeds"], data_te["pooled"]
-
-        shuffle_keys = [key for key in variants if str(key).startswith("shuffle_")]
-        shuffle_prob = min(max(self.shuffle_prob, 0.0), 1.0) if shuffle_keys else 0.0
-        if shuffle_prob > 0 and self.worker_rng.random() < shuffle_prob:
-            variant = variants[self.worker_rng.choice(shuffle_keys)]
-            return variant["embeds"], variant["pooled"]
-
-        variant = variants.get("original")
-        if variant:
-            return variant["embeds"], variant["pooled"]
-        return data_te["embeds"], data_te["pooled"]
-
     def __getitem__(self, i):
         try:
             if self.worker_rng is None: self._init_worker_rng()
@@ -824,7 +1204,7 @@ class ImageTextLatentDataset(Dataset):
 
             data_te = self._load_tensor(path_te)
             latents = self._load_latent_payload(path_lat)
-            embeds, pooled = self._select_caption_variant(data_te)
+            embeds, pooled = data_te["embeds"], data_te["pooled"]
 
             if torch.isnan(latents).any() or torch.isinf(latents).any(): return None
 
@@ -841,6 +1221,10 @@ class ImageTextLatentDataset(Dataset):
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
                 item["embeds"], item["pooled"] = self.null_embeds, self.null_pooled
+            elif self.cond_scale_enabled:
+                scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
+                item["embeds"] = self.null_embeds + (item["embeds"] - self.null_embeds) * scale
+                item["pooled"] = self.null_pooled + (item["pooled"] - self.null_pooled) * scale
 
             return item
         except Exception as e:
@@ -924,9 +1308,10 @@ def print_dataset_resolution_sample(dataset, sample_count=5):
         targ_ar = targ_w / targ_h if targ_h else 1.0
         ar_error_pct = (abs(orig_ar - targ_ar) / orig_ar * 100) if orig_ar else 0.0
         stem = Path(item["te_path"]).stem.replace("_te", "")
+        variant_label = f", variant {item.get('bucket_variant_index', 0)}" if item.get("bucket_variant_index", 0) else ""
         print(
             f"INFO:   {stem}: original {orig_w}x{orig_h} (AR {orig_ar:.4f}) -> "
-            f"target {targ_w}x{targ_h} (AR {targ_ar:.4f}), "
+            f"target {targ_w}x{targ_h} (AR {targ_ar:.4f}){variant_label}, "
             f"AR diff {ar_error_pct:.2f}%, cropped not stretched"
         )
 

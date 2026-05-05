@@ -4,21 +4,22 @@
     "OUTPUT_DIR": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
     "CACHING_BATCH_SIZE": 1,
     "NUM_WORKERS": 0,
-    "UNCONDITIONAL_DROPOUT": false,
-    "CAPTION_SHUFFLE_ENABLED": true,
-    "CAPTION_SHUFFLE_VARIANTS": 5,
-    "CAPTION_SHUFFLE_KEEP_FIRST": 3,
-    "CAPTION_TAG_SEPARATOR": ",",
-    "UNCONDITIONAL_DROPOUT_CHANCE": 0.04999999999999999,
-    "CAPTION_SHUFFLE_CHANCE": 0.25,
+    "UNCONDITIONAL_DROPOUT": true,
+    "UNCONDITIONAL_DROPOUT_CHANCE": 0.05,
+    "TEXT_CONDITIONING_SCALE_ENABLED": true,
+    "TEXT_CONDITIONING_SCALE_MIN": 0.5,
+    "TEXT_CONDITIONING_SCALE_MAX": 1.0,
+    "CAPTION_CHUNKING_ENABLED": true,
     "TARGET_PIXEL_AREA": "1048576",
     "SHOULD_UPSCALE": true,
     "MAX_AREA_TOLERANCE": "1.0",
+    "MULTI_BUCKET_ENABLED": true,
+    "MULTI_BUCKET_EXTRA_BUCKETS": 3,
     "PREDICTION_TYPE": "rectified_flow",
-    "MAX_TRAIN_STEPS": "3000",
+    "MAX_TRAIN_STEPS": "1500",
     "BATCH_SIZE": 1,
-    "SAVE_EVERY_N_STEPS": "1600",
-    "GRADIENT_ACCUMULATION_STEPS": "12",
+    "SAVE_EVERY_N_STEPS": "2600",
+    "GRADIENT_ACCUMULATION_STEPS": "4",
     "MIXED_PRECISION": "bfloat16",
     "CLIP_GRAD_NORM": "50.0",
     "SEED": "61",
@@ -27,9 +28,8 @@
     "UNET_EXCLUDE_TARGETS": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*",
     "LR_GRAPH_MIN": "1.0e-7",
     "LR_GRAPH_MAX": "5e-5",
-    "MEMORY_EFFICIENT_ATTENTION": "sdpa",
-    "VAE_SHIFT_FACTOR": 0.03,
-    "VAE_SCALING_FACTOR": 0.6023,
+    "MEMORY_EFFICIENT_ATTENTION": "pytorch29_optimized",
+    "VAE_NORMALIZATION_MODE": "flux_bn32",
     "VAE_LATENT_CHANNELS": 32,
     "LR_CUSTOM_CURVE": [
         [
@@ -37,11 +37,11 @@
             1e-07
         ],
         [
-            0.04485488,
+            0.05804749,
             5e-05
         ],
         [
-            0.94459103,
+            0.89973615,
             5e-05
         ],
         [
@@ -53,51 +53,37 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\test",
+            "path": "C:/Users/Administrator/Pictures\\Artists\\by myomomoo",
             "repeats": 1
         }
     ],
-    "OPTIMIZER_TYPE": "velorms",
-    "LOSS_TYPE": "MSE",
+    "OPTIMIZER_TYPE": "raven",
+    "LOSS_TYPE": "DestinationLoss",
     "NOISE_MODE": "normal",
     "TIMESTEP_MODE": "Wave",
     "TIMESTEP_ALLOCATION": {
-        "bin_size": 30,
+        "bin_size": 50,
         "counts": [
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            89,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            88,
-            87,
-            87,
-            87,
-            87,
-            87,
-            87
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75,
+            75
         ]
     },
     "RAVEN_PARAMS": {
@@ -127,5 +113,7 @@
     "VELORMS_PARAMS": {
         "weight_decay": 0.01,
         "eps": 1e-08
-    }
+    },
+    "VAE_SHIFT_FACTOR": null,
+    "VAE_SCALING_FACTOR": null
 }
