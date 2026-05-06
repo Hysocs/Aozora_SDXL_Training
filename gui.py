@@ -2170,7 +2170,7 @@ UI_DEFS = {
     "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_ENABLED": ("Use Soft Text Conditioning", "Randomly dull caption conditioning by interpolating caption embeddings toward empty-prompt embeddings.", "check"),
     "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
-    "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Keep at 1.0 to still include full-strength captions.", "dspin", 0.0, 1.0, 0.05, 2),
+    "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Values above 1 extrapolate caption conditioning past full strength.", "dspin", 0.0, 2.0, 0.05, 2),
     "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
     "TARGET_PIXEL_AREA":           ("Target Pixel Area", "e.g., 1024*1024=1048576.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),

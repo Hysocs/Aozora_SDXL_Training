@@ -634,14 +634,14 @@ def get_text_conditioning_scale_range(config):
     min_scale = float(getattr(config, "TEXT_CONDITIONING_SCALE_MIN", 1.0))
     max_scale = float(getattr(config, "TEXT_CONDITIONING_SCALE_MAX", 1.0))
     min_scale = min(max(min_scale, 0.0), 1.0)
-    max_scale = min(max(max_scale, 0.0), 1.0)
+    max_scale = min(max(max_scale, 0.0), 2.0)
     if min_scale > max_scale:
         min_scale, max_scale = max_scale, min_scale
     return min_scale, max_scale
 
 def text_conditioning_scale_enabled(config):
     min_scale, max_scale = get_text_conditioning_scale_range(config)
-    return min_scale < 1.0 or max_scale < 1.0
+    return min_scale < 1.0 or max_scale > 1.0
 
 def null_conditioning_cache_needed(config):
     return bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)) or text_conditioning_scale_enabled(config)
@@ -1660,9 +1660,8 @@ def main():
                         loss = error.square().mean()
                     else:
                         min_side = min(height, width)
-                        min_crop = max(1, int(min_side * 0.25))
-                        max_crop = max(min_crop, int(min_side * 0.55))
-                        full_area = float(height * width)
+                        min_crop = max(1, int(min_side * 0.15))
+                        max_crop = max(min_crop, int(min_side * 0.75))
                         patch_losses = []
 
                         for sample_index in range(batch_size):
@@ -1670,7 +1669,7 @@ def main():
                             top = int(torch.randint(0, height - crop_side + 1, (1,), device=error.device).item())
                             left = int(torch.randint(0, width - crop_side + 1, (1,), device=error.device).item())
                             patch = error[sample_index, :, top:top + crop_side, left:left + crop_side]
-                            patch_losses.append(patch.square().mean() * (full_area / float(crop_side * crop_side)))
+                            patch_losses.append(patch.square().mean())
 
                         loss = torch.stack(patch_losses).mean()
                 else:

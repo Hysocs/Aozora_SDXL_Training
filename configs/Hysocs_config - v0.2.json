@@ -7,8 +7,8 @@
     "UNCONDITIONAL_DROPOUT": false,
     "UNCONDITIONAL_DROPOUT_CHANCE": 0.05,
     "TEXT_CONDITIONING_SCALE_ENABLED": true,
-    "TEXT_CONDITIONING_SCALE_MIN": 0.25,
-    "TEXT_CONDITIONING_SCALE_MAX": 1.0,
+    "TEXT_CONDITIONING_SCALE_MIN": 0.75,
+    "TEXT_CONDITIONING_SCALE_MAX": 1.2500000000000002,
     "CAPTION_CHUNKING_ENABLED": true,
     "TARGET_PIXEL_AREA": "1048576",
     "SHOULD_UPSCALE": true,
@@ -53,7 +53,7 @@
     "RESUME_TRAINING": false,
     "INSTANCE_DATASETS": [
         {
-            "path": "C:/Users/Administrator/Pictures\\Artists\\by madaotheory",
+            "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Mesugaki no O-mo-cha",
             "repeats": 1
         }
     ],
