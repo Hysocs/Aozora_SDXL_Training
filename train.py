@@ -141,6 +141,8 @@ class TrainingConfig:
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         user_config = json.load(f)
+                    if user_config.get("LOSS_TYPE") == "DestinationLoss":
+                        user_config["LOSS_TYPE"] = "PatchMSE"
                     for key, value in user_config.items():
                         setattr(self, key, value)
                 except (json.JSONDecodeError, TypeError) as e:
@@ -1650,8 +1652,27 @@ def main():
                 pred = unet(noisy_latents.to(config.compute_dtype), timesteps_conditioning, embeds,
                             added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-                if getattr(config, "LOSS_TYPE", "MSE") == "DestinationLoss" and config.is_rectified_flow:
-                    loss = F.mse_loss(noisy_latents.float() - t_exp.float() * pred.float(), latents.float())
+                if getattr(config, "LOSS_TYPE", "MSE") == "PatchMSE" and config.is_rectified_flow:
+                    error = pred.float() - target.float()
+                    batch_size, _, height, width = error.shape
+
+                    if height <= 1 or width <= 1:
+                        loss = error.square().mean()
+                    else:
+                        min_side = min(height, width)
+                        min_crop = max(1, int(min_side * 0.25))
+                        max_crop = max(min_crop, int(min_side * 0.55))
+                        full_area = float(height * width)
+                        patch_losses = []
+
+                        for sample_index in range(batch_size):
+                            crop_side = int(torch.randint(min_crop, max_crop + 1, (1,), device=error.device).item())
+                            top = int(torch.randint(0, height - crop_side + 1, (1,), device=error.device).item())
+                            left = int(torch.randint(0, width - crop_side + 1, (1,), device=error.device).item())
+                            patch = error[sample_index, :, top:top + crop_side, left:left + crop_side]
+                            patch_losses.append(patch.square().mean() * (full_area / float(crop_side * crop_side)))
+
+                        loss = torch.stack(patch_losses).mean()
                 else:
                     loss = F.mse_loss(pred.float(), target.float())
 

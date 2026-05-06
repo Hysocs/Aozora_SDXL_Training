@@ -2191,7 +2191,7 @@ UI_DEFS = {
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "DestinationLoss"]),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
@@ -3244,7 +3244,9 @@ class TrainingGUI(QtWidgets.QWidget):
             self._toggle_optimizer_widgets()
 
             loss_type = self.current_config.get("LOSS_TYPE", "MSE")
-            self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "DestinationLoss"} else "MSE")
+            if loss_type == "DestinationLoss":
+                loss_type = "PatchMSE"
+            self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "PatchMSE"} else "MSE")
 
             if "SHOULD_UPSCALE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
