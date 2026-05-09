@@ -12,7 +12,7 @@ A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built beca
 Works with v-prediction and Flow Matching models (NoobAI, Illustrious, etc.) out of the box.
 
 <img src="https://i.imgur.com/KWgV0OE.png" alt="Gui" width="850"/>
-<img src="https://i.imgur.com/YJUapIP.png" alt="Gui" width="850"/>
+<img src="https://i.imgur.com/uwacboa.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/1OzLZAu.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/kURMA08.png" alt="Gui" width="850"/>
 
