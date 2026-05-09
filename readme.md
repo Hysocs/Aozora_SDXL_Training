@@ -13,10 +13,16 @@ It is built for users who want more control than a preset-only trainer, but do n
 >
 > **Note:** Earlier versions may have caused failed training runs. Stabilizing SDXL training on consumer hardware is difficult, and this project is still evolving.
 
-<img src="https://i.imgur.com/KWgV0OE.png" alt="Gui" width="850"/>
-<img src="https://i.imgur.com/XURoDBZ.png" alt="Gui" width="850"/>
-<img src="https://i.imgur.com/uwacboa.png" alt="Gui" width="850"/>
-<img src="https://i.imgur.com/1OzLZAu.png" alt="Gui" width="850"/>
+<table>
+  <tr>
+    <td><img src="https://i.imgur.com/KWgV0OE.png" alt="GUI 1" width="425"/></td>
+    <td><img src="https://i.imgur.com/XURoDBZ.png" alt="GUI 2" width="425"/></td>
+  </tr>
+  <tr>
+    <td><img src="https://i.imgur.com/uwacboa.png" alt="GUI 3" width="425"/></td>
+    <td><img src="https://i.imgur.com/1OzLZAu.png" alt="GUI 4" width="425"/></td>
+  </tr>
+</table>
 
 ---
 
