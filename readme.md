@@ -1,86 +1,390 @@
 # Aozora SDXL Trainer
 
+Aozora SDXL Trainer is a GUI-based SDXL fine-tuning trainer focused on making full-model training practical on single consumer GPUs.
+
+It is built for users who want more control than a preset-only trainer, but do not want to manage large JSON configs by hand. The goal is simple: train SDXL models efficiently on 12 GB class GPUs while keeping the important training controls visible, editable, and understandable.
+
 > [!WARNING]
-> **Beta Software:** This project is under active development. It is functional and currently trains successfully on my system, but it has not been broadly tested across different hardware or environments. Some setup-specific changes may be required.
+> **Beta Software:** This project is still in active development. It is functional and currently trains successfully on my system, but it has not been broadly tested across different hardware, drivers, models, or environments.
 >
-> In current testing, it can train **80–90% of the full SDXL UNet** using only **11.80 GB VRAM**, with performance around **1.55 seconds per iteration** and **15 seconds per optimizer step**.
+> Current testing shows SDXL training can run with **80–90% of the full UNet trainable** on **11.80 GB VRAM**, at roughly **1.55 seconds per iteration** and **15 seconds per optimizer step**.
 >
-> Some rough edges, minor bugs, and compatibility issues should be expected. The main goal is to make SDXL training practical and efficient on **12 GB VRAM GPUs** without adding unnecessary complexity or relying on heavy compromises.
+> Expect rough edges, bugs, and setup-specific issues. The main goal is to make SDXL training practical on **12 GB VRAM GPUs** without forcing low-resolution training or hiding every important option behind config files.
 >
-> **Note:** If previous versions caused failed training attempts, I apologize. Getting SDXL training stable on consumer GPUs is difficult, and this project is still evolving.
-
-A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or require you to train at lower resolutions.
-
-Works with v-prediction and Flow Matching models (NoobAI, Illustrious, etc.) out of the box.
+> **Note:** Earlier versions may have caused failed training runs. Stabilizing SDXL training on consumer hardware is difficult, and this project is still evolving.
 
 <img src="https://i.imgur.com/KWgV0OE.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/XURoDBZ.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/uwacboa.png" alt="Gui" width="850"/>
 <img src="https://i.imgur.com/1OzLZAu.png" alt="Gui" width="850"/>
 
+---
+
+## What This Trainer Does
+
+Aozora is designed for SDXL fine-tuning on a single NVIDIA GPU.
+
+It supports standard SDXL-style models and modern prediction types, including:
+
+- `epsilon`
+- `v_prediction`
+- `rectified_flow`
+
+This makes it usable with common SDXL model families as well as newer v-prediction and flow-matching models.
+
+The trainer handles dataset preparation, caption embedding caching, latent caching, timestep sampling, optimizer configuration, checkpoint saving, resume states, and live GUI monitoring.
+
+---
 
 ## Who This Is For
 
-- You have **12GB-16GB VRAM** (RTX 3060/4060/4070 etc.)
-- You want to train on **one GPU** (no multi-GPU setup needed)
-- You're tired of editing JSON configs and want buttons that work
+This trainer is mainly for users who:
 
-## What It Actually Does
+- Have a **12 GB to 16 GB NVIDIA GPU** (8 GB can work buts its super slow)
+- Want to train SDXL on a **single GPU**
+- Want GUI controls instead of editing configs manually
+- Want to train more of the UNet without needing a 24 GB GPU
+- Want control over timesteps, learning rate shape, layer targeting, and optimizer behavior
+- Are comfortable testing beta software and adjusting settings when needed
 
-**Custom Optimizers**
-Two built-in optimizers designed specifically for 12GB training:
+---
 
-- **RavenAdamW**: Pre-allocates GPU buffers so you don't get OOM errors mid-training. Keeps momentum/variance states on CPU, computes updates on GPU using shared buffers. Has proper weight decay ordering (decay happens before the update, not after) and optional gradient centralization. Uses 50% less vram than Adamw8bit while being float32 percision.
+## Feature Overview
 
-- **VeloRMS**: Even more memory efficient. Uses velocity + RMS normalization with a small "leak" of gradient info to keep things stable on sparse updates (like when training specific layers). Also CPU-offloads states. Includes verbose logging mode that prints diagnostics every N steps so you can see if your model is about to explode.
+### Low-VRAM SDXL Training
 
-**Ticket Pool Timesteps**
-Instead of random timestep sampling, you get a visual "ticket pool" system. You can allocate how many training steps go to early vs middle vs late timesteps using a bar chart. Want to train mostly on the middle 200-800 range for Flow models? Drag the bars. The system handles the distribution math for you.
+Aozora is built around keeping SDXL training usable on consumer GPUs.
 
-**Graph Learning Rate Scheduler**
-Draw your LR curve visually in the GUI. Want a warmup that spikes then cosine decays? Click the points, drag them around. The graph interpolates between points so you get exact control over the schedule without editing config files.
+The trainer combines:
 
-**Layer Targeting**
-Pick exactly which UNet blocks train. Want only attention layers? Just check those boxes. Saves VRAM and prevents overfitting compared to training everything.
+- CPU-offloaded optimizer states
+- mixed precision training
+- gradient checkpointing
+- memory-efficient attention backends
+- latent caching
+- text embedding caching
+- selective layer targeting
+- checkpoint/resume support
 
-**v-pred & Flow Support**
-Handles both standard epsilon-prediction and modern flow-matching models. Includes the shift scheduling and timestep distributions that actually work for SDXL (not just SD 1.5 ported over).
+This allows more of the SDXL UNet to remain trainable while keeping VRAM usage low.
 
-**Frozen Text Encoder Training**
-Caches text embeddings so you can train with text encoder updates off by default (saves ~4GB VRAM). Optional token-embedding-only mode for teaching new concepts without destroying the base model's understanding.
+---
 
-**Smart Latent Caching**
-Pre-processes your images through the VAE once, stores them compressed. Training runs faster because it's not encoding images every step.
+### GUI-Based Training Workflow
 
-**Dynamic Resolution Shifting**
-Automatically adjusts flow-shift strength based on your image resolution. Training 1536px images uses different noise scheduling than 1024px - it's handled automatically.
+Most major training options are exposed through the GUI.
 
-**Memory Stack**
-- Flash Attention 2 support
-- Gradient checkpointing 
-- BF16/FP16 mixed precision
-- The optimizers handle their own CPU offloading so you don't run out of VRAM keeping optimizer states
+You can configure:
+
+- dataset folders
+- base model path
+- VAE settings
+- prediction type
+- batch size
+- gradient accumulation
+- learning rate curve
+- timestep distribution
+- optimizer type
+- optimizer parameters
+- precision mode
+- checkpoint frequency
+- resume paths
+- layer exclusion keywords
+- caption chunking
+- multi-bucket caching
+
+The goal is to make the training setup readable and editable without constantly opening config files.
+
+---
+
+### Custom Optimizers
+
+Aozora includes custom optimizers designed around low-VRAM full-model training.
+
+#### Raven
+
+Raven is the balanced default optimizer.
+
+It is designed to reduce VRAM usage while still behaving close to a full-precision AdamW-style optimizer. It keeps optimizer state off the GPU and uses shared GPU buffers during the update step.
+
+Best for:
+
+- general SDXL fine-tuning
+- 12 GB class GPUs
+- users who want the safest default option
+- training a large part of the UNet
+
+#### Titan
+
+Titan is a more aggressive VRAM-saving optimizer option.
+
+It is intended for cases where Raven is still too heavy or where you want to push trainable parameter count lower in memory usage. It may be slower, but can make larger training setups fit.
+
+Best for:
+
+- lower VRAM pressure
+- heavier layer coverage
+- experiments where speed matters less than fitting the run
+  
+---
+
+### Timestep Ticket Allocation
+
+Instead of relying only on basic random timestep sampling, Aozora uses a visual timestep ticket system.
+
+You can control how much training is assigned to different timestep ranges. This is useful because different model types and training goals often benefit from different timestep focus.
+
+The GUI includes distribution tools such as:
+
+- Wave
+- Logit-Normal
+- Beta
+
+This gives more direct control over where training effort is spent, especially for v-prediction and rectified-flow models.
+
+---
+
+### Visual Learning Rate Curve
+
+Aozora includes a graph-based learning rate scheduler.
+
+Instead of picking only a fixed scheduler preset, you can shape the LR curve visually. The trainer interpolates between curve points and applies that learning rate during training.
+
+Useful for:
+
+- warmup curves
+- cosine-like decay
+- linear decay
+- custom ramps
+- restart-style schedules
+- experimental LR shapes
+
+---
+
+### Layer Targeting
+
+The trainer supports excluding UNet layers by keyword.
+
+This lets you reduce VRAM usage and control what parts of the model are updated. For example, you can freeze specific blocks or module types while keeping the rest trainable.
+
+This is useful for:
+
+- fitting larger runs into VRAM
+- reducing overfitting
+- testing which parts of the UNet matter most
+- training most of the model while excluding the most expensive sections
+
+---
+
+### Latent and Text Embedding Caching
+
+Aozora caches expensive preprocessing work before training.
+
+It can cache:
+
+- VAE latents
+- SDXL text encoder embeddings
+- pooled text embeddings
+- null conditioning embeddings when needed
+
+This reduces repeated work during training and helps keep training speed consistent.
+
+---
+
+### Caption Chunking
+
+Caption chunking allows longer captions to be encoded in multiple CLIP-sized chunks instead of being cut down to a single 77-token window.
+
+This is useful for datasets with long natural-language captions or detailed tag lists.
+
+---
+
+### Multi-Bucket Cache
+
+The trainer can cache images into multiple nearby bucket resolutions.
+
+This helps reduce aspect-ratio overfitting by exposing the model to nearby shape variations instead of tying each concept too strongly to one exact training resolution.
+
+This can increase cache time and disk usage, but it is useful for concepts that need to generate well across more than one aspect ratio.
+
+---
+
+### Resolution-Aware Bucketing
+
+Images are assigned to SDXL-style bucket resolutions based on their aspect ratio and target pixel area.
+
+The trainer stores original size, target size, crop coordinates, and scaled size metadata so SDXL conditioning receives the correct size information during training.
+
+---
+
+### VAE Normalization Options
+
+Aozora includes configurable VAE normalization support.
+
+Supported modes include:
+
+- scalar shift/scale normalization
+- Flux BN32-style normalization when using compatible VAE sources
+
+This is useful for models or VAEs that do not follow the same latent scaling assumptions as standard SDXL.
+
+---
+
+### Prediction Type Support
+
+The trainer supports:
+
+- epsilon prediction
+- v-prediction
+- rectified flow
+
+This allows the same trainer to work across different SDXL model types instead of assuming every model uses the same training target.
+
+---
+
+### Training Console and Live Metrics
+
+The GUI includes a training console and live metrics view.
+
+The console is designed to handle large amounts of output without freezing the UI by storing logs in a compressed buffer and only rendering the visible section.
+
+Training output includes:
+
+- loss
+- timestep
+- step time
+- ETA
+- optimizer step
+- learning rate
+- gradient norm
+- checkpoint status
+- VRAM reporting
+
+---
+
+### Checkpointing and Resume
+
+Aozora can save training checkpoints during a run and resume from saved state files.
+
+This includes:
+
+- model checkpoint output
+- optimizer state
+- scheduler state
+- timestep sampler state
+- resume model path
+- resume state path
+
+This is important for long training runs, unstable beta testing, or recovering from crashes.
+
+---
 
 ## Quick Start
 
-1. Put your images in a folder with matching .txt captions
-2. Run `setup.bat` (pick Flash Attention if you have RTX 20-series or newer)
-3. Run `start_gui.bat`
-4. Select your base model, set your folder, adjust features to your liking or use a preset, hit Train
+1. Put your images in a dataset folder.
+2. Add matching `.txt` caption files next to the images.
+3. Run `setup.bat`.
+4. Run `start_gui.bat`.
+5. Select your base model.
+6. Select your dataset folder.
+7. Pick or adjust a preset.
+8. **(Important)** set a vae config matching your model!
+9. Press **Train**.
 
-Checkpoints save to `output/checkpoints/` every N steps. If it crashes, resume from the latest `.pt` state file.
+Checkpoints are saved to:
+
+```txt
+output/checkpoints/
+````
+
+If training crashes or you stop the run, resume from the latest saved `.pt` state file and matching model checkpoint.
+
+---
+
+## Dataset Format
+
+Use a folder of images with optional matching captions.
+
+Example:
+
+```txt
+dataset/
+  image_001.png
+  image_001.txt
+  image_002.png
+  image_002.txt
+  image_003.jpg
+  image_003.txt
+```
+
+If a caption file is missing, the image filename is used as the fallback caption.
+
+Supported image formats include:
+
+* `.jpg`
+* `.jpeg`
+* `.png`
+* `.webp`
+* `.bmp`
+* `.tiff`
+
+---
 
 ## Requirements
 
-- Windows 10/11
-- Python 3.10
-- NVIDIA GPU with 12GB+ VRAM
-- About 20GB free disk space for the environment
-- 32GB of ram for offloading
+Recommended:
 
-## Notes
+* Windows 10/11
+* Python 3.10
+* NVIDIA GPU with 12 GB+ VRAM
+* 32 GB system RAM
+* 20 GB+ free disk space for the environment
+* additional disk space for latent/text cache files
+* recent NVIDIA drivers
 
-- Only works with standard SDXL format models (fp16/bf16 safetensors)
-- Layer targeting is hand-tuned for specific architectures - using merged models might behave weird
-- Flow models need the shift factor set right (GUI has presets)
-- Raven and Velo optimizers are designed for single-GPU training; they offload to CPU to save VRAM which will be slower on multi-GPU setups
+A 12 GB GPU is the main target, but actual memory use depends on:
+
+* model type
+* optimizer
+* trainable layer count
+* resolution
+* batch size
+* gradient accumulation
+* attention backend
+* caption chunking
+* multi-bucket cache settings
+
+---
+
+## Notes and Limitations
+
+* This is beta software.
+* Currently only tested mostly on my own system.
+* Some hardware or driver setups may need changes.
+* Standard SDXL-format `.safetensors` models are the main target.
+* Merged models may behave differently depending on architecture changes, i recommend training only base models to avoid issue.
+* Layer targeting depends on module names, so unusual model structures may need different exclude keywords.
+* Flow models need correct prediction and shift settings.
+* CPU-offloaded optimizers save VRAM but can be slower than fully GPU-resident optimizers.
+* Multi-bucket caching improves flexibility but increases cache size.
+* Caption chunking can improve long-caption handling but increases embedding size.
+
+---
+
+## Current Goal
+
+The current goal of Aozora is not to be the most feature-packed trainer.
+
+The goal is to make SDXL fine-tuning practical, inspectable, and efficient on consumer hardware while keeping the training process understandable.
+
+Future improvements should keep that same direction:
+
+* fewer hidden assumptions
+* more visible controls
+* stable low-VRAM behavior
+* better defaults
+* cleaner debugging
+* practical full-model SDXL training on single GPUs
+
+```
+
