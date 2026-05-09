@@ -1,11 +1,13 @@
 # Aozora SDXL Trainer
 
 > [!WARNING]
-> **Beta Software:** This is still under active development and in beta. It is fully functional but only tested on my system, modifications may be required to function on other devices. it is successfully training 80–90% of the full UNet using only 11.80 GB VRAM, with ~1.55 seconds per iteration and ~15 seconds per optimizer step.
+> **Beta Software:** This project is under active development. It is functional and currently trains successfully on my system, but it has not been broadly tested across different hardware or environments. Some setup-specific changes may be required.
 >
-> Some rough edges and minor issues are to be expected. The primary goal is to make SDXL training practical and efficient on 12 GB VRAM GPUs without the usual compromises or complexity.
+> In current testing, it can train **80–90% of the full SDXL UNet** using only **11.80 GB VRAM**, with performance around **1.55 seconds per iteration** and **15 seconds per optimizer step**.
 >
-> **Note:** Sorry for any previously failed attempts at training. Getting this stable on consumer hardware is tricky.
+> Some rough edges, minor bugs, and compatibility issues should be expected. The main goal is to make SDXL training practical and efficient on **12 GB VRAM GPUs** without adding unnecessary complexity or relying on heavy compromises.
+>
+> **Note:** If previous versions caused failed training attempts, I apologize. Getting SDXL training stable on consumer GPUs is difficult, and this project is still evolving.
 
 A GUI trainer for SDXL fine-tuning that fits on single consumer GPUs. Built because existing tools either need 24GB+ or require you to train at lower resolutions.
 
