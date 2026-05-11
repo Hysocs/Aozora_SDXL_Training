@@ -126,9 +126,6 @@ def check_if_anima_caching_needed(config):
                 f"index_exists={index_path.exists()}."
             )
             return True
-        if null_conditioning_cache_needed(config) and not (cache_dir / "null_embeds.pt").exists():
-            print(f"INFO: Anima cache rebuild needed for {root}: missing null_embeds.pt.")
-            return True
         try:
             with open(index_path, "r", encoding="utf-8") as f:
                 index_data = json.load(f)
@@ -444,8 +441,51 @@ def encode_image_anima(pipe, image, device, tiled=True, tile_size=(96, 96), tile
     return latents
 
 
+def save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids):
+    torch.save(
+        {
+            "prompt_emb": null_prompt_emb[0].to(dtype=torch.float32).cpu(),
+            "t5xxl_ids": null_t5xxl_ids[0].to(dtype=torch.long).cpu(),
+        },
+        cache_dir / "null_embeds.pt",
+    )
+
+
+def ensure_anima_null_conditioning_cache(config, pipe, device):
+    if not null_conditioning_cache_needed(config):
+        return
+
+    cache_name = anima_cache_folder_name(config)
+    missing_cache_dirs = []
+    for root in anima_dataset_roots(config):
+        cache_dir = root / cache_name
+        if (cache_dir / "dataset_index.json").exists() and not (cache_dir / "null_embeds.pt").exists():
+            missing_cache_dirs.append(cache_dir)
+
+    if not missing_cache_dirs:
+        return
+
+    print(f"INFO: Creating Anima null conditioning cache for {len(missing_cache_dirs)} dataset(s).")
+    if hasattr(pipe, "dit"):
+        pipe.dit.cpu()
+    pipe.vae.cpu()
+    pipe.text_encoder.to(device=device, dtype=config.compute_dtype)
+    pipe.text_encoder.eval()
+
+    with torch.no_grad():
+        null_prompt_emb, null_t5xxl_ids = encode_prompt_anima(pipe, "", device)
+    for cache_dir in missing_cache_dirs:
+        save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids)
+
+    pipe.text_encoder.cpu()
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
 def precompute_and_cache_anima(config, pipe, device):
     if not check_if_anima_caching_needed(config):
+        ensure_anima_null_conditioning_cache(config, pipe, device)
         print("\n" + "=" * 60 + "\nINFO: Anima DiT datasets already cached.\n" + "=" * 60 + "\n")
         return
 
@@ -567,13 +607,7 @@ def precompute_and_cache_anima(config, pipe, device):
                         pbar.update(1)
 
         if null_prompt_emb is not None and null_t5xxl_ids is not None:
-            torch.save(
-                {
-                    "prompt_emb": null_prompt_emb[0].to(dtype=torch.float32).cpu(),
-                    "t5xxl_ids": null_t5xxl_ids[0].to(dtype=torch.long).cpu(),
-                },
-                cache_dir / "null_embeds.pt",
-            )
+            save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids)
 
         pipe.text_encoder.cpu()
         gc.collect()
