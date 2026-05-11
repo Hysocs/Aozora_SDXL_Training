@@ -115,7 +115,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Amane",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Nonomura Byouin no Hitobito",
                 "repeats": 1
             },
             {
@@ -123,7 +123,11 @@
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Gakuin Kairou",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\Selling Girl",
+                "repeats": 1
+            },
+            {
+                "path": "C:/Users/Administrator/Pictures\\Artists\\by shikyou_yoru",
                 "repeats": 1
             },
             {
@@ -131,11 +135,11 @@
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\Selling Girl",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Gakuin Kairou",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Kosi no hi",
+                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Amane",
                 "repeats": 1
             },
             {
@@ -143,11 +147,7 @@
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Nonomura Byouin no Hitobito",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Artists\\by shikyou_yoru",
+                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Kosi no hi",
                 "repeats": 1
             }
         ],

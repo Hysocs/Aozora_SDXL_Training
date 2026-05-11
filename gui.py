@@ -41,9 +41,10 @@ TEXT_SEC   = "#7a7f9a"
 DANGER     = "#f74b6a"
 SUCCESS    = "#3ef78e"
 WARN       = "#f7c948"
+ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
-TRAINING_MODE_ANIMA_DIT = "Anima DiT (Qwen)"
+TRAINING_MODE_ANIMA_DIT = "Anima DiT"
 DIT_AVAILABLE = importlib.util.find_spec("diffsynth") is not None
 SDXL_PATH_KEYS = {
     "SINGLE_FILE_CHECKPOINT_PATH",
@@ -1796,6 +1797,10 @@ class ProcessRunner(QThread):
         self.creation_flags = creation_flags
         self.process = None
 
+    @staticmethod
+    def _clean_output_line(line):
+        return ANSI_ESCAPE_RE.sub("", line)
+
     def run(self):
         try:
             flags = self.creation_flags
@@ -1808,7 +1813,7 @@ class ProcessRunner(QThread):
                 universal_newlines=True, bufsize=1, creationflags=flags)
             self.logSignal.emit(f"INFO: Started subprocess (PID: {self.process.pid})")
             for line in iter(self.process.stdout.readline, ''):
-                line = line.strip()
+                line = self._clean_output_line(line.strip())
                 if not line or "NOTE: Redirects are currently not supported" in line: continue
                 if line.startswith("GUI_PARAM_INFO::"):
                     self.paramInfoSignal.emit(line.replace('GUI_PARAM_INFO::', '').strip())
