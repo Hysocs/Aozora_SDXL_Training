@@ -109,56 +109,70 @@ def anima_cache_options_match(cached_options, expected_options):
     )
 
 
-def check_if_anima_caching_needed(config):
+def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cache_name=None):
+    expected_options = expected_options or get_anima_cache_options(config)
+    cache_name = cache_name or anima_cache_folder_name(config)
+    cache_dir = root / cache_name
+    index_path = cache_dir / "dataset_index.json"
+    if not cache_dir.exists() or not index_path.exists():
+        print(
+            "INFO: Anima cache rebuild needed for "
+            f"{root}: cache_dir_exists={cache_dir.exists()}, "
+            f"index_exists={index_path.exists()}."
+        )
+        return True
+    try:
+        with open(index_path, "r", encoding="utf-8") as f:
+            index_data = json.load(f)
+        cached_options = index_data.get("cache_options")
+        if not anima_cache_options_match(cached_options, expected_options):
+            print(f"INFO: Anima cache rebuild needed for {root}: cache options changed.")
+            cached_norm = normalize_anima_cache_options(cached_options, expected_options)
+            expected_norm = normalize_anima_cache_options(expected_options)
+            if isinstance(cached_norm, dict) and isinstance(expected_norm, dict):
+                all_keys = sorted(set(cached_norm) | set(expected_norm))
+                for key in all_keys:
+                    cached_value = cached_norm.get(key, "<missing>")
+                    expected_value = expected_norm.get(key, "<missing>")
+                    if cached_value != expected_value:
+                        print(f"  - {key}: cached={cached_value!r}, expected={expected_value!r}")
+            else:
+                print(f"  cached_options={cached_options!r}")
+                print(f"  expected_options={expected_options!r}")
+            return True
+        files = index_data.get("files", [])
+        if not files:
+            print(f"INFO: Anima cache rebuild needed for {root}: dataset_index has no files.")
+            return True
+        for item in files[: min(len(files), 10)]:
+            cache_path = Path(item.get("cache_path", ""))
+            if not cache_path.exists():
+                print(f"INFO: Anima cache rebuild needed for {root}: missing cached item {cache_path}.")
+                return True
+    except Exception:
+        print(f"INFO: Anima cache rebuild needed for {root}: failed to read/validate {index_path}.")
+        traceback.print_exc()
+        return True
+    return False
+
+
+def anima_roots_needing_cache_rebuild(config):
+    roots = anima_dataset_roots(config)
     if bool(getattr(config, "REBUILD_CACHE", False)):
         print("INFO: Rebuilding Anima DiT cache because REBUILD_CACHE=True.")
-        return True
+        return roots
 
     expected_options = get_anima_cache_options(config)
     cache_name = anima_cache_folder_name(config)
-    for root in anima_dataset_roots(config):
-        cache_dir = root / cache_name
-        index_path = cache_dir / "dataset_index.json"
-        if not cache_dir.exists() or not index_path.exists():
-            print(
-                "INFO: Anima cache rebuild needed for "
-                f"{root}: cache_dir_exists={cache_dir.exists()}, "
-                f"index_exists={index_path.exists()}."
-            )
-            return True
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
-            cached_options = index_data.get("cache_options")
-            if not anima_cache_options_match(cached_options, expected_options):
-                print(f"INFO: Anima cache rebuild needed for {root}: cache options changed.")
-                cached_norm = normalize_anima_cache_options(cached_options, expected_options)
-                expected_norm = normalize_anima_cache_options(expected_options)
-                if isinstance(cached_norm, dict) and isinstance(expected_norm, dict):
-                    all_keys = sorted(set(cached_norm) | set(expected_norm))
-                    for key in all_keys:
-                        cached_value = cached_norm.get(key, "<missing>")
-                        expected_value = expected_norm.get(key, "<missing>")
-                        if cached_value != expected_value:
-                            print(f"  - {key}: cached={cached_value!r}, expected={expected_value!r}")
-                else:
-                    print(f"  cached_options={cached_options!r}")
-                    print(f"  expected_options={expected_options!r}")
-                return True
-            files = index_data.get("files", [])
-            if not files:
-                print(f"INFO: Anima cache rebuild needed for {root}: dataset_index has no files.")
-                return True
-            for item in files[: min(len(files), 10)]:
-                cache_path = Path(item.get("cache_path", ""))
-                if not cache_path.exists():
-                    print(f"INFO: Anima cache rebuild needed for {root}: missing cached item {cache_path}.")
-                    return True
-        except Exception:
-            print(f"INFO: Anima cache rebuild needed for {root}: failed to read/validate {index_path}.")
-            traceback.print_exc()
-            return True
-    return False
+    return [
+        root
+        for root in roots
+        if anima_cache_rebuild_needed_for_root(config, root, expected_options, cache_name)
+    ]
+
+
+def check_if_anima_caching_needed(config):
+    return bool(anima_roots_needing_cache_rebuild(config))
 
 
 def find_anima_base_dit_path(config):
@@ -484,7 +498,8 @@ def ensure_anima_null_conditioning_cache(config, pipe, device):
 
 
 def precompute_and_cache_anima(config, pipe, device):
-    if not check_if_anima_caching_needed(config):
+    roots_to_rebuild = anima_roots_needing_cache_rebuild(config)
+    if not roots_to_rebuild:
         ensure_anima_null_conditioning_cache(config, pipe, device)
         print("\n" + "=" * 60 + "\nINFO: Anima DiT datasets already cached.\n" + "=" * 60 + "\n")
         return
@@ -497,7 +512,7 @@ def precompute_and_cache_anima(config, pipe, device):
         else 0
     )
 
-    for root in anima_dataset_roots(config):
+    for root in roots_to_rebuild:
         if not root.exists():
             print(f"WARNING: Dataset folder does not exist: {root}")
             continue
@@ -663,6 +678,8 @@ def precompute_and_cache_anima(config, pipe, device):
         with open(cache_dir / "dataset_index.json", "w", encoding="utf-8") as f:
             json.dump({"version": 3, "cache_options": expected_options, "files": valid_index_data}, f)
         print(f"INFO: Cached {len(valid_index_data)} Anima DiT items to {cache_dir}")
+
+    ensure_anima_null_conditioning_cache(config, pipe, device)
 
 
 class AnimaCachedDataset(Dataset):
