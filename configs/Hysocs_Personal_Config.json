@@ -115,39 +115,11 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Nonomura Byouin no Hitobito",
+                "path": "C:/Users/Administrator/Pictures\\Artists",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Artists\\by rosu_1109",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\Selling Girl",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Artists\\by shikyou_yoru",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Artists\\by watti3600",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Gakuin Kairou",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Amane",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Artists\\by myomomoo",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Character_Sets(ai_tagged)\\from Kosi no hi",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
                 "repeats": 1
             }
         ],
@@ -162,27 +134,27 @@
         "anima_should_upscale": true,
         "anima_target_pixel_area": "1048576",
         "anima_max_area_tolerance": "1.0",
-        "anima_multi_bucket_enabled": true,
-        "anima_multi_bucket_extra_buckets": 2,
+        "anima_multi_bucket_enabled": false,
+        "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "1000",
+        "anima_max_train_steps": "50000",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "5",
+        "anima_gradient_accumulation_steps": "8",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
-        "anima_save_every_n_steps": "2600",
+        "anima_save_every_n_steps": "1500",
         "anima_lr_custom_curve": [
             [
                 0.0,
                 1e-07
             ],
             [
-                0.07651715,
+                0.02110818,
                 6e-06
             ],
             [
-                0.90237467,
+                0.98153034,
                 6e-06
             ],
             [
@@ -196,31 +168,31 @@
         "anima_timestep_allocation": {
             "bin_size": 40,
             "counts": [
-                1,
-                4,
-                10,
-                17,
-                26,
-                35,
-                44,
-                53,
-                61,
-                67,
-                71,
-                74,
-                75,
-                74,
-                71,
-                67,
-                60,
-                53,
-                44,
-                35,
-                26,
-                17,
-                10,
-                4,
-                1
+                37,
+                328,
+                793,
+                1274,
+                1710,
+                2085,
+                2397,
+                2651,
+                2852,
+                3002,
+                3107,
+                3169,
+                3190,
+                3169,
+                3107,
+                3002,
+                2852,
+                2651,
+                2397,
+                2085,
+                1710,
+                1274,
+                793,
+                328,
+                37
             ]
         },
         "anima_optimizer_type": "raven",
@@ -254,7 +226,7 @@
         },
         "anima_loss_type": "MSE",
         "anima_memory_efficient_attention": "sdpa",
-        "anima_timestep_mode": "Beta",
+        "anima_timestep_mode": "Logit-Normal",
         "anima_vae_normalization_mode": "scalar",
         "anima_vae_shift_factor": 0.0,
         "anima_vae_scaling_factor": 0.13025,
