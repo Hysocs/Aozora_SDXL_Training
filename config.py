@@ -1,17 +1,40 @@
+import copy
+
 # ====================================================================================
 # DEFAULT CONFIGURATION
-# Updated for Custom Timestep Ticket Allocation (Bar Chart)
 # ====================================================================================
+
+CONFIG_VERSION = 2
+MODE_SDXL = "sdxl"
+MODE_ANIMA = "anima"
+TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
+TRAINING_MODE_ANIMA = "Anima DiT (Qwen)"
+MODE_LABELS = {
+    MODE_SDXL: TRAINING_MODE_SDXL,
+    MODE_ANIMA: TRAINING_MODE_ANIMA,
+}
 
 # --- Paths ---
 SINGLE_FILE_CHECKPOINT_PATH = "./model.safetensors"
 VAE_PATH = ""
 OUTPUT_DIR = "./output"
 
+# --- Architecture ---
+TRAINING_MODE = "Stable Diffusion XL (SDXL)"
+DIT_PATH = ""
+DIT_VAE_PATH = ""
+ANIMA_BASE_DIT_PATH = ""
+ANIMA_DIT_SAVE_PREFIX = "auto"
+TEXT_ENCODER_PATH = ""
+TOKENIZER_PATH = "Qwen/Qwen3-0.6B:./"
+TOKENIZER_T5XXL_PATH = "stabilityai/stable-diffusion-3.5-large:tokenizer_3/"
+
 # --- Resume Training ---
 RESUME_TRAINING = False
 RESUME_MODEL_PATH = ""
 RESUME_STATE_PATH = ""
+ANIMA_RESUME_MODEL_PATH = ""
+ANIMA_RESUME_STATE_PATH = ""
 
 # --- Dataset Configuration ---
 INSTANCE_DATASETS = [
@@ -52,6 +75,7 @@ SAVE_EVERY_N_STEPS = 1000
 
 # --- UNet Layer Exclusion (Blacklist) ---
 UNET_EXCLUDE_TARGETS = "conv1, conv2"
+DIT_EXCLUDE_TARGETS = ""
 
 # --- Learning Rate Scheduler ---
 LR_CUSTOM_CURVE = [
@@ -60,6 +84,7 @@ LR_CUSTOM_CURVE = [
     [0.85, 8.0e-7],
     [1.0, 1.0e-7]
 ]
+LEARNING_RATE = 8.0e-7
 LR_GRAPH_MIN = 0.0
 LR_GRAPH_MAX = 1.0e-6
 
@@ -105,9 +130,171 @@ SEMANTIC_ENTROPY_WEIGHT = 0.2
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "sdpa"
 TIMESTEP_MODE = "Wave"
+USE_GRADIENT_CHECKPOINTING = True
+USE_GRADIENT_CHECKPOINTING_OFFLOAD = True
+
+# --- DiT / Anima Cache Configuration ---
+ANIMA_CACHE_FOLDER_NAME = ".precomputed_anima_dit_cache"
+VAE_CACHING_TILED = True
+VAE_CACHING_TILE_SIZE = [96, 96]
+VAE_CACHING_TILE_STRIDE = [72, 72]
+REBUILD_CACHE = False
 
 # --- VAE Configuration ---
 VAE_NORMALIZATION_MODE = "scalar"  # scalar or flux_bn32 (ComfyUI Flux 32ch BN layout)
 VAE_SHIFT_FACTOR = None      # None = auto-detect, else use this value
 VAE_SCALING_FACTOR = None    # None = auto-detect, else use this value
 VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
+
+
+LEGACY_FLAT_KEYS = [
+    "SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH", "OUTPUT_DIR", "TRAINING_MODE",
+    "DIT_PATH", "DIT_VAE_PATH", "ANIMA_BASE_DIT_PATH", "ANIMA_DIT_SAVE_PREFIX",
+    "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
+    "RESUME_TRAINING", "RESUME_MODEL_PATH", "RESUME_STATE_PATH",
+    "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH", "INSTANCE_DATASETS",
+    "CACHING_BATCH_SIZE", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
+    "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED",
+    "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX",
+    "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE", "TARGET_PIXEL_AREA",
+    "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS",
+    "PREDICTION_TYPE", "MAX_TRAIN_STEPS", "BATCH_SIZE",
+    "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM",
+    "SEED", "SAVE_EVERY_N_STEPS", "UNET_EXCLUDE_TARGETS", "DIT_EXCLUDE_TARGETS",
+    "LR_CUSTOM_CURVE", "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX",
+    "TIMESTEP_ALLOCATION", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS",
+    "VELORMS_PARAMS", "LOSS_TYPE", "SEMANTIC_SEP_WEIGHT",
+    "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT",
+    "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
+    "USE_GRADIENT_CHECKPOINTING", "USE_GRADIENT_CHECKPOINTING_OFFLOAD",
+    "ANIMA_CACHE_FOLDER_NAME", "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE",
+    "VAE_CACHING_TILE_STRIDE", "REBUILD_CACHE", "VAE_NORMALIZATION_MODE",
+    "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR", "VAE_LATENT_CHANNELS",
+]
+
+PER_MODE_FLAT_KEYS = [
+    "OUTPUT_DIR", "RESUME_TRAINING", "INSTANCE_DATASETS", "CACHING_BATCH_SIZE",
+    "NUM_WORKERS", "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
+    "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN",
+    "TEXT_CONDITIONING_SCALE_MAX", "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE",
+    "TARGET_PIXEL_AREA", "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED",
+    "MULTI_BUCKET_EXTRA_BUCKETS", "PREDICTION_TYPE", "MAX_TRAIN_STEPS",
+    "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION",
+    "CLIP_GRAD_NORM", "SEED", "SAVE_EVERY_N_STEPS", "LR_CUSTOM_CURVE",
+    "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX", "TIMESTEP_ALLOCATION",
+    "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
+    "LOSS_TYPE", "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
+    "VAE_NORMALIZATION_MODE", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR",
+    "VAE_LATENT_CHANNELS", "REBUILD_CACHE",
+]
+
+MODE_SPECIFIC_FLAT_KEYS = {
+    MODE_SDXL: [
+        "SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH", "RESUME_MODEL_PATH",
+        "RESUME_STATE_PATH", "UNET_EXCLUDE_TARGETS",
+    ],
+    MODE_ANIMA: [
+        "DIT_PATH", "DIT_VAE_PATH", "ANIMA_BASE_DIT_PATH", "ANIMA_DIT_SAVE_PREFIX",
+        "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
+        "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH",
+        "DIT_EXCLUDE_TARGETS", "USE_GRADIENT_CHECKPOINTING",
+        "USE_GRADIENT_CHECKPOINTING_OFFLOAD", "ANIMA_CACHE_FOLDER_NAME",
+        "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE", "VAE_CACHING_TILE_STRIDE",
+    ],
+}
+
+NESTED_NAME_OVERRIDES = {
+    "SINGLE_FILE_CHECKPOINT_PATH": "base_model_path",
+    "DIT_PATH": "dit_model_path",
+    "DIT_VAE_PATH": "vae_path",
+    "ANIMA_BASE_DIT_PATH": "base_dit_template_path",
+    "ANIMA_DIT_SAVE_PREFIX": "dit_save_prefix",
+    "TOKENIZER_PATH": "qwen_tokenizer",
+    "TOKENIZER_T5XXL_PATH": "t5xxl_tokenizer",
+    "RESUME_TRAINING": "resume_training",
+    "RESUME_MODEL_PATH": "resume_model_path",
+    "RESUME_STATE_PATH": "resume_state_path",
+    "ANIMA_RESUME_MODEL_PATH": "resume_model_path",
+    "ANIMA_RESUME_STATE_PATH": "resume_state_path",
+}
+
+
+def mode_key_from_label(value):
+    text = str(value or "").strip().lower()
+    if text in {MODE_ANIMA, TRAINING_MODE_ANIMA.lower()} or text.startswith("anima"):
+        return MODE_ANIMA
+    return MODE_SDXL
+
+
+def nested_key_for(mode_key, flat_key):
+    suffix = NESTED_NAME_OVERRIDES.get(flat_key, flat_key.lower())
+    if suffix.startswith(f"{mode_key}_"):
+        return suffix
+    return f"{mode_key}_{suffix}"
+
+
+def flat_defaults():
+    return {key: copy.deepcopy(globals()[key]) for key in LEGACY_FLAT_KEYS if key in globals()}
+
+
+def mode_flat_keys(mode_key):
+    return [*PER_MODE_FLAT_KEYS, *MODE_SPECIFIC_FLAT_KEYS.get(mode_key, [])]
+
+
+def default_mode_config(mode_key):
+    defaults = flat_defaults()
+    return {
+        nested_key_for(mode_key, flat_key): copy.deepcopy(defaults.get(flat_key))
+        for flat_key in mode_flat_keys(mode_key)
+    }
+
+
+def default_preset():
+    return {
+        "config_version": CONFIG_VERSION,
+        "active_mode": MODE_SDXL,
+        MODE_SDXL: default_mode_config(MODE_SDXL),
+        MODE_ANIMA: default_mode_config(MODE_ANIMA),
+    }
+
+
+def nest_flat_config(flat_config, mode_key=None, base_preset=None):
+    mode_key = mode_key_from_label(mode_key or flat_config.get("TRAINING_MODE"))
+    preset = copy.deepcopy(base_preset) if base_preset else default_preset()
+    preset["config_version"] = CONFIG_VERSION
+    preset["active_mode"] = mode_key
+    preset.setdefault(mode_key, default_mode_config(mode_key))
+    for flat_key in mode_flat_keys(mode_key):
+        if flat_key in flat_config:
+            preset[mode_key][nested_key_for(mode_key, flat_key)] = copy.deepcopy(flat_config[flat_key])
+    return preset
+
+
+def normalize_preset(config_data):
+    if not isinstance(config_data, dict):
+        return default_preset()
+    if MODE_SDXL in config_data or MODE_ANIMA in config_data:
+        preset = default_preset()
+        preset["active_mode"] = mode_key_from_label(config_data.get("active_mode", config_data.get("TRAINING_MODE")))
+        for mode_key in (MODE_SDXL, MODE_ANIMA):
+            if isinstance(config_data.get(mode_key), dict):
+                preset[mode_key].update(copy.deepcopy(config_data[mode_key]))
+        return preset
+    return nest_flat_config(config_data)
+
+
+def flatten_preset(config_data, mode_key=None):
+    preset = normalize_preset(config_data)
+    mode_key = mode_key_from_label(mode_key or preset.get("active_mode"))
+    flat = flat_defaults()
+    flat["TRAINING_MODE"] = MODE_LABELS[mode_key]
+    mode_block = preset.get(mode_key, {})
+    for flat_key in mode_flat_keys(mode_key):
+        nested_key = nested_key_for(mode_key, flat_key)
+        if nested_key in mode_block:
+            flat[flat_key] = copy.deepcopy(mode_block[nested_key])
+    if mode_key == MODE_ANIMA:
+        flat["VAE_PATH"] = flat.get("DIT_VAE_PATH", "")
+        flat["RESUME_MODEL_PATH"] = ""
+        flat["RESUME_STATE_PATH"] = ""
+    return flat

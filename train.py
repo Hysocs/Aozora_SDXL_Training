@@ -45,8 +45,17 @@ Image.MAX_IMAGE_PIXELS = 190_000_000
 ImageFile.LOAD_TRUNCATED_IMAGES = False
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 FLUX_BN_EPS = 1e-4
+CLIP_CHUNK_TOKEN_COUNT = 77
+CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
+    "version",
+    "unconditional_dropout",
+    "null_conditioning_needed",
+    "text_conditioning_scale_enabled",
+    "caption_embedding_layout",
+}
 BN_MEAN_SUFFIXES = [
     "bn.running_mean",
     "normalize.bn.running_mean",
@@ -121,9 +130,8 @@ def generate_noise(latents, generator, device, dtype=None, step=None, seed=None)
 
 class TrainingConfig:
     def __init__(self):
-        for key, value in default_config.__dict__.items():
-            if not key.startswith('__'):
-                setattr(self, key, value)
+        for key, value in default_config.flat_defaults().items():
+            setattr(self, key, value)
         self._load_from_user_config()
         self._type_check_and_correct()
         self.NOISE_MODE = "normal"
@@ -140,7 +148,7 @@ class TrainingConfig:
                 print(f"INFO: Loading configuration from {path}")
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
-                        user_config = json.load(f)
+                        user_config = default_config.flatten_preset(json.load(f))
                     if user_config.get("LOSS_TYPE") == "DestinationLoss":
                         user_config["LOSS_TYPE"] = "PatchMSE"
                     for key, value in user_config.items():
@@ -151,10 +159,24 @@ class TrainingConfig:
                 print(f"WARNING: Config {path} not found. Using defaults.")
 
     def _type_check_and_correct(self):
-        for key, value in list(self.__dict__.items()):
-            if key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"] and getattr(self, "RESUME_TRAINING", False):
+        if getattr(self, "RESUME_TRAINING", False):
+            is_anima = str(getattr(self, "TRAINING_MODE", "")).lower().startswith("anima")
+            resume_path_keys = (
+                [("ANIMA_RESUME_MODEL_PATH", "RESUME_MODEL_PATH"), ("ANIMA_RESUME_STATE_PATH", "RESUME_STATE_PATH")]
+                if is_anima
+                else [("RESUME_MODEL_PATH", None), ("RESUME_STATE_PATH", None)]
+            )
+            for key, fallback_key in resume_path_keys:
+                value = getattr(self, key, "")
+                if not value and fallback_key:
+                    fallback_value = getattr(self, fallback_key, "")
+                    if fallback_value:
+                        setattr(self, key, fallback_value)
+                        value = fallback_value
                 if not value or not Path(value).exists():
                     raise FileNotFoundError(f"RESUME_TRAINING is enabled, but {key}='{value}' is not a valid file path.")
+
+        for key, value in list(self.__dict__.items()):
             if key == "UNET_EXCLUDE_TARGETS":
                 if isinstance(value, str): setattr(self, key, [item.strip() for item in value.split(',') if item.strip()])
                 elif isinstance(value, list): setattr(self, key, [item for item in value if item])
@@ -646,6 +668,14 @@ def text_conditioning_scale_enabled(config):
 def null_conditioning_cache_needed(config):
     return bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)) or text_conditioning_scale_enabled(config)
 
+def normalize_cache_options_for_image_cache(cache_options):
+    if not isinstance(cache_options, dict):
+        return cache_options
+    return {k: v for k, v in cache_options.items() if k not in CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS}
+
+def cache_options_match_for_image_cache(cached_options, expected_options):
+    return normalize_cache_options_for_image_cache(cached_options) == normalize_cache_options_for_image_cache(expected_options)
+
 def get_caption_cache_options(config):
     vae_source = get_vae_source_for_config(config)
     vae_source_path = ""
@@ -663,8 +693,8 @@ def get_caption_cache_options(config):
             vae_source_path = str(vae_source)
 
     return {
-        "version": 10,
-        "unconditional_dropout": bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)),
+        "version": 11,
+        "caption_embedding_layout": "fixed_total_chunks",
         "caption_chunking_enabled": caption_chunking_enabled(config),
         "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
         "multi_bucket_extra_buckets": int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0) if getattr(config, "MULTI_BUCKET_ENABLED", False) else 0,
@@ -703,7 +733,7 @@ def check_if_caching_needed(config):
         try:
             with open(index_path, "r", encoding="utf-8") as f:
                 index_data = json.load(f)
-            if index_data.get("cache_options") != expected_cache_options:
+            if not cache_options_match_for_image_cache(index_data.get("cache_options"), expected_cache_options):
                 needs_caching = True
             indexed_files = index_data.get("files", [])
             if any("scaled_size" not in item for item in indexed_files):
@@ -726,7 +756,7 @@ def check_if_caching_needed(config):
             for f in cached_te_files[: min(len(cached_te_files), 10)]:
                 try:
                     data_te = torch.load(f, map_location="cpu", weights_only=True)
-                    if data_te.get("cache_options") != expected_cache_options:
+                    if not cache_options_match_for_image_cache(data_te.get("cache_options"), expected_cache_options):
                         needs_caching = True
                         break
                 except Exception:
@@ -952,9 +982,6 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
 
-        if null_embeds is not None and null_pooled is not None:
-            torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
-
         paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
         multi_bucket_extra = (
             max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
@@ -968,13 +995,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         if index_path.exists():
             try:
                 with open(index_path, "r", encoding="utf-8") as f:
-                    force_recaching = json.load(f).get("cache_options") != expected_cache_options
+                    force_recaching = not cache_options_match_for_image_cache(json.load(f).get("cache_options"), expected_cache_options)
             except Exception:
                 force_recaching = True
 
         if force_recaching:
             stale_files = list(cache_dir.glob("*_te*.pt")) + list(cache_dir.glob("*_lat.pt"))
-            stale_files += [cache_dir / "null_embeds.pt"]
             for stale_file in stale_files:
                 if not stale_file.exists():
                     continue
@@ -982,6 +1008,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     stale_file.unlink()
                 except OSError as e:
                     print(f"WARNING: Could not remove stale cache file {stale_file}: {e}")
+
+        if null_embeds is not None and null_pooled is not None:
+            torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
         to_process = []
         for p in paths:
@@ -1127,7 +1156,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 print(f"WARNING: Could not index {f}: {e}")
                 
         with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"version": 10, "cache_options": expected_cache_options, "files": index_data}, f)
+            json.dump({"version": 11, "cache_options": expected_cache_options, "files": index_data}, f)
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -1165,7 +1194,7 @@ class ImageTextLatentDataset(Dataset):
         self.null_embeds = None
         self.null_pooled = None
         self.cond_scale_min, self.cond_scale_max = get_text_conditioning_scale_range(config)
-        self.cond_scale_enabled = self.cond_scale_min < 1.0 or self.cond_scale_max < 1.0
+        self.cond_scale_enabled = self.cond_scale_min < 1.0 or self.cond_scale_max > 1.0
         self.dropout_prob = (
             min(max(float(getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0)), 0.0), 1.0)
             if getattr(config, "UNCONDITIONAL_DROPOUT", False)
@@ -1196,6 +1225,48 @@ class ImageTextLatentDataset(Dataset):
             return payload.get("latents")
         return payload
 
+    def _resize_null_embeds(self, target_len, dtype):
+        null_embeds = self.null_embeds
+        if null_embeds is None:
+            return null_embeds
+        if null_embeds.shape[0] == target_len:
+            return null_embeds.to(dtype=dtype)
+
+        null_len = null_embeds.shape[0]
+        if target_len < null_len:
+            return null_embeds[:target_len].to(dtype=dtype)
+
+        chunk_len = CLIP_CHUNK_TOKEN_COUNT if null_len >= CLIP_CHUNK_TOKEN_COUNT else null_len
+        if chunk_len <= 0 or null_len % chunk_len != 0:
+            pad = null_embeds[-1:].expand(target_len - null_len, -1)
+            return torch.cat([null_embeds, pad], dim=0).to(dtype=dtype)
+
+        null_chunk = null_embeds[-chunk_len:]
+        missing = target_len - null_len
+        full_chunks, partial_chunk = divmod(missing, chunk_len)
+        parts = [null_embeds]
+        if full_chunks:
+            parts.append(null_chunk.repeat(full_chunks, 1))
+        if partial_chunk:
+            parts.append(null_chunk[:partial_chunk])
+        return torch.cat(parts, dim=0).to(dtype=dtype)
+
+    def _align_null_embeds(self, embeds):
+        null_embeds = self.null_embeds
+        if null_embeds is None or embeds.shape == null_embeds.shape:
+            return embeds, null_embeds
+        if embeds.dim() != 2 or null_embeds.dim() != 2 or embeds.shape[1] != null_embeds.shape[1]:
+            return embeds, null_embeds
+
+        embed_len = embeds.shape[0]
+        null_len = null_embeds.shape[0]
+        if embed_len < null_len:
+            pad = self._resize_null_embeds(null_len, embeds.dtype)[embed_len:null_len]
+            embeds = torch.cat([embeds, pad], dim=0)
+        elif embed_len > null_len:
+            null_embeds = self._resize_null_embeds(embed_len, null_embeds.dtype)
+        return embeds, null_embeds
+
     def __getitem__(self, i):
         try:
             if self.worker_rng is None: self._init_worker_rng()
@@ -1222,10 +1293,12 @@ class ImageTextLatentDataset(Dataset):
             }
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
-                item["embeds"], item["pooled"] = self.null_embeds, self.null_pooled
+                _, null_embeds = self._align_null_embeds(item["embeds"])
+                item["embeds"], item["pooled"] = null_embeds, self.null_pooled
             elif self.cond_scale_enabled:
                 scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
-                item["embeds"] = self.null_embeds + (item["embeds"] - self.null_embeds) * scale
+                embeds, null_embeds = self._align_null_embeds(item["embeds"])
+                item["embeds"] = null_embeds + (embeds - null_embeds) * scale
                 item["pooled"] = self.null_pooled + (item["pooled"] - self.null_pooled) * scale
 
             return item

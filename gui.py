@@ -8,6 +8,7 @@ import sys
 import shutil
 import ctypes
 import zlib
+import importlib.util
 from pathlib import Path
 from collections import deque
 from datetime import datetime
@@ -40,6 +41,36 @@ TEXT_SEC   = "#7a7f9a"
 DANGER     = "#f74b6a"
 SUCCESS    = "#3ef78e"
 WARN       = "#f7c948"
+
+TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
+TRAINING_MODE_ANIMA_DIT = "Anima DiT (Qwen)"
+DIT_AVAILABLE = importlib.util.find_spec("diffsynth") is not None
+SDXL_PATH_KEYS = {
+    "SINGLE_FILE_CHECKPOINT_PATH",
+    "VAE_PATH",
+    "RESUME_MODEL_PATH",
+    "RESUME_STATE_PATH",
+}
+ANIMA_PATH_KEYS = {
+    "DIT_PATH",
+    "ANIMA_BASE_DIT_PATH",
+    "DIT_VAE_PATH",
+    "TEXT_ENCODER_PATH",
+    "TOKENIZER_PATH",
+    "TOKENIZER_T5XXL_PATH",
+    "ANIMA_RESUME_MODEL_PATH",
+    "ANIMA_RESUME_STATE_PATH",
+}
+ANIMA_LOCKED_WIDGET_KEYS = {
+    "PREDICTION_TYPE",
+    "MEMORY_EFFICIENT_ATTENTION",
+    "LOSS_TYPE",
+    "CAPTION_CHUNKING_ENABLED",
+    "VAE_NORMALIZATION_MODE",
+    "VAE_SHIFT_FACTOR",
+    "VAE_SCALING_FACTOR",
+    "VAE_LATENT_CHANNELS",
+}
 
 TEXT_MUTED   = "#383b4075"
 BORDER_MUTED = "#191c2675"
@@ -1788,7 +1819,7 @@ class ProcessRunner(QThread):
                     else:
                         self.progressSignal.emit(line.split('\r')[-1], is_progress)
                     self.metricsSignal.emit(line)
-                    if "saved latents cache" in line.lower() or "caching complete" in line.lower():
+                    if "saved latents cache" in line.lower() or "caching complete" in line.lower() or "anima dit items" in line.lower():
                         self.cacheCreatedSignal.emit()
             self.finishedSignal.emit(self.process.wait())
         except Exception as e:
@@ -2162,7 +2193,13 @@ class DatasetManagerWidget(QtWidgets.QWidget):
 
 UI_DEFS = {
     "SINGLE_FILE_CHECKPOINT_PATH": ("Base Model (.safetensors)", "Path to the base SDXL model.", "path", "file_safetensors"),
+    "DIT_PATH":                    ("DiT Model (.safetensors)", "Path to the Anima DiT diffusion model.", "path", "file_safetensors"),
+    "ANIMA_BASE_DIT_PATH":         ("Base DiT Template", "Optional original anima-preview.safetensors used to instantiate the architecture when a fine-tune cannot be auto-detected.", "path", "file_safetensors"),
+    "DIT_VAE_PATH":                ("DiT VAE (.safetensors)", "Path to the VAE used by the Anima DiT model.", "path", "file_safetensors"),
     "VAE_PATH":                    ("Separate VAE (Optional)", "Leave empty to use the VAE from the base model.", "path", "file_safetensors"),
+    "TEXT_ENCODER_PATH":           ("Text Encoder (.safetensors)", "Path to the Qwen text encoder for Anima DiT.", "path", "file_safetensors"),
+    "TOKENIZER_PATH":              ("Tokenizer", "Tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
+    "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer", "T5XXL tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
@@ -2185,12 +2222,17 @@ UI_DEFS = {
     "MIXED_PRECISION":             ("Mixed Precision", "bfloat16 for modern GPUs, float16 for older.", "combo", ["bfloat16", "float16"]),
     "CLIP_GRAD_NORM":              ("Gradient Clipping", "Maximum gradient norm. 0 to disable.", "line"),
     "SEED":                        ("Seed", "Ensures reproducible training.", "line"),
-    "RESUME_MODEL_PATH":           ("Resume Model", "The .safetensors checkpoint file.", "path", "file_safetensors"),
-    "RESUME_STATE_PATH":           ("Resume State", "The .pt optimizer state file.", "path", "file_pt"),
+    "RESUME_MODEL_PATH":           ("SDXL Resume Model", "The SDXL .safetensors checkpoint file.", "path", "file_safetensors"),
+    "RESUME_STATE_PATH":           ("SDXL Resume State", "The SDXL .pt optimizer state file.", "path", "file_pt"),
+    "ANIMA_RESUME_MODEL_PATH":     ("Anima Resume Model", "The Anima DiT .safetensors checkpoint file.", "path", "file_safetensors"),
+    "ANIMA_RESUME_STATE_PATH":     ("Anima Resume State", "The Anima DiT .pt optimizer state file.", "path", "file_pt"),
     "UNET_EXCLUDE_TARGETS":        ("Exclude Layers (Keywords)", "Keywords for layers to exclude (comma-separated).", "textedit", 100),
+    "DIT_EXCLUDE_TARGETS":         ("Exclude DiT Layers", "Keywords or fnmatch patterns for DiT layers to exclude.", "textedit", 100),
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
+    "USE_GRADIENT_CHECKPOINTING":  ("DiT Gradient Checkpointing", "Use DiT gradient checkpointing when supported by the model.", "check"),
+    "USE_GRADIENT_CHECKPOINTING_OFFLOAD": ("DiT Checkpoint Offload", "Offload DiT checkpoint activations when supported.", "check"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
@@ -2211,20 +2253,13 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets = {}
         self.process_runner = None
         self.current_config = {}
+        self.current_preset = default_config.default_preset()
+        self.current_mode_key = default_config.MODE_SDXL
+        self._applying_config = False
+        self.keyed_groups = []
         self.last_line_is_progress = False
-        self.default_config = {
-            key: copy.deepcopy(getattr(default_config, key))
-            for key in UI_DEFS
-            if hasattr(default_config, key)
-        }
-        for key in [
-            "RESUME_TRAINING", "INSTANCE_DATASETS", "LR_CUSTOM_CURVE",
-            "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
-            "LOSS_TYPE", "TIMESTEP_MODE", "TIMESTEP_ALLOCATION"
-        ]:
-            if hasattr(default_config, key):
-                self.default_config[key] = copy.deepcopy(getattr(default_config, key))
-        self.default_config.setdefault("NOISE_MODE", "normal")
+        self.default_preset = default_config.default_preset()
+        self.default_config = default_config.flatten_preset(self.default_preset, default_config.MODE_SDXL)
         self.presets = {}
         self.last_browsed_path = os.getcwd()
 
@@ -2244,11 +2279,23 @@ class TrainingGUI(QtWidgets.QWidget):
             self._load_first_config()
         self.config_dropdown.blockSignals(False)
 
+    def _create_training_mode_combo(self):
+        self.training_mode_combo = make_combo([TRAINING_MODE_SDXL, TRAINING_MODE_ANIMA_DIT])
+        self.training_mode_combo.setMinimumWidth(185)
+        if not DIT_AVAILABLE:
+            self._set_combo_item_enabled(
+                self.training_mode_combo,
+                TRAINING_MODE_ANIMA_DIT,
+                False,
+                "Install/enable diffsynth to use Anima DiT training.",
+            )
+        self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
+
     def _initialize_configs(self):
         os.makedirs(self.config_dir, exist_ok=True)
         if not any(f.endswith(".json") and f != "gui_state.json" for f in os.listdir(self.config_dir)):
             with open(os.path.join(self.config_dir, "default.json"), 'w') as f:
-                json.dump(self.default_config, f, indent=4)
+                json.dump(self.default_preset, f, indent=4)
         self.presets = {}
         for fn in os.listdir(self.config_dir):
             if fn.endswith(".json") and fn != "gui_state.json":
@@ -2280,16 +2327,22 @@ class TrainingGUI(QtWidgets.QWidget):
             self.config_dropdown.setCurrentIndex(0)
             self.load_selected_config(0)
         else:
-            self.current_config = copy.deepcopy(self.default_config)
+            self.current_preset = copy.deepcopy(self.default_preset)
+            self.current_mode_key = self.current_preset["active_mode"]
+            self.current_config = default_config.flatten_preset(self.current_preset, self.current_mode_key)
             self._apply_config_to_widgets()
 
     def load_selected_config(self, index):
         key = self.config_dropdown.itemData(index) or self.config_dropdown.itemText(index).replace(" ", "_").lower()
         if key in self.presets:
-            self.current_config = {**copy.deepcopy(self.default_config), **self.presets[key]}
+            self.current_preset = default_config.normalize_preset(self.presets[key])
+            self.current_mode_key = self.current_preset["active_mode"]
+            self.current_config = default_config.flatten_preset(self.current_preset, self.current_mode_key)
             self.log(f"Loaded config: '{key}.json'")
         else:
-            self.current_config = copy.deepcopy(self.default_config)
+            self.current_preset = copy.deepcopy(self.default_preset)
+            self.current_mode_key = self.current_preset["active_mode"]
+            self.current_config = default_config.flatten_preset(self.current_preset, self.current_mode_key)
             self.log(f"Warning: preset '{key}' not found, using defaults.")
         self._apply_config_to_widgets()
         self._save_gui_state()
@@ -2326,17 +2379,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.config_dropdown.blockSignals(False)
             self.log(f"Saved preset: '{name}.json'")
         except Exception as e: self.log(f"Error saving preset: {e}")
-
-    def restore_defaults(self):
-        idx = self.config_dropdown.currentIndex()
-        if idx < 0: return
-        key = self.config_dropdown.itemData(idx) or self.config_dropdown.itemText(idx).replace(" ", "_").lower()
-        if QtWidgets.QMessageBox.question(self, "Restore Defaults",
-                                          f"Overwrite '{key}.json' with hardcoded defaults?",
-                                          QtWidgets.QMessageBox.StandardButton.Yes | QtWidgets.QMessageBox.StandardButton.No) == QtWidgets.QMessageBox.StandardButton.Yes:
-            self.presets[key] = copy.deepcopy(self.default_config)
-            self.save_config(); self.load_selected_config(idx)
-            self.log(f"Restored '{key}.json' to defaults.")
 
     def _make_widget(self, key):
         if key not in UI_DEFS: return None, None
@@ -2400,6 +2442,84 @@ class TrainingGUI(QtWidgets.QWidget):
         if key in self.widgets:
             getattr(self.widgets[key], signal_name).connect(callback)
 
+    def _is_dit_mode(self):
+        return getattr(self, "training_mode_combo", None) and self.training_mode_combo.currentText() == TRAINING_MODE_ANIMA_DIT
+
+    def _set_combo_item_enabled(self, combo, text, enabled, tooltip=""):
+        idx = combo.findText(text)
+        if idx < 0:
+            return
+        item = combo.model().item(idx)
+        if not item:
+            return
+        flags = item.flags()
+        if enabled:
+            item.setFlags(flags | QtCore.Qt.ItemFlag.ItemIsEnabled)
+        else:
+            item.setFlags(flags & ~QtCore.Qt.ItemFlag.ItemIsEnabled)
+        item.setToolTip(tooltip)
+
+    def _update_architecture_controls(self):
+        is_dit = self._is_dit_mode()
+        if is_dit and not DIT_AVAILABLE:
+            self.training_mode_combo.blockSignals(True)
+            self.training_mode_combo.setCurrentText(TRAINING_MODE_SDXL)
+            self.training_mode_combo.blockSignals(False)
+            is_dit = False
+            self.log("Anima DiT mode is unavailable because diffsynth is not installed/enabled.")
+
+        self._update_path_mode_controls()
+        if hasattr(self, "unet_exclusion_group"):
+            self.unet_exclusion_group.setVisible(not is_dit)
+        if hasattr(self, "dit_exclusion_group"):
+            self.dit_exclusion_group.setVisible(is_dit)
+        if hasattr(self, "advanced_group"):
+            self.advanced_group.setVisible(not is_dit)
+        if hasattr(self, "dit_runtime_group"):
+            self.dit_runtime_group.setVisible(is_dit)
+
+        for key in ANIMA_LOCKED_WIDGET_KEYS:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(not is_dit)
+        self._update_mode_locked_group_states()
+
+        if "UNCONDITIONAL_DROPOUT" in self.widgets:
+            self.widgets["UNCONDITIONAL_DROPOUT"].setEnabled(True)
+        if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
+            self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(
+                self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
+            )
+        if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
+            self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].setEnabled(True)
+            self._update_text_conditioning_scale_controls()
+
+        if not is_dit:
+            self._update_vae_normalization_controls()
+        if hasattr(self, "dataset_manager"):
+            self.dataset_manager.refresh_cache_buttons()
+
+    def _update_path_mode_controls(self):
+        is_dit = self._is_dit_mode()
+        is_resume = (
+            hasattr(self, "model_load_strategy_combo")
+            and self.model_load_strategy_combo.currentIndex() == 1
+        )
+
+        if hasattr(self, "model_load_strategy_combo"):
+            self.model_load_strategy_combo.setVisible(True)
+        if hasattr(self, "model_load_mode_label"):
+            self.model_load_mode_label.setVisible(True)
+        if hasattr(self, "path_stacked_widget"):
+            self.path_stacked_widget.setCurrentIndex(1 if is_resume else 0)
+            self.path_stacked_widget.setVisible(not is_dit)
+            self._sync_path_stack_height()
+        if hasattr(self, "dit_paths_widget"):
+            self.dit_paths_widget.setVisible(is_dit)
+        if hasattr(self, "dit_model_path_row"):
+            self.dit_model_path_row.setVisible(is_dit and not is_resume)
+        if hasattr(self, "anima_resume_paths_widget"):
+            self.anima_resume_paths_widget.setVisible(is_dit and is_resume)
+
     def _add_vertical_field(self, layout, label, widget, tooltip=None):
         if tooltip:
             label.setToolTip(tooltip)
@@ -2460,6 +2580,7 @@ class TrainingGUI(QtWidgets.QWidget):
     def _form_group(self, title, keys, layout_cls=QtWidgets.QFormLayout):
         gb, _ = group_box(title, layout_cls)
         self._add_form_keys(gb.layout(), keys)
+        self._register_keyed_group(gb, keys)
         return gb
 
     def _vertical_form_group(self, title, keys):
@@ -2467,7 +2588,18 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.setSpacing(8)
         for key in keys:
             self._add_vertical_widget_key(lay, key)
+        self._register_keyed_group(gb, keys)
         return gb
+
+    def _register_keyed_group(self, group, keys):
+        self.keyed_groups.append((group, set(keys)))
+
+    def _update_mode_locked_group_states(self):
+        locked_keys = ANIMA_LOCKED_WIDGET_KEYS if self._is_dit_mode() else set()
+        for group, keys in self.keyed_groups:
+            if not keys:
+                continue
+            group.setEnabled(not keys.issubset(locked_keys))
 
     def _make_scroll_panel(self, widget, min_width=None, max_width=None):
         scroll = QtWidgets.QScrollArea()
@@ -2485,6 +2617,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log_textbox = VirtualConsoleWidget(visible_lines=900, clear_callback=self.clear_console_log)
 
         self.tab_view = QtWidgets.QTabWidget()
+        self._create_training_mode_combo()
 
         for title_text, builder in [("Dataset", self._build_dataset_tab),
                                     ("Model && Training Parameters", self._build_model_training_tab)]:
@@ -2519,6 +2652,10 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.setContentsMargins(10, 5, 10, 5)
         lay.setSpacing(8)
 
+        lay.addWidget(make_label("Architecture:"))
+        lay.addWidget(self.training_mode_combo)
+
+        lay.addWidget(make_label("Config:"))
         self.config_dropdown = NoScrollComboBox()
         for name in sorted(self.presets.keys()):
             self.config_dropdown.addItem(name.replace("_", " ").title(), name)
@@ -2526,10 +2663,6 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addWidget(self.config_dropdown)
         lay.addWidget(make_btn("Save Config", self.save_config))
         lay.addWidget(make_btn("Save As...", self.save_as_config))
-        restore_btn = make_btn("↺", self.restore_defaults)
-        restore_btn.setFixedHeight(32)
-        restore_btn.setToolTip("Restore Selected Config to Defaults")
-        lay.addWidget(restore_btn)
         self.tab_view.setCornerWidget(corner, QtCore.Qt.Corner.TopRightCorner)
 
     def _build_bottom_bar(self):
@@ -2631,28 +2764,12 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets[key].setEnabled(enabled)
 
     def _build_architecture_group(self):
-        mode_gb, mode_lay = group_box("Architecture & Prediction", QtWidgets.QVBoxLayout)
+        mode_gb, mode_lay = group_box("Prediction", QtWidgets.QVBoxLayout)
         mode_lay.setSpacing(4)
 
-        row = QtWidgets.QHBoxLayout()
-        row.setContentsMargins(0, 0, 0, 0)
-        row.setSpacing(8)
-
-        self.training_mode_combo = make_combo(["Stable Diffusion XL (SDXL)"])
-        self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
-        arch_col = QtWidgets.QVBoxLayout()
-        arch_col.setContentsMargins(0, 0, 0, 0)
-        arch_col.setSpacing(3)
-        self._add_vertical_field(arch_col, make_label("Architecture:"), self.training_mode_combo)
-        row.addLayout(arch_col, 1)
-
-        pred_col = QtWidgets.QVBoxLayout()
-        pred_col.setContentsMargins(0, 0, 0, 0)
-        pred_col.setSpacing(3)
-        self._add_vertical_widget_key(pred_col, "PREDICTION_TYPE")
-        row.addLayout(pred_col, 1)
-        mode_lay.addLayout(row)
+        self._add_vertical_widget_key(mode_lay, "PREDICTION_TYPE")
         self.widgets["PREDICTION_TYPE"].currentTextChanged.connect(self._on_prediction_type_changed)
+        self._register_keyed_group(mode_gb, ["PREDICTION_TYPE"])
         return mode_gb
 
     def _build_model_training_tab(self, parent):
@@ -2675,9 +2792,18 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_training_length_group())
         settings_lay.addWidget(self._build_batching_group())
         settings_lay.addWidget(self._build_runtime_group())
-        settings_lay.addWidget(self._vertical_form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"]))
+        self.unet_exclusion_group = self._vertical_form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"])
+        self.dit_exclusion_group = self._vertical_form_group("DiT Layer Exclusion", ["DIT_EXCLUDE_TARGETS"])
+        settings_lay.addWidget(self.unet_exclusion_group)
+        settings_lay.addWidget(self.dit_exclusion_group)
         settings_lay.addWidget(self._build_loss_group())
-        settings_lay.addWidget(self._build_advanced_group())
+        self.advanced_group = self._build_advanced_group()
+        self.dit_runtime_group = self._vertical_form_group(
+            "DiT Runtime",
+            ["USE_GRADIENT_CHECKPOINTING", "USE_GRADIENT_CHECKPOINTING_OFFLOAD"],
+        )
+        settings_lay.addWidget(self.advanced_group)
+        settings_lay.addWidget(self.dit_runtime_group)
         settings_lay.addStretch(1)
         split.addWidget(self._make_scroll_panel(settings_panel, 380, 500))
 
@@ -2720,7 +2846,8 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.setContentsMargins(6, 6, 6, 6)
         lay.setSpacing(3)
         self.model_load_strategy_combo = make_combo(["Load Base Model", "Resume from Checkpoint"])
-        self._add_vertical_field(lay, make_label("Mode:"), self.model_load_strategy_combo)
+        self.model_load_mode_label = make_label("Mode:")
+        self._add_vertical_field(lay, self.model_load_mode_label, self.model_load_strategy_combo)
 
         self.path_stacked_widget = QtWidgets.QStackedWidget()
         self.path_stacked_widget.setContentsMargins(0, 0, 0, 0)
@@ -2752,10 +2879,31 @@ class TrainingGUI(QtWidgets.QWidget):
         self.path_stacked_widget.addWidget(resume_page)
         lay.addWidget(self.path_stacked_widget)
 
+        self.dit_paths_widget = QtWidgets.QWidget()
+        dit_lay = QtWidgets.QVBoxLayout(self.dit_paths_widget)
+        dit_lay.setContentsMargins(0, 0, 0, 0)
+        dit_lay.setSpacing(2)
+        self.dit_model_path_row = self._make_compact_path_row("DIT_PATH")
+        dit_lay.addWidget(self.dit_model_path_row)
+        self.anima_resume_paths_widget = QtWidgets.QWidget()
+        anima_resume_lay = QtWidgets.QVBoxLayout(self.anima_resume_paths_widget)
+        anima_resume_lay.setContentsMargins(0, 0, 0, 0)
+        anima_resume_lay.setSpacing(2)
+        for key in ["ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH"]:
+            anima_resume_lay.addWidget(self._make_compact_path_row(key))
+        dit_lay.addWidget(self.anima_resume_paths_widget)
+        dit_lay.addWidget(self._make_compact_path_row("ANIMA_BASE_DIT_PATH"))
+        dit_lay.addWidget(self._make_compact_path_row("DIT_VAE_PATH"))
+        dit_lay.addWidget(self._make_compact_path_row("TEXT_ENCODER_PATH"))
+        self._add_vertical_widget_key(dit_lay, "TOKENIZER_PATH")
+        self._add_vertical_widget_key(dit_lay, "TOKENIZER_T5XXL_PATH")
+        lay.addWidget(self.dit_paths_widget)
+
         lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
 
-        self.model_load_strategy_combo.currentIndexChanged.connect(self.path_stacked_widget.setCurrentIndex)
+        self.model_load_strategy_combo.currentIndexChanged.connect(lambda _: self._update_path_mode_controls())
         self.path_stacked_widget.currentChanged.connect(lambda _: self._sync_path_stack_height())
+        self._update_path_mode_controls()
         self._sync_path_stack_height()
         return gb
 
@@ -2964,6 +3112,10 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_vae_group(self):
         gb, lay = group_box("VAE Configuration")
+        self._register_keyed_group(
+            gb,
+            ["VAE_NORMALIZATION_MODE", "VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"],
+        )
         form = QtWidgets.QFormLayout()
         self._add_form_keys(form, ["VAE_NORMALIZATION_MODE", "VAE_LATENT_CHANNELS", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR"])
         self.widgets["VAE_NORMALIZATION_MODE"].currentTextChanged.connect(lambda _: self._update_vae_normalization_controls())
@@ -2982,7 +3134,10 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addLayout(preset_grid)
         lay.addWidget(make_separator())
         detect_btn = make_btn("Run VAE Diagnostics", self.launch_vae_detector)
-        detect_btn.setStyleSheet(f"background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT};")
+        detect_btn.setStyleSheet(
+            f"QPushButton {{ background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT}; }}"
+            f"QPushButton:disabled {{ color: {TEXT_MUTED}; background: transparent; border: 1px solid {BORDER_MUTED}; }}"
+        )
         lay.addWidget(detect_btn)
         return gb
 
@@ -3203,13 +3358,47 @@ class TrainingGUI(QtWidgets.QWidget):
             self.dataset_manager.refresh_cache_buttons()
 
     def _on_training_mode_changed(self, text):
+        if self._applying_config:
+            self._update_architecture_controls()
+            return
+        old_mode = self.current_mode_key
+        new_mode = default_config.mode_key_from_label(text)
+        if old_mode != new_mode:
+            self._store_current_mode_config(old_mode)
+            self.current_mode_key = new_mode
+            self.current_preset["active_mode"] = new_mode
+            self.current_config = default_config.flatten_preset(self.current_preset, new_mode)
+            self._apply_config_to_widgets()
+            return
+        self._update_architecture_controls()
         if hasattr(self, 'dataset_manager'): 
             self.dataset_manager.refresh_cache_buttons()
 
+    def _store_current_mode_config(self, mode_key=None):
+        mode_key = mode_key or self.current_mode_key
+        flat_cfg = self._collect_flat_config(mode_key)
+        self.current_preset = default_config.nest_flat_config(flat_cfg, mode_key, self.current_preset)
+        self.current_preset["active_mode"] = mode_key
+
     def _apply_config_to_widgets(self):
+        self._applying_config = True
         for w in self.widgets.values(): w.blockSignals(True)
         try:
             mode = self.current_config.get("TRAINING_MODE", "SDXL")
+            if mode == "SDXL":
+                mode = TRAINING_MODE_SDXL
+            if mode == TRAINING_MODE_ANIMA_DIT and not DIT_AVAILABLE:
+                mode = TRAINING_MODE_SDXL
+                self.current_config = default_config.flatten_preset(self.current_preset, default_config.MODE_SDXL)
+            self.current_mode_key = default_config.mode_key_from_label(mode)
+            self.current_preset["active_mode"] = self.current_mode_key
+            if "DIT_VAE_PATH" not in self.current_config and self.current_config.get("VAE_PATH"):
+                self.current_config["DIT_VAE_PATH"] = self.current_config.get("VAE_PATH")
+            if mode == TRAINING_MODE_ANIMA_DIT:
+                if not self.current_config.get("ANIMA_RESUME_MODEL_PATH") and self.current_config.get("RESUME_MODEL_PATH"):
+                    self.current_config["ANIMA_RESUME_MODEL_PATH"] = self.current_config.get("RESUME_MODEL_PATH")
+                if not self.current_config.get("ANIMA_RESUME_STATE_PATH") and self.current_config.get("RESUME_STATE_PATH"):
+                    self.current_config["ANIMA_RESUME_STATE_PATH"] = self.current_config.get("RESUME_STATE_PATH")
             self.training_mode_combo.blockSignals(True)
             self.training_mode_combo.setCurrentText(mode)
             self.training_mode_combo.blockSignals(False)
@@ -3277,6 +3466,7 @@ class TrainingGUI(QtWidgets.QWidget):
             if hasattr(self, 'dataset_manager'):
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
             self._update_training_calculations()
+            self._update_architecture_controls()
 
             if "PREDICTION_TYPE" in self.widgets:
                 self._on_prediction_type_changed(self.widgets["PREDICTION_TYPE"].currentText())
@@ -3286,21 +3476,26 @@ class TrainingGUI(QtWidgets.QWidget):
 
         finally:
             for w in self.widgets.values(): w.blockSignals(False)
+            self._applying_config = False
 
-    def _collect_config(self):
+    def _collect_flat_config(self, mode_key=None):
         cfg = {}
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
                      "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE",
                      "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
+        mode_key = mode_key or default_config.mode_key_from_label(self.training_mode_combo.currentText())
+        cfg["TRAINING_MODE"] = default_config.MODE_LABELS[mode_key]
+        is_dit = mode_key == default_config.MODE_ANIMA
+        inactive_path_keys = SDXL_PATH_KEYS if is_dit else ANIMA_PATH_KEYS
 
         for key in [*UI_DEFS.keys(), "LR_CUSTOM_CURVE"]:
             val = self.current_config.get(key)
             if key in skip_keys: continue
+            if key in inactive_path_keys: continue
             if val is None: continue
             cfg[key] = [[round(p[0], 8), round(p[1], 10)] for p in val] if key == "LR_CUSTOM_CURVE" else val
 
-        cfg["TRAINING_MODE"] = self.training_mode_combo.currentText()
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
@@ -3339,6 +3534,11 @@ class TrainingGUI(QtWidgets.QWidget):
             cfg[key] = None if vae_norm_mode == "flux_bn32" else self.widgets[key].value()
         cfg["VAE_LATENT_CHANNELS"] = self.widgets["VAE_LATENT_CHANNELS"].value()
         return cfg
+
+    def _collect_config(self):
+        self._store_current_mode_config(self.current_mode_key)
+        self.current_preset["active_mode"] = self.current_mode_key
+        return copy.deepcopy(self.current_preset)
 
     def _update_training_calculations(self):
         try:
@@ -3390,6 +3590,8 @@ class TrainingGUI(QtWidgets.QWidget):
         return self.get_current_cache_folder_names()[0]
 
     def get_current_cache_folder_names(self):
+        if self._is_dit_mode():
+            return [".precomputed_anima_dit_cache"]
         pred_type = self.widgets["PREDICTION_TYPE"].currentText() if "PREDICTION_TYPE" in self.widgets else ""
         if pred_type == "rectified_flow":
             return [".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
@@ -3405,8 +3607,10 @@ class TrainingGUI(QtWidgets.QWidget):
         key = self.config_dropdown.itemData(self.config_dropdown.currentIndex()) or ""
         config_path = os.path.abspath(os.path.join(self.config_dir, f"{key}.json"))
         if not os.path.exists(config_path): self.log(f"CRITICAL: Config not found: {config_path}"); return
-        train_py_path = os.path.abspath("train.py")
-        if not os.path.exists(train_py_path): self.log(f"CRITICAL: train.py not found."); return
+        is_dit = self.training_mode_combo.currentText() == TRAINING_MODE_ANIMA_DIT
+        train_script = "train_anima.py" if is_dit else "train.py"
+        train_py_path = os.path.abspath(train_script)
+        if not os.path.exists(train_py_path): self.log(f"CRITICAL: {train_script} not found."); return
 
         self.start_button.setVisible(False); self.stop_button.setVisible(True); self.force_save_button.setVisible(True)
         self.live_metrics_widget.clear_data()
@@ -3435,7 +3639,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner.cacheCreatedSignal.connect(self.dataset_manager.refresh_cache_buttons)
         if os.name == 'nt': prevent_sleep(True)
         self.process_runner.start()
-        self.log(f"INFO: Starting train.py with config: {config_path}")
+        self.log(f"INFO: Starting {train_script} with config: {config_path}")
 
     def stop_training(self):
         if self.process_runner and self.process_runner.isRunning(): self.process_runner.stop()
