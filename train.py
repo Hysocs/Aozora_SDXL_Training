@@ -48,6 +48,38 @@ torch.backends.cudnn.allow_tf32 = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 FLUX_BN_EPS = 1e-4
+IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+
+
+def collect_image_paths(root):
+    return [
+        p
+        for ext in IMAGE_EXTENSIONS
+        for p in root.rglob(f"*{ext}")
+    ]
+
+
+def cache_stem_for_image(root, image_path):
+    return str(image_path.relative_to(root).with_suffix('')).replace(os.sep, '_')
+
+
+def cache_base_stem_from_te_path(path):
+    name = Path(path).name
+    if not name.endswith("_te.pt"):
+        return None
+    stem = name[:-len("_te.pt")]
+    return re.sub(r"_mb\d+$", "", stem)
+
+
+def remove_cache_pair_for_te_path(te_path):
+    te_path = Path(te_path)
+    lat_path = Path(str(te_path).replace("_te.pt", "_lat.pt"))
+    for path in (te_path, lat_path):
+        try:
+            if path.exists():
+                path.unlink()
+        except OSError as e:
+            print(f"WARNING: Could not remove stale cache file {path}: {e}")
 CLIP_CHUNK_TOKEN_COUNT = 77
 CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
     "version",
@@ -393,7 +425,7 @@ class BucketBatchSampler(Sampler):
         yield from batches
 
     def __len__(self):
-        return self.total_images
+        return math.ceil(self.total_images / self.batch_size)
 
 
 STANDARD_SDXL_BUCKETS = [
@@ -720,8 +752,22 @@ def check_if_caching_needed(config):
     for dataset in config.INSTANCE_DATASETS:
         root = Path(dataset["path"])
         if not root.exists(): continue
-        image_paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
-        if not image_paths: continue
+        image_paths = collect_image_paths(root)
+        if not image_paths:
+            cache_dir = root / cache_folder_name
+            index_path = cache_dir / "dataset_index.json"
+            cached_te_files = list(cache_dir.glob("*_te.pt")) if cache_dir.exists() else []
+            if cached_te_files:
+                needs_caching = True
+            elif index_path.exists():
+                try:
+                    with open(index_path, "r", encoding="utf-8") as f:
+                        if json.load(f).get("files"):
+                            needs_caching = True
+                except Exception:
+                    needs_caching = True
+            continue
+        current_cache_stems = {cache_stem_for_image(root, p) for p in image_paths}
 
         cache_dir = root / cache_folder_name
         if not cache_dir.exists():
@@ -740,7 +786,17 @@ def check_if_caching_needed(config):
                 needs_caching = True
             if len(indexed_files) < len(image_paths):
                 needs_caching = True
-            for item in indexed_files[: min(len(indexed_files), 10)]:
+            indexed_base_stems = {
+                cache_base_stem_from_te_path(item.get("te_path", ""))
+                for item in indexed_files
+                if item.get("te_path")
+            }
+            indexed_base_stems.discard(None)
+            if not current_cache_stems.issubset(indexed_base_stems):
+                needs_caching = True
+            if any(stem not in current_cache_stems for stem in indexed_base_stems):
+                needs_caching = True
+            for item in indexed_files:
                 te_path = item.get("te_path")
                 lat_path = item.get("lat_path")
                 if not te_path or not lat_path or not Path(te_path).exists() or not Path(lat_path).exists():
@@ -750,6 +806,15 @@ def check_if_caching_needed(config):
             needs_caching = True
 
         cached_te_files = list(cache_dir.glob("*_te.pt"))
+        cached_base_stems = {
+            cache_base_stem_from_te_path(f)
+            for f in cached_te_files
+        }
+        cached_base_stems.discard(None)
+        if any(stem not in current_cache_stems for stem in cached_base_stems):
+            needs_caching = True
+        if not current_cache_stems.issubset(cached_base_stems):
+            needs_caching = True
         if len(cached_te_files) < len(image_paths):
             needs_caching = True
         else:
@@ -982,7 +1047,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cache_dir = root / cache_folder_name
         cache_dir.mkdir(exist_ok=True)
 
-        paths = [p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")]
+        paths = collect_image_paths(root)
+        current_cache_stems = {cache_stem_for_image(root, p) for p in paths}
         multi_bucket_extra = (
             max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
             if getattr(config, "MULTI_BUCKET_ENABLED", False)
@@ -1008,13 +1074,22 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     stale_file.unlink()
                 except OSError as e:
                     print(f"WARNING: Could not remove stale cache file {stale_file}: {e}")
+        else:
+            stale_te_files = [
+                f for f in cache_dir.glob("*_te.pt")
+                if cache_base_stem_from_te_path(f) not in current_cache_stems
+            ]
+            if stale_te_files:
+                print(f"INFO: Removing {len(stale_te_files)} stale SDXL cache item(s) for deleted images in {root.name}.")
+            for stale_file in stale_te_files:
+                remove_cache_pair_for_te_path(stale_file)
 
         if null_embeds is not None and null_pooled is not None:
             torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
 
         to_process = []
         for p in paths:
-            safe_stem = str(p.relative_to(root).with_suffix('')).replace(os.sep, '_')
+            safe_stem = cache_stem_for_image(root, p)
             if force_recaching or not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists():
                 to_process.append(p)
 
@@ -1141,11 +1216,23 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         cached_files = list(cache_dir.glob("*_te.pt"))
         for f in cached_files:
             try:
+                if cache_base_stem_from_te_path(f) not in current_cache_stems:
+                    remove_cache_pair_for_te_path(f)
+                    continue
+                lat_path = Path(str(f).replace("_te.pt", "_lat.pt"))
+                if not lat_path.exists():
+                    print(f"WARNING: Skipping cached text file with missing latent: {f}")
+                    continue
                 data_te = torch.load(f, map_location='cpu')
+                relative_path = data_te.get("relative_path")
+                if relative_path and not (root / relative_path).exists():
+                    remove_cache_pair_for_te_path(f)
+                    continue
                 
                 index_data.append({
                     "te_path": str(f),
-                    "lat_path": str(f).replace("_te.pt", "_lat.pt"),
+                    "lat_path": str(lat_path),
+                    "relative_path": relative_path,
                     "target_size": data_te.get('target_size'),
                     "original_size": data_te.get('original_size'),
                     "scaled_size": data_te.get('scaled_size', data_te.get('original_size')),
@@ -1516,7 +1603,7 @@ def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, opti
     optim_state = optimizer.save_cpu_state() if hasattr(optimizer, 'save_cpu_state') else optimizer.state_dict()
     training_state = {
         'global_step': global_step, 'micro_step': micro_step, 'optimizer_state': optim_state,
-        'sampler_seed': sampler.seed, 'sampler_epoch': sampler.epoch,
+        'sampler_seed': sampler.seed, 'sampler_epoch': max(sampler.epoch - 1, 0),
         'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
         'torch_cpu_state': torch.get_rng_state(),
         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,

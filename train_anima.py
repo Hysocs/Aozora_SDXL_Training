@@ -4,6 +4,7 @@ import json
 import math
 import os
 import random
+import re
 import time
 import traceback
 import uuid
@@ -72,6 +73,35 @@ def anima_dataset_roots(config):
     ]
 
 
+ANIMA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
+
+
+def collect_anima_image_paths(root):
+    return [
+        p
+        for ext in ANIMA_IMAGE_EXTENSIONS
+        for p in root.rglob(f"*{ext}")
+    ]
+
+
+def anima_cache_stem_for_image(root, image_path, cache_suffix=""):
+    return str(image_path.relative_to(root).with_suffix("")).replace(os.sep, "_") + cache_suffix
+
+
+def anima_cache_base_stem(cache_path):
+    stem = Path(cache_path).stem
+    return re.sub(r"_mb\d+$", "", stem)
+
+
+def remove_anima_cache_file(cache_path):
+    try:
+        cache_path = Path(cache_path)
+        if cache_path.exists():
+            cache_path.unlink()
+    except OSError as e:
+        print(f"WARNING: Could not remove stale Anima cache file {cache_path}: {e}")
+
+
 def get_anima_cache_options(config):
     return {
         "version": 3,
@@ -124,6 +154,8 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
     try:
         with open(index_path, "r", encoding="utf-8") as f:
             index_data = json.load(f)
+        image_paths = collect_anima_image_paths(root)
+        current_cache_stems = {anima_cache_stem_for_image(root, p) for p in image_paths}
         cached_options = index_data.get("cache_options")
         if not anima_cache_options_match(cached_options, expected_options):
             print(f"INFO: Anima cache rebuild needed for {root}: cache options changed.")
@@ -144,7 +176,18 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
         if not files:
             print(f"INFO: Anima cache rebuild needed for {root}: dataset_index has no files.")
             return True
-        for item in files[: min(len(files), 10)]:
+        indexed_base_stems = {
+            anima_cache_base_stem(item.get("cache_path", ""))
+            for item in files
+            if item.get("cache_path")
+        }
+        if not current_cache_stems.issubset(indexed_base_stems):
+            print(f"INFO: Anima cache rebuild needed for {root}: new image(s) are not cached.")
+            return True
+        if any(stem not in current_cache_stems for stem in indexed_base_stems):
+            print(f"INFO: Anima cache rebuild needed for {root}: cached image(s) were removed from the dataset.")
+            return True
+        for item in files:
             cache_path = Path(item.get("cache_path", ""))
             if not cache_path.exists():
                 print(f"INFO: Anima cache rebuild needed for {root}: missing cached item {cache_path}.")
@@ -519,28 +562,88 @@ def precompute_and_cache_anima(config, pipe, device):
 
         cache_dir = root / cache_name
         cache_dir.mkdir(parents=True, exist_ok=True)
-        for f in cache_dir.glob("*.pt"):
+        index_path = cache_dir / "dataset_index.json"
+        force_recaching = bool(getattr(config, "REBUILD_CACHE", False))
+        existing_index_data = []
+        if index_path.exists() and not force_recaching:
             try:
-                f.unlink()
-            except OSError as e:
-                print(f"WARNING: Could not remove stale Anima cache file {f}: {e}")
+                with open(index_path, "r", encoding="utf-8") as f:
+                    existing_index = json.load(f)
+                force_recaching = not anima_cache_options_match(existing_index.get("cache_options"), expected_options)
+                existing_index_data = existing_index.get("files", []) if not force_recaching else []
+            except Exception:
+                force_recaching = True
 
-        image_paths = [
-            p for ext in [".jpg", ".jpeg", ".png", ".webp", ".bmp"]
-            for p in root.rglob(f"*{ext}")
-        ]
+        image_paths = collect_anima_image_paths(root)
+        current_cache_stems = {anima_cache_stem_for_image(root, p) for p in image_paths}
         if not image_paths:
+            stale_files = list(cache_dir.glob("*.pt"))
+            if stale_files:
+                print(f"INFO: Removing {len(stale_files)} stale Anima cache item(s) because {root.name} has no images.")
+            for f in stale_files:
+                remove_anima_cache_file(f)
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump({"version": 3, "cache_options": expected_options, "files": []}, f)
             print(f"WARNING: No images found in {root}")
             continue
 
-        print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name}...")
+        if force_recaching:
+            for f in cache_dir.glob("*.pt"):
+                remove_anima_cache_file(f)
+            existing_index_data = []
+        else:
+            stale_files = [
+                f for f in cache_dir.glob("*.pt")
+                if f.name != "null_embeds.pt" and anima_cache_base_stem(f) not in current_cache_stems
+            ]
+            if stale_files:
+                print(f"INFO: Removing {len(stale_files)} stale Anima cache item(s) for deleted images in {root.name}.")
+            for f in stale_files:
+                remove_anima_cache_file(f)
+
+        kept_index_data = []
+        cached_primary_stems = set()
+        for item in existing_index_data:
+            cache_path = Path(item.get("cache_path", ""))
+            base_stem = anima_cache_base_stem(cache_path)
+            if base_stem not in current_cache_stems or not cache_path.exists():
+                remove_anima_cache_file(cache_path)
+                continue
+            try:
+                payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+                source_path = Path(payload.get("image_path", ""))
+                if source_path and not source_path.exists():
+                    remove_anima_cache_file(cache_path)
+                    continue
+                if payload.get("latents") is None:
+                    remove_anima_cache_file(cache_path)
+                    continue
+            except Exception:
+                remove_anima_cache_file(cache_path)
+                continue
+            kept_index_data.append(item)
+            if int(item.get("bucket_variant_index", 0) or 0) == 0:
+                cached_primary_stems.add(base_stem)
+
+        to_process = [
+            p for p in image_paths
+            if force_recaching or anima_cache_stem_for_image(root, p) not in cached_primary_stems
+        ]
+
+        if not to_process:
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump({"version": 3, "cache_options": expected_options, "files": kept_index_data}, f)
+            print(f"INFO: Anima DiT cache current for {root.name}: {len(kept_index_data)} item(s).")
+            continue
+
+        print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name} ({len(to_process)} new/missing image(s))...")
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
                 pool.imap(
                     validate_and_assign_resolution,
-                    [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in image_paths],
+                    [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process],
                 ),
-                total=len(image_paths),
+                total=len(to_process),
             ))
 
         expanded_results = []
@@ -579,7 +682,8 @@ def precompute_and_cache_anima(config, pipe, device):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        index_data = []
+        index_data = list(kept_index_data)
+        new_index_data = []
         print(f"INFO: Anima cache phase 1/2: text encoder for {root.name}")
         pipe.text_encoder.to(device=device, dtype=config.compute_dtype)
         pipe.text_encoder.eval()
@@ -596,7 +700,7 @@ def precompute_and_cache_anima(config, pipe, device):
                 for (w, h), batch_meta in batches:
                     for m in batch_meta:
                         prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, m["caption"], device)
-                        safe_filename = str(m["ip"].relative_to(root).with_suffix("")).replace(os.sep, "_") + m.get("cache_suffix", "")
+                        safe_filename = anima_cache_stem_for_image(root, m["ip"], m.get("cache_suffix", ""))
                         cache_path = cache_dir / f"{safe_filename}.pt"
                         torch.save({
                             "latents": None,
@@ -611,14 +715,16 @@ def precompute_and_cache_anima(config, pipe, device):
                             "bucket_variant_index": m.get("bucket_variant_index", 0),
                             "cache_options": expected_options,
                         }, cache_path)
-                        index_data.append({
+                        new_item = {
                             "cache_path": str(cache_path),
                             "target_size": (w, h),
                             "original_size": m["original_size"],
                             "scaled_size": m["scaled_size"],
                             "crop_coords": m.get("crop_coords", (0, 0)),
                             "bucket_variant_index": m.get("bucket_variant_index", 0),
-                        })
+                        }
+                        index_data.append(new_item)
+                        new_index_data.append(new_item)
                         pbar.update(1)
 
         if null_prompt_emb is not None and null_t5xxl_ids is not None:
@@ -640,8 +746,8 @@ def precompute_and_cache_anima(config, pipe, device):
         pipe.vae.eval()
 
         with torch.inference_mode():
-            with tqdm(total=len(index_data), desc=f"Caching Anima VAE {root.name}", unit="item") as pbar:
-                for item in index_data:
+            with tqdm(total=len(new_index_data), desc=f"Caching Anima VAE {root.name}", unit="item") as pbar:
+                for item in new_index_data:
                     cache_path = Path(item["cache_path"])
                     payload = torch.load(cache_path, map_location="cpu", weights_only=True)
                     image_path = Path(payload["image_path"])
@@ -892,18 +998,104 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nINFO: Saving DiT to: {output_path.name}")
+
+    named_params = dict(dit.named_parameters())
+    named_buffers = dict(dit.named_buffers())
+    param_keys = set(named_params.keys())
+    buffer_keys = set(named_buffers.keys())
+    total_param_count = sum(p.numel() for p in named_params.values())
+    trainable_param_count = sum(p.numel() for p in named_params.values() if p.requires_grad)
+    frozen_param_count = total_param_count - trainable_param_count
+
     state = {}
     key_prefix = "" if str(key_prefix).lower() == "auto" else str(key_prefix or "")
-    for k, v in dit.state_dict().items():
+    raw_state = dit.state_dict()
+    saved_param_count = 0
+    saved_trainable_param_count = 0
+    saved_frozen_param_count = 0
+    saved_buffer_count = 0
+    saved_bytes = 0
+    dtype_counts = defaultdict(lambda: {"tensors": 0, "elements": 0})
+    for k, v in raw_state.items():
         out_key = f"{key_prefix}{k}"
-        state[out_key] = v.detach().cpu().to(dtype=compute_dtype) if torch.is_floating_point(v) else v.detach().cpu()
+        tensor_cpu = v.detach().cpu().to(dtype=compute_dtype) if torch.is_floating_point(v) else v.detach().cpu()
+        state[out_key] = tensor_cpu
+        saved_bytes += tensor_cpu.numel() * tensor_cpu.element_size()
+        dtype_key = str(tensor_cpu.dtype).replace("torch.", "")
+        dtype_counts[dtype_key]["tensors"] += 1
+        dtype_counts[dtype_key]["elements"] += tensor_cpu.numel()
+        if k in param_keys:
+            saved_param_count += tensor_cpu.numel()
+            if named_params[k].requires_grad:
+                saved_trainable_param_count += tensor_cpu.numel()
+            else:
+                saved_frozen_param_count += tensor_cpu.numel()
+        elif k in buffer_keys:
+            saved_buffer_count += tensor_cpu.numel()
+
+    missing_params = sorted(param_keys - set(raw_state.keys()))
+    missing_trainable_params = [k for k in missing_params if named_params[k].requires_grad]
+    extra_state_keys = sorted(set(raw_state.keys()) - param_keys - buffer_keys)
+
+    print("INFO: DiT save accounting:")
+    print(f"- Model parameters:       {total_param_count:,}")
+    print(f"- Parameters saved:       {saved_param_count:,} / {total_param_count:,} ({(saved_param_count / max(total_param_count, 1)) * 100:.2f}%)")
+    print(f"- Trainable saved:        {saved_trainable_param_count:,} / {trainable_param_count:,} ({(saved_trainable_param_count / max(trainable_param_count, 1)) * 100:.2f}%)")
+    print(f"- Frozen saved:           {saved_frozen_param_count:,} / {frozen_param_count:,} ({(saved_frozen_param_count / max(frozen_param_count, 1)) * 100:.2f}%)")
+    print(f"- Buffer elements saved:  {saved_buffer_count:,}")
+    print(f"- State tensors saved:    {len(state):,}")
+    print(f"- Estimated tensor bytes: {saved_bytes / (1024 ** 2):.2f} MiB")
+    if dtype_counts:
+        dtype_summary = ", ".join(
+            f"{dtype}: {info['tensors']:,} tensors / {info['elements']:,} elems"
+            for dtype, info in sorted(dtype_counts.items())
+        )
+        print(f"- Saved dtypes:           {dtype_summary}")
+    if missing_params:
+        print(f"WARNING: {len(missing_params):,} named parameters were not present in state_dict().")
+        if missing_trainable_params:
+            print(f"WARNING: {len(missing_trainable_params):,} missing parameters were trainable.")
+        for name in missing_params[:10]:
+            print(f"  -> missing param: {name}")
+        if len(missing_params) > 10:
+            print(f"  ... and {len(missing_params) - 10:,} more")
+    else:
+        print("INFO: All named DiT parameters are present in the saved state.")
+    if extra_state_keys:
+        print(f"INFO: State dict has {len(extra_state_keys):,} non-parameter/non-buffer tensor keys.")
+        for name in extra_state_keys[:5]:
+            print(f"  -> extra state: {name}")
+        if len(extra_state_keys) > 5:
+            print(f"  ... and {len(extra_state_keys) - 5:,} more")
     if key_prefix:
         print(f"INFO: Saved DiT keys with prefix: {key_prefix}")
     save_file(state, str(output_path))
+    file_size = output_path.stat().st_size if output_path.exists() else 0
+    try:
+        with safe_open(str(output_path), framework="pt", device="cpu") as f:
+            disk_keys = set(f.keys())
+        expected_keys = set(state.keys())
+        missing_disk_keys = sorted(expected_keys - disk_keys)
+        unexpected_disk_keys = sorted(disk_keys - expected_keys)
+        print(f"INFO: Safetensors file keys: {len(disk_keys):,} / expected {len(expected_keys):,}")
+        print(f"INFO: Safetensors file size: {file_size / (1024 ** 2):.2f} MiB")
+        if missing_disk_keys or unexpected_disk_keys:
+            print(
+                "WARNING: Safetensors key verification mismatch "
+                f"(missing={len(missing_disk_keys):,}, unexpected={len(unexpected_disk_keys):,})."
+            )
+            for name in missing_disk_keys[:10]:
+                print(f"  -> missing on disk: {name}")
+            for name in unexpected_disk_keys[:10]:
+                print(f"  -> unexpected on disk: {name}")
+        else:
+            print("INFO: Safetensors key verification passed.")
+    except Exception as e:
+        print(f"WARNING: Could not verify saved safetensors keys: {e}")
     print("INFO: DiT save complete.")
 
 
-def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_scheduler, sampler, config):
+def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_scheduler, sampler, config, noise_generator=None, batch_sampler=None):
     output_dir = Path(config.OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
     model_filename = f"{Path(config.DIT_PATH).stem}_step_{global_step}.safetensors"
@@ -921,10 +1113,12 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
         "optimizer_state": optim_state,
         "sampler_seed": sampler.seed,
         "sampler_pool_index": sampler.pool_index,
+        "batch_sampler_epoch": max(batch_sampler.epoch - 1, 0) if batch_sampler is not None else 0,
         "random_state": random.getstate(),
         "numpy_state": np.random.get_state(),
         "torch_cpu_state": torch.get_rng_state(),
         "torch_cuda_state": torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
+        "noise_generator_state": noise_generator.get_state() if noise_generator is not None else None,
     }, output_dir / state_filename)
 
 
@@ -983,12 +1177,18 @@ def run_anima_dit_training(config):
 
     micro_step = optimizer_step = 0
     optimizer_state = None
+    saved_sampler_pool_index = None
+    saved_noise_generator_state = None
+    saved_batch_sampler_epoch = 0
     if is_resuming:
         print("\n" + "=" * 50 + "\n--- RESUMING ANIMA DIT TRAINING SESSION ---\n")
         training_state = torch.load(Path(config.ANIMA_RESUME_STATE_PATH), map_location="cpu", weights_only=False)
         micro_step = training_state.get("micro_step", training_state.get("global_step", 0) * config.GRADIENT_ACCUMULATION_STEPS)
         optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
         optimizer_state = training_state.get("optimizer_state")
+        saved_sampler_pool_index = training_state.get("sampler_pool_index")
+        saved_noise_generator_state = training_state.get("noise_generator_state")
+        saved_batch_sampler_epoch = training_state.get("batch_sampler_epoch", 0)
         config.DIT_PATH = config.ANIMA_RESUME_MODEL_PATH
         if "random_state" in training_state:
             random.setstate(training_state["random_state"])
@@ -1034,6 +1234,8 @@ def run_anima_dit_training(config):
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
     batch_sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, config.SEED, shuffle=True)
+    if is_resuming:
+        batch_sampler.set_epoch(saved_batch_sampler_epoch)
     dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -1044,7 +1246,9 @@ def run_anima_dit_training(config):
 
     total_scheduler_timesteps = len(pipe.scheduler.timesteps)
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
-    if micro_step > 0:
+    if saved_sampler_pool_index is not None:
+        timestep_sampler.pool_index = int(saved_sampler_pool_index) % len(timestep_sampler.ticket_pool)
+    elif micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
     scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
     scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
@@ -1055,6 +1259,8 @@ def run_anima_dit_training(config):
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
+    if saved_noise_generator_state is not None:
+        generator.set_state(saved_noise_generator_state)
     accumulated_latent_paths = set()
     optim_step_times = deque(maxlen=20)
     global_step_times = deque(maxlen=50)
@@ -1063,6 +1269,7 @@ def run_anima_dit_training(config):
     last_optim_step_log_time = time.time()
     optimizer.zero_grad(set_to_none=True)
     dataloader_iter = iter(dataloader)
+    batches_to_skip = micro_step % len(dataloader) if is_resuming and len(dataloader) > 0 else 0
 
     while micro_step < config.MAX_TRAIN_STEPS:
         try:
@@ -1070,6 +1277,9 @@ def run_anima_dit_training(config):
         except StopIteration:
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
+        if batches_to_skip > 0:
+            batches_to_skip -= 1
+            continue
         if not batch:
             continue
 
@@ -1139,7 +1349,17 @@ def run_anima_dit_training(config):
             if scheduled_save or force_save:
                 reason = "Emergency checkpoint requested" if force_save and not scheduled_save else "Saving checkpoint"
                 reporter.log_message(f"\n--- {reason} at optimizer step {optimizer_step} ---")
-                save_anima_checkpoint_pt(optimizer_step, micro_step, dit, optimizer, lr_scheduler, timestep_sampler, config)
+                save_anima_checkpoint_pt(
+                    optimizer_step,
+                    micro_step + 1,
+                    dit,
+                    optimizer,
+                    lr_scheduler,
+                    timestep_sampler,
+                    config,
+                    generator,
+                    batch_sampler,
+                )
 
         step_duration = time.time() - last_step_time
         global_step_times.append(step_duration)
