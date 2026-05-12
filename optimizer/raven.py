@@ -173,9 +173,6 @@ class RavenAdamW(Optimizer):
         return cpu_state
 
     def load_cpu_state(self, cpu_state):
-        if "state" in cpu_state and "param_groups" in cpu_state:
-            return self._load_standard_state_as_cpu(cpu_state)
-
         saved_dtype = cpu_state.get("_momentum_dtype", self._momentum_dtype)
         params_with_grad = [
             p for group in self.param_groups for p in group["params"] if p.requires_grad
@@ -204,35 +201,6 @@ class RavenAdamW(Optimizer):
         if saved_dtype != self._momentum_dtype:
             print(
                 f"[RavenAdamW] Loaded state saved in {saved_dtype}, "
-                f"converted to {self._momentum_dtype}."
-            )
-
-    def _load_standard_state_as_cpu(self, state_dict):
-        saved_dtype = state_dict.get("_momentum_dtype", self._momentum_dtype)
-        saved_state = state_dict.get("state", {})
-        saved_groups = state_dict.get("param_groups", [])
-
-        for current_group, saved_group in zip(self.param_groups, saved_groups):
-            for p, saved_param_id in zip(current_group["params"], saved_group.get("params", [])):
-                if not p.requires_grad or saved_param_id not in saved_state:
-                    continue
-                saved = saved_state[saved_param_id]
-                exp_avg = saved.get("exp_avg")
-                exp_avg_sq = saved.get("exp_avg_sq")
-                if exp_avg is None or exp_avg_sq is None:
-                    continue
-                step = saved.get("step", 0)
-                if torch.is_tensor(step):
-                    step = int(step.item())
-                self.state[p] = {
-                    "step": step,
-                    "exp_avg": exp_avg.to(device="cpu", dtype=self._momentum_dtype),
-                    "exp_avg_sq": exp_avg_sq.to(device="cpu", dtype=self._momentum_dtype),
-                }
-
-        if saved_dtype != self._momentum_dtype:
-            print(
-                f"[RavenAdamW] Loaded legacy state saved in {saved_dtype}, "
                 f"converted to {self._momentum_dtype}."
             )
 
