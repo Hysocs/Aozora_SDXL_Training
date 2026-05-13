@@ -2214,7 +2214,8 @@ UI_DEFS = {
     "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Values above 1 extrapolate caption conditioning past full strength.", "dspin", 0.0, 2.0, 0.05, 2),
     "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
-    "TARGET_PIXEL_AREA":           ("Target Pixel Area", "e.g., 1024*1024=1048576.", "line"),
+    "MAX_BUCKET_RESOLUTION":       ("Max Bucket Size", "Largest square bucket tier. Aspect buckets are chosen from the preset ladder up to this size.", "combo", ["896", "1024", "1152", "1536"]),
+    "TARGET_PIXEL_AREA":           ("Target Pixel Area", "Legacy setting kept for older configs.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
     "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
     "MULTI_BUCKET_ENABLED":        ("Use Multi-Bucket Cache", "Cache each image into nearby bucket resolutions so concepts are less tied to one aspect ratio.", "check"),
@@ -2730,7 +2731,7 @@ class TrainingGUI(QtWidgets.QWidget):
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "NUM_WORKERS"]),
             ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
-            ("Aspect Ratio Bucketing", ["TARGET_PIXEL_AREA", "SHOULD_UPSCALE", "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
+            ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
         ]:
             settings_lay.addWidget(self._form_group(title, keys))
         settings_lay.addStretch(1)
@@ -2745,9 +2746,6 @@ class TrainingGUI(QtWidgets.QWidget):
         split.setSizes([340, 980])
         layout.addWidget(split, 1)
 
-        if "MAX_AREA_TOLERANCE" in self.widgets:
-            self._connect_widget_signal("SHOULD_UPSCALE", "stateChanged",
-                                        lambda s: self.widgets["MAX_AREA_TOLERANCE"].setEnabled(bool(s)))
         if "MULTI_BUCKET_EXTRA_BUCKETS" in self.widgets:
             self._connect_widget_signal("MULTI_BUCKET_ENABLED", "stateChanged",
                                         lambda s: self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(bool(s)))
@@ -3442,7 +3440,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 loss_type = "PatchMSE"
             self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "PatchMSE"} else "MSE")
 
-            if "SHOULD_UPSCALE" in self.widgets:
+            if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
                 self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "MULTI_BUCKET_ENABLED" in self.widgets:
                 self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(self.widgets["MULTI_BUCKET_ENABLED"].isChecked())
@@ -3500,6 +3498,12 @@ class TrainingGUI(QtWidgets.QWidget):
             if key in inactive_path_keys: continue
             if val is None: continue
             cfg[key] = [[round(p[0], 8), round(p[1], 10)] for p in val] if key == "LR_CUSTOM_CURVE" else val
+
+        try:
+            max_bucket = int(str(cfg.get("MAX_BUCKET_RESOLUTION", 1024)).split()[0])
+            cfg["TARGET_PIXEL_AREA"] = max_bucket * max_bucket
+        except (TypeError, ValueError):
+            cfg["TARGET_PIXEL_AREA"] = 1024 * 1024
 
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()

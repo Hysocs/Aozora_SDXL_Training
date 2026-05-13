@@ -30,6 +30,7 @@ from train import (
     consume_force_save_flag,
     create_optimizer,
     fix_alpha_channel,
+    get_max_bucket_resolution_for_config,
     get_multi_bucket_resolutions,
     get_text_conditioning_scale_range,
     make_bucket_variant_metadata,
@@ -38,6 +39,7 @@ from train import (
     set_seed,
     smart_resize,
     validate_and_assign_resolution,
+    BUCKET_LAYOUT_VERSION,
 )
 
 AnimaImagePipeline = None
@@ -105,7 +107,8 @@ def remove_anima_cache_file(cache_path):
 def get_anima_cache_options(config):
     return {
         "version": 3,
-        "target_pixel_area": int(getattr(config, "TARGET_PIXEL_AREA", 1024 * 1024)),
+        "bucket_layout": BUCKET_LAYOUT_VERSION,
+        "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "should_upscale": bool(getattr(config, "SHOULD_UPSCALE", False)),
         "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
         "multi_bucket_extra_buckets": int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0),
@@ -636,27 +639,24 @@ def precompute_and_cache_anima(config, pipe, device):
             print(f"INFO: Anima DiT cache current for {root.name}: {len(kept_index_data)} item(s).")
             continue
 
+        max_bucket_resolution = get_max_bucket_resolution_for_config(config)
+        max_bucket_area = max_bucket_resolution * max_bucket_resolution
         print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name} ({len(to_process)} new/missing image(s))...")
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
                 pool.imap(
                     validate_and_assign_resolution,
-                    [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process],
+                    [(p, max_bucket_area, 64, config.SHOULD_UPSCALE) for p in to_process],
                 ),
                 total=len(to_process),
             ))
 
         expanded_results = []
         for m in (r for r in results if r):
-            target_area = (
-                m["original_area"]
-                if not config.SHOULD_UPSCALE and m["original_area"] < config.TARGET_PIXEL_AREA
-                else config.TARGET_PIXEL_AREA
-            )
             buckets = get_multi_bucket_resolutions(
                 m["original_size"][0],
                 m["original_size"][1],
-                target_area,
+                max_bucket_area,
                 config.SHOULD_UPSCALE,
                 multi_bucket_extra,
             )
@@ -919,6 +919,28 @@ def anima_collate_fn(batch):
         "target_size": [item["target_size"] for item in batch],
         "latent_path": [item["latent_path"] for item in batch],
     }
+
+
+def print_anima_dataset_resolution_sample(dataset, sample_count=5):
+    sample_count = min(sample_count, len(dataset.items))
+    if sample_count <= 0:
+        return
+
+    print(f"INFO: Anima dataset resolution sample ({sample_count} cached item{'s' if sample_count != 1 else ''}):")
+    for item in dataset.items[:sample_count]:
+        orig_w, orig_h = item["original_size"]
+        targ_w, targ_h = item["target_size"]
+        orig_ar = orig_w / orig_h if orig_h else 1.0
+        targ_ar = targ_w / targ_h if targ_h else 1.0
+        ar_error_pct = (abs(orig_ar - targ_ar) / orig_ar * 100) if orig_ar else 0.0
+        target_area = targ_w * targ_h
+        stem = Path(item["cache_path"]).stem
+        variant_label = f", variant {item.get('bucket_variant_index', 0)}" if item.get("bucket_variant_index", 0) else ""
+        print(
+            f"INFO:   {stem}: original {orig_w}x{orig_h} (AR {orig_ar:.4f}) -> "
+            f"target {targ_w}x{targ_h} ({target_area:,} px, AR {targ_ar:.4f})"
+            f"{variant_label}, AR diff {ar_error_pct:.2f}%, cropped not stretched"
+        )
 
 
 class AnimaTimestepSampler:
@@ -1233,6 +1255,7 @@ def run_anima_dit_training(config):
 
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
+    print_anima_dataset_resolution_sample(dataset, sample_count=5)
     batch_sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, config.SEED, shuffle=True)
     if is_resuming:
         batch_sampler.set_epoch(saved_batch_sampler_epoch)

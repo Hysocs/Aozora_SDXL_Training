@@ -56,10 +56,12 @@ CAPTION_CHUNKING_ENABLED = False
 
 # --- Aspect Ratio Bucketing ---
 SHOULD_UPSCALE = False
-TARGET_PIXEL_AREA = 1048576  # 1024*1024
-MAX_AREA_TOLERANCE = 1.1     # Note: Present in GUI, but training relies purely on optimal SDXL buckets
+MAX_BUCKET_RESOLUTION = 1024  # Options: 896, 1024, 1152, 1536
+TARGET_PIXEL_AREA = 1048576  # Legacy fallback for older configs.
+MAX_AREA_TOLERANCE = 1.1     # Legacy GUI setting; training does not use it.
 MULTI_BUCKET_ENABLED = False
 MULTI_BUCKET_EXTRA_BUCKETS = 0
+MAX_BUCKET_RESOLUTION_CHOICES = (896, 1024, 1152, 1536)
 
 # --- Core Training Parameters ---
 PREDICTION_TYPE = "v_prediction"
@@ -156,7 +158,7 @@ LEGACY_FLAT_KEYS = [
     "CACHING_BATCH_SIZE", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
     "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED",
     "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX",
-    "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE", "TARGET_PIXEL_AREA",
+    "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE", "MAX_BUCKET_RESOLUTION", "TARGET_PIXEL_AREA",
     "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS",
     "PREDICTION_TYPE", "MAX_TRAIN_STEPS", "BATCH_SIZE",
     "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM",
@@ -177,7 +179,7 @@ PER_MODE_FLAT_KEYS = [
     "NUM_WORKERS", "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
     "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN",
     "TEXT_CONDITIONING_SCALE_MAX", "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE",
-    "TARGET_PIXEL_AREA", "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED",
+    "MAX_BUCKET_RESOLUTION", "TARGET_PIXEL_AREA", "MAX_AREA_TOLERANCE", "MULTI_BUCKET_ENABLED",
     "MULTI_BUCKET_EXTRA_BUCKETS", "PREDICTION_TYPE", "MAX_TRAIN_STEPS",
     "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION",
     "CLIP_GRAD_NORM", "SEED", "SAVE_EVERY_N_STEPS", "LR_CUSTOM_CURVE",
@@ -237,6 +239,15 @@ def flat_defaults():
     return {key: copy.deepcopy(globals()[key]) for key in LEGACY_FLAT_KEYS if key in globals()}
 
 
+def max_bucket_resolution_from_legacy_area(value):
+    try:
+        root = int(round(float(value) ** 0.5))
+    except (TypeError, ValueError):
+        return MAX_BUCKET_RESOLUTION
+    valid = [size for size in MAX_BUCKET_RESOLUTION_CHOICES if size <= root]
+    return valid[-1] if valid else MAX_BUCKET_RESOLUTION_CHOICES[0]
+
+
 def mode_flat_keys(mode_key):
     return [*PER_MODE_FLAT_KEYS, *MODE_SPECIFIC_FLAT_KEYS.get(mode_key, [])]
 
@@ -264,6 +275,8 @@ def nest_flat_config(flat_config, mode_key=None, base_preset=None):
     preset["config_version"] = CONFIG_VERSION
     preset["active_mode"] = mode_key
     preset.setdefault(mode_key, default_mode_config(mode_key))
+    if "MAX_BUCKET_RESOLUTION" not in flat_config and "TARGET_PIXEL_AREA" in flat_config:
+        preset[mode_key][nested_key_for(mode_key, "MAX_BUCKET_RESOLUTION")] = max_bucket_resolution_from_legacy_area(flat_config["TARGET_PIXEL_AREA"])
     for flat_key in mode_flat_keys(mode_key):
         if flat_key in flat_config:
             preset[mode_key][nested_key_for(mode_key, flat_key)] = copy.deepcopy(flat_config[flat_key])
@@ -278,7 +291,12 @@ def normalize_preset(config_data):
         preset["active_mode"] = mode_key_from_label(config_data.get("active_mode", config_data.get("TRAINING_MODE")))
         for mode_key in (MODE_SDXL, MODE_ANIMA):
             if isinstance(config_data.get(mode_key), dict):
-                preset[mode_key].update(copy.deepcopy(config_data[mode_key]))
+                mode_data = copy.deepcopy(config_data[mode_key])
+                max_bucket_key = nested_key_for(mode_key, "MAX_BUCKET_RESOLUTION")
+                target_area_key = nested_key_for(mode_key, "TARGET_PIXEL_AREA")
+                if max_bucket_key not in mode_data and target_area_key in mode_data:
+                    mode_data[max_bucket_key] = max_bucket_resolution_from_legacy_area(mode_data[target_area_key])
+                preset[mode_key].update(mode_data)
         return preset
     return nest_flat_config(config_data)
 
@@ -293,6 +311,10 @@ def flatten_preset(config_data, mode_key=None):
         nested_key = nested_key_for(mode_key, flat_key)
         if nested_key in mode_block:
             flat[flat_key] = copy.deepcopy(mode_block[nested_key])
+    max_bucket_key = nested_key_for(mode_key, "MAX_BUCKET_RESOLUTION")
+    target_area_key = nested_key_for(mode_key, "TARGET_PIXEL_AREA")
+    if max_bucket_key not in mode_block and target_area_key in mode_block:
+        flat["MAX_BUCKET_RESOLUTION"] = max_bucket_resolution_from_legacy_area(mode_block[target_area_key])
     if mode_key == MODE_ANIMA:
         flat["VAE_PATH"] = flat.get("DIT_VAE_PATH", "")
         flat["RESUME_MODEL_PATH"] = ""

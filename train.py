@@ -438,66 +438,101 @@ STANDARD_SDXL_BUCKETS = [
     (1600, 512), (512, 1600),
     (896, 896), (768, 768),
 ]
+MAX_BUCKET_RESOLUTION_CHOICES = (896, 1024, 1152, 1536)
+BUCKET_LAYOUT_VERSION = "preset_ladder_v1"
 
 
-def get_optimal_bucket(orig_w, orig_h, target_area=None, stride=64):
+def resolve_max_bucket_resolution(value=None):
+    if value is None:
+        return 1024
+    try:
+        numeric = int(float(value))
+    except (TypeError, ValueError):
+        return 1024
+
+    if numeric > 4096:
+        numeric = int(round(math.sqrt(max(1, numeric))))
+
+    valid = [size for size in MAX_BUCKET_RESOLUTION_CHOICES if size <= numeric]
+    return valid[-1] if valid else MAX_BUCKET_RESOLUTION_CHOICES[0]
+
+
+def get_max_bucket_resolution_for_config(config):
+    if hasattr(config, "MAX_BUCKET_RESOLUTION"):
+        return resolve_max_bucket_resolution(getattr(config, "MAX_BUCKET_RESOLUTION"))
+    return resolve_max_bucket_resolution(getattr(config, "TARGET_PIXEL_AREA", 1024 * 1024))
+
+
+def get_bucket_ladder(max_bucket_resolution=None):
+    max_bucket_resolution = resolve_max_bucket_resolution(max_bucket_resolution)
+    buckets = set()
+    if max_bucket_resolution < 1024:
+        tiers = [max_bucket_resolution]
+    else:
+        tiers = [1024, *[tier for tier in (1152, 1536) if tier <= max_bucket_resolution]]
+
+    for tier in tiers:
+        if tier == 1024:
+            buckets.update(STANDARD_SDXL_BUCKETS)
+            continue
+        scale = tier / 1024
+        for width, height in STANDARD_SDXL_BUCKETS:
+            scaled_w = max(64, int(round((width * scale) / 64)) * 64)
+            scaled_h = max(64, int(round((height * scale) / 64)) * 64)
+            buckets.add((scaled_w, scaled_h))
+
+    return sorted(buckets, key=lambda item: (item[0] * item[1], item[0], item[1]))
+
+
+def get_optimal_bucket(orig_w, orig_h, target_area=None, stride=64, should_upscale=False):
     orig_ar = orig_w / max(orig_h, 1)
-    orig_area = orig_w * orig_h
-    
-    if target_area is None:
-        target_area = 1024 * 1024
-    
+    max_bucket_resolution = resolve_max_bucket_resolution(target_area)
+    candidate_buckets = get_bucket_ladder(max_bucket_resolution)
+    target_area = max_bucket_resolution * max_bucket_resolution
+
     def bucket_score(bw, bh):
         bucket_ar = bw / max(bh, 1)
         bucket_area = bw * bh
         ar_error = abs(bucket_ar - orig_ar) / max(orig_ar, 0.01)
-        if bucket_area > 0 and target_area > 0:
-            area_error = abs(math.log(bucket_area / target_area))
-        else:
-            area_error = 100.0
+        area_error = abs(math.log(bucket_area / target_area)) if bucket_area > 0 else 100.0
         return ar_error * 10.0 + area_error
-    
-    best_bucket = min(STANDARD_SDXL_BUCKETS, key=lambda b: bucket_score(b[0], b[1]))
+
+    best_bucket = min(candidate_buckets, key=lambda b: bucket_score(b[0], b[1]))
     bw, bh = best_bucket
-    
-    if bw > orig_w and bh > orig_h:
-        fitting_buckets = [(w, h) for w, h in STANDARD_SDXL_BUCKETS 
-                          if w <= orig_w and h <= orig_h]
+
+    if not should_upscale and (bw > orig_w or bh > orig_h):
+        fitting_buckets = [(w, h) for w, h in candidate_buckets if w <= orig_w and h <= orig_h]
         if fitting_buckets:
             best_bucket = max(fitting_buckets, key=lambda b: b[0] * b[1])
         else:
-            best_bucket = min(STANDARD_SDXL_BUCKETS, key=lambda b: b[0] * b[1])
-    
+            best_bucket = min(candidate_buckets, key=lambda b: b[0] * b[1])
+
     return best_bucket
 
 def get_multi_bucket_resolutions(orig_w, orig_h, target_area=None, should_upscale=False, max_extra=0):
-    primary = get_optimal_bucket(orig_w, orig_h, target_area, 64)
+    primary = get_optimal_bucket(orig_w, orig_h, target_area, 64, should_upscale)
     if max_extra <= 0:
         return [primary]
 
     orig_ar = orig_w / max(orig_h, 1)
-    if target_area is None:
-        target_area = 1024 * 1024
-
-    def bucket_score(bucket):
-        bw, bh = bucket
-        bucket_ar = bw / max(bh, 1)
-        bucket_area = bw * bh
-        ar_error = abs(bucket_ar - orig_ar) / max(orig_ar, 0.01)
-        area_error = abs(math.log(bucket_area / target_area)) if bucket_area > 0 and target_area > 0 else 100.0
-        return ar_error * 10.0 + area_error
+    max_bucket_resolution = resolve_max_bucket_resolution(target_area)
+    target_area = max_bucket_resolution * max_bucket_resolution
 
     candidates = []
-    for bucket in STANDARD_SDXL_BUCKETS:
+    for bucket in get_bucket_ladder(max_bucket_resolution):
         if bucket == primary:
             continue
         bw, bh = bucket
-        if not should_upscale and bw > orig_w and bh > orig_h:
+        if not should_upscale and (bw > orig_w or bh > orig_h):
             continue
-        candidates.append(bucket)
+        bucket_ar = bw / max(bh, 1)
+        bucket_area = bw * bh
+        ar_error = abs(bucket_ar - orig_ar) / max(orig_ar, 0.01)
+        area_error = abs(math.log(bucket_area / target_area)) if bucket_area > 0 else 100.0
+        candidates.append((ar_error * 10.0 + area_error, bucket))
 
-    candidates.sort(key=bucket_score)
-    return [primary] + candidates[:max_extra]
+    candidates.sort(key=lambda item: item[0])
+    return [primary] + [bucket for _, bucket in candidates[:max_extra]]
 
 def make_bucket_variant_metadata(base_meta, target_w, target_h, variant_index=0):
     orig_w, orig_h = base_meta["original_size"]
@@ -550,10 +585,7 @@ def validate_and_assign_resolution(args):
             if w <= 0 or h <= 0: 
                 return None
 
-        if not should_upscale and (w * h) < target_area:
-            target_w, target_h = get_optimal_bucket(w, h, w * h, stride)
-        else:
-            target_w, target_h = get_optimal_bucket(w, h, target_area, stride)
+        target_w, target_h = get_optimal_bucket(w, h, target_area, stride, should_upscale)
 
         scale = max(target_w / w, target_h / h)
         scaled_w = int(round(w * scale))
@@ -726,6 +758,8 @@ def get_caption_cache_options(config):
 
     return {
         "version": 11,
+        "bucket_layout": BUCKET_LAYOUT_VERSION,
+        "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "caption_embedding_layout": "fixed_total_chunks",
         "caption_chunking_enabled": caption_chunking_enabled(config),
         "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
@@ -1095,15 +1129,16 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
         if to_process:
             with Pool(processes=min(cpu_count(), 8)) as pool:
-                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, config.TARGET_PIXEL_AREA, 64, config.SHOULD_UPSCALE) for p in to_process]), total=len(to_process)))
+                max_bucket_resolution = get_max_bucket_resolution_for_config(config)
+                max_bucket_area = max_bucket_resolution * max_bucket_resolution
+                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, max_bucket_area, 64, config.SHOULD_UPSCALE) for p in to_process]), total=len(to_process)))
 
             expanded_results = []
             for m in (r for r in results if r):
-                target_area = (m["original_area"] if not config.SHOULD_UPSCALE and m["original_area"] < config.TARGET_PIXEL_AREA else config.TARGET_PIXEL_AREA)
                 buckets_for_image = get_multi_bucket_resolutions(
                     m["original_size"][0],
                     m["original_size"][1],
-                    target_area,
+                    max_bucket_area,
                     config.SHOULD_UPSCALE,
                     multi_bucket_extra,
                 )
