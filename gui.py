@@ -72,6 +72,7 @@ ANIMA_LOCKED_WIDGET_KEYS = {
     "VAE_SCALING_FACTOR",
     "VAE_LATENT_CHANNELS",
 }
+CAPTION_JSON_TYPES = ("tags", "nl", "tags_nl", "nl_tags")
 
 TEXT_MUTED   = "#383b4075"
 BORDER_MUTED = "#191c2675"
@@ -1854,8 +1855,10 @@ class DatasetLoaderThread(QThread):
             for file_path in Path(self.path).rglob("*"):
                 if file_path.suffix.lower() in exts:
                     cap_path = file_path.with_suffix('.txt')
+                    json_path = file_path.with_suffix('.json')
                     images_data.append({"image_path": str(file_path),
                                         "caption_path": str(cap_path) if cap_path.exists() else None,
+                                        "json_caption_path": str(json_path) if json_path.exists() else None,
                                         "caption_loaded": False, "caption": ""})
         except Exception as e:
             print(f"Error scanning {self.path}: {e}")
@@ -2011,7 +2014,24 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             return
         data = ds["images_data"][ds["current_preview_idx"]]
         if not data["caption_loaded"]:
-            if data["caption_path"]:
+            caption_mode = "txt"
+            if "CAPTION_SOURCE_TYPE" in self.parent_gui.widgets:
+                caption_mode = self.parent_gui.widgets["CAPTION_SOURCE_TYPE"].currentText()
+            if caption_mode == "json":
+                if data.get("json_caption_path"):
+                    try:
+                        with open(data["json_caption_path"], 'r', encoding='utf-8') as f:
+                            payload = json.load(f)
+                        parts = []
+                        for key in CAPTION_JSON_TYPES:
+                            value = payload.get(key, "") if isinstance(payload, dict) else ""
+                            parts.append(f"{key}: {str(value).strip() or '[missing]'}")
+                        data["caption"] = "\n\n".join(parts)
+                    except Exception as e:
+                        data["caption"] = f"[Error reading JSON caption: {e}]"
+                else:
+                    data["caption"] = "[No JSON caption file]"
+            elif data["caption_path"]:
                 try:
                     with open(data["caption_path"], 'r', encoding='utf-8') as f: data["caption"] = f.read().strip()
                 except Exception: data["caption"] = "[Error reading caption]"
@@ -2207,6 +2227,7 @@ UI_DEFS = {
     "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer", "T5XXL tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
+    "CACHE_PRECISION":             ("Cache Precision", "Floating-point dtype used for cached text embeddings and latents on disk.", "combo", ["float32", "bfloat16", "float16"]),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
     "UNCONDITIONAL_DROPOUT":       ("Use Null Conditioning Dropout", "At random, train a sample with empty-prompt conditioning instead of its caption.", "check"),
     "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
@@ -2214,10 +2235,13 @@ UI_DEFS = {
     "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Values above 1 extrapolate caption conditioning past full strength.", "dspin", 0.0, 2.0, 0.05, 2),
     "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
+    "CAPTION_SOURCE_TYPE":         ("Caption Type", "Use .txt sidecars or exact-format .json sidecars.", "combo", ["txt", "json"]),
+    "CAPTION_TAGS_PERCENT":        ("Tags %", "Training-time chance to load the cached tags caption variant.", "spin", 0, 100),
+    "CAPTION_NL_PERCENT":          ("NL %", "Training-time chance to load the cached natural-language caption variant.", "spin", 0, 100),
+    "CAPTION_TAGS_NL_PERCENT":     ("Tags+NL %", "Training-time chance to load tags followed by natural language.", "spin", 0, 100),
+    "CAPTION_NL_TAGS_PERCENT":     ("NL+Tags %", "Training-time chance to load natural language followed by tags.", "spin", 0, 100),
     "MAX_BUCKET_RESOLUTION":       ("Max Bucket Size", "Largest square bucket tier. Aspect buckets are chosen from the preset ladder up to this size.", "combo", ["896", "1024", "1152", "1536"]),
-    "TARGET_PIXEL_AREA":           ("Target Pixel Area", "Legacy setting kept for older configs.", "line"),
     "SHOULD_UPSCALE":              ("Upscale Images", "Upscale small images closer to bucket limit.", "check"),
-    "MAX_AREA_TOLERANCE":          ("Max Area Tolerance", "Multiplier over target area when upscaling.", "line"),
     "MULTI_BUCKET_ENABLED":        ("Use Multi-Bucket Cache", "Cache each image into nearby bucket resolutions so concepts are less tied to one aspect ratio.", "check"),
     "MULTI_BUCKET_EXTRA_BUCKETS":  ("Extra Buckets Per Image", "Maximum number of additional nearby buckets to cache per image. Higher values increase cache time and disk use.", "spin", 0, 8),
     "PREDICTION_TYPE":             ("Prediction Type", "v_prediction, epsilon, or rectified_flow.", "combo", ["epsilon", "v_prediction", "rectified_flow"]),
@@ -2548,6 +2572,7 @@ class TrainingGUI(QtWidgets.QWidget):
         elif isinstance(w, QtWidgets.QPlainTextEdit): self.current_config[key] = w.toPlainText().strip()
         elif isinstance(w, QtWidgets.QCheckBox): self.current_config[key] = w.isChecked()
         elif isinstance(w, QtWidgets.QComboBox): self.current_config[key] = w.currentText()
+        elif isinstance(w, QtWidgets.QSlider): self.current_config[key] = w.value()
         elif isinstance(w, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = w.value()
         elif isinstance(w, LRCurveWidget): self.current_config[key] = w.get_points()
         elif isinstance(w, TimestepHistogramWidget): self.current_config[key] = w.get_allocation()
@@ -2568,6 +2593,10 @@ class TrainingGUI(QtWidgets.QWidget):
                 idx = next((i for i in range(w.count()) if w.itemText(i).split()[0] == text), -1)
             if idx >= 0:
                 w.setCurrentIndex(idx)
+        elif isinstance(w, QtWidgets.QSlider):
+            w.setValue(int(value))
+            if hasattr(self, "caption_value_labels") and key in self.caption_value_labels:
+                self.caption_value_labels[key].setText(f"{int(value)}%")
         elif isinstance(w, QtWidgets.QDoubleSpinBox): w.setValue(float(value))
         elif isinstance(w, QtWidgets.QSpinBox): w.setValue(int(value))
         w.blockSignals(False)
@@ -2726,9 +2755,10 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.setContentsMargins(0, 0, 10, 0)
         settings_lay.setSpacing(10)
         settings_lay.addWidget(make_label("Dataset Settings", color=ACCENT, bold=True, size=12))
+        settings_lay.addWidget(self._build_caption_source_group())
         settings_lay.addWidget(self._build_vae_group())
         for title, keys in [
-            ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "NUM_WORKERS"]),
+            ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "CACHE_PRECISION", "NUM_WORKERS"]),
             ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
             ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
@@ -2756,6 +2786,93 @@ class TrainingGUI(QtWidgets.QWidget):
             self._connect_widget_signal("TEXT_CONDITIONING_SCALE_ENABLED", "stateChanged",
                                         lambda _: self._update_text_conditioning_scale_controls())
             self._update_text_conditioning_scale_controls()
+
+    def _build_caption_source_group(self):
+        gb, lay = group_box("Caption Source", QtWidgets.QVBoxLayout)
+        lay.setSpacing(8)
+
+        top = QtWidgets.QHBoxLayout()
+        top.setContentsMargins(0, 0, 0, 0)
+        top.addWidget(make_label("Caption Type:"))
+        combo = make_combo(["txt", "json"])
+        combo.setToolTip("txt uses image.txt. json uses image.json with tags, nl, tags_nl, and nl_tags keys.")
+        combo.currentTextChanged.connect(lambda _, k="CAPTION_SOURCE_TYPE": self._sync_widget(k))
+        combo.currentTextChanged.connect(lambda _: self._update_caption_json_controls())
+        combo.currentTextChanged.connect(lambda _: self.dataset_manager._queue_preview_refresh() if hasattr(self, "dataset_manager") else None)
+        self.widgets["CAPTION_SOURCE_TYPE"] = combo
+        top.addWidget(combo, 1)
+        help_btn = make_btn("?", self._show_json_caption_help)
+        help_btn.setFixedSize(28, 28)
+        help_btn.setToolTip("Show required JSON caption format")
+        top.addWidget(help_btn)
+        lay.addLayout(top)
+
+        self.caption_json_rows = []
+        self.caption_value_labels = {}
+        for key, label in [
+            ("CAPTION_TAGS_PERCENT", "Tags"),
+            ("CAPTION_NL_PERCENT", "NL"),
+            ("CAPTION_TAGS_NL_PERCENT", "Tags+NL"),
+            ("CAPTION_NL_TAGS_PERCENT", "NL+Tags"),
+        ]:
+            row = self._make_caption_slider_row(key, label)
+            self.caption_json_rows.append(row)
+            lay.addWidget(row)
+
+        self._register_keyed_group(
+            gb,
+            [
+                "CAPTION_SOURCE_TYPE",
+                "CAPTION_TAGS_PERCENT",
+                "CAPTION_NL_PERCENT",
+                "CAPTION_TAGS_NL_PERCENT",
+                "CAPTION_NL_TAGS_PERCENT",
+            ],
+        )
+        QtCore.QTimer.singleShot(0, self._update_caption_json_controls)
+        return gb
+
+    def _make_caption_slider_row(self, key, label):
+        row = QtWidgets.QWidget()
+        row_lay = QtWidgets.QHBoxLayout(row)
+        row_lay.setContentsMargins(0, 0, 0, 0)
+        row_lay.setSpacing(8)
+        row_lay.addWidget(make_label(label), 0)
+        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider.setRange(0, 100)
+        slider.setSingleStep(1)
+        slider.setPageStep(5)
+        value_label = make_label("0%", color=ACCENT, bold=True)
+        value_label.setMinimumWidth(42)
+        value_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter)
+        slider.valueChanged.connect(lambda v, k=key: self._sync_widget(k))
+        slider.valueChanged.connect(lambda v, lbl=value_label: lbl.setText(f"{v}%"))
+        self.widgets[key] = slider
+        self.caption_value_labels[key] = value_label
+        row_lay.addWidget(slider, 1)
+        row_lay.addWidget(value_label)
+        return row
+
+    def _update_caption_json_controls(self):
+        is_json = self.widgets.get("CAPTION_SOURCE_TYPE") and self.widgets["CAPTION_SOURCE_TYPE"].currentText() == "json"
+        for row in getattr(self, "caption_json_rows", []):
+            row.setVisible(is_json)
+        if hasattr(self, "dataset_manager"):
+            self.dataset_manager.release_preview_resources(clear_caption_cache=True)
+
+    def _show_json_caption_help(self):
+        text = (
+            "JSON caption mode expects one .json file next to each image with exact keys:\n\n"
+            "{\n"
+            "  \"tags\": \"best quality, score_7, safe, 1girl, solo, pink hair\",\n"
+            "  \"nl\": \"An anime-style girl with pink hair sits in a bedroom.\",\n"
+            "  \"tags_nl\": \"best quality, score_7, safe, 1girl, solo, pink hair. An anime-style girl with pink hair sits in a bedroom.\",\n"
+            "  \"nl_tags\": \"An anime-style girl with pink hair sits in a bedroom. best quality, score_7, safe, 1girl, solo, pink hair\"\n"
+            "}\n\n"
+            "All four keys must exist and be non-empty. Extra keys are ignored. "
+            "The four sliders are training-time weights; caching stores all four variants."
+        )
+        QtWidgets.QMessageBox.information(self, "JSON Caption Format", text)
 
     def _update_text_conditioning_scale_controls(self):
         enabled = (
@@ -3409,7 +3526,7 @@ class TrainingGUI(QtWidgets.QWidget):
             is_resuming = self.current_config.get("RESUME_TRAINING", False)
             self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
 
-            skip = {"OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "NOISE_TYPE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
+            skip = {"OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
             skip |= {k for k in self.widgets if k.startswith(("RAVEN_", "TITAN_", "VELORMS_"))}
             for key, w in self.widgets.items():
                 if key in skip: continue
@@ -3436,18 +3553,16 @@ class TrainingGUI(QtWidgets.QWidget):
             self._toggle_optimizer_widgets()
 
             loss_type = self.current_config.get("LOSS_TYPE", "MSE")
-            if loss_type == "DestinationLoss":
-                loss_type = "PatchMSE"
             self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "PatchMSE"} else "MSE")
 
-            if "SHOULD_UPSCALE" in self.widgets and "MAX_AREA_TOLERANCE" in self.widgets:
-                self.widgets["MAX_AREA_TOLERANCE"].setEnabled(self.widgets["SHOULD_UPSCALE"].isChecked())
             if "MULTI_BUCKET_ENABLED" in self.widgets:
                 self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(self.widgets["MULTI_BUCKET_ENABLED"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
                 self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
             if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
                 self._update_text_conditioning_scale_controls()
+            if "CAPTION_SOURCE_TYPE" in self.widgets:
+                self._update_caption_json_controls()
             if "VAE_PATH" in self.widgets:
                 self._set_optional_vae_visible(bool(self.widgets["VAE_PATH"].text().strip()))
             self._update_vae_normalization_controls()
@@ -3485,8 +3600,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg = {}
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
-                     "NOISE_TYPE", "NOISE_OFFSET", "LOSS_TYPE",
-                     "TIMESTEP_ALLOCATION", "TIMESTEP_WEIGHTING_CURVE"}
+                     "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
         mode_key = mode_key or default_config.mode_key_from_label(self.training_mode_combo.currentText())
         cfg["TRAINING_MODE"] = default_config.MODE_LABELS[mode_key]
         is_dit = mode_key == default_config.MODE_ANIMA
@@ -3498,12 +3612,6 @@ class TrainingGUI(QtWidgets.QWidget):
             if key in inactive_path_keys: continue
             if val is None: continue
             cfg[key] = [[round(p[0], 8), round(p[1], 10)] for p in val] if key == "LR_CUSTOM_CURVE" else val
-
-        try:
-            max_bucket = int(str(cfg.get("MAX_BUCKET_RESOLUTION", 1024)).split()[0])
-            cfg["TARGET_PIXEL_AREA"] = max_bucket * max_bucket
-        except (TypeError, ValueError):
-            cfg["TARGET_PIXEL_AREA"] = 1024 * 1024
 
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()

@@ -2,6 +2,7 @@ import inspect
 import fnmatch
 import re
 import os
+import hashlib
 from pathlib import Path
 import gc
 import json
@@ -49,6 +50,9 @@ os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 FLUX_BN_EPS = 1e-4
 IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
+CAPTION_JSON_TYPES = ("tags", "nl", "tags_nl", "nl_tags")
+CAPTION_JSON_PRIMARY_TYPE = "tags_nl"
+CAPTION_JSON_VARIANT_RE = re.compile(r"_json_(tags|nl|tags_nl|nl_tags)$")
 
 
 def collect_image_paths(root):
@@ -64,20 +68,136 @@ def cache_stem_for_image(root, image_path):
 
 
 def cache_base_stem_from_te_path(path):
+    stem = cache_item_stem_from_te_path(path)
+    if stem is None:
+        return None
+    return re.sub(r"_mb\d+$", "", stem)
+
+
+def cache_item_stem_from_te_path(path):
     name = Path(path).name
     if not name.endswith("_te.pt"):
         return None
     stem = name[:-len("_te.pt")]
-    return re.sub(r"_mb\d+$", "", stem)
+    return strip_json_caption_suffix(stem)
+
+
+def strip_json_caption_suffix(stem):
+    return CAPTION_JSON_VARIANT_RE.sub("", str(stem))
+
+
+def json_caption_cache_suffix(caption_type, enabled=True):
+    return f"_json_{caption_type}" if enabled else ""
+
+
+def caption_types_for_cache(json_caption_mode):
+    return CAPTION_JSON_TYPES if json_caption_mode else ("txt",)
+
+
+def caption_source_type(config_or_value=None):
+    value = config_or_value
+    if config_or_value is not None and not isinstance(config_or_value, str):
+        value = getattr(config_or_value, "CAPTION_SOURCE_TYPE", "txt")
+    value = str(value or "txt").strip().lower()
+    return "json" if value == "json" else "txt"
+
+
+def json_caption_mode_enabled(config_or_value=None):
+    return caption_source_type(config_or_value) == "json"
+
+
+def get_json_caption_weights(config):
+    weights = {
+        "tags": int(getattr(config, "CAPTION_TAGS_PERCENT", 40) or 0),
+        "nl": int(getattr(config, "CAPTION_NL_PERCENT", 10) or 0),
+        "tags_nl": int(getattr(config, "CAPTION_TAGS_NL_PERCENT", 25) or 0),
+        "nl_tags": int(getattr(config, "CAPTION_NL_TAGS_PERCENT", 25) or 0),
+    }
+    weights = {k: max(0, v) for k, v in weights.items()}
+    if sum(weights.values()) <= 0:
+        weights[CAPTION_JSON_PRIMARY_TYPE] = 100
+    return weights
+
+
+def choose_caption_variant(rng, weights):
+    total = sum(max(0, int(weights.get(k, 0) or 0)) for k in CAPTION_JSON_TYPES)
+    if total <= 0:
+        return CAPTION_JSON_PRIMARY_TYPE
+    roll = rng.uniform(0, total)
+    upto = 0
+    for key in CAPTION_JSON_TYPES:
+        upto += max(0, int(weights.get(key, 0) or 0))
+        if roll <= upto:
+            return key
+    return CAPTION_JSON_PRIMARY_TYPE
+
+
+def caption_variant_index(variant_paths, path_key="te_path"):
+    return {
+        key: {path_key: str(variant_paths[key])}
+        for key in CAPTION_JSON_TYPES
+    }
+
+
+def selected_caption_variant_path(item, rng, weights, path_key="te_path", primary_key="te_path", fallback_key=None, enabled=True):
+    variants = item.get("caption_variants")
+    if enabled and isinstance(variants, dict):
+        caption_type = choose_caption_variant(rng, weights)
+        variant = variants.get(caption_type) or variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variants.values()))
+        if isinstance(variant, dict) and variant.get(path_key):
+            return variant[path_key]
+    return item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
+
+
+def lat_path_for_te_path(te_path):
+    te_path = Path(te_path)
+    name = te_path.name
+    if not name.endswith("_te.pt"):
+        return Path(str(te_path).replace("_te.pt", "_lat.pt"))
+    stem = name[:-len("_te.pt")]
+    stem = strip_json_caption_suffix(stem)
+    return te_path.with_name(f"{stem}_lat.pt")
+
+
+def text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path", fallback_key=None):
+    variants = item.get("caption_variants")
+    if isinstance(variants, dict):
+        return [
+            value.get(path_key)
+            for value in variants.values()
+            if isinstance(value, dict) and value.get(path_key)
+        ]
+    path = item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
+    return [path] if path else []
+
+
+def te_paths_for_index_item(item):
+    return text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path")
 
 
 def remove_cache_pair_for_te_path(te_path):
     te_path = Path(te_path)
-    lat_path = Path(str(te_path).replace("_te.pt", "_lat.pt"))
+    lat_path = lat_path_for_te_path(te_path)
     for path in (te_path, lat_path):
         try:
             if path.exists():
                 path.unlink()
+        except OSError as e:
+            print(f"WARNING: Could not remove stale cache file {path}: {e}")
+
+
+def remove_cache_files_for_stem(cache_dir, base_stem):
+    name_re = re.compile(
+        rf"^{re.escape(str(base_stem))}"
+        rf"(?:_mb\d+)?"
+        rf"(?:_json_(?:{'|'.join(CAPTION_JSON_TYPES)}))?"
+        rf"_(?:te|lat)\.pt$"
+    )
+    for path in Path(cache_dir).glob("*.pt"):
+        if not name_re.match(path.name):
+            continue
+        try:
+            path.unlink()
         except OSError as e:
             print(f"WARNING: Could not remove stale cache file {path}: {e}")
 CLIP_CHUNK_TOKEN_COUNT = 77
@@ -88,6 +208,29 @@ CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
     "text_conditioning_scale_enabled",
     "caption_embedding_layout",
 }
+
+
+def cache_float_dtype(config):
+    precision = str(getattr(config, "CACHE_PRECISION", "bfloat16") or "bfloat16").strip().lower()
+    aliases = {
+        "fp32": "float32",
+        "float": "float32",
+        "bf16": "bfloat16",
+        "bfp16": "bfloat16",
+        "fp16": "float16",
+        "half": "float16",
+    }
+    precision = aliases.get(precision, precision)
+    if precision == "float32":
+        return torch.float32
+    if precision == "float16":
+        return torch.float16
+    return torch.bfloat16
+
+
+def cache_float_dtype_name(config):
+    return str(cache_float_dtype(config)).replace("torch.", "")
+
 BN_MEAN_SUFFIXES = [
     "bn.running_mean",
     "normalize.bn.running_mean",
@@ -181,8 +324,6 @@ class TrainingConfig:
                 try:
                     with open(path, 'r', encoding='utf-8') as f:
                         user_config = default_config.flatten_preset(json.load(f))
-                    if user_config.get("LOSS_TYPE") == "DestinationLoss":
-                        user_config["LOSS_TYPE"] = "PatchMSE"
                     for key, value in user_config.items():
                         setattr(self, key, value)
                 except (json.JSONDecodeError, TypeError) as e:
@@ -460,7 +601,7 @@ def resolve_max_bucket_resolution(value=None):
 def get_max_bucket_resolution_for_config(config):
     if hasattr(config, "MAX_BUCKET_RESOLUTION"):
         return resolve_max_bucket_resolution(getattr(config, "MAX_BUCKET_RESOLUTION"))
-    return resolve_max_bucket_resolution(getattr(config, "TARGET_PIXEL_AREA", 1024 * 1024))
+    return resolve_max_bucket_resolution(default_config.MAX_BUCKET_RESOLUTION)
 
 
 def get_bucket_ladder(max_bucket_resolution=None):
@@ -575,7 +716,11 @@ def smart_resize(image, target_w, target_h):
     return cropped
 
 def validate_and_assign_resolution(args):
-    ip, target_area, stride, should_upscale = args
+    if len(args) >= 5:
+        ip, target_area, stride, should_upscale, caption_mode = args[:5]
+    else:
+        ip, target_area, stride, should_upscale = args
+        caption_mode = "txt"
     try:
         with Image.open(ip) as img: 
             img.verify()
@@ -594,11 +739,15 @@ def validate_and_assign_resolution(args):
         crop_left = max(0, (scaled_w - target_w) // 2)
         crop_top = max(0, (scaled_h - target_h) // 2)
 
-        caption = read_caption_for_image(ip)
+        caption_variants = read_caption_variants_for_image(ip, caption_mode)
+        caption_signature = caption_signature_from_variants(caption_variants)
+        caption = caption_variants.get("txt") or caption_variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(caption_variants.values()))
 
         return {
             "ip": ip, 
             "caption": caption, 
+            "caption_variants": caption_variants,
+            "caption_signature": caption_signature,
             "target_resolution": (target_w, target_h),
             "original_size": (w, h), 
             "scaled_size": (scaled_w, scaled_h),
@@ -615,7 +764,43 @@ def caption_chunking_enabled(config):
     return bool(getattr(config, "CAPTION_CHUNKING_ENABLED", False))
 
 
-def read_caption_for_image(ip):
+def read_caption_for_image(ip, caption_mode="txt"):
+    variants = read_caption_variants_for_image(ip, caption_mode)
+    return variants.get("txt") or variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variants.values()))
+
+
+def caption_signature_from_variants(caption_variants):
+    payload = {key: caption_variants[key] for key in sorted(caption_variants)}
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def caption_signature_for_image(ip, caption_mode="txt"):
+    return caption_signature_from_variants(read_caption_variants_for_image(ip, caption_mode))
+
+
+def read_caption_variants_for_image(ip, caption_mode="txt"):
+    mode = caption_source_type(caption_mode)
+    if mode == "json":
+        cp = ip.with_suffix('.json')
+        if not cp.exists():
+            raise FileNotFoundError(f"JSON caption sidecar not found: {cp}")
+        with open(cp, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            raise ValueError(f"JSON caption must be an object: {cp}")
+        variants = {}
+        missing = []
+        for key in CAPTION_JSON_TYPES:
+            value = data.get(key)
+            if isinstance(value, str) and value.strip():
+                variants[key] = value.strip()
+            else:
+                missing.append(key)
+        if missing:
+            raise ValueError(f"JSON caption {cp} is missing non-empty key(s): {', '.join(missing)}")
+        return variants
+
     cp = ip.with_suffix('.txt')
     caption = ip.stem.replace('_', ' ')
     if cp.exists():
@@ -623,7 +808,7 @@ def read_caption_for_image(ip):
             content = f.read().strip()
             if content:
                 caption = content
-    return caption
+    return {"txt": caption}
 
 
 def get_tokenizer_max_length(tokenizer):
@@ -654,12 +839,17 @@ def get_max_caption_chunks_for_config(config, t1, t2):
         if not root.exists():
             continue
         for ip in (p for ext in ['.jpg', '.jpeg', '.png', '.webp', '.bmp'] for p in root.rglob(f"*{ext}")):
-            caption = read_caption_for_image(ip)
-            max_chunks = max(
-                max_chunks,
-                get_caption_chunk_count(caption, t1),
-                get_caption_chunk_count(caption, t2),
-            )
+            try:
+                caption_variants = read_caption_variants_for_image(ip, caption_source_type(config))
+            except Exception as e:
+                print(f"[CAPTION READ ERROR] Skipping caption chunk scan for {ip}, Reason: {e}")
+                continue
+            for caption in caption_variants.values():
+                max_chunks = max(
+                    max_chunks,
+                    get_caption_chunk_count(caption, t1),
+                    get_caption_chunk_count(caption, t2),
+                )
     return max_chunks
 
 
@@ -757,10 +947,13 @@ def get_caption_cache_options(config):
             vae_source_path = str(vae_source)
 
     return {
-        "version": 11,
+        "version": 12,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
+        "cache_float_dtype": cache_float_dtype_name(config),
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "caption_embedding_layout": "fixed_total_chunks",
+        "caption_source_type": caption_source_type(config),
+        "caption_json_types": list(CAPTION_JSON_TYPES),
         "caption_chunking_enabled": caption_chunking_enabled(config),
         "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
         "multi_bucket_extra_buckets": int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0) if getattr(config, "MULTI_BUCKET_ENABLED", False) else 0,
@@ -778,6 +971,8 @@ def check_if_caching_needed(config):
     needs_caching = False
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
+    json_caption_mode = json_caption_mode_enabled(config)
+    expected_te_multiplier = len(CAPTION_JSON_TYPES) if json_caption_mode else 1
 
     if null_conditioning_cache_needed(config):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
@@ -821,9 +1016,9 @@ def check_if_caching_needed(config):
             if len(indexed_files) < len(image_paths):
                 needs_caching = True
             indexed_base_stems = {
-                cache_base_stem_from_te_path(item.get("te_path", ""))
+                cache_base_stem_from_te_path(te_path)
                 for item in indexed_files
-                if item.get("te_path")
+                for te_path in te_paths_for_index_item(item)
             }
             indexed_base_stems.discard(None)
             if not current_cache_stems.issubset(indexed_base_stems):
@@ -831,11 +1026,21 @@ def check_if_caching_needed(config):
             if any(stem not in current_cache_stems for stem in indexed_base_stems):
                 needs_caching = True
             for item in indexed_files:
-                te_path = item.get("te_path")
+                te_paths = te_paths_for_index_item(item)
                 lat_path = item.get("lat_path")
-                if not te_path or not lat_path or not Path(te_path).exists() or not Path(lat_path).exists():
+                if not te_paths or not lat_path or not Path(lat_path).exists() or any(not Path(p).exists() for p in te_paths):
                     needs_caching = True
                     break
+                relative_path = item.get("relative_path")
+                cached_signature = item.get("caption_signature")
+                if relative_path:
+                    try:
+                        if caption_signature_for_image(root / relative_path, caption_source_type(config)) != cached_signature:
+                            needs_caching = True
+                            break
+                    except Exception:
+                        needs_caching = True
+                        break
         except Exception:
             needs_caching = True
 
@@ -849,7 +1054,7 @@ def check_if_caching_needed(config):
             needs_caching = True
         if not current_cache_stems.issubset(cached_base_stems):
             needs_caching = True
-        if len(cached_te_files) < len(image_paths):
+        if len(cached_te_files) < len(image_paths) * expected_te_multiplier:
             needs_caching = True
         else:
             for f in cached_te_files[: min(len(cached_te_files), 10)]:
@@ -1030,6 +1235,9 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
+    cache_dtype = cache_float_dtype(config)
+    caption_mode = caption_source_type(config)
+    json_caption_mode = json_caption_mode_enabled(caption_mode)
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
@@ -1091,11 +1299,19 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         if multi_bucket_extra > 0:
             print(f"INFO: Multi-bucket cache enabled: up to {multi_bucket_extra} extra bucket(s) per image.")
         force_recaching = True
+        indexed_caption_signatures = {}
         index_path = cache_dir / "dataset_index.json"
         if index_path.exists():
             try:
                 with open(index_path, "r", encoding="utf-8") as f:
-                    force_recaching = not cache_options_match_for_image_cache(json.load(f).get("cache_options"), expected_cache_options)
+                    existing_index = json.load(f)
+                force_recaching = not cache_options_match_for_image_cache(existing_index.get("cache_options"), expected_cache_options)
+                if not force_recaching:
+                    for item in existing_index.get("files", []):
+                        lat_path = item.get("lat_path")
+                        if lat_path:
+                            item_stem = Path(lat_path).stem.replace("_lat", "")
+                            indexed_caption_signatures[item_stem] = item.get("caption_signature")
             except Exception:
                 force_recaching = True
 
@@ -1119,19 +1335,41 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 remove_cache_pair_for_te_path(stale_file)
 
         if null_embeds is not None and null_pooled is not None:
-            torch.save({"embeds": null_embeds.cpu(), "pooled": null_pooled.cpu()}, cache_dir / "null_embeds.pt")
+            torch.save(
+                {
+                    "embeds": null_embeds.to(dtype=cache_dtype).cpu(),
+                    "pooled": null_pooled.to(dtype=cache_dtype).cpu(),
+                },
+                cache_dir / "null_embeds.pt",
+            )
 
         to_process = []
         for p in paths:
             safe_stem = cache_stem_for_image(root, p)
-            if force_recaching or not (cache_dir / f"{safe_stem}_te.pt").exists() or not (cache_dir / f"{safe_stem}_lat.pt").exists():
+            lat_exists = (cache_dir / f"{safe_stem}_lat.pt").exists()
+            if json_caption_mode:
+                text_exists = all((cache_dir / f"{safe_stem}{json_caption_cache_suffix(key)}_te.pt").exists() for key in CAPTION_JSON_TYPES)
+            else:
+                text_exists = (cache_dir / f"{safe_stem}_te.pt").exists()
+            if force_recaching or not text_exists or not lat_exists:
+                to_process.append(p)
+                continue
+            cached_signature = indexed_caption_signatures.get(safe_stem)
+            try:
+                current_signature = caption_signature_for_image(p, caption_mode)
+            except Exception as e:
+                print(f"[CAPTION READ ERROR] Removing stale cache for {p}, Reason: {e}")
+                remove_cache_files_for_stem(cache_dir, safe_stem)
+                continue
+            if current_signature != cached_signature:
+                remove_cache_files_for_stem(cache_dir, safe_stem)
                 to_process.append(p)
 
         if to_process:
             with Pool(processes=min(cpu_count(), 8)) as pool:
                 max_bucket_resolution = get_max_bucket_resolution_for_config(config)
                 max_bucket_area = max_bucket_resolution * max_bucket_resolution
-                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, max_bucket_area, 64, config.SHOULD_UPSCALE) for p in to_process]), total=len(to_process)))
+                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in to_process]), total=len(to_process)))
 
             expanded_results = []
             for m in (r for r in results if r):
@@ -1193,8 +1431,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
                     if not images_global: continue
 
+                    caption_jobs = []
+                    for meta_index, m in enumerate(valid_meta_final):
+                        caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
+                        if json_caption_mode:
+                            for caption_type in caption_types_for_cache(json_caption_mode):
+                                caption_jobs.append((meta_index, caption_type, caption_variants[caption_type]))
+                        else:
+                            caption_jobs.append((meta_index, "txt", caption_variants.get("txt", m["caption"])))
+
                     embeds_all, pooled_all = compute_text_embeddings_sdxl(
-                        [m["caption"] for m in valid_meta_final],
+                        [caption for _, _, caption in caption_jobs],
                         t1, t2, te1, te2, device,
                         allow_chunking=allow_caption_chunking,
                         total_chunks=caption_total_chunks,
@@ -1224,24 +1471,35 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                         norm_std = latents_global.std().item()
 
                     latents_global = latents_global.cpu()
+                    text_embeddings_by_meta = defaultdict(dict)
+                    for embed_index, (meta_index, caption_type, caption) in enumerate(caption_jobs):
+                        text_embeddings_by_meta[meta_index][caption_type] = {
+                            "caption": caption,
+                            "embeds": embeds_all[embed_index].to(dtype=cache_dtype).cpu(),
+                            "pooled": pooled_all[embed_index].to(dtype=cache_dtype).cpu(),
+                        }
 
                     for j, m in enumerate(valid_meta_final):
                         safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_') + m.get("cache_suffix", "")
-                        torch.save({
-                            "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
-                            "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
-                            "target_size": (w, h),
-                            "crop_coords": m.get("crop_coords", (0, 0)),
-                            "bucket_variant_index": m.get("bucket_variant_index", 0),
-                            "caption": m["caption"],
-                            "embeds": embeds_all[j].to(dtype=torch.float32).cpu(),
-                            "pooled": pooled_all[j].to(dtype=torch.float32).cpu(),
-                            "cache_options": expected_cache_options,
-                            "vae_normalization_mode": vae_norm_mode,
-                            "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
-                            "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
-                        }, cache_dir / f"{safe_filename}_te.pt")
-                        torch.save(latents_global[j].to(dtype=torch.float32).cpu(), cache_dir / f"{safe_filename}_lat.pt")
+                        for caption_type, text_payload in text_embeddings_by_meta[j].items():
+                            suffix = json_caption_cache_suffix(caption_type, json_caption_mode)
+                            torch.save({
+                                "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
+                                "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
+                                "target_size": (w, h),
+                                "crop_coords": m.get("crop_coords", (0, 0)),
+                                "bucket_variant_index": m.get("bucket_variant_index", 0),
+                                "caption_type": caption_type,
+                                "caption": text_payload["caption"],
+                                "caption_signature": m.get("caption_signature"),
+                                "embeds": text_payload["embeds"],
+                                "pooled": text_payload["pooled"],
+                                "cache_options": expected_cache_options,
+                                "vae_normalization_mode": vae_norm_mode,
+                                "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
+                                "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
+                            }, cache_dir / f"{safe_filename}{suffix}_te.pt")
+                        torch.save(latents_global[j].to(dtype=cache_dtype).cpu(), cache_dir / f"{safe_filename}_lat.pt")
                         mark_cache_variant_done(m, encode_pbar)
 
                     if batch_idx % 20 == 0: torch.cuda.empty_cache()
@@ -1249,22 +1507,48 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         print(f"INFO: Building fast JSON index for {root.name}...")
         index_data = []
         cached_files = list(cache_dir.glob("*_te.pt"))
-        for f in cached_files:
+        if json_caption_mode:
+            grouped_te_files = defaultdict(dict)
+            for f in cached_files:
+                item_stem = cache_item_stem_from_te_path(f)
+                if item_stem is None:
+                    continue
+                try:
+                    caption_type = torch.load(f, map_location='cpu', weights_only=True).get("caption_type")
+                    if caption_type in CAPTION_JSON_TYPES:
+                        grouped_te_files[item_stem][caption_type] = f
+                except Exception as e:
+                    print(f"WARNING: Could not inspect cached text file {f}: {e}")
+
+            iterable_index_items = []
+            for item_stem, variant_paths in grouped_te_files.items():
+                if any(key not in variant_paths for key in CAPTION_JSON_TYPES):
+                    print(f"WARNING: Skipping incomplete JSON caption cache item: {item_stem}")
+                    continue
+                iterable_index_items.append((item_stem, variant_paths[CAPTION_JSON_PRIMARY_TYPE], variant_paths))
+        else:
+            iterable_index_items = [
+                (cache_item_stem_from_te_path(f), f, None)
+                for f in cached_files
+                if cache_item_stem_from_te_path(f) is not None
+            ]
+
+        for item_stem, f, variant_paths in iterable_index_items:
             try:
                 if cache_base_stem_from_te_path(f) not in current_cache_stems:
                     remove_cache_pair_for_te_path(f)
                     continue
-                lat_path = Path(str(f).replace("_te.pt", "_lat.pt"))
+                lat_path = cache_dir / f"{item_stem}_lat.pt"
                 if not lat_path.exists():
                     print(f"WARNING: Skipping cached text file with missing latent: {f}")
                     continue
-                data_te = torch.load(f, map_location='cpu')
+                data_te = torch.load(f, map_location='cpu', weights_only=True)
                 relative_path = data_te.get("relative_path")
                 if relative_path and not (root / relative_path).exists():
                     remove_cache_pair_for_te_path(f)
                     continue
-                
-                index_data.append({
+
+                index_item = {
                     "te_path": str(f),
                     "lat_path": str(lat_path),
                     "relative_path": relative_path,
@@ -1273,12 +1557,16 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     "scaled_size": data_te.get('scaled_size', data_te.get('original_size')),
                     "crop_coords": data_te.get('crop_coords', (0,0)),
                     "bucket_variant_index": data_te.get("bucket_variant_index", 0),
-                })
+                    "caption_signature": data_te.get("caption_signature"),
+                }
+                if variant_paths:
+                    index_item["caption_variants"] = caption_variant_index(variant_paths)
+                index_data.append(index_item)
             except Exception as e:
                 print(f"WARNING: Could not index {f}: {e}")
                 
         with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"version": 11, "cache_options": expected_cache_options, "files": index_data}, f)
+            json.dump({"version": 12, "cache_options": expected_cache_options, "files": index_data}, f)
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -1290,6 +1578,8 @@ class ImageTextLatentDataset(Dataset):
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
         self.worker_rng = None
+        self.json_caption_mode = json_caption_mode_enabled(config)
+        self.caption_weights = get_json_caption_weights(config)
         cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
@@ -1394,7 +1684,12 @@ class ImageTextLatentDataset(Dataset):
             if self.worker_rng is None: self._init_worker_rng()
             
             item_data = self.items[i]
-            path_te = item_data["te_path"]
+            path_te = selected_caption_variant_path(
+                item_data,
+                self.worker_rng,
+                self.caption_weights,
+                enabled=self.json_caption_mode,
+            )
             path_lat = item_data["lat_path"]
 
             data_te = self._load_tensor(path_te)

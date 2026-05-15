@@ -19,9 +19,12 @@
         "sdxl_text_conditioning_scale_max": 1.2500000000000002,
         "sdxl_caption_chunking_enabled": true,
         "sdxl_should_upscale": true,
+        "sdxl_caption_source_type": "txt",
+        "sdxl_caption_tags_percent": 40,
+        "sdxl_caption_nl_percent": 10,
+        "sdxl_caption_tags_nl_percent": 25,
+        "sdxl_caption_nl_tags_percent": 25,
         "sdxl_max_bucket_resolution": 1024,
-        "sdxl_target_pixel_area": 1048576,
-        "sdxl_max_area_tolerance": "1.0",
         "sdxl_multi_bucket_enabled": true,
         "sdxl_multi_bucket_extra_buckets": 2,
         "sdxl_prediction_type": "v_prediction",
@@ -109,14 +112,16 @@
         "sdxl_vae_path": "",
         "sdxl_resume_model_path": "",
         "sdxl_resume_state_path": "",
-        "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*"
+        "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*",
+        "sdxl_target_pixel_area": 1048576,
+        "sdxl_max_area_tolerance": "1.0"
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\test",
+                "path": "C:/Users/Administrator/Pictures\\f",
                 "repeats": 1
             }
         ],
@@ -129,15 +134,18 @@
         "anima_text_conditioning_scale_max": 1.2499999999999993,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
-        "anima_max_bucket_resolution": 1152,
-        "anima_target_pixel_area": 1327104,
-        "anima_max_area_tolerance": "1.0",
-        "anima_multi_bucket_enabled": true,
+        "anima_caption_source_type": "json",
+        "anima_caption_tags_percent": 60,
+        "anima_caption_nl_percent": 10,
+        "anima_caption_tags_nl_percent": 30,
+        "anima_caption_nl_tags_percent": 0,
+        "anima_max_bucket_resolution": "1024",
+        "anima_multi_bucket_enabled": false,
         "anima_multi_bucket_extra_buckets": 5,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "500",
+        "anima_max_train_steps": "1000",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "8",
+        "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
@@ -148,12 +156,12 @@
                 1e-07
             ],
             [
-                0.02110818,
-                6e-06
+                0.02638522,
+                6.5e-06
             ],
             [
-                0.98153034,
-                6e-06
+                0.9762533,
+                6.5e-06
             ],
             [
                 1.0,
@@ -162,35 +170,35 @@
         ],
         "anima_learning_rate": 8e-07,
         "anima_lr_graph_min": "1.0e-7",
-        "anima_lr_graph_max": "6e-6",
+        "anima_lr_graph_max": "6.5e-6",
         "anima_timestep_allocation": {
             "bin_size": 40,
             "counts": [
-                8,
-                9,
-                10,
-                12,
-                14,
+                17,
                 17,
                 20,
                 24,
-                27,
                 29,
-                31,
-                32,
-                33,
-                32,
-                31,
-                29,
-                27,
-                24,
-                21,
+                35,
+                41,
+                48,
+                54,
+                59,
+                63,
+                65,
+                65,
+                65,
+                62,
+                58,
+                53,
+                47,
+                41,
+                34,
+                28,
+                23,
+                19,
                 17,
-                14,
-                12,
-                10,
-                9,
-                8
+                16
             ]
         },
         "anima_optimizer_type": "raven",
@@ -251,6 +259,8 @@
         "anima_vae_caching_tile_stride": [
             72,
             72
-        ]
+        ],
+        "anima_target_pixel_area": 1048576,
+        "anima_max_area_tolerance": "1.0"
     }
 }
