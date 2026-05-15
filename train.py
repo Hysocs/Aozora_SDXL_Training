@@ -1238,6 +1238,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
     cache_dtype = cache_float_dtype(config)
     caption_mode = caption_source_type(config)
     json_caption_mode = json_caption_mode_enabled(caption_mode)
+    print(f"INFO: SDXL cache precision: {cache_float_dtype_name(config)} for text embeddings and VAE latents.")
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()

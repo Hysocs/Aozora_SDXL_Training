@@ -2227,7 +2227,7 @@ UI_DEFS = {
     "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer", "T5XXL tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
-    "CACHE_PRECISION":             ("Cache Precision", "Floating-point dtype used for cached text embeddings and latents on disk.", "combo", ["float32", "bfloat16", "float16"]),
+    "CACHE_PRECISION":             ("Cache Precision", "Floating-point dtype used for cached text embeddings and VAE latents on disk.", "combo", ["float32", "bfloat16", "float16"]),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
     "UNCONDITIONAL_DROPOUT":       ("Use Null Conditioning Dropout", "At random, train a sample with empty-prompt conditioning instead of its caption.", "check"),
     "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),

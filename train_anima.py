@@ -641,6 +641,7 @@ def precompute_and_cache_anima(config, pipe, device):
     caption_mode = caption_source_type(config)
     json_caption_mode = json_caption_mode_enabled(config)
     active_caption_types = anima_caption_types_for_cache(config, json_caption_mode)
+    print(f"INFO: Anima cache precision: {anima_cache_float_dtype_name(config)} for text embeddings and VAE latents.")
     multi_bucket_extra = (
         max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
         if getattr(config, "MULTI_BUCKET_ENABLED", False)
