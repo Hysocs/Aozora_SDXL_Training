@@ -1,6 +1,5 @@
 import inspect
 import fnmatch
-import re
 import os
 import hashlib
 from pathlib import Path
@@ -40,6 +39,33 @@ from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     FusedAttnProcessor2_0
 )
+from training_cache import (
+    CAPTION_JSON_PRIMARY_TYPE,
+    CAPTION_JSON_TYPES,
+    cache_base_stem_from_cache_path,
+    cache_base_stem_from_te_path,
+    cache_index_exists,
+    cache_item_stem_from_te_path,
+    cache_metadata_matches,
+    cache_stem_for_image,
+    caption_file_signature_for_image,
+    caption_source_type,
+    caption_types_for_cache,
+    caption_variant_index,
+    collect_image_paths,
+    expected_cache_paths_for_metadata,
+    image_file_signature,
+    json_caption_cache_suffix,
+    json_caption_mode_enabled,
+    load_cache_index,
+    remove_cache_files_for_stem,
+    remove_cache_pair_for_te_path,
+    save_cache_index,
+    selected_caption_variant_path,
+    strip_json_caption_suffix,
+    te_paths_for_index_item,
+    text_cache_paths_for_index_item,
+)
 
 warnings.filterwarnings("ignore", category=UserWarning, module=TiffImagePlugin.__name__, message="Corrupt EXIF data")
 Image.MAX_IMAGE_PIXELS = 190_000_000
@@ -49,61 +75,6 @@ torch.backends.cudnn.allow_tf32 = True
 os.environ["TOKENIZERS_PARALLELISM"] = "false"
 
 FLUX_BN_EPS = 1e-4
-IMAGE_EXTENSIONS = ('.jpg', '.jpeg', '.png', '.webp', '.bmp')
-CAPTION_JSON_TYPES = ("tags", "nl", "tags_nl", "nl_tags")
-CAPTION_JSON_PRIMARY_TYPE = "tags_nl"
-CAPTION_JSON_VARIANT_RE = re.compile(r"_json_(tags|nl|tags_nl|nl_tags)$")
-
-
-def collect_image_paths(root):
-    return [
-        p
-        for ext in IMAGE_EXTENSIONS
-        for p in root.rglob(f"*{ext}")
-    ]
-
-
-def cache_stem_for_image(root, image_path):
-    return str(image_path.relative_to(root).with_suffix('')).replace(os.sep, '_')
-
-
-def cache_base_stem_from_te_path(path):
-    stem = cache_item_stem_from_te_path(path)
-    if stem is None:
-        return None
-    return re.sub(r"_mb\d+$", "", stem)
-
-
-def cache_item_stem_from_te_path(path):
-    name = Path(path).name
-    if not name.endswith("_te.pt"):
-        return None
-    stem = name[:-len("_te.pt")]
-    return strip_json_caption_suffix(stem)
-
-
-def strip_json_caption_suffix(stem):
-    return CAPTION_JSON_VARIANT_RE.sub("", str(stem))
-
-
-def json_caption_cache_suffix(caption_type, enabled=True):
-    return f"_json_{caption_type}" if enabled else ""
-
-
-def caption_types_for_cache(json_caption_mode):
-    return CAPTION_JSON_TYPES if json_caption_mode else ("txt",)
-
-
-def caption_source_type(config_or_value=None):
-    value = config_or_value
-    if config_or_value is not None and not isinstance(config_or_value, str):
-        value = getattr(config_or_value, "CAPTION_SOURCE_TYPE", "txt")
-    value = str(value or "txt").strip().lower()
-    return "json" if value == "json" else "txt"
-
-
-def json_caption_mode_enabled(config_or_value=None):
-    return caption_source_type(config_or_value) == "json"
 
 
 def get_json_caption_weights(config):
@@ -119,87 +90,86 @@ def get_json_caption_weights(config):
     return weights
 
 
-def choose_caption_variant(rng, weights):
-    total = sum(max(0, int(weights.get(k, 0) or 0)) for k in CAPTION_JSON_TYPES)
-    if total <= 0:
-        return CAPTION_JSON_PRIMARY_TYPE
-    roll = rng.uniform(0, total)
-    upto = 0
-    for key in CAPTION_JSON_TYPES:
-        upto += max(0, int(weights.get(key, 0) or 0))
-        if roll <= upto:
-            return key
-    return CAPTION_JSON_PRIMARY_TYPE
-
-
-def caption_variant_index(variant_paths, path_key="te_path"):
-    return {
-        key: {path_key: str(variant_paths[key])}
-        for key in CAPTION_JSON_TYPES
-    }
-
-
-def selected_caption_variant_path(item, rng, weights, path_key="te_path", primary_key="te_path", fallback_key=None, enabled=True):
-    variants = item.get("caption_variants")
-    if enabled and isinstance(variants, dict):
-        caption_type = choose_caption_variant(rng, weights)
-        variant = variants.get(caption_type) or variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variants.values()))
-        if isinstance(variant, dict) and variant.get(path_key):
-            return variant[path_key]
-    return item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
-
-
-def lat_path_for_te_path(te_path):
-    te_path = Path(te_path)
-    name = te_path.name
-    if not name.endswith("_te.pt"):
-        return Path(str(te_path).replace("_te.pt", "_lat.pt"))
-    stem = name[:-len("_te.pt")]
-    stem = strip_json_caption_suffix(stem)
-    return te_path.with_name(f"{stem}_lat.pt")
-
-
-def text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path", fallback_key=None):
-    variants = item.get("caption_variants")
-    if isinstance(variants, dict):
-        return [
-            value.get(path_key)
-            for value in variants.values()
-            if isinstance(value, dict) and value.get(path_key)
-        ]
-    path = item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
-    return [path] if path else []
-
-
-def te_paths_for_index_item(item):
-    return text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path")
-
-
-def remove_cache_pair_for_te_path(te_path):
-    te_path = Path(te_path)
-    lat_path = lat_path_for_te_path(te_path)
-    for path in (te_path, lat_path):
-        try:
-            if path.exists():
-                path.unlink()
-        except OSError as e:
-            print(f"WARNING: Could not remove stale cache file {path}: {e}")
-
-
-def remove_cache_files_for_stem(cache_dir, base_stem):
-    name_re = re.compile(
-        rf"^{re.escape(str(base_stem))}"
-        rf"(?:_mb\d+)?"
-        rf"(?:_json_(?:{'|'.join(CAPTION_JSON_TYPES)}))?"
-        rf"_(?:te|lat)\.pt$"
+def sdxl_text_cache_compatible_options(cached_options, expected_options):
+    cached = normalize_cache_options_for_image_cache(cached_options)
+    expected = normalize_cache_options_for_image_cache(expected_options)
+    if not isinstance(cached, dict) or not isinstance(expected, dict):
+        return False
+    text_keys = (
+        "text_cache_float_dtype",
+        "caption_source_type",
+        "caption_json_types",
+        "caption_chunking_enabled",
+        "caption_embedding_layout",
     )
-    for path in Path(cache_dir).glob("*.pt"):
-        if not name_re.match(path.name):
-            continue
-        try:
-            path.unlink()
-        except OSError as e:
-            print(f"WARNING: Could not remove stale cache file {path}: {e}")
+    return all(cached.get(key) == expected.get(key) for key in text_keys)
+
+
+def sdxl_lat_cache_compatible_options(cached_options, expected_options):
+    cached = normalize_cache_options_for_image_cache(cached_options)
+    expected = normalize_cache_options_for_image_cache(expected_options)
+    if not isinstance(cached, dict) or not isinstance(expected, dict):
+        return False
+    latent_keys = (
+        "vae_cache_float_dtype",
+        "vae_normalization_mode",
+        "vae_shift_factor",
+        "vae_scaling_factor",
+        "vae_latent_channels",
+        "vae_path",
+        "vae_source_path",
+        "vae_source_size",
+        "vae_source_mtime_ns",
+    )
+    return all(cached.get(key) == expected.get(key) for key in latent_keys)
+
+
+def sdxl_text_cache_valid(path, root, meta, caption_type, caption, text_cache_dtype, expected_options):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        embeds = payload.get("embeds")
+        pooled = payload.get("pooled")
+        return (
+            embeds is not None
+            and pooled is not None
+            and embeds.dtype == text_cache_dtype
+            and pooled.dtype == text_cache_dtype
+            and payload.get("caption_type") == caption_type
+            and payload.get("caption") == caption
+            and payload.get("caption_signature") == meta.get("caption_signature")
+            and cache_metadata_matches(payload, root, meta)
+            and sdxl_text_cache_compatible_options(payload.get("cache_options"), expected_options)
+        )
+    except Exception:
+        return False
+
+
+def sdxl_lat_cache_valid(path, primary_te_path, root, meta, vae_cache_dtype, expected_options):
+    try:
+        lat_payload = torch.load(path, map_location="cpu", weights_only=True)
+        if isinstance(lat_payload, dict):
+            if not cache_metadata_matches(lat_payload, root, meta):
+                return False
+            if not sdxl_lat_cache_compatible_options(lat_payload.get("cache_options"), expected_options):
+                return False
+            latents = lat_payload.get("latents")
+        else:
+            if not Path(primary_te_path).exists():
+                return False
+            text_payload = torch.load(primary_te_path, map_location="cpu", weights_only=True)
+            if not cache_metadata_matches(text_payload, root, meta):
+                return False
+            if not sdxl_lat_cache_compatible_options(text_payload.get("cache_options"), expected_options):
+                return False
+            latents = lat_payload
+        return (
+            latents is not None
+            and latents.dtype == vae_cache_dtype
+            and not torch.isnan(latents).any()
+            and not torch.isinf(latents).any()
+        )
+    except Exception:
+        return False
 CLIP_CHUNK_TOKEN_COUNT = 77
 CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
     "version",
@@ -958,6 +928,17 @@ def normalize_cache_options_for_image_cache(cache_options):
 def cache_options_match_for_image_cache(cached_options, expected_options):
     return normalize_cache_options_for_image_cache(cached_options) == normalize_cache_options_for_image_cache(expected_options)
 
+
+def cached_file_signatures_match(item, image_path, caption_mode):
+    image_sig = item.get("image_file_signature")
+    caption_sig = item.get("caption_file_signature")
+    if not image_sig or not caption_sig:
+        return None
+    return (
+        image_sig == image_file_signature(image_path)
+        and caption_sig == caption_file_signature_for_image(image_path, caption_mode)
+    )
+
 def get_caption_cache_options(config):
     vae_source = get_vae_source_for_config(config)
     vae_source_path = ""
@@ -1013,15 +994,13 @@ def check_if_caching_needed(config):
         image_paths = collect_image_paths(root)
         if not image_paths:
             cache_dir = root / cache_folder_name
-            index_path = cache_dir / "dataset_index.json"
             cached_te_files = list(cache_dir.glob("*_te.pt")) if cache_dir.exists() else []
             if cached_te_files:
                 needs_caching = True
-            elif index_path.exists():
+            elif cache_index_exists(cache_dir):
                 try:
-                    with open(index_path, "r", encoding="utf-8") as f:
-                        if json.load(f).get("files"):
-                            needs_caching = True
+                    if load_cache_index(cache_dir).get("files"):
+                        needs_caching = True
                 except Exception:
                     needs_caching = True
             continue
@@ -1031,12 +1010,10 @@ def check_if_caching_needed(config):
         if not cache_dir.exists():
             needs_caching = True; continue
             
-        index_path = cache_dir / "dataset_index.json"
-        if not index_path.exists():
+        if not cache_index_exists(cache_dir):
             needs_caching = True; continue
         try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
+            index_data = load_cache_index(cache_dir)
             if not cache_options_match_for_image_cache(index_data.get("cache_options"), expected_cache_options):
                 needs_caching = True
             indexed_files = index_data.get("files", [])
@@ -1064,7 +1041,12 @@ def check_if_caching_needed(config):
                 cached_signature = item.get("caption_signature")
                 if relative_path:
                     try:
-                        if caption_signature_for_image(root / relative_path, caption_source_type(config)) != cached_signature:
+                        image_path = root / relative_path
+                        stat_match = cached_file_signatures_match(item, image_path, caption_source_type(config))
+                        if stat_match is False:
+                            needs_caching = True
+                            break
+                        if stat_match is None and caption_signature_for_image(image_path, caption_source_type(config)) != cached_signature:
                             needs_caching = True
                             break
                     except Exception:
@@ -1333,22 +1315,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         )
         if multi_bucket_extra > 0:
             print(f"INFO: Multi-bucket cache enabled: up to {multi_bucket_extra} extra bucket(s) per image.")
-        force_recaching = True
-        indexed_caption_signatures = {}
-        index_path = cache_dir / "dataset_index.json"
-        if index_path.exists():
+        force_recaching = bool(getattr(config, "REBUILD_CACHE", False))
+        if cache_index_exists(cache_dir) and not force_recaching:
             try:
-                with open(index_path, "r", encoding="utf-8") as f:
-                    existing_index = json.load(f)
-                force_recaching = not cache_options_match_for_image_cache(existing_index.get("cache_options"), expected_cache_options)
-                if not force_recaching:
-                    for item in existing_index.get("files", []):
-                        lat_path = item.get("lat_path")
-                        if lat_path:
-                            item_stem = Path(lat_path).stem.replace("_lat", "")
-                            indexed_caption_signatures[item_stem] = item.get("caption_signature")
+                existing_index = load_cache_index(cache_dir)
+                if not cache_options_match_for_image_cache(existing_index.get("cache_options"), expected_cache_options):
+                    print(
+                        f"INFO: SDXL cache options changed for {root.name}; "
+                        "reusing compatible cached files and filling only missing variants."
+                    )
             except Exception:
-                force_recaching = True
+                print(f"INFO: SDXL cache index for {root.name} is unreadable; rebuilding index from cache files.")
 
         if force_recaching:
             stale_files = list(cache_dir.glob("*_te*.pt")) + list(cache_dir.glob("*_lat.pt"))
@@ -1360,14 +1337,17 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 except OSError as e:
                     print(f"WARNING: Could not remove stale cache file {stale_file}: {e}")
         else:
-            stale_te_files = [
-                f for f in cache_dir.glob("*_te.pt")
-                if cache_base_stem_from_te_path(f) not in current_cache_stems
+            stale_files = [
+                f for f in cache_dir.glob("*.pt")
+                if f.name not in {"null_embeds.pt", "dataset_index.pt"} and cache_base_stem_from_cache_path(f) not in current_cache_stems
             ]
-            if stale_te_files:
-                print(f"INFO: Removing {len(stale_te_files)} stale SDXL cache item(s) for deleted images in {root.name}.")
-            for stale_file in stale_te_files:
-                remove_cache_pair_for_te_path(stale_file)
+            if stale_files:
+                print(f"INFO: Removing {len(stale_files)} stale SDXL cache item(s) for deleted images in {root.name}.")
+            for stale_file in stale_files:
+                try:
+                    stale_file.unlink()
+                except OSError as e:
+                    print(f"WARNING: Could not remove stale cache file {stale_file}: {e}")
 
         if null_embeds is not None and null_pooled is not None:
             torch.save(
@@ -1378,33 +1358,12 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 cache_dir / "null_embeds.pt",
             )
 
-        to_process = []
-        for p in paths:
-            safe_stem = cache_stem_for_image(root, p)
-            lat_exists = (cache_dir / f"{safe_stem}_lat.pt").exists()
-            if json_caption_mode:
-                text_exists = all((cache_dir / f"{safe_stem}{json_caption_cache_suffix(key)}_te.pt").exists() for key in CAPTION_JSON_TYPES)
-            else:
-                text_exists = (cache_dir / f"{safe_stem}_te.pt").exists()
-            if force_recaching or not text_exists or not lat_exists:
-                to_process.append(p)
-                continue
-            cached_signature = indexed_caption_signatures.get(safe_stem)
-            try:
-                current_signature = caption_signature_for_image(p, caption_mode)
-            except Exception as e:
-                print(f"[CAPTION READ ERROR] Removing stale cache for {p}, Reason: {e}")
-                remove_cache_files_for_stem(cache_dir, safe_stem)
-                continue
-            if current_signature != cached_signature:
-                remove_cache_files_for_stem(cache_dir, safe_stem)
-                to_process.append(p)
-
-        if to_process:
+        if paths:
             with Pool(processes=min(cpu_count(), 8)) as pool:
                 max_bucket_resolution = get_max_bucket_resolution_for_config(config)
                 max_bucket_area = max_bucket_resolution * max_bucket_resolution
-                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in to_process]), total=len(to_process)))
+                print(f"INFO: Validating SDXL images and assigning buckets for {root.name} ({len(paths)} image(s))...")
+                results = list(tqdm(pool.imap(validate_and_assign_resolution, [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in paths]), total=len(paths)))
 
             expanded_results = []
             for m in (r for r in results if r):
@@ -1418,127 +1377,171 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                 for variant_index, (target_w, target_h) in enumerate(buckets_for_image):
                     expanded_results.append(make_bucket_variant_metadata(m, target_w, target_h, variant_index))
 
-            grouped = defaultdict(list)
-            for m in expanded_results: grouped[m["target_resolution"]].append(m)
-
-            batches = [(res, grouped[res][i:i + config.CACHING_BATCH_SIZE]) for res in grouped for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)]
-            random.shuffle(batches)
-
-            variants_total_by_image = defaultdict(int)
-            variants_done_by_image = defaultdict(int)
-            started_images = set()
+            cache_caption_types = caption_types_for_cache(json_caption_mode)
+            text_jobs = []
+            lat_jobs = []
+            reused_text_count = 0
+            reused_lat_count = 0
+            expected_cache_files = set()
             for m in expanded_results:
-                variants_total_by_image[str(m["ip"].relative_to(root))] += 1
+                caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
+                text_paths, lat_path = expected_cache_paths_for_metadata(root, cache_dir, m, cache_caption_types, json_caption_mode)
+                expected_cache_files.add(lat_path.resolve())
+                for caption_type in cache_caption_types:
+                    te_path = text_paths[caption_type]
+                    expected_cache_files.add(te_path.resolve())
+                    caption = caption_variants[caption_type]
+                    if te_path.exists() and sdxl_text_cache_valid(te_path, root, m, caption_type, caption, text_cache_dtype, expected_cache_options):
+                        reused_text_count += 1
+                    else:
+                        text_jobs.append((m, caption_type, caption, te_path))
 
-            touched_images = 0
-            total_images = len(variants_total_by_image)
+                primary_te_path = text_paths.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(text_paths.values()))
+                if lat_path.exists() and sdxl_lat_cache_valid(lat_path, primary_te_path, root, m, vae_cache_dtype, expected_cache_options):
+                    reused_lat_count += 1
+                else:
+                    lat_jobs.append((m, lat_path))
 
-            def mark_cache_variant_done(meta, progress_bar):
-                nonlocal touched_images
-                image_key = str(meta["ip"].relative_to(root))
-                total_variants = variants_total_by_image[image_key]
-                if total_variants <= 0 or variants_done_by_image[image_key] >= total_variants:
-                    return
-                if image_key not in started_images:
-                    started_images.add(image_key)
-                    touched_images += 1
-                variants_done_by_image[image_key] += 1
-                progress_bar.set_postfix_str(
-                    f"image_step {variants_done_by_image[image_key]}/{total_variants}, images {touched_images}/{total_images}"
+            obsolete_files = [
+                f for f in cache_dir.glob("*.pt")
+                if f.name not in {"null_embeds.pt", "dataset_index.pt"}
+                and cache_base_stem_from_cache_path(f) in current_cache_stems
+                and f.resolve() not in expected_cache_files
+            ]
+            if obsolete_files:
+                print(f"INFO: Removing {len(obsolete_files)} obsolete SDXL cache variant(s) for {root.name}.")
+            for f in obsolete_files:
+                try:
+                    f.unlink()
+                except OSError as e:
+                    print(f"WARNING: Could not remove stale cache file {f}: {e}")
+
+            if text_jobs or lat_jobs:
+                print(
+                    f"INFO: SDXL cache reuse for {root.name}: "
+                    f"{reused_text_count}/{len(expanded_results) * len(cache_caption_types)} text item(s), "
+                    f"{reused_lat_count}/{len(expanded_results)} latent item(s)."
                 )
-                progress_bar.update(1)
 
-            with tqdm(total=len(expanded_results), desc=f"Encoding {root.name}", unit="step") as encode_pbar:
-                for batch_idx, ((w, h), batch_meta) in enumerate(batches):
-                    images_global, valid_meta_final, skipped_meta = [], [], []
-                    for m in batch_meta:
-                        try:
-                            with Image.open(m['ip']) as img:
-                                img_resized = smart_resize(fix_alpha_channel(img), w, h)
-                                images_global.append(transform(img_resized))
-                                valid_meta_final.append(m)
-                        except Exception as e:
-                            skipped_meta.append(m)
-                            tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
-
-                    for m in skipped_meta:
-                        mark_cache_variant_done(m, encode_pbar)
-
-                    if not images_global: continue
-
-                    caption_jobs = []
-                    for meta_index, m in enumerate(valid_meta_final):
-                        caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
-                        if json_caption_mode:
-                            for caption_type in caption_types_for_cache(json_caption_mode):
-                                caption_jobs.append((meta_index, caption_type, caption_variants[caption_type]))
-                        else:
-                            caption_jobs.append((meta_index, "txt", caption_variants.get("txt", m["caption"])))
-
-                    embeds_all, pooled_all = compute_text_embeddings_sdxl(
-                        [caption for _, _, caption in caption_jobs],
-                        t1, t2, te1, te2, device,
-                        allow_chunking=allow_caption_chunking,
-                        total_chunks=caption_total_chunks,
-                    )
-
-                    with torch.no_grad():
-                        latents_global = vae.encode(torch.stack(images_global).to(device, dtype=torch.float32)).latent_dist.mean
-                        raw_min = latents_global.min().item()
-                        raw_max = latents_global.max().item()
-                        raw_mean = latents_global.mean().item()
-                        raw_std = latents_global.std().item()
-
-                        if vae_norm_mode == "flux_bn32":
-                            if latents_global.shape[1] != 32:
-                                raise RuntimeError(
-                                    f"flux_bn32 expects 32-channel latents, got shape {tuple(latents_global.shape)}"
-                                )
-                            latents_global = apply_flux_bn32_norm(latents_global, bn_mean_128, bn_var_128)
-                        elif getattr(vae.config, 'shift_factor', None) is not None:
-                            latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
-                        else:
-                            latents_global = latents_global * vae.config.scaling_factor
-
-                        norm_min = latents_global.min().item()
-                        norm_max = latents_global.max().item()
-                        norm_mean = latents_global.mean().item()
-                        norm_std = latents_global.std().item()
-
-                    latents_global = latents_global.cpu()
-                    text_embeddings_by_meta = defaultdict(dict)
-                    for embed_index, (meta_index, caption_type, caption) in enumerate(caption_jobs):
-                        text_embeddings_by_meta[meta_index][caption_type] = {
-                            "caption": caption,
-                            "embeds": embeds_all[embed_index].to(dtype=text_cache_dtype).cpu(),
-                            "pooled": pooled_all[embed_index].to(dtype=text_cache_dtype).cpu(),
-                        }
-
-                    for j, m in enumerate(valid_meta_final):
-                        safe_filename = str(m['ip'].relative_to(root).with_suffix('')).replace(os.sep, '_') + m.get("cache_suffix", "")
-                        for caption_type, text_payload in text_embeddings_by_meta[j].items():
-                            suffix = json_caption_cache_suffix(caption_type, json_caption_mode)
+            if text_jobs:
+                text_batch_size = max(1, int(getattr(config, "CACHING_BATCH_SIZE", 1) or 1) * len(cache_caption_types))
+                with tqdm(total=len(text_jobs), desc=f"Caching SDXL text {root.name}", unit="item") as text_pbar:
+                    for i in range(0, len(text_jobs), text_batch_size):
+                        batch_jobs = text_jobs[i:i + text_batch_size]
+                        embeds_all, pooled_all = compute_text_embeddings_sdxl(
+                            [caption for _, _, caption, _ in batch_jobs],
+                            t1, t2, te1, te2, device,
+                            allow_chunking=allow_caption_chunking,
+                            total_chunks=caption_total_chunks,
+                        )
+                        for embed_index, (m, caption_type, caption, te_path) in enumerate(batch_jobs):
+                            w, h = m["target_resolution"]
                             torch.save({
-                                "original_stem": m['ip'].stem, "relative_path": str(m['ip'].relative_to(root)),
-                                "original_size": m["original_size"], "scaled_size": m.get("scaled_size", m["original_size"]),
+                                "original_stem": m["ip"].stem,
+                                "relative_path": str(m["ip"].relative_to(root)),
+                                "image_file_signature": image_file_signature(m["ip"]),
+                                "caption_file_signature": caption_file_signature_for_image(m["ip"], caption_mode),
+                                "original_size": m["original_size"],
+                                "scaled_size": m.get("scaled_size", m["original_size"]),
                                 "target_size": (w, h),
                                 "crop_coords": m.get("crop_coords", (0, 0)),
                                 "bucket_variant_index": m.get("bucket_variant_index", 0),
                                 "caption_type": caption_type,
-                                "caption": text_payload["caption"],
+                                "caption": caption,
                                 "caption_signature": m.get("caption_signature"),
-                                "embeds": text_payload["embeds"],
-                                "pooled": text_payload["pooled"],
+                                "embeds": embeds_all[embed_index].to(dtype=text_cache_dtype).cpu(),
+                                "pooled": pooled_all[embed_index].to(dtype=text_cache_dtype).cpu(),
                                 "cache_options": expected_cache_options,
                                 "vae_normalization_mode": vae_norm_mode,
-                                "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
+                                "vae_shift": vae.config.shift_factor,
+                                "vae_scale": vae.config.scaling_factor,
                                 "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
-                            }, cache_dir / f"{safe_filename}{suffix}_te.pt")
-                        torch.save(latents_global[j].to(dtype=vae_cache_dtype).cpu(), cache_dir / f"{safe_filename}_lat.pt")
-                        mark_cache_variant_done(m, encode_pbar)
+                            }, te_path)
+                            text_pbar.update(1)
 
-                    if batch_idx % 20 == 0: torch.cuda.empty_cache()
-                
+            if lat_jobs:
+                grouped = defaultdict(list)
+                for m, lat_path in lat_jobs:
+                    grouped[m["target_resolution"]].append((m, lat_path))
+
+                batches = [
+                    (res, grouped[res][i:i + config.CACHING_BATCH_SIZE])
+                    for res in grouped
+                    for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)
+                ]
+                random.shuffle(batches)
+
+                with tqdm(total=len(lat_jobs), desc=f"Caching SDXL VAE {root.name}", unit="item") as vae_pbar:
+                    for batch_idx, ((w, h), batch_meta) in enumerate(batches):
+                        images_global, valid_meta_final, skipped_meta = [], [], []
+                        for m, lat_path in batch_meta:
+                            try:
+                                with Image.open(m['ip']) as img:
+                                    img_resized = smart_resize(fix_alpha_channel(img), w, h)
+                                    images_global.append(transform(img_resized))
+                                    valid_meta_final.append((m, lat_path))
+                            except Exception as e:
+                                skipped_meta.append((m, lat_path))
+                                tqdm.write(f"[SKIP] {m['ip'].name}: {e}")
+
+                        for _, lat_path in skipped_meta:
+                            try:
+                                Path(lat_path).unlink()
+                            except OSError:
+                                pass
+                            vae_pbar.update(1)
+
+                        if not images_global:
+                            continue
+
+                        with torch.no_grad():
+                            latents_global = vae.encode(torch.stack(images_global).to(device, dtype=torch.float32)).latent_dist.mean
+                            raw_min = latents_global.min().item()
+                            raw_max = latents_global.max().item()
+                            raw_mean = latents_global.mean().item()
+                            raw_std = latents_global.std().item()
+
+                            if vae_norm_mode == "flux_bn32":
+                                if latents_global.shape[1] != 32:
+                                    raise RuntimeError(
+                                        f"flux_bn32 expects 32-channel latents, got shape {tuple(latents_global.shape)}"
+                                    )
+                                latents_global = apply_flux_bn32_norm(latents_global, bn_mean_128, bn_var_128)
+                            elif getattr(vae.config, 'shift_factor', None) is not None:
+                                latents_global = (latents_global - vae.config.shift_factor) * vae.config.scaling_factor
+                            else:
+                                latents_global = latents_global * vae.config.scaling_factor
+
+                            norm_min = latents_global.min().item()
+                            norm_max = latents_global.max().item()
+                            norm_mean = latents_global.mean().item()
+                            norm_std = latents_global.std().item()
+
+                        latents_global = latents_global.cpu()
+                        for j, (m, lat_path) in enumerate(valid_meta_final):
+                            w, h = m["target_resolution"]
+                            torch.save({
+                                "latents": latents_global[j].to(dtype=vae_cache_dtype).cpu(),
+                                "relative_path": str(m["ip"].relative_to(root)),
+                                "image_file_signature": image_file_signature(m["ip"]),
+                                "caption_file_signature": caption_file_signature_for_image(m["ip"], caption_mode),
+                                "original_size": m["original_size"],
+                                "scaled_size": m.get("scaled_size", m["original_size"]),
+                                "target_size": (w, h),
+                                "crop_coords": m.get("crop_coords", (0, 0)),
+                                "bucket_variant_index": m.get("bucket_variant_index", 0),
+                                "caption_signature": m.get("caption_signature"),
+                                "cache_options": expected_cache_options,
+                                "vae_normalization_mode": vae_norm_mode,
+                                "vae_shift": vae.config.shift_factor,
+                                "vae_scale": vae.config.scaling_factor,
+                                "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
+                            }, lat_path)
+                            vae_pbar.update(1)
+
+                        if batch_idx % 20 == 0:
+                            torch.cuda.empty_cache()
+
         print(f"INFO: Building fast JSON index for {root.name}...")
         index_data = []
         cached_files = list(cache_dir.glob("*_te.pt"))
@@ -1587,6 +1590,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     "te_path": str(f),
                     "lat_path": str(lat_path),
                     "relative_path": relative_path,
+                    "image_file_signature": data_te.get("image_file_signature"),
+                    "caption_file_signature": data_te.get("caption_file_signature"),
                     "target_size": data_te.get('target_size'),
                     "original_size": data_te.get('original_size'),
                     "scaled_size": data_te.get('scaled_size', data_te.get('original_size')),
@@ -1600,8 +1605,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             except Exception as e:
                 print(f"WARNING: Could not index {f}: {e}")
                 
-        with open(index_path, 'w', encoding='utf-8') as f:
-            json.dump({"version": 12, "cache_options": expected_cache_options, "files": index_data}, f)
+        index_path = save_cache_index(cache_dir, {"version": 12, "cache_options": expected_cache_options, "files": index_data})
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -1618,10 +1622,9 @@ class ImageTextLatentDataset(Dataset):
         cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
         for ds in config.INSTANCE_DATASETS:
             root = Path(ds["path"])
-            index_path = root / cache_folder_name / "dataset_index.json"
-            if index_path.exists():
-                with open(index_path, 'r', encoding='utf-8') as f:
-                    index_data = json.load(f)
+            cache_dir = root / cache_folder_name
+            if cache_index_exists(cache_dir):
+                index_data = load_cache_index(cache_dir)
                     
                 repeats = int(ds.get("repeats", 1))
                 for _ in range(repeats):
@@ -1629,7 +1632,7 @@ class ImageTextLatentDataset(Dataset):
                         self.items.append(item)
                         self.bucket_keys.append(tuple(item["target_size"]))
             else:
-                print(f"WARNING: Index missing at {index_path}. Please re-run caching!")
+                print(f"WARNING: Index missing at {cache_dir}. Please re-run caching!")
 
         if not self.items: raise ValueError("No cached files found.")
 

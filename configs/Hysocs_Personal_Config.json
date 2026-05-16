@@ -6,11 +6,11 @@
         "sdxl_resume_training": false,
         "sdxl_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\test",
+                "path": "C:/Users/Administrator/Pictures\\Artists\\by capry",
                 "repeats": 1
             }
         ],
-        "sdxl_caching_batch_size": 2,
+        "sdxl_caching_batch_size": 1,
         "sdxl_cache_precision": "bfloat16",
         "sdxl_text_cache_precision": "bfloat16",
         "sdxl_vae_cache_precision": "bfloat16",
@@ -22,7 +22,7 @@
         "sdxl_text_conditioning_scale_max": 1.2500000000000002,
         "sdxl_caption_chunking_enabled": true,
         "sdxl_should_upscale": true,
-        "sdxl_caption_source_type": "txt",
+        "sdxl_caption_source_type": "json",
         "sdxl_caption_tags_percent": 40,
         "sdxl_caption_nl_percent": 10,
         "sdxl_caption_tags_nl_percent": 25,
@@ -30,7 +30,7 @@
         "sdxl_max_bucket_resolution": 1024,
         "sdxl_multi_bucket_enabled": true,
         "sdxl_multi_bucket_extra_buckets": 2,
-        "sdxl_prediction_type": "v_prediction",
+        "sdxl_prediction_type": "epsilon",
         "sdxl_max_train_steps": "10000",
         "sdxl_batch_size": 1,
         "sdxl_gradient_accumulation_steps": 4,
@@ -121,21 +121,17 @@
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
-        "anima_resume_training": true,
+        "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Artists",
+                "path": "C:/Users/Administrator/Pictures\\Artists\\by diptip",
                 "repeats": 1
             }
         ],
         "anima_caching_batch_size": 1,
         "anima_cache_precision": "bfloat16",
-        "anima_text_cache_precision": "float32",
-        "anima_vae_cache_precision": "float32",
+        "anima_text_cache_precision": "bfloat16",
+        "anima_vae_cache_precision": "bfloat16",
         "anima_num_workers": 0,
         "anima_unconditional_dropout": false,
         "anima_unconditional_dropout_chance": 0.05,

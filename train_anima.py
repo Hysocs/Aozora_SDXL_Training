@@ -1,6 +1,5 @@
 import gc
 import fnmatch
-import json
 import math
 import os
 import random
@@ -19,6 +18,24 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
+from training_cache import (
+    CAPTION_JSON_PRIMARY_TYPE,
+    cache_index_exists,
+    cache_stem_for_image,
+    caption_file_signature_for_image,
+    caption_source_type,
+    caption_types_for_cache,
+    collect_image_paths,
+    image_file_signature,
+    json_caption_cache_suffix,
+    json_caption_mode_enabled,
+    load_cache_index,
+    remove_cache_files_for_stem,
+    save_cache_index,
+    selected_caption_variant_path,
+    strip_json_caption_suffix,
+    text_cache_paths_for_index_item,
+)
 
 from train import (
     AsyncReporter,
@@ -28,11 +45,7 @@ from train import (
     TrainingDiagnostics,
     cache_float_dtype,
     cache_float_dtype_name,
-    cache_options_match_for_image_cache,
     caption_signature_for_image,
-    CAPTION_JSON_PRIMARY_TYPE,
-    caption_types_for_cache,
-    caption_source_type,
     consume_force_save_flag,
     create_optimizer,
     fix_alpha_channel,
@@ -40,19 +53,13 @@ from train import (
     get_max_bucket_resolution_for_config,
     get_multi_bucket_resolutions,
     get_text_conditioning_scale_range,
-    json_caption_mode_enabled,
     make_bucket_variant_metadata,
     normalize_cache_options_for_image_cache,
     null_conditioning_cache_needed,
-    json_caption_cache_suffix,
-    remove_cache_files_for_stem,
-    selected_caption_variant_path,
     set_seed,
     smart_resize,
-    strip_json_caption_suffix,
     text_cache_float_dtype,
     text_cache_float_dtype_name,
-    text_cache_paths_for_index_item,
     validate_and_assign_resolution,
     vae_cache_float_dtype,
     vae_cache_float_dtype_name,
@@ -138,19 +145,12 @@ def anima_dataset_roots(config):
     ]
 
 
-ANIMA_IMAGE_EXTENSIONS = (".jpg", ".jpeg", ".png", ".webp", ".bmp")
-
-
 def collect_anima_image_paths(root):
-    return [
-        p
-        for ext in ANIMA_IMAGE_EXTENSIONS
-        for p in root.rglob(f"*{ext}")
-    ]
+    return collect_image_paths(root)
 
 
 def anima_cache_stem_for_image(root, image_path, cache_suffix=""):
-    return str(image_path.relative_to(root).with_suffix("")).replace(os.sep, "_") + cache_suffix
+    return cache_stem_for_image(root, image_path) + cache_suffix
 
 
 def anima_cache_base_stem(cache_path):
@@ -249,6 +249,7 @@ def anima_lat_cache_valid(path, meta, vae_cache_dtype):
 
 
 def get_anima_cache_options(config):
+    multi_bucket_enabled = bool(getattr(config, "MULTI_BUCKET_ENABLED", False))
     return {
         "version": 5,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
@@ -258,8 +259,12 @@ def get_anima_cache_options(config):
         "caption_json_types": list(anima_caption_types_for_cache(config)),
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "should_upscale": bool(getattr(config, "SHOULD_UPSCALE", False)),
-        "multi_bucket_enabled": bool(getattr(config, "MULTI_BUCKET_ENABLED", False)),
-        "multi_bucket_extra_buckets": int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0),
+        "multi_bucket_enabled": multi_bucket_enabled,
+        "multi_bucket_extra_buckets": (
+            int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0)
+            if multi_bucket_enabled
+            else 0
+        ),
         "vae_caching_tiled": bool(getattr(config, "VAE_CACHING_TILED", True)),
         "vae_caching_tile_size": list(getattr(config, "VAE_CACHING_TILE_SIZE", [96, 96])),
         "vae_caching_tile_stride": list(getattr(config, "VAE_CACHING_TILE_STRIDE", [72, 72])),
@@ -290,21 +295,30 @@ def anima_cache_options_match(cached_options, expected_options):
     )
 
 
+def anima_cached_file_signatures_match(item, image_path, caption_mode):
+    image_sig = item.get("image_file_signature")
+    caption_sig = item.get("caption_file_signature")
+    if not image_sig or not caption_sig:
+        return None
+    return (
+        image_sig == image_file_signature(image_path)
+        and caption_sig == caption_file_signature_for_image(image_path, caption_mode)
+    )
+
+
 def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cache_name=None):
     expected_options = expected_options or get_anima_cache_options(config)
     cache_name = cache_name or anima_cache_folder_name(config)
     cache_dir = root / cache_name
-    index_path = cache_dir / "dataset_index.json"
-    if not cache_dir.exists() or not index_path.exists():
+    if not cache_dir.exists() or not cache_index_exists(cache_dir):
         print(
             "INFO: Anima cache rebuild needed for "
             f"{root}: cache_dir_exists={cache_dir.exists()}, "
-            f"index_exists={index_path.exists()}."
+            f"index_exists={cache_index_exists(cache_dir)}."
         )
         return True
     try:
-        with open(index_path, "r", encoding="utf-8") as f:
-            index_data = json.load(f)
+        index_data = load_cache_index(cache_dir)
         image_paths = collect_anima_image_paths(root)
         current_cache_stems = {anima_cache_stem_for_image(root, p) for p in image_paths}
         cached_options = index_data.get("cache_options")
@@ -351,14 +365,19 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
             relative_path = item.get("relative_path")
             if relative_path:
                 try:
-                    if caption_signature_for_image(root / relative_path, caption_source_type(config)) != item.get("caption_signature"):
+                    image_path = root / relative_path
+                    stat_match = anima_cached_file_signatures_match(item, image_path, caption_source_type(config))
+                    if stat_match is False:
+                        print(f"INFO: Anima cache rebuild needed for {root}: image/caption file changed for {relative_path}.")
+                        return True
+                    if stat_match is None and caption_signature_for_image(image_path, caption_source_type(config)) != item.get("caption_signature"):
                         print(f"INFO: Anima cache rebuild needed for {root}: caption changed for {relative_path}.")
                         return True
                 except Exception as e:
                     print(f"INFO: Anima cache rebuild needed for {root}: caption invalid for {relative_path}: {e}")
                     return True
     except Exception:
-        print(f"INFO: Anima cache rebuild needed for {root}: failed to read/validate {index_path}.")
+        print(f"INFO: Anima cache rebuild needed for {root}: failed to read/validate cache index.")
         traceback.print_exc()
         return True
     return False
@@ -682,7 +701,7 @@ def ensure_anima_null_conditioning_cache(config, pipe, device):
     missing_cache_dirs = []
     for root in anima_dataset_roots(config):
         cache_dir = root / cache_name
-        if (cache_dir / "dataset_index.json").exists() and not (cache_dir / "null_embeds.pt").exists():
+        if cache_index_exists(cache_dir) and not (cache_dir / "null_embeds.pt").exists():
             missing_cache_dirs.append(cache_dir)
 
     if not missing_cache_dirs:
@@ -739,12 +758,10 @@ def precompute_and_cache_anima(config, pipe, device):
 
         cache_dir = root / cache_name
         cache_dir.mkdir(parents=True, exist_ok=True)
-        index_path = cache_dir / "dataset_index.json"
         force_recaching = bool(getattr(config, "REBUILD_CACHE", False))
-        if index_path.exists() and not force_recaching:
+        if cache_index_exists(cache_dir) and not force_recaching:
             try:
-                with open(index_path, "r", encoding="utf-8") as f:
-                    existing_index = json.load(f)
+                existing_index = load_cache_index(cache_dir)
                 if not anima_cache_options_match(existing_index.get("cache_options"), expected_options):
                     print(
                         f"INFO: Anima cache options changed for {root.name}; "
@@ -761,8 +778,7 @@ def precompute_and_cache_anima(config, pipe, device):
                 print(f"INFO: Removing {len(stale_files)} stale Anima cache item(s) because {root.name} has no images.")
             for f in stale_files:
                 remove_anima_cache_file(f)
-            with open(index_path, "w", encoding="utf-8") as f:
-                json.dump({"version": 5, "cache_options": expected_options, "files": []}, f)
+            save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": []})
             print(f"WARNING: No images found in {root}")
             continue
 
@@ -772,7 +788,7 @@ def precompute_and_cache_anima(config, pipe, device):
         else:
             stale_files = [
                 f for f in cache_dir.glob("*.pt")
-                if f.name != "null_embeds.pt" and anima_cache_base_stem(f) not in current_cache_stems
+                if f.name not in {"null_embeds.pt", "dataset_index.pt"} and anima_cache_base_stem(f) not in current_cache_stems
             ]
             if stale_files:
                 print(f"INFO: Removing {len(stale_files)} stale Anima cache item(s) for deleted images in {root.name}.")
@@ -836,6 +852,8 @@ def precompute_and_cache_anima(config, pipe, device):
                 "te_path": primary_te_path,
                 "lat_path": str(lat_path),
                 "relative_path": str(m["ip"].relative_to(root)),
+                "image_file_signature": image_file_signature(m["ip"]),
+                "caption_file_signature": caption_file_signature_for_image(m["ip"], caption_mode),
                 "target_size": tuple(m["target_resolution"]),
                 "original_size": m["original_size"],
                 "scaled_size": m["scaled_size"],
@@ -849,7 +867,7 @@ def precompute_and_cache_anima(config, pipe, device):
 
         obsolete_files = [
             f for f in cache_dir.glob("*.pt")
-            if f.name != "null_embeds.pt"
+            if f.name not in {"null_embeds.pt", "dataset_index.pt"}
             and anima_cache_base_stem(f) in current_cache_stems
             and f.resolve() not in expected_cache_files
         ]
@@ -859,8 +877,7 @@ def precompute_and_cache_anima(config, pipe, device):
             remove_anima_cache_file(f)
 
         if not text_jobs and not lat_jobs:
-            with open(index_path, "w", encoding="utf-8") as f:
-                json.dump({"version": 5, "cache_options": expected_options, "files": index_data}, f)
+            save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": index_data})
             print(f"INFO: Anima DiT cache current for {root.name}: {len(index_data)} item(s).")
             continue
 
@@ -903,6 +920,8 @@ def precompute_and_cache_anima(config, pipe, device):
                             "caption_signature": m.get("caption_signature"),
                             "image_path": str(m["ip"]),
                             "relative_path": str(m["ip"].relative_to(root)),
+                            "image_file_signature": image_file_signature(m["ip"]),
+                            "caption_file_signature": caption_file_signature_for_image(m["ip"], caption_mode),
                             "original_size": m["original_size"],
                             "scaled_size": m["scaled_size"],
                             "target_size": tuple(m["target_resolution"]),
@@ -951,9 +970,11 @@ def precompute_and_cache_anima(config, pipe, device):
                             cached_latents = latents[0].to(dtype=vae_cache_dtype).cpu()
                             torch.save({
                                 "latents": cached_latents,
-                                "image_path": str(image_path),
-                                "relative_path": str(m["ip"].relative_to(root)),
-                                "original_size": m["original_size"],
+                            "image_path": str(image_path),
+                            "relative_path": str(m["ip"].relative_to(root)),
+                            "image_file_signature": image_file_signature(m["ip"]),
+                            "caption_file_signature": caption_file_signature_for_image(m["ip"], caption_mode),
+                            "original_size": m["original_size"],
                                 "scaled_size": m["scaled_size"],
                                 "target_size": tuple(m["target_resolution"]),
                                 "crop_coords": m.get("crop_coords", (0, 0)),
@@ -979,8 +1000,7 @@ def precompute_and_cache_anima(config, pipe, device):
             item for item in index_data
             if all(Path(path).exists() for path in anima_cache_paths_for_index_item(item))
         ]
-        with open(cache_dir / "dataset_index.json", "w", encoding="utf-8") as f:
-            json.dump({"version": 5, "cache_options": expected_options, "files": valid_index_data}, f)
+        save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": valid_index_data})
         print(f"INFO: Cached {len(valid_index_data)} Anima DiT items to {cache_dir}")
 
     ensure_anima_null_conditioning_cache(config, pipe, device)
@@ -1007,12 +1027,11 @@ class AnimaCachedDataset(Dataset):
 
         for ds in getattr(config, "INSTANCE_DATASETS", []):
             root = Path(ds["path"])
-            index_path = root / cache_name / "dataset_index.json"
-            if not index_path.exists():
-                print(f"WARNING: Anima DiT index missing at {index_path}.")
+            cache_dir = root / cache_name
+            if not cache_index_exists(cache_dir):
+                print(f"WARNING: Anima DiT index missing at {cache_dir}.")
                 continue
-            with open(index_path, "r", encoding="utf-8") as f:
-                index_data = json.load(f)
+            index_data = load_cache_index(cache_dir)
             repeats = int(ds.get("repeats", 1))
             for _ in range(repeats):
                 for item in index_data["files"]:
