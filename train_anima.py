@@ -50,8 +50,12 @@ from train import (
     set_seed,
     smart_resize,
     strip_json_caption_suffix,
+    text_cache_float_dtype,
+    text_cache_float_dtype_name,
     text_cache_paths_for_index_item,
     validate_and_assign_resolution,
+    vae_cache_float_dtype,
+    vae_cache_float_dtype_name,
     BUCKET_LAYOUT_VERSION,
 )
 
@@ -86,6 +90,22 @@ def anima_cache_float_dtype(config):
 
 def anima_cache_float_dtype_name(config):
     return cache_float_dtype_name(config)
+
+
+def anima_text_cache_float_dtype(config):
+    return text_cache_float_dtype(config)
+
+
+def anima_text_cache_float_dtype_name(config):
+    return text_cache_float_dtype_name(config)
+
+
+def anima_vae_cache_float_dtype(config):
+    return vae_cache_float_dtype(config)
+
+
+def anima_vae_cache_float_dtype_name(config):
+    return vae_cache_float_dtype_name(config)
 
 
 def anima_caption_types_for_cache(config, json_caption_mode=None):
@@ -171,11 +191,69 @@ def remove_anima_cache_file(cache_path):
         print(f"WARNING: Could not remove stale Anima cache file {cache_path}: {e}")
 
 
+def anima_expected_cache_paths(root, cache_dir, meta, active_caption_types, json_caption_mode):
+    safe_filename = anima_cache_stem_for_image(root, meta["ip"], meta.get("cache_suffix", ""))
+    text_paths = {
+        caption_type: cache_dir / f"{safe_filename}{json_caption_cache_suffix(caption_type, json_caption_mode)}_te.pt"
+        for caption_type in active_caption_types
+    }
+    return text_paths, cache_dir / f"{safe_filename}_lat.pt"
+
+
+def anima_metadata_matches(payload, meta, check_caption=True):
+    if not isinstance(payload, dict):
+        return False
+    if check_caption and payload.get("caption_signature") != meta.get("caption_signature"):
+        return False
+    relative_path = str(meta["ip"].relative_to(meta["root"]))
+    return (
+        payload.get("relative_path") == relative_path
+        and tuple(payload.get("original_size", ())) == tuple(meta["original_size"])
+        and tuple(payload.get("scaled_size", ())) == tuple(meta["scaled_size"])
+        and tuple(payload.get("target_size", ())) == tuple(meta["target_resolution"])
+        and tuple(payload.get("crop_coords", (0, 0))) == tuple(meta.get("crop_coords", (0, 0)))
+        and int(payload.get("bucket_variant_index", 0) or 0) == int(meta.get("bucket_variant_index", 0) or 0)
+    )
+
+
+def anima_text_cache_valid(path, meta, caption_type, caption, text_cache_dtype):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        prompt_emb = payload.get("prompt_emb")
+        t5xxl_ids = payload.get("t5xxl_ids")
+        return (
+            prompt_emb is not None
+            and t5xxl_ids is not None
+            and prompt_emb.dtype == text_cache_dtype
+            and payload.get("caption_type") == caption_type
+            and payload.get("caption") == caption
+            and anima_metadata_matches(payload, meta, check_caption=True)
+        )
+    except Exception:
+        return False
+
+
+def anima_lat_cache_valid(path, meta, vae_cache_dtype):
+    try:
+        payload = torch.load(path, map_location="cpu", weights_only=True)
+        latents = payload.get("latents") if isinstance(payload, dict) else None
+        return (
+            latents is not None
+            and latents.dtype == vae_cache_dtype
+            and not torch.isnan(latents).any()
+            and not torch.isinf(latents).any()
+            and anima_metadata_matches(payload, meta, check_caption=False)
+        )
+    except Exception:
+        return False
+
+
 def get_anima_cache_options(config):
     return {
         "version": 5,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
-        "cache_float_dtype": anima_cache_float_dtype_name(config),
+        "text_cache_float_dtype": anima_text_cache_float_dtype_name(config),
+        "vae_cache_float_dtype": anima_vae_cache_float_dtype_name(config),
         "caption_source_type": caption_source_type(config),
         "caption_json_types": list(anima_caption_types_for_cache(config)),
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
@@ -573,8 +651,9 @@ def encode_prompt_anima(pipe, caption, device):
 
 
 @torch.no_grad()
-def encode_image_anima(pipe, image, device, tiled=True, tile_size=(96, 96), tile_stride=(72, 72)):
-    image_tensor = pipe.preprocess_image(image).to(device="cpu", dtype=pipe.torch_dtype)
+def encode_image_anima(pipe, image, device, tiled=True, tile_size=(96, 96), tile_stride=(72, 72), dtype=None):
+    dtype = dtype or pipe.torch_dtype
+    image_tensor = pipe.preprocess_image(image).to(device="cpu", dtype=dtype)
     latents = pipe.vae.encode(
         image_tensor.unsqueeze(2),
         device=device,
@@ -585,10 +664,10 @@ def encode_image_anima(pipe, image, device, tiled=True, tile_size=(96, 96), tile
     return latents
 
 
-def save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, cache_dtype):
+def save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, text_cache_dtype):
     torch.save(
         {
-            "prompt_emb": null_prompt_emb[0].to(dtype=cache_dtype).cpu(),
+            "prompt_emb": null_prompt_emb[0].to(dtype=text_cache_dtype).cpu(),
             "t5xxl_ids": null_t5xxl_ids[0].to(dtype=torch.long).cpu(),
         },
         cache_dir / "null_embeds.pt",
@@ -618,9 +697,9 @@ def ensure_anima_null_conditioning_cache(config, pipe, device):
 
     with torch.no_grad():
         null_prompt_emb, null_t5xxl_ids = encode_prompt_anima(pipe, "", device)
-    cache_dtype = anima_cache_float_dtype(config)
+    text_cache_dtype = anima_text_cache_float_dtype(config)
     for cache_dir in missing_cache_dirs:
-        save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, cache_dtype)
+        save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, text_cache_dtype)
 
     pipe.text_encoder.cpu()
     gc.collect()
@@ -636,12 +715,17 @@ def precompute_and_cache_anima(config, pipe, device):
         return
 
     cache_name = anima_cache_folder_name(config)
-    cache_dtype = anima_cache_float_dtype(config)
+    text_cache_dtype = anima_text_cache_float_dtype(config)
+    vae_cache_dtype = anima_vae_cache_float_dtype(config)
     expected_options = get_anima_cache_options(config)
     caption_mode = caption_source_type(config)
     json_caption_mode = json_caption_mode_enabled(config)
     active_caption_types = anima_caption_types_for_cache(config, json_caption_mode)
-    print(f"INFO: Anima cache precision: {anima_cache_float_dtype_name(config)} for text embeddings and VAE latents.")
+    print(
+        "INFO: Anima cache precision: "
+        f"text={anima_text_cache_float_dtype_name(config)}, "
+        f"vae={anima_vae_cache_float_dtype_name(config)}."
+    )
     multi_bucket_extra = (
         max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
         if getattr(config, "MULTI_BUCKET_ENABLED", False)
@@ -657,15 +741,17 @@ def precompute_and_cache_anima(config, pipe, device):
         cache_dir.mkdir(parents=True, exist_ok=True)
         index_path = cache_dir / "dataset_index.json"
         force_recaching = bool(getattr(config, "REBUILD_CACHE", False))
-        existing_index_data = []
         if index_path.exists() and not force_recaching:
             try:
                 with open(index_path, "r", encoding="utf-8") as f:
                     existing_index = json.load(f)
-                force_recaching = not anima_cache_options_match(existing_index.get("cache_options"), expected_options)
-                existing_index_data = existing_index.get("files", []) if not force_recaching else []
+                if not anima_cache_options_match(existing_index.get("cache_options"), expected_options):
+                    print(
+                        f"INFO: Anima cache options changed for {root.name}; "
+                        "reusing compatible cached files and filling only missing variants."
+                    )
             except Exception:
-                force_recaching = True
+                print(f"INFO: Anima cache index for {root.name} is unreadable; rebuilding index from cache files.")
 
         image_paths = collect_anima_image_paths(root)
         current_cache_stems = {anima_cache_stem_for_image(root, p) for p in image_paths}
@@ -683,7 +769,6 @@ def precompute_and_cache_anima(config, pipe, device):
         if force_recaching:
             for f in cache_dir.glob("*.pt"):
                 remove_anima_cache_file(f)
-            existing_index_data = []
         else:
             stale_files = [
                 f for f in cache_dir.glob("*.pt")
@@ -694,67 +779,16 @@ def precompute_and_cache_anima(config, pipe, device):
             for f in stale_files:
                 remove_anima_cache_file(f)
 
-        kept_index_data = []
-        cached_primary_stems = set()
-        for item in existing_index_data:
-            text_paths = anima_text_cache_paths_for_index_item(item)
-            lat_path = anima_lat_path_for_item(item)
-            cache_paths = [*text_paths, lat_path] if lat_path else text_paths
-            base_stem = anima_cache_base_stem(lat_path or (text_paths[0] if text_paths else ""))
-            if base_stem not in current_cache_stems or any(not Path(p).exists() for p in cache_paths):
-                for path in cache_paths:
-                    remove_anima_cache_file(path)
-                continue
-            try:
-                lat_payload = torch.load(lat_path, map_location="cpu", weights_only=True)
-                source_path = Path(lat_payload.get("image_path", ""))
-                if source_path and not source_path.exists():
-                    for path in cache_paths:
-                        remove_anima_cache_file(path)
-                    continue
-                if lat_payload.get("latents") is None:
-                    for path in cache_paths:
-                        remove_anima_cache_file(path)
-                    continue
-                relative_path = item.get("relative_path")
-                if relative_path:
-                    try:
-                        if caption_signature_for_image(root / relative_path, caption_mode) != item.get("caption_signature"):
-                            remove_cache_files_for_stem(cache_dir, base_stem)
-                            continue
-                    except Exception as e:
-                        print(f"[ANIMA CAPTION READ ERROR] Removing stale cache for {root / relative_path}, Reason: {e}")
-                        remove_cache_files_for_stem(cache_dir, base_stem)
-                        continue
-            except Exception:
-                for path in cache_paths:
-                    remove_anima_cache_file(path)
-                continue
-            kept_index_data.append(item)
-            if int(item.get("bucket_variant_index", 0) or 0) == 0:
-                cached_primary_stems.add(base_stem)
-
-        to_process = [
-            p for p in image_paths
-            if force_recaching or anima_cache_stem_for_image(root, p) not in cached_primary_stems
-        ]
-
-        if not to_process:
-            with open(index_path, "w", encoding="utf-8") as f:
-                json.dump({"version": 5, "cache_options": expected_options, "files": kept_index_data}, f)
-            print(f"INFO: Anima DiT cache current for {root.name}: {len(kept_index_data)} item(s).")
-            continue
-
         max_bucket_resolution = get_max_bucket_resolution_for_config(config)
         max_bucket_area = max_bucket_resolution * max_bucket_resolution
-        print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name} ({len(to_process)} new/missing image(s))...")
+        print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name} ({len(image_paths)} image(s))...")
         with Pool(processes=min(cpu_count(), 8)) as pool:
             results = list(tqdm(
                 pool.imap(
                     validate_and_assign_resolution,
-                    [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in to_process],
+                    [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in image_paths],
                 ),
-                total=len(to_process),
+                total=len(image_paths),
             ))
 
         expanded_results = []
@@ -767,18 +801,74 @@ def precompute_and_cache_anima(config, pipe, device):
                 multi_bucket_extra,
             )
             for variant_index, (target_w, target_h) in enumerate(buckets):
-                expanded_results.append(make_bucket_variant_metadata(m, target_w, target_h, variant_index))
+                variant_meta = make_bucket_variant_metadata(m, target_w, target_h, variant_index)
+                variant_meta["root"] = root
+                expanded_results.append(variant_meta)
 
-        grouped = defaultdict(list)
+        index_data = []
+        text_jobs = []
+        lat_jobs = []
+        reused_text_count = 0
+        reused_lat_count = 0
+        expected_cache_files = set()
         for m in expanded_results:
-            grouped[m["target_resolution"]].append(m)
+            caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
+            text_paths, lat_path = anima_expected_cache_paths(root, cache_dir, m, active_caption_types, json_caption_mode)
+            expected_cache_files.add(lat_path.resolve())
+            variant_cache_paths = {}
+            for caption_type in active_caption_types:
+                te_path = text_paths[caption_type]
+                expected_cache_files.add(te_path.resolve())
+                variant_cache_paths[caption_type] = str(te_path)
+                caption = caption_variants[caption_type]
+                if te_path.exists() and anima_text_cache_valid(te_path, m, caption_type, caption, text_cache_dtype):
+                    reused_text_count += 1
+                else:
+                    text_jobs.append((m, caption_type, caption, te_path))
 
-        batches = [
-            (res, grouped[res][i:i + config.CACHING_BATCH_SIZE])
-            for res in grouped
-            for i in range(0, len(grouped[res]), config.CACHING_BATCH_SIZE)
+            if lat_path.exists() and anima_lat_cache_valid(lat_path, m, vae_cache_dtype):
+                reused_lat_count += 1
+            else:
+                lat_jobs.append((m, lat_path))
+
+            primary_te_path = variant_cache_paths.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variant_cache_paths.values()))
+            item = {
+                "te_path": primary_te_path,
+                "lat_path": str(lat_path),
+                "relative_path": str(m["ip"].relative_to(root)),
+                "target_size": tuple(m["target_resolution"]),
+                "original_size": m["original_size"],
+                "scaled_size": m["scaled_size"],
+                "crop_coords": m.get("crop_coords", (0, 0)),
+                "bucket_variant_index": m.get("bucket_variant_index", 0),
+                "caption_signature": m.get("caption_signature"),
+            }
+            if json_caption_mode:
+                item["caption_variants"] = anima_caption_variant_index(variant_cache_paths)
+            index_data.append(item)
+
+        obsolete_files = [
+            f for f in cache_dir.glob("*.pt")
+            if f.name != "null_embeds.pt"
+            and anima_cache_base_stem(f) in current_cache_stems
+            and f.resolve() not in expected_cache_files
         ]
-        random.shuffle(batches)
+        if obsolete_files:
+            print(f"INFO: Removing {len(obsolete_files)} obsolete Anima cache variant(s) for {root.name}.")
+        for f in obsolete_files:
+            remove_anima_cache_file(f)
+
+        if not text_jobs and not lat_jobs:
+            with open(index_path, "w", encoding="utf-8") as f:
+                json.dump({"version": 5, "cache_options": expected_options, "files": index_data}, f)
+            print(f"INFO: Anima DiT cache current for {root.name}: {len(index_data)} item(s).")
+            continue
+
+        print(
+            f"INFO: Anima cache reuse for {root.name}: "
+            f"{reused_text_count}/{len(expanded_results) * len(active_caption_types)} text item(s), "
+            f"{reused_lat_count}/{len(expanded_results)} latent item(s)."
+        )
 
         if hasattr(pipe, "dit"):
             pipe.dit.cpu()
@@ -788,68 +878,42 @@ def precompute_and_cache_anima(config, pipe, device):
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
 
-        index_data = list(kept_index_data)
-        new_index_data = []
         print(f"INFO: Anima cache phase 1/2: text encoder for {root.name}")
-        pipe.text_encoder.to(device=device, dtype=config.compute_dtype)
-        pipe.text_encoder.eval()
-        pipe.vae.cpu()
+        if text_jobs or null_conditioning_cache_needed(config):
+            pipe.text_encoder.to(device=device, dtype=config.compute_dtype)
+            pipe.text_encoder.eval()
+            pipe.vae.cpu()
 
-        if null_conditioning_cache_needed(config):
+        if null_conditioning_cache_needed(config) and (text_jobs or not (cache_dir / "null_embeds.pt").exists()):
             with torch.no_grad():
                 null_prompt_emb, null_t5xxl_ids = encode_prompt_anima(pipe, "", device)
         else:
             null_prompt_emb, null_t5xxl_ids = None, None
 
-        with torch.no_grad():
-            text_total = len(expanded_results) * len(active_caption_types)
-            with tqdm(total=text_total, desc=f"Caching Anima text {root.name}", unit="item") as pbar:
-                for (w, h), batch_meta in batches:
-                    for m in batch_meta:
-                        safe_filename = anima_cache_stem_for_image(root, m["ip"], m.get("cache_suffix", ""))
-                        caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
-                        variant_cache_paths = {}
-                        for caption_type in active_caption_types:
-                            prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption_variants[caption_type], device)
-                            suffix = json_caption_cache_suffix(caption_type, json_caption_mode)
-                            te_path = cache_dir / f"{safe_filename}{suffix}_te.pt"
-                            torch.save({
-                                "prompt_emb": prompt_emb[0].to(dtype=cache_dtype).cpu(),
-                                "t5xxl_ids": t5xxl_ids[0].to(dtype=torch.long).cpu(),
-                                "caption_type": caption_type,
-                                "caption": caption_variants[caption_type],
-                                "caption_signature": m.get("caption_signature"),
-                                "image_path": str(m["ip"]),
-                                "relative_path": str(m["ip"].relative_to(root)),
-                                "original_size": m["original_size"],
-                                "scaled_size": m["scaled_size"],
-                                "target_size": (w, h),
-                                "crop_coords": m.get("crop_coords", (0, 0)),
-                                "bucket_variant_index": m.get("bucket_variant_index", 0),
-                                "cache_options": expected_options,
-                            }, te_path)
-                            variant_cache_paths[caption_type] = str(te_path)
-                            pbar.update(1)
-                        primary_te_path = variant_cache_paths.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variant_cache_paths.values()))
-                        lat_path = cache_dir / f"{safe_filename}_lat.pt"
-                        new_item = {
-                            "te_path": primary_te_path,
-                            "lat_path": str(lat_path),
+        if text_jobs:
+            with torch.no_grad():
+                with tqdm(total=len(text_jobs), desc=f"Caching Anima text {root.name}", unit="item") as pbar:
+                    for m, caption_type, caption, te_path in text_jobs:
+                        prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption, device)
+                        torch.save({
+                            "prompt_emb": prompt_emb[0].to(dtype=text_cache_dtype).cpu(),
+                            "t5xxl_ids": t5xxl_ids[0].to(dtype=torch.long).cpu(),
+                            "caption_type": caption_type,
+                            "caption": caption,
+                            "caption_signature": m.get("caption_signature"),
+                            "image_path": str(m["ip"]),
                             "relative_path": str(m["ip"].relative_to(root)),
-                            "target_size": (w, h),
                             "original_size": m["original_size"],
                             "scaled_size": m["scaled_size"],
+                            "target_size": tuple(m["target_resolution"]),
                             "crop_coords": m.get("crop_coords", (0, 0)),
                             "bucket_variant_index": m.get("bucket_variant_index", 0),
-                            "caption_signature": m.get("caption_signature"),
-                        }
-                        if json_caption_mode:
-                            new_item["caption_variants"] = anima_caption_variant_index(variant_cache_paths)
-                        index_data.append(new_item)
-                        new_index_data.append(new_item)
+                            "cache_options": expected_options,
+                        }, te_path)
+                        pbar.update(1)
 
         if null_prompt_emb is not None and null_t5xxl_ids is not None:
-            save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, cache_dtype)
+            save_anima_null_conditioning_cache(cache_dir, null_prompt_emb, null_t5xxl_ids, text_cache_dtype)
 
         pipe.text_encoder.cpu()
         gc.collect()
@@ -858,56 +922,53 @@ def precompute_and_cache_anima(config, pipe, device):
 
         tile_size = tuple(getattr(config, "VAE_CACHING_TILE_SIZE", [96, 96]))
         tile_stride = tuple(getattr(config, "VAE_CACHING_TILE_STRIDE", [72, 72]))
-        print(
-            "INFO: Anima cache phase 2/2: VAE "
-            f"(tiled={getattr(config, 'VAE_CACHING_TILED', True)}, "
-            f"tile_size={tile_size}, tile_stride={tile_stride})"
-        )
-        pipe.vae.to(device=device, dtype=config.compute_dtype)
-        pipe.vae.eval()
+        if lat_jobs:
+            print(
+                "INFO: Anima cache phase 2/2: VAE "
+                f"(tiled={getattr(config, 'VAE_CACHING_TILED', True)}, "
+                f"tile_size={tile_size}, tile_stride={tile_stride})"
+            )
+            pipe.vae.to(device=device, dtype=vae_cache_dtype)
+            pipe.vae.eval()
 
-        with torch.inference_mode():
-            with tqdm(total=len(new_index_data), desc=f"Caching Anima VAE {root.name}", unit="item") as pbar:
-                for item in new_index_data:
-                    te_paths = [Path(p) for p in anima_text_cache_paths_for_index_item(item)]
-                    lat_path = Path(item["lat_path"])
-                    meta_payload = torch.load(te_paths[0], map_location="cpu", weights_only=True)
-                    image_path = Path(meta_payload["image_path"])
-                    w, h = item["target_size"]
-                    try:
-                        with Image.open(image_path) as img:
-                            image = smart_resize(fix_alpha_channel(img), w, h)
-                        latents = encode_image_anima(
-                            pipe,
-                            image,
-                            device,
-                            tiled=bool(getattr(config, "VAE_CACHING_TILED", True)),
-                            tile_size=tile_size,
-                            tile_stride=tile_stride,
-                        )
-                        cached_latents = latents[0].to(dtype=cache_dtype).cpu()
-                        torch.save({
-                            "latents": cached_latents,
-                            "image_path": str(image_path),
-                            "relative_path": meta_payload.get("relative_path"),
-                            "original_size": item["original_size"],
-                            "scaled_size": item["scaled_size"],
-                            "target_size": item["target_size"],
-                            "crop_coords": item.get("crop_coords", (0, 0)),
-                            "bucket_variant_index": item.get("bucket_variant_index", 0),
-                            "caption_signature": item.get("caption_signature"),
-                            "cache_options": expected_options,
-                        }, lat_path)
-                    except Exception as e:
-                        print(f"[SKIP ANIMA VAE] {image_path.name}: {e}")
-                        for variant_path in [*te_paths, lat_path]:
-                            try:
-                                variant_path.unlink()
-                            except OSError:
-                                pass
-                    if torch.cuda.is_available():
-                        torch.cuda.empty_cache()
-                    pbar.update(1)
+            with torch.inference_mode():
+                with tqdm(total=len(lat_jobs), desc=f"Caching Anima VAE {root.name}", unit="item") as pbar:
+                    for m, lat_path in lat_jobs:
+                        image_path = Path(m["ip"])
+                        w, h = m["target_resolution"]
+                        try:
+                            with Image.open(image_path) as img:
+                                image = smart_resize(fix_alpha_channel(img), w, h)
+                            latents = encode_image_anima(
+                                pipe,
+                                image,
+                                device,
+                                tiled=bool(getattr(config, "VAE_CACHING_TILED", True)),
+                                tile_size=tile_size,
+                                tile_stride=tile_stride,
+                                dtype=vae_cache_dtype,
+                            )
+                            cached_latents = latents[0].to(dtype=vae_cache_dtype).cpu()
+                            torch.save({
+                                "latents": cached_latents,
+                                "image_path": str(image_path),
+                                "relative_path": str(m["ip"].relative_to(root)),
+                                "original_size": m["original_size"],
+                                "scaled_size": m["scaled_size"],
+                                "target_size": tuple(m["target_resolution"]),
+                                "crop_coords": m.get("crop_coords", (0, 0)),
+                                "bucket_variant_index": m.get("bucket_variant_index", 0),
+                                "caption_signature": m.get("caption_signature"),
+                                "cache_options": expected_options,
+                            }, lat_path)
+                        except Exception as e:
+                            print(f"[SKIP ANIMA VAE] {image_path.name}: {e}")
+                            remove_anima_cache_file(lat_path)
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+                        pbar.update(1)
+        else:
+            print(f"INFO: Anima cache phase 2/2: VAE cache already current for {root.name}.")
 
         pipe.vae.cpu()
         gc.collect()

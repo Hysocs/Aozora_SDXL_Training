@@ -210,8 +210,15 @@ CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
 }
 
 
-def cache_float_dtype(config):
-    precision = str(getattr(config, "CACHE_PRECISION", "bfloat16") or "bfloat16").strip().lower()
+def _cache_precision_value(config, attr_name="CACHE_PRECISION"):
+    precision = getattr(config, attr_name, None)
+    if precision is None:
+        precision = getattr(config, "CACHE_PRECISION", "bfloat16")
+    return precision
+
+
+def cache_float_dtype(config, attr_name="CACHE_PRECISION"):
+    precision = str(_cache_precision_value(config, attr_name) or "bfloat16").strip().lower()
     aliases = {
         "fp32": "float32",
         "float": "float32",
@@ -228,8 +235,24 @@ def cache_float_dtype(config):
     return torch.bfloat16
 
 
-def cache_float_dtype_name(config):
-    return str(cache_float_dtype(config)).replace("torch.", "")
+def cache_float_dtype_name(config, attr_name="CACHE_PRECISION"):
+    return str(cache_float_dtype(config, attr_name)).replace("torch.", "")
+
+
+def text_cache_float_dtype(config):
+    return cache_float_dtype(config, "TEXT_CACHE_PRECISION")
+
+
+def text_cache_float_dtype_name(config):
+    return cache_float_dtype_name(config, "TEXT_CACHE_PRECISION")
+
+
+def vae_cache_float_dtype(config):
+    return cache_float_dtype(config, "VAE_CACHE_PRECISION")
+
+
+def vae_cache_float_dtype_name(config):
+    return cache_float_dtype_name(config, "VAE_CACHE_PRECISION")
 
 BN_MEAN_SUFFIXES = [
     "bn.running_mean",
@@ -925,7 +948,12 @@ def null_conditioning_cache_needed(config):
 def normalize_cache_options_for_image_cache(cache_options):
     if not isinstance(cache_options, dict):
         return cache_options
-    return {k: v for k, v in cache_options.items() if k not in CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS}
+    normalized = {k: v for k, v in cache_options.items() if k not in CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS}
+    legacy_precision = normalized.pop("cache_float_dtype", None)
+    if legacy_precision is not None:
+        normalized.setdefault("text_cache_float_dtype", legacy_precision)
+        normalized.setdefault("vae_cache_float_dtype", legacy_precision)
+    return normalized
 
 def cache_options_match_for_image_cache(cached_options, expected_options):
     return normalize_cache_options_for_image_cache(cached_options) == normalize_cache_options_for_image_cache(expected_options)
@@ -949,7 +977,8 @@ def get_caption_cache_options(config):
     return {
         "version": 12,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
-        "cache_float_dtype": cache_float_dtype_name(config),
+        "text_cache_float_dtype": text_cache_float_dtype_name(config),
+        "vae_cache_float_dtype": vae_cache_float_dtype_name(config),
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "caption_embedding_layout": "fixed_total_chunks",
         "caption_source_type": caption_source_type(config),
@@ -1235,10 +1264,15 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
-    cache_dtype = cache_float_dtype(config)
+    text_cache_dtype = text_cache_float_dtype(config)
+    vae_cache_dtype = vae_cache_float_dtype(config)
     caption_mode = caption_source_type(config)
     json_caption_mode = json_caption_mode_enabled(caption_mode)
-    print(f"INFO: SDXL cache precision: {cache_float_dtype_name(config)} for text embeddings and VAE latents.")
+    print(
+        "INFO: SDXL cache precision: "
+        f"text={text_cache_float_dtype_name(config)}, "
+        f"vae={vae_cache_float_dtype_name(config)}."
+    )
 
     vae.to(device, dtype=torch.float32)
     vae.enable_tiling()
@@ -1338,8 +1372,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         if null_embeds is not None and null_pooled is not None:
             torch.save(
                 {
-                    "embeds": null_embeds.to(dtype=cache_dtype).cpu(),
-                    "pooled": null_pooled.to(dtype=cache_dtype).cpu(),
+                    "embeds": null_embeds.to(dtype=text_cache_dtype).cpu(),
+                    "pooled": null_pooled.to(dtype=text_cache_dtype).cpu(),
                 },
                 cache_dir / "null_embeds.pt",
             )
@@ -1476,8 +1510,8 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     for embed_index, (meta_index, caption_type, caption) in enumerate(caption_jobs):
                         text_embeddings_by_meta[meta_index][caption_type] = {
                             "caption": caption,
-                            "embeds": embeds_all[embed_index].to(dtype=cache_dtype).cpu(),
-                            "pooled": pooled_all[embed_index].to(dtype=cache_dtype).cpu(),
+                            "embeds": embeds_all[embed_index].to(dtype=text_cache_dtype).cpu(),
+                            "pooled": pooled_all[embed_index].to(dtype=text_cache_dtype).cpu(),
                         }
 
                     for j, m in enumerate(valid_meta_final):
@@ -1500,7 +1534,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                                 "vae_shift": vae.config.shift_factor, "vae_scale": vae.config.scaling_factor,
                                 "flux_bn_eps": FLUX_BN_EPS if vae_norm_mode == "flux_bn32" else None,
                             }, cache_dir / f"{safe_filename}{suffix}_te.pt")
-                        torch.save(latents_global[j].to(dtype=cache_dtype).cpu(), cache_dir / f"{safe_filename}_lat.pt")
+                        torch.save(latents_global[j].to(dtype=vae_cache_dtype).cpu(), cache_dir / f"{safe_filename}_lat.pt")
                         mark_cache_variant_done(m, encode_pbar)
 
                     if batch_idx % 20 == 0: torch.cuda.empty_cache()

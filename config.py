@@ -47,6 +47,8 @@ INSTANCE_DATASETS = [
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
 CACHE_PRECISION = "bfloat16"
+TEXT_CACHE_PRECISION = "bfloat16"
+VAE_CACHE_PRECISION = "bfloat16"
 NUM_WORKERS = 0
 UNCONDITIONAL_DROPOUT = False
 UNCONDITIONAL_DROPOUT_CHANCE = 0.0
@@ -159,7 +161,8 @@ FLAT_KEYS = [
     "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
     "RESUME_TRAINING", "RESUME_MODEL_PATH", "RESUME_STATE_PATH",
     "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH", "INSTANCE_DATASETS",
-    "CACHING_BATCH_SIZE", "CACHE_PRECISION", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
+    "CACHING_BATCH_SIZE", "CACHE_PRECISION", "TEXT_CACHE_PRECISION",
+    "VAE_CACHE_PRECISION", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
     "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED",
     "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX",
     "CAPTION_CHUNKING_ENABLED", "CAPTION_SOURCE_TYPE", "CAPTION_TAGS_PERCENT",
@@ -181,7 +184,8 @@ FLAT_KEYS = [
 
 PER_MODE_FLAT_KEYS = [
     "OUTPUT_DIR", "RESUME_TRAINING", "INSTANCE_DATASETS", "CACHING_BATCH_SIZE",
-    "CACHE_PRECISION", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
+    "CACHE_PRECISION", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION",
+    "NUM_WORKERS", "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
     "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN",
     "TEXT_CONDITIONING_SCALE_MAX", "CAPTION_CHUNKING_ENABLED", "SHOULD_UPSCALE",
     "CAPTION_SOURCE_TYPE", "CAPTION_TAGS_PERCENT", "CAPTION_NL_PERCENT",
@@ -286,7 +290,14 @@ def normalize_preset(config_data):
     preset["active_mode"] = mode_key_from_label(config_data.get("active_mode"))
     for mode_key in (MODE_SDXL, MODE_ANIMA):
         if isinstance(config_data.get(mode_key), dict):
-            preset[mode_key].update(copy.deepcopy(config_data[mode_key]))
+            mode_data = copy.deepcopy(config_data[mode_key])
+            legacy_key = nested_key_for(mode_key, "CACHE_PRECISION")
+            text_key = nested_key_for(mode_key, "TEXT_CACHE_PRECISION")
+            vae_key = nested_key_for(mode_key, "VAE_CACHE_PRECISION")
+            if legacy_key in mode_data:
+                mode_data.setdefault(text_key, mode_data[legacy_key])
+                mode_data.setdefault(vae_key, mode_data[legacy_key])
+            preset[mode_key].update(mode_data)
     return preset
 
 

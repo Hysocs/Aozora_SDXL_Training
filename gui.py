@@ -2227,7 +2227,8 @@ UI_DEFS = {
     "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer", "T5XXL tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
-    "CACHE_PRECISION":             ("Cache Precision", "Floating-point dtype used for cached text embeddings and VAE latents on disk.", "combo", ["float32", "bfloat16", "float16"]),
+    "TEXT_CACHE_PRECISION":        ("Text Cache Precision", "Floating-point dtype used for cached text embeddings on disk.", "combo", ["float32", "bfloat16", "float16"]),
+    "VAE_CACHE_PRECISION":         ("VAE Cache Precision", "Floating-point dtype used for VAE latent caching. Anima VAE encoding also uses this dtype.", "combo", ["float32", "bfloat16", "float16"]),
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
     "UNCONDITIONAL_DROPOUT":       ("Use Null Conditioning Dropout", "At random, train a sample with empty-prompt conditioning instead of its caption.", "check"),
     "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
@@ -2758,7 +2759,7 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_caption_source_group())
         settings_lay.addWidget(self._build_vae_group())
         for title, keys in [
-            ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "CACHE_PRECISION", "NUM_WORKERS"]),
+            ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS"]),
             ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
             ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
