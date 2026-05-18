@@ -4,6 +4,7 @@ import math
 import os
 import random
 import re
+import sys
 import time
 import traceback
 import uuid
@@ -68,6 +69,18 @@ from train import (
 
 AnimaImagePipeline = None
 ModelConfig = None
+
+
+def configure_console_output():
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
+configure_console_output()
 
 
 def normalize_anima_config(config):
@@ -826,13 +839,23 @@ def precompute_and_cache_anima(config, pipe, device):
         lat_jobs = []
         reused_text_count = 0
         reused_lat_count = 0
+        expected_text_count = 0
         expected_cache_files = set()
         for m in expanded_results:
             caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
-            text_paths, lat_path = anima_expected_cache_paths(root, cache_dir, m, active_caption_types, json_caption_mode)
+            item_caption_types = tuple(key for key in active_caption_types if key in caption_variants)
+            if not item_caption_types:
+                fallback_caption_type = (
+                    CAPTION_JSON_PRIMARY_TYPE
+                    if CAPTION_JSON_PRIMARY_TYPE in caption_variants
+                    else next(iter(caption_variants))
+                )
+                item_caption_types = (fallback_caption_type,)
+            text_paths, lat_path = anima_expected_cache_paths(root, cache_dir, m, item_caption_types, json_caption_mode)
             expected_cache_files.add(lat_path.resolve())
             variant_cache_paths = {}
-            for caption_type in active_caption_types:
+            expected_text_count += len(item_caption_types)
+            for caption_type in item_caption_types:
                 te_path = text_paths[caption_type]
                 expected_cache_files.add(te_path.resolve())
                 variant_cache_paths[caption_type] = str(te_path)
@@ -883,7 +906,7 @@ def precompute_and_cache_anima(config, pipe, device):
 
         print(
             f"INFO: Anima cache reuse for {root.name}: "
-            f"{reused_text_count}/{len(expanded_results) * len(active_caption_types)} text item(s), "
+            f"{reused_text_count}/{expected_text_count} text item(s), "
             f"{reused_lat_count}/{len(expanded_results)} latent item(s)."
         )
 

@@ -783,15 +783,12 @@ def read_caption_variants_for_image(ip, caption_mode="txt"):
         if not isinstance(data, dict):
             raise ValueError(f"JSON caption must be an object: {cp}")
         variants = {}
-        missing = []
         for key in CAPTION_JSON_TYPES:
             value = data.get(key)
             if isinstance(value, str) and value.strip():
                 variants[key] = value.strip()
-            else:
-                missing.append(key)
-        if missing:
-            raise ValueError(f"JSON caption {cp} is missing non-empty key(s): {', '.join(missing)}")
+        if not variants:
+            raise ValueError(f"JSON caption {cp} must contain at least one non-empty caption key: {', '.join(CAPTION_JSON_TYPES)}")
         return variants
 
     cp = ip.with_suffix('.txt')
@@ -982,7 +979,6 @@ def check_if_caching_needed(config):
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
     json_caption_mode = json_caption_mode_enabled(config)
-    expected_te_multiplier = len(CAPTION_JSON_TYPES) if json_caption_mode else 1
 
     if null_conditioning_cache_needed(config):
         if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
@@ -1065,7 +1061,34 @@ def check_if_caching_needed(config):
             needs_caching = True
         if not current_cache_stems.issubset(cached_base_stems):
             needs_caching = True
-        if len(cached_te_files) < len(image_paths) * expected_te_multiplier:
+        expected_te_count = 0
+        try:
+            max_bucket_resolution = get_max_bucket_resolution_for_config(config)
+            max_bucket_area = max_bucket_resolution * max_bucket_resolution
+            multi_bucket_extra = (
+                max(0, int(getattr(config, "MULTI_BUCKET_EXTRA_BUCKETS", 0) or 0))
+                if getattr(config, "MULTI_BUCKET_ENABLED", False)
+                else 0
+            )
+            for image_path in image_paths:
+                caption_variant_count = (
+                    len(read_caption_variants_for_image(image_path, caption_source_type(config)))
+                    if json_caption_mode
+                    else 1
+                )
+                with Image.open(image_path) as img:
+                    bucket_count = len(get_multi_bucket_resolutions(
+                        img.width,
+                        img.height,
+                        max_bucket_area,
+                        getattr(config, "SHOULD_UPSCALE", False),
+                        multi_bucket_extra,
+                    ))
+                expected_te_count += caption_variant_count * bucket_count
+        except Exception:
+            needs_caching = True
+            expected_te_count = len(image_paths)
+        if len(cached_te_files) < expected_te_count:
             needs_caching = True
         else:
             for f in cached_te_files[: min(len(cached_te_files), 10)]:
@@ -1382,12 +1405,15 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             lat_jobs = []
             reused_text_count = 0
             reused_lat_count = 0
+            expected_text_count = 0
             expected_cache_files = set()
             for m in expanded_results:
                 caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
-                text_paths, lat_path = expected_cache_paths_for_metadata(root, cache_dir, m, cache_caption_types, json_caption_mode)
+                item_caption_types = tuple(key for key in cache_caption_types if key in caption_variants)
+                text_paths, lat_path = expected_cache_paths_for_metadata(root, cache_dir, m, item_caption_types, json_caption_mode)
                 expected_cache_files.add(lat_path.resolve())
-                for caption_type in cache_caption_types:
+                expected_text_count += len(item_caption_types)
+                for caption_type in item_caption_types:
                     te_path = text_paths[caption_type]
                     expected_cache_files.add(te_path.resolve())
                     caption = caption_variants[caption_type]
@@ -1419,7 +1445,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             if text_jobs or lat_jobs:
                 print(
                     f"INFO: SDXL cache reuse for {root.name}: "
-                    f"{reused_text_count}/{len(expanded_results) * len(cache_caption_types)} text item(s), "
+                    f"{reused_text_count}/{expected_text_count} text item(s), "
                     f"{reused_lat_count}/{len(expanded_results)} latent item(s)."
                 )
 
@@ -1560,10 +1586,10 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
             iterable_index_items = []
             for item_stem, variant_paths in grouped_te_files.items():
-                if any(key not in variant_paths for key in CAPTION_JSON_TYPES):
-                    print(f"WARNING: Skipping incomplete JSON caption cache item: {item_stem}")
+                if not variant_paths:
                     continue
-                iterable_index_items.append((item_stem, variant_paths[CAPTION_JSON_PRIMARY_TYPE], variant_paths))
+                primary_variant = variant_paths.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variant_paths.values()))
+                iterable_index_items.append((item_stem, primary_variant, variant_paths))
         else:
             iterable_index_items = [
                 (cache_item_stem_from_te_path(f), f, None)

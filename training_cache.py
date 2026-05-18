@@ -169,13 +169,15 @@ def caption_variant_index(variant_paths, path_key="te_path"):
     return {
         key: {path_key: str(variant_paths[key])}
         for key in CAPTION_JSON_TYPES
+        if key in variant_paths
     }
 
 
 def selected_caption_variant_path(item, rng, weights, path_key="te_path", primary_key="te_path", fallback_key=None, enabled=True):
     variants = item.get("caption_variants")
     if enabled and isinstance(variants, dict):
-        caption_type = choose_caption_variant(rng, weights)
+        available_weights = {key: weights.get(key, 0) for key in variants}
+        caption_type = choose_caption_variant(rng, available_weights)
         variant = variants.get(caption_type) or variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variants.values()))
         if isinstance(variant, dict) and variant.get(path_key):
             return variant[path_key]
