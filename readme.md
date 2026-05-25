@@ -4,6 +4,10 @@ Aozora SDXL Trainer is a GUI-based SDXL fine-tuning trainer focused on making fu
 
 It is built for users who want more control than a preset-only trainer, but do not want to manage large JSON configs by hand. The goal is simple: train SDXL models efficiently on 12 GB class GPUs while keeping the important training controls visible, editable, and understandable.
 
+> [**Currently supports**]
+> - SDXL (EPS, VPRED, RECT FLOW)
+> - Anima
+
 > [!WARNING]
 > **Beta Software:** This project is still in active development. It is functional and currently trains successfully on my system, but it has not been broadly tested across different hardware, drivers, models, or environments.
 >

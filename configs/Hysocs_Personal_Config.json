@@ -124,12 +124,16 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "repeats": 2
+            },
+            {
+                "path": "C:/Users/Administrator/Pictures\\e621 Artists",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Artists",
-                "repeats": 1
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
+                "repeats": 2
             }
         ],
         "anima_caching_batch_size": 1,
@@ -140,20 +144,20 @@
         "anima_unconditional_dropout": false,
         "anima_unconditional_dropout_chance": 0.05,
         "anima_text_conditioning_scale_enabled": true,
-        "anima_text_conditioning_scale_min": 0.7500000000000001,
-        "anima_text_conditioning_scale_max": 1.25,
+        "anima_text_conditioning_scale_min": 0.6499999999999999,
+        "anima_text_conditioning_scale_max": 1.35,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
         "anima_caption_source_type": "json",
-        "anima_caption_tags_percent": 70,
-        "anima_caption_nl_percent": 30,
+        "anima_caption_tags_percent": 65,
+        "anima_caption_nl_percent": 35,
         "anima_caption_tags_nl_percent": 0,
         "anima_caption_nl_tags_percent": 0,
         "anima_max_bucket_resolution": "1024",
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "50000",
+        "anima_max_train_steps": "105000",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -166,11 +170,11 @@
                 1e-08
             ],
             [
-                0.04485488,
+                0.01846966,
                 5e-06
             ],
             [
-                0.91292876,
+                0.98944591,
                 5e-06
             ],
             [
@@ -184,31 +188,31 @@
         "anima_timestep_allocation": {
             "bin_size": 40,
             "counts": [
-                820,
-                861,
-                984,
-                1178,
-                1433,
-                1729,
-                2047,
-                2366,
-                2662,
-                2917,
-                3113,
-                3236,
-                3279,
-                3237,
-                3115,
-                2920,
-                2666,
-                2369,
-                2051,
-                1733,
-                1436,
-                1181,
-                985,
-                862,
-                820
+                1722,
+                1806,
+                2058,
+                2478,
+                3003,
+                3633,
+                4305,
+                4977,
+                5586,
+                6132,
+                6531,
+                6804,
+                6888,
+                6804,
+                6531,
+                6132,
+                5607,
+                4977,
+                4305,
+                3633,
+                3024,
+                2478,
+                2058,
+                1806,
+                1722
             ]
         },
         "anima_optimizer_type": "raven",
