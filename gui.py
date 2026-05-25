@@ -54,7 +54,6 @@ SDXL_PATH_KEYS = {
 }
 ANIMA_PATH_KEYS = {
     "DIT_PATH",
-    "ANIMA_BASE_DIT_PATH",
     "DIT_VAE_PATH",
     "TEXT_ENCODER_PATH",
     "TOKENIZER_PATH",
@@ -2219,12 +2218,11 @@ class DatasetManagerWidget(QtWidgets.QWidget):
 UI_DEFS = {
     "SINGLE_FILE_CHECKPOINT_PATH": ("Base Model (.safetensors)", "Path to the base SDXL model.", "path", "file_safetensors"),
     "DIT_PATH":                    ("DiT Model (.safetensors)", "Path to the Anima DiT diffusion model.", "path", "file_safetensors"),
-    "ANIMA_BASE_DIT_PATH":         ("Base DiT Template", "Optional original anima-preview.safetensors used to instantiate the architecture when a fine-tune cannot be auto-detected.", "path", "file_safetensors"),
     "DIT_VAE_PATH":                ("DiT VAE (.safetensors)", "Path to the VAE used by the Anima DiT model.", "path", "file_safetensors"),
     "VAE_PATH":                    ("Separate VAE (Optional)", "Leave empty to use the VAE from the base model.", "path", "file_safetensors"),
     "TEXT_ENCODER_PATH":           ("Text Encoder (.safetensors)", "Path to the Qwen text encoder for Anima DiT.", "path", "file_safetensors"),
-    "TOKENIZER_PATH":              ("Tokenizer", "Tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
-    "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer", "T5XXL tokenizer model id and origin pattern, formatted as model_id:origin.", "line"),
+    "TOKENIZER_PATH":              ("Qwen Tokenizer Folder", "Local folder containing the Qwen tokenizer files for Anima.", "path", "folder"),
+    "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer Folder", "Local folder containing the T5XXL tokenizer files for Anima.", "path", "folder"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "TEXT_CACHE_PRECISION":        ("Text Cache Precision", "Floating-point dtype used for cached text embeddings on disk.", "combo", ["float32", "bfloat16", "float16"]),
@@ -3013,11 +3011,14 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in ["ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH"]:
             anima_resume_lay.addWidget(self._make_compact_path_row(key))
         dit_lay.addWidget(self.anima_resume_paths_widget)
-        dit_lay.addWidget(self._make_compact_path_row("ANIMA_BASE_DIT_PATH"))
         dit_lay.addWidget(self._make_compact_path_row("DIT_VAE_PATH"))
         dit_lay.addWidget(self._make_compact_path_row("TEXT_ENCODER_PATH"))
-        self._add_vertical_widget_key(dit_lay, "TOKENIZER_PATH")
-        self._add_vertical_widget_key(dit_lay, "TOKENIZER_T5XXL_PATH")
+        tokenizer_help_btn = make_btn("!", self._show_anima_tokenizer_help)
+        tokenizer_help_btn.setFixedSize(24, 24)
+        tokenizer_help_btn.setStyleSheet("padding: 0; min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px; font-weight: bold;")
+        tokenizer_help_btn.setToolTip("Show Anima tokenizer download links")
+        dit_lay.addWidget(self._make_compact_path_row("TOKENIZER_PATH", [tokenizer_help_btn]))
+        dit_lay.addWidget(self._make_compact_path_row("TOKENIZER_T5XXL_PATH"))
         lay.addWidget(self.dit_paths_widget)
 
         lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
@@ -3027,6 +3028,47 @@ class TrainingGUI(QtWidgets.QWidget):
         self._update_path_mode_controls()
         self._sync_path_stack_height()
         return gb
+
+    def _show_anima_tokenizer_help(self):
+        dialog = QtWidgets.QDialog(self)
+        dialog.setWindowTitle("Anima Tokenizer Files")
+        dialog.setMinimumWidth(520)
+        lay = QtWidgets.QVBoxLayout(dialog)
+        lay.setContentsMargins(14, 14, 14, 14)
+        lay.setSpacing(10)
+
+        text = QtWidgets.QLabel(
+            "Anima needs two tokenizer folders in addition to the DiT, VAE, and Qwen text encoder weights.\n\n"
+            "Select local folders that contain tokenizer files such as tokenizer.json, tokenizer.model, "
+            "spiece.model, or vocab.json. Training will use only the selected local folders and will not "
+            "download them automatically."
+        )
+        text.setWordWrap(True)
+        lay.addWidget(text)
+
+        links = QtWidgets.QLabel(
+            '<b>Qwen tokenizer:</b><br>'
+            '<a href="https://huggingface.co/Qwen/Qwen3-0.6B">https://huggingface.co/Qwen/Qwen3-0.6B</a><br><br>'
+            '<b>T5XXL tokenizer:</b><br>'
+            '<a href="https://huggingface.co/stabilityai/stable-diffusion-3.5-large/tree/main/tokenizer_3">'
+            'https://huggingface.co/stabilityai/stable-diffusion-3.5-large/tree/main/tokenizer_3</a><br><br>'
+            '<b>T5XXL fallback:</b><br>'
+            '<a href="https://huggingface.co/google/t5-v1_1-xxl">https://huggingface.co/google/t5-v1_1-xxl</a>'
+        )
+        links.setOpenExternalLinks(True)
+        links.setWordWrap(True)
+        links.setTextInteractionFlags(
+            QtCore.Qt.TextInteractionFlag.TextBrowserInteraction |
+            QtCore.Qt.TextInteractionFlag.LinksAccessibleByMouse
+        )
+        lay.addWidget(links)
+
+        close_btn = make_btn("Close", dialog.accept)
+        row = QtWidgets.QHBoxLayout()
+        row.addStretch(1)
+        row.addWidget(close_btn)
+        lay.addLayout(row)
+        dialog.exec()
 
     def _set_optional_vae_visible(self, visible):
         if hasattr(self, "optional_vae_row"):

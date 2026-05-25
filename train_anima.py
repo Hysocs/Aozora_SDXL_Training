@@ -415,25 +415,6 @@ def check_if_anima_caching_needed(config):
     return bool(anima_roots_needing_cache_rebuild(config))
 
 
-def find_anima_base_dit_path(config):
-    candidates = []
-    configured = getattr(config, "ANIMA_BASE_DIT_PATH", "") or getattr(config, "DIT_BASE_PATH", "")
-    if configured:
-        candidates.append(Path(configured))
-
-    dit_path = Path(getattr(config, "DIT_PATH", "") or "")
-    if dit_path:
-        candidates.extend([
-            dit_path.with_name("anima-preview.safetensors"),
-            dit_path.with_name("anima_preview.safetensors"),
-        ])
-
-    for candidate in candidates:
-        if candidate and candidate.exists():
-            return str(candidate)
-    return None
-
-
 def default_huggingface_cache_root():
     hf_home = os.environ.get("HF_HOME")
     if hf_home:
@@ -465,32 +446,50 @@ def local_tokenizer_path(model_id, origin_file_pattern):
     return None
 
 
-def make_anima_tokenizer_config(model_id, origin_file_pattern):
-    local_path = local_tokenizer_path(model_id, origin_file_pattern)
-    if local_path:
-        return ModelConfig(path=local_path, skip_download=True)
+def tokenizer_folder_has_required_files(path):
+    if not path:
+        return False
+    folder = Path(path).expanduser()
+    if folder.is_file():
+        folder = folder.parent
+    required_files = ("tokenizer.json", "spiece.model", "tokenizer.model", "vocab.json")
+    return folder.exists() and any((folder / name).exists() for name in required_files)
 
-    return ModelConfig(
-        model_id=model_id,
-        origin_file_pattern=origin_file_pattern,
-        download_source="huggingface",
-        local_model_path=default_huggingface_cache_root(),
+
+def resolve_local_tokenizer_path(value, label, default_model_id=None, default_origin="./"):
+    raw_value = str(value or "").strip()
+    candidates = []
+
+    if raw_value:
+        direct = Path(raw_value).expanduser()
+        candidates.append(direct.parent if direct.is_file() else direct)
+
+        # Backward compatibility for old configs that stored model_id:origin.
+        if ":" in raw_value and not direct.exists():
+            model_id, origin = raw_value.split(":", 1)
+            legacy_path = local_tokenizer_path(model_id, origin)
+            if legacy_path:
+                candidates.append(Path(legacy_path))
+
+    if default_model_id:
+        default_path = local_tokenizer_path(default_model_id, default_origin)
+        if default_path:
+            candidates.append(Path(default_path))
+
+    for candidate in candidates:
+        if tokenizer_folder_has_required_files(candidate):
+            return str(candidate)
+
+    raise FileNotFoundError(
+        f"{label} tokenizer folder is required for Anima DiT training. "
+        "Select a local folder containing tokenizer.json, spiece.model, tokenizer.model, or vocab.json. "
+        "Use the tokenizer help button in the GUI for download links."
     )
 
 
-def make_anima_t5xxl_tokenizer_config(model_id, origin_file_pattern):
-    local_path = local_tokenizer_path(model_id, origin_file_pattern)
-    if local_path:
-        return ModelConfig(path=local_path, skip_download=True)
-
-    if model_id == "stabilityai/stable-diffusion-3.5-large":
-        print(
-            "INFO: T5XXL tokenizer from stabilityai/stable-diffusion-3.5-large is gated on Hugging Face. "
-            "Using google/t5-v1_1-xxl tokenizer instead."
-        )
-        return make_anima_tokenizer_config("google/t5-v1_1-xxl", "./")
-
-    return make_anima_tokenizer_config(model_id, origin_file_pattern)
+def make_anima_tokenizer_config(path, label):
+    local_path = resolve_local_tokenizer_path(path, label)
+    return ModelConfig(path=local_path, skip_download=True)
 
 
 def ensure_anima_diffsynth_available():
@@ -506,14 +505,6 @@ def ensure_anima_diffsynth_available():
         ) from e
     AnimaImagePipeline = _AnimaImagePipeline
     ModelConfig = _ModelConfig
-
-
-def normalize_anima_dit_state_key(key):
-    for prefix in ("pipe.dit.", "dit.", "model.diffusion_model.", "diffusion_model.", "model."):
-        if key.startswith(prefix):
-            key = key[len(prefix):]
-            break
-    return key.replace("net.", "")
 
 
 def detect_anima_dit_key_prefix(path):
@@ -533,53 +524,6 @@ def detect_anima_dit_key_prefix(path):
     return best_prefix if best_count / total >= 0.8 else ""
 
 
-def load_anima_dit_weights(dit, path):
-    path = str(path)
-    target_shapes = {name: tuple(param.shape) for name, param in dit.state_dict().items()}
-    remapped = {}
-    skipped_shape = []
-    skipped_unknown = 0
-
-    with safe_open(path, framework="pt", device="cpu") as f:
-        for source_key in f.keys():
-            target_key = normalize_anima_dit_state_key(source_key)
-            if target_key not in target_shapes:
-                skipped_unknown += 1
-                continue
-
-            tensor = f.get_tensor(source_key)
-            if tuple(tensor.shape) != target_shapes[target_key]:
-                skipped_shape.append((source_key, tuple(tensor.shape), target_key, target_shapes[target_key]))
-                continue
-            remapped[target_key] = tensor
-
-    if not remapped:
-        raise RuntimeError(
-            f"No matching DiT tensors were found in {path}. "
-            "Expected raw Anima DiT keys or keys prefixed with pipe.dit./dit./model."
-        )
-
-    incompatible = dit.load_state_dict(remapped, strict=False, assign=True)
-    print(
-        f"INFO: Loaded fine-tuned Anima DiT weights from {Path(path).name}: "
-        f"{len(remapped):,}/{len(target_shapes):,} tensors matched."
-    )
-    if skipped_unknown:
-        print(f"INFO: Ignored {skipped_unknown:,} non-DiT or unknown tensor(s).")
-    if skipped_shape:
-        print(f"WARNING: Ignored {len(skipped_shape):,} tensor(s) with shape mismatches.")
-        for source_key, source_shape, target_key, target_shape in skipped_shape[:5]:
-            print(f"  {source_key} {source_shape} -> {target_key} expected {target_shape}")
-        if len(skipped_shape) > 5:
-            print(f"  ... and {len(skipped_shape) - 5} more")
-    if incompatible.missing_keys:
-        print(f"WARNING: {len(incompatible.missing_keys):,} DiT key(s) were not supplied by the fine-tune.")
-    detected_prefix = detect_anima_dit_key_prefix(path)
-    del remapped
-    gc.collect()
-    return detected_prefix
-
-
 def load_anima_pipe(config, device):
     ensure_anima_diffsynth_available()
 
@@ -590,17 +534,8 @@ def load_anima_pipe(config, device):
         ModelConfig(path=config.VAE_PATH),
     ]
 
-    tokenizer_model_id = "Qwen/Qwen3-0.6B"
-    tokenizer_origin = "./"
-    if isinstance(config.TOKENIZER_PATH, str) and ":" in config.TOKENIZER_PATH:
-        tokenizer_model_id, tokenizer_origin = config.TOKENIZER_PATH.split(":", 1)
-    tokenizer_config = make_anima_tokenizer_config(tokenizer_model_id, tokenizer_origin)
-
-    t5xxl_model_id = "stabilityai/stable-diffusion-3.5-large"
-    t5xxl_origin = "tokenizer_3/"
-    if isinstance(config.TOKENIZER_T5XXL_PATH, str) and ":" in config.TOKENIZER_T5XXL_PATH:
-        t5xxl_model_id, t5xxl_origin = config.TOKENIZER_T5XXL_PATH.split(":", 1)
-    tokenizer_t5xxl_config = make_anima_t5xxl_tokenizer_config(t5xxl_model_id, t5xxl_origin)
+    tokenizer_config = make_anima_tokenizer_config(config.TOKENIZER_PATH, "Qwen")
+    tokenizer_t5xxl_config = make_anima_tokenizer_config(config.TOKENIZER_T5XXL_PATH, "T5XXL")
 
     loaded_template_path = config.DIT_PATH
     try:
@@ -615,28 +550,11 @@ def load_anima_pipe(config, device):
         message = str(e)
         if "Cannot detect the model type" not in message:
             raise
-        base_dit_path = find_anima_base_dit_path(config)
-        if not base_dit_path:
-            raise RuntimeError(
-                "DiffSynth could not auto-detect the selected DiT file, and no base template was found. "
-                "Set 'Base DiT Template' in the GUI to the original anima-preview.safetensors, then keep "
-                "your fine-tune in 'DiT Model'."
-            ) from e
-
-        print(
-            "WARNING: DiffSynth could not auto-detect the selected DiT file. "
-            f"Using {Path(base_dit_path).name} as the architecture template, then overlaying fine-tune weights."
-        )
-        model_configs[0] = ModelConfig(path=base_dit_path)
-        loaded_template_path = base_dit_path
-        pipe = AnimaImagePipeline.from_pretrained(
-            torch_dtype=config.compute_dtype,
-            device=device,
-            model_configs=model_configs,
-            tokenizer_config=tokenizer_config,
-            tokenizer_t5xxl_config=tokenizer_t5xxl_config,
-        )
-        loaded_prefix = load_anima_dit_weights(pipe.dit, original_dit_path)
+        raise RuntimeError(
+            "The selected Anima DiT file could not be loaded because DiffSynth cannot detect its model type. "
+            "The file is likely missing required architecture metadata or was saved in an unsupported/corrupted format. "
+            "Repair or re-export the DiT checkpoint with proper Anima metadata, then select the repaired file."
+        ) from e
     else:
         loaded_prefix = detect_anima_dit_key_prefix(original_dit_path)
 
