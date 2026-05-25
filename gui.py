@@ -2544,6 +2544,10 @@ class TrainingGUI(QtWidgets.QWidget):
             self._sync_path_stack_height()
         if hasattr(self, "dit_paths_widget"):
             self.dit_paths_widget.setVisible(is_dit)
+        if hasattr(self, "tokenizer_paths_group"):
+            self.tokenizer_paths_group.setVisible(is_dit)
+        if hasattr(self, "model_paths_group"):
+            self.model_paths_group.setTitle("Anima Model Files" if is_dit else "SDXL Model Files")
         if hasattr(self, "dit_model_path_row"):
             self.dit_model_path_row.setVisible(is_dit and not is_resume)
         if hasattr(self, "anima_resume_paths_widget"):
@@ -2968,6 +2972,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.model_load_mode_label = make_label("Mode:")
         self._add_vertical_field(lay, self.model_load_mode_label, self.model_load_strategy_combo)
 
+        self.model_paths_group, model_paths_lay = self._make_path_subgroup("Model Files")
         self.path_stacked_widget = QtWidgets.QStackedWidget()
         self.path_stacked_widget.setContentsMargins(0, 0, 0, 0)
         self.path_stacked_widget.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
@@ -2996,7 +3001,7 @@ class TrainingGUI(QtWidgets.QWidget):
         for key in ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"]:
             resume_lay.addWidget(self._make_compact_path_row(key))
         self.path_stacked_widget.addWidget(resume_page)
-        lay.addWidget(self.path_stacked_widget)
+        model_paths_lay.addWidget(self.path_stacked_widget)
 
         self.dit_paths_widget = QtWidgets.QWidget()
         dit_lay = QtWidgets.QVBoxLayout(self.dit_paths_widget)
@@ -3013,21 +3018,53 @@ class TrainingGUI(QtWidgets.QWidget):
         dit_lay.addWidget(self.anima_resume_paths_widget)
         dit_lay.addWidget(self._make_compact_path_row("DIT_VAE_PATH"))
         dit_lay.addWidget(self._make_compact_path_row("TEXT_ENCODER_PATH"))
+        model_paths_lay.addWidget(self.dit_paths_widget)
+        lay.addWidget(self.model_paths_group)
+
+        self.tokenizer_paths_group, tokenizer_paths_lay = self._make_path_subgroup("Tokenizer Folders")
         tokenizer_help_btn = make_btn("!", self._show_anima_tokenizer_help)
         tokenizer_help_btn.setFixedSize(24, 24)
         tokenizer_help_btn.setStyleSheet("padding: 0; min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px; font-weight: bold;")
         tokenizer_help_btn.setToolTip("Show Anima tokenizer download links")
-        dit_lay.addWidget(self._make_compact_path_row("TOKENIZER_PATH", [tokenizer_help_btn]))
-        dit_lay.addWidget(self._make_compact_path_row("TOKENIZER_T5XXL_PATH"))
-        lay.addWidget(self.dit_paths_widget)
+        tokenizer_paths_lay.addWidget(self._make_compact_path_row("TOKENIZER_PATH", [tokenizer_help_btn]))
+        tokenizer_paths_lay.addWidget(self._make_compact_path_row("TOKENIZER_T5XXL_PATH"))
+        lay.addWidget(self.tokenizer_paths_group)
 
-        lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
+        self.output_paths_group, output_paths_lay = self._make_path_subgroup("Output")
+        output_paths_lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
+        lay.addWidget(self.output_paths_group)
 
         self.model_load_strategy_combo.currentIndexChanged.connect(lambda _: self._update_path_mode_controls())
         self.path_stacked_widget.currentChanged.connect(lambda _: self._sync_path_stack_height())
         self._update_path_mode_controls()
         self._sync_path_stack_height()
         return gb
+
+    def _make_path_subgroup(self, title):
+        gb = QtWidgets.QGroupBox(title)
+        gb.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
+        gb.setStyleSheet(
+            f"QGroupBox {{ "
+            f"border: 1px solid {BORDER}; "
+            "border-radius: 5px; "
+            "margin-top: 12px; "
+            "padding: 8px 6px 6px 6px; "
+            f"background: {GRAPH_BG}; "
+            f"}} "
+            f"QGroupBox::title {{ "
+            "subcontrol-origin: margin; "
+            "subcontrol-position: top left; "
+            "left: 8px; "
+            "padding: 0 4px; "
+            f"color: {ACCENT}; "
+            "font-weight: bold; "
+            f"background: {DARK_BG}; "
+            f"}}"
+        )
+        lay = QtWidgets.QVBoxLayout(gb)
+        lay.setContentsMargins(6, 8, 6, 6)
+        lay.setSpacing(3)
+        return gb, lay
 
     def _show_anima_tokenizer_help(self):
         dialog = QtWidgets.QDialog(self)
