@@ -690,6 +690,7 @@ def precompute_and_cache_anima(config, pipe, device):
         cache_dir = root / cache_name
         cache_dir.mkdir(parents=True, exist_ok=True)
         force_recaching = bool(getattr(config, "REBUILD_CACHE", False))
+        existing_index = None
         if cache_index_exists(cache_dir) and not force_recaching:
             try:
                 existing_index = load_cache_index(cache_dir)
@@ -728,15 +729,60 @@ def precompute_and_cache_anima(config, pipe, device):
 
         max_bucket_resolution = get_max_bucket_resolution_for_config(config)
         max_bucket_area = max_bucket_resolution * max_bucket_resolution
-        print(f"INFO: Validating Anima DiT images and assigning buckets for {root.name} ({len(image_paths)} image(s))...")
-        with Pool(processes=min(cpu_count(), 8)) as pool:
-            results = list(tqdm(
-                pool.imap(
-                    validate_and_assign_resolution,
-                    [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in image_paths],
-                ),
-                total=len(image_paths),
-            ))
+        existing_items_by_relative_path = defaultdict(list)
+        can_reuse_index_metadata = (
+            existing_index is not None
+            and not force_recaching
+            and anima_cache_options_match(existing_index.get("cache_options"), expected_options)
+        )
+        if can_reuse_index_metadata:
+            for item in existing_index.get("files", []):
+                relative_path = item.get("relative_path")
+                if relative_path:
+                    existing_items_by_relative_path[relative_path].append(item)
+
+        reused_index_items = []
+        image_paths_to_validate = []
+        for image_path in image_paths:
+            relative_path = str(image_path.relative_to(root))
+            existing_items = existing_items_by_relative_path.get(relative_path, [])
+            if existing_items:
+                signatures_match = anima_cached_file_signatures_match(
+                    existing_items[0],
+                    image_path,
+                    caption_mode,
+                )
+                existing_paths = [
+                    path
+                    for item in existing_items
+                    for path in anima_cache_paths_for_index_item(item)
+                ]
+                if signatures_match and existing_paths and all(Path(path).exists() for path in existing_paths):
+                    reused_index_items.extend(existing_items)
+                    continue
+            image_paths_to_validate.append(image_path)
+
+        if reused_index_items:
+            print(
+                f"INFO: Reusing Anima cache metadata for {len(reused_index_items)} indexed bucket item(s) "
+                f"from unchanged images in {root.name}."
+            )
+
+        if image_paths_to_validate:
+            print(
+                f"INFO: Validating Anima DiT images and assigning buckets for {root.name} "
+                f"({len(image_paths_to_validate)}/{len(image_paths)} image(s))..."
+            )
+            with Pool(processes=min(cpu_count(), 8)) as pool:
+                results = list(tqdm(
+                    pool.imap(
+                        validate_and_assign_resolution,
+                        [(p, max_bucket_area, 64, config.SHOULD_UPSCALE, caption_mode) for p in image_paths_to_validate],
+                    ),
+                    total=len(image_paths_to_validate),
+                ))
+        else:
+            results = []
 
         expanded_results = []
         for m in (r for r in results if r):
@@ -759,6 +805,11 @@ def precompute_and_cache_anima(config, pipe, device):
         reused_lat_count = 0
         expected_text_count = 0
         expected_cache_files = set()
+        for item in reused_index_items:
+            for cache_path in anima_cache_paths_for_index_item(item):
+                expected_cache_files.add(Path(cache_path).resolve())
+            index_data.append(item)
+
         for m in expanded_results:
             caption_variants = m.get("caption_variants") or {"txt": m["caption"]}
             item_caption_types = tuple(key for key in active_caption_types if key in caption_variants)
@@ -983,7 +1034,7 @@ class AnimaCachedDataset(Dataset):
             raise ValueError("No cached Anima DiT files found.")
 
         combined = list(zip(self.items, self.bucket_keys))
-        random.shuffle(combined)
+        random.Random(self.seed).shuffle(combined)
         self.items, self.bucket_keys = zip(*combined)
         self.items = list(self.items)
         self.bucket_keys = list(self.bucket_keys)
@@ -1435,6 +1486,12 @@ def run_anima_dit_training(config):
         pin_memory=True,
         collate_fn=anima_collate_fn,
     )
+    resume_batch_index = 0
+    if is_resuming and len(dataloader) > 0:
+        resume_batch_index = micro_step % len(dataloader)
+        if resume_batch_index > 0 and hasattr(batch_sampler, "set_start_batch_index"):
+            batch_sampler.set_start_batch_index(resume_batch_index)
+            print(f"INFO: Fast-forwarding Anima dataloader to batch {resume_batch_index} without loading skipped cache items.")
 
     total_scheduler_timesteps = len(pipe.scheduler.timesteps)
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
@@ -1461,7 +1518,11 @@ def run_anima_dit_training(config):
     last_optim_step_log_time = time.time()
     optimizer.zero_grad(set_to_none=True)
     dataloader_iter = iter(dataloader)
-    batches_to_skip = micro_step % len(dataloader) if is_resuming and len(dataloader) > 0 else 0
+    batches_to_skip = (
+        resume_batch_index
+        if is_resuming and len(dataloader) > 0 and not hasattr(batch_sampler, "set_start_batch_index")
+        else 0
+    )
 
     while micro_step < config.MAX_TRAIN_STEPS:
         try:

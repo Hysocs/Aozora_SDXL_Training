@@ -498,10 +498,14 @@ class BucketBatchSampler(Sampler):
         self.seed = seed
         self.shuffle = shuffle
         self.epoch = 0
+        self.start_batch_index = 0
         self.total_images = len(self.dataset)
 
     def set_epoch(self, epoch):
         self.epoch = epoch
+
+    def set_start_batch_index(self, batch_index):
+        self.start_batch_index = max(0, int(batch_index or 0))
 
     def __iter__(self):
         g = torch.Generator()
@@ -554,6 +558,10 @@ class BucketBatchSampler(Sampler):
                     for key in sorted(bucket_batches)
                     for batch in bucket_batches[key]
                 ]
+
+        if self.start_batch_index > 0:
+            batches = batches[self.start_batch_index:]
+            self.start_batch_index = 0
 
         self.epoch += 1
         yield from batches
