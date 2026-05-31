@@ -124,16 +124,12 @@
         "anima_resume_training": true,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
-                "repeats": 2
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\e621 Artists",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
-                "repeats": 2
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "repeats": 1
             }
         ],
         "anima_caching_batch_size": 1,
@@ -258,8 +254,8 @@
         "anima_text_encoder_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/TextEncoders/qwen_3_06b_base.safetensors",
         "anima_qwen_tokenizer": "C:/Users/Administrator/.cache/huggingface/Qwen/Qwen3-0.6B",
         "anima_t5xxl_tokenizer": "C:/Users/Administrator/.cache/huggingface/google/t5-v1_1-xxl",
-        "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/anima_baseV10_step_1946_step_4004_step_5624.safetensors",
-        "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_5624.pt",
+        "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/anima_baseV10_step_1946_step_4004_step_5624_step_7556_step_9541.safetensors",
+        "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_9541.pt",
         "anima_dit_exclude_targets": "llm_adapter.*",
         "anima_use_gradient_checkpointing": true,
         "anima_use_gradient_checkpointing_offload": false,
