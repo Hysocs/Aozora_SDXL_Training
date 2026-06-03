@@ -12,7 +12,7 @@ import importlib.util
 from pathlib import Path
 from collections import deque
 from datetime import datetime
-from itertools import islice
+from bisect import bisect_left, bisect_right
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
@@ -842,7 +842,6 @@ class GraphPanel(QtWidgets.QWidget):
         super().__init__(parent)
         self.title = title
         self.y_label = y_label
-        self.smoothing_window_size = 15
         self.lines = []
         self.padding = {'top': 35, 'bottom': 40, 'left': 70, 'right': 20}
         self.bg_color = QtGui.QColor(PANEL_BG)
@@ -852,11 +851,27 @@ class GraphPanel(QtWidgets.QWidget):
         self.title_color = QtGui.QColor(ACCENT)
         self.x_min, self.x_max = 0, 100
         self.y_min, self.y_max = 0, 1
-        self.smoothing_level = 0.0
+        self.data_x_min, self.data_x_max = 0, 100
         self.fill_enabled = True
-        self.zoom_level = 1.0
-        self.pan_offset = 0
+        self.view_x_min = None
+        self.view_x_max = None
+        self.render_x_min = None
+        self.render_x_max = None
+        self.target_y_min = 0
+        self.target_y_max = 1
+        self.render_y_min = None
+        self.render_y_max = None
+        self.drag_start_pos = None
+        self.drag_start_range = None
+        self.hover_point = None
         self._dirty_bounds = True
+        self.anim_timer = QtCore.QTimer(self)
+        self.anim_timer.timeout.connect(self._animate_view)
+        self.repaint_timer = QtCore.QTimer(self)
+        self.repaint_timer.setSingleShot(True)
+        self.repaint_timer.timeout.connect(self.update)
+        self.setMouseTracking(True)
+        self.setMinimumHeight(220)
 
     def _graph_rect(self):
         return QtCore.QRect(self.padding['left'], self.padding['top'],
@@ -865,9 +880,10 @@ class GraphPanel(QtWidgets.QWidget):
 
     def add_line(self, color, label, max_points=2000, linewidth=2):
         self.lines.append({
-            'data': deque(maxlen=max_points),
-            'smoothed_data': deque(maxlen=max_points),
-            'smoothing_window': deque(maxlen=self.smoothing_window_size),
+            'data': [],
+            'x_values': [],
+            'max_points': max_points,
+            'version': 0,
             'color': QtGui.QColor(color),
             'label': label,
             'linewidth': linewidth,
@@ -877,39 +893,116 @@ class GraphPanel(QtWidgets.QWidget):
     def append_data(self, line_index, x, y):
         if 0 <= line_index < len(self.lines):
             line = self.lines[line_index]
-            line['data'].append((x, y))
-            line['smoothing_window'].append(y)
-            line['smoothed_data'].append((x, sum(line['smoothing_window']) / len(line['smoothing_window'])))
+            if line['x_values'] and x <= line['x_values'][-1]:
+                pos = bisect_left(line['x_values'], x)
+                if pos < len(line['x_values']) and line['x_values'][pos] == x:
+                    line['data'][pos] = (x, y)
+                else:
+                    line['data'].insert(pos, (x, y))
+                    line['x_values'].insert(pos, x)
+            else:
+                line['data'].append((x, y))
+                line['x_values'].append(x)
+            line['version'] += 1
+            if len(line['data']) > line['max_points']:
+                self._compact_line(line)
+            self._refresh_data_range()
+            self._fit_full_range(False)
             self._dirty_bounds = True
+            self._schedule_repaint()
 
     def clear_all_data(self):
         for line in self.lines:
-            line['data'].clear(); line['smoothed_data'].clear(); line['smoothing_window'].clear()
-        self.pan_offset = 0
+            line['data'].clear()
+            line['x_values'].clear()
+            line['version'] += 1
+        self.view_x_min = None
+        self.view_x_max = None
+        self.render_x_min = None
+        self.render_x_max = None
+        self.render_y_min = None
+        self.render_y_max = None
+        self.hover_point = None
         self._dirty_bounds = True
         self._update_bounds()
         self.update()
 
-    def _get_visible_range(self, data_deque):
-        if not data_deque: return 0, 0
-        total = len(data_deque)
-        visible = max(2, int(total / self.zoom_level))
-        end = min(self.pan_offset + visible, total)
-        return self.pan_offset, end
+    def _refresh_data_range(self):
+        firsts = [line['data'][0][0] for line in self.lines if line['data']]
+        lasts = [line['data'][-1][0] for line in self.lines if line['data']]
+        if not firsts or not lasts:
+            self.data_x_min, self.data_x_max = 0, 100
+            self.view_x_min, self.view_x_max = None, None
+            return
+        self.data_x_min = min(firsts)
+        self.data_x_max = max(lasts)
+        if self.data_x_min == self.data_x_max:
+            self.data_x_max = self.data_x_min + 1
 
-    def _get_visible_slice(self, data_deque):
-        if not data_deque: return []
-        start, end = self._get_visible_range(data_deque)
-        return list(islice(data_deque, start, end))
+    def _fit_full_range(self, animate=True):
+        self.view_x_min = self.data_x_min
+        self.view_x_max = self.data_x_max
+        if not animate:
+            self.render_x_min = self.view_x_min
+            self.render_x_max = self.view_x_max
+            self.render_y_min = None
+            self.render_y_max = None
+        self._dirty_bounds = True
+        if animate:
+            self._start_view_animation()
 
-    def _sample_visible_pairs(self, raw, smoothed, max_points):
-        count = min(len(raw), len(smoothed))
+    def _compact_line(self, line):
+        data = line['data']
+        target = max(256, line['max_points'] // 2)
+        if len(data) <= target:
+            return
+        bucket_count = max(2, (target - 2) // 2)
+        middle = data[1:-1]
+        bucket_size = len(middle) / bucket_count
+        compacted = [data[0]]
+        for bucket in range(bucket_count):
+            start = int(bucket * bucket_size)
+            end = int((bucket + 1) * bucket_size)
+            if bucket == bucket_count - 1:
+                end = len(middle)
+            segment = middle[start:end]
+            if not segment:
+                continue
+            min_i = min(range(len(segment)), key=lambda i: segment[i][1])
+            max_i = max(range(len(segment)), key=lambda i: segment[i][1])
+            for local_i in sorted({min_i, max_i}):
+                compacted.append(segment[local_i])
+        compacted.append(data[-1])
+        line['data'] = compacted
+        line['x_values'] = [x for x, _ in compacted]
+        line['version'] += 1
+
+    def _get_visible_slice(self, line):
+        data = line['data']
+        if not data: return []
+        view_min = self.x_min
+        view_max = self.x_max
+        if len(data) <= 2:
+            return data[:]
+        x_values = line['x_values']
+        start = bisect_left(x_values, view_min)
+        end = bisect_right(x_values, view_max)
+        start = max(0, start - 1)
+        end = min(len(data), end + 1)
+        if start >= end:
+            if start >= len(data):
+                return data[-1:]
+            return data[start:start + 1]
+        return data[start:end]
+
+    def _sample_visible_points(self, raw, max_points):
+        count = len(raw)
         if count <= max_points:
-            return raw[:count], smoothed[:count]
+            return raw[:count]
 
         bucket_count = max(2, max_points // 2)
         bucket_size = count / bucket_count
-        sampled_raw, sampled_smoothed = [], []
+        sampled = []
 
         for bucket in range(bucket_count):
             start = int(bucket * bucket_size)
@@ -925,66 +1018,39 @@ class GraphPanel(QtWidgets.QWidget):
             min_i = min(range(len(segment)), key=lambda i: segment[i][1])
             max_i = max(range(len(segment)), key=lambda i: segment[i][1])
             for local_i in sorted({min_i, max_i}):
-                idx = start + local_i
-                sampled_raw.append(raw[idx])
-                sampled_smoothed.append(smoothed[idx])
+                sampled.append(raw[start + local_i])
 
-        return sampled_raw, sampled_smoothed
-
-    def _make_screen_bins(self, raw, smoothed, rect):
-        count = min(len(raw), len(smoothed))
-        if count < 2:
-            return []
-
-        x_span = self.x_max - self.x_min or 1
-        pixel_bins = {}
-        for i in range(count):
-            x = raw[i][0]
-            y = raw[i][1] * (1 - self.smoothing_level) + smoothed[i][1] * self.smoothing_level
-            px = int(rect.left() + ((x - self.x_min) / x_span) * rect.width())
-            if px < rect.left() or px > rect.right():
-                continue
-            bucket = pixel_bins.get(px)
-            if bucket is None:
-                pixel_bins[px] = [x, y, y, y, 1]
-            else:
-                bucket[0] = x
-                bucket[1] = min(bucket[1], y)
-                bucket[2] = max(bucket[2], y)
-                bucket[3] += y
-                bucket[4] += 1
-
-        mean_points = []
-        for px in sorted(pixel_bins):
-            x, _y_min, _y_max, y_sum, n = pixel_bins[px]
-            x_screen = float(px)
-            mean_points.append(QtCore.QPointF(x_screen, self._to_screen(x, y_sum / n).y()))
-        return mean_points
+        return sampled
 
     def _update_bounds(self):
         all_y, all_x = [], []
+        target_x_min = self.view_x_min if self.view_x_min is not None else self.data_x_min
+        target_x_max = self.view_x_max if self.view_x_max is not None else self.data_x_max
+        if self.render_x_min is None or self.render_x_max is None:
+            self.render_x_min, self.render_x_max = target_x_min, target_x_max
+        self.x_min, self.x_max = self.render_x_min, self.render_x_max
         for line in self.lines:
-            raw = self._get_visible_slice(line['data'])
-            smo = self._get_visible_slice(line['smoothed_data'])
-            count = min(len(raw), len(smo))
-            if count:
-                all_x.extend(raw[i][0] for i in range(count))
-                all_y.extend(
-                    raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level
-                    for i in range(count)
-                )
+            raw = self._get_visible_slice(line)
+            if raw:
+                all_x.extend(x for x, _ in raw)
+                all_y.extend(y for _, y in raw)
         if all_x:
-            self.x_min = min(all_x)
-            self.x_max = max(all_x)
+            self.x_min = self.render_x_min
+            self.x_max = self.render_x_max
+            if self.x_min == self.x_max:
+                self.x_max = self.x_min + 1
             if all_y:
                 yr = max(all_y) - min(all_y) or 1
-                self.y_min = min(all_y) - yr * 0.05
-                self.y_max = max(all_y) + yr * 0.05
+                self.target_y_min = min(all_y) - yr * 0.08
+                self.target_y_max = max(all_y) + yr * 0.08
             else:
-                self.y_min, self.y_max = 0, 1
+                self.target_y_min, self.target_y_max = 0, 1
         else:
             self.x_min, self.x_max = 0, 100
-            self.y_min, self.y_max = 0, 1
+            self.target_y_min, self.target_y_max = 0, 1
+        if self.render_y_min is None or self.render_y_max is None:
+            self.render_y_min, self.render_y_max = self.target_y_min, self.target_y_max
+        self.y_min, self.y_max = self.render_y_min, self.render_y_max
         self._dirty_bounds = False
 
     def _to_screen(self, x, y):
@@ -995,6 +1061,11 @@ class GraphPanel(QtWidgets.QWidget):
         sx = self.padding['left'] + ((x - self.x_min) / xr) * gw
         sy = self.padding['top'] + gh - ((y - self.y_min) / yr) * gh
         return QtCore.QPointF(sx, sy)
+
+    def _from_screen_x(self, px):
+        gr = self._graph_rect()
+        xr = self.x_max - self.x_min or 1
+        return self.x_min + ((px - gr.left()) / max(1, gr.width())) * xr
 
     def paintEvent(self, event):
         if self._dirty_bounds:
@@ -1008,6 +1079,7 @@ class GraphPanel(QtWidgets.QWidget):
         self._draw_lines(painter, gr)
         self._draw_title(painter)
         self._draw_legend(painter)
+        self._draw_hover(painter, gr)
 
     def _draw_grid(self, painter, rect):
         painter.setPen(QtGui.QPen(self.grid_color, 1))
@@ -1039,29 +1111,39 @@ class GraphPanel(QtWidgets.QWidget):
                          QtCore.Qt.AlignmentFlag.AlignCenter, "Step")
 
     def _draw_lines(self, painter, rect):
-        max_points = max(64, rect.width() * 2)
+        painter.save()
+        painter.setClipRect(rect)
+        max_points = max(128, rect.width() * 2)
         for line in self.lines:
-            raw = self._get_visible_slice(line['data'])
-            smo = self._get_visible_slice(line['smoothed_data'])
-            if len(raw) < 2 or len(raw) != len(smo): continue
-            dense_view = len(raw) > max_points
-            if dense_view:
-                pts = self._make_screen_bins(raw, smo, rect)
-            else:
-                raw, smo = self._sample_visible_pairs(raw, smo, max_points)
-                pts = [self._to_screen(raw[i][0], raw[i][1] * (1 - self.smoothing_level) + smo[i][1] * self.smoothing_level)
-                       for i in range(len(raw))]
+            raw = self._get_visible_slice(line)
+            if len(raw) < 2: continue
+            sampled = self._sample_visible_points(raw, max_points)
+            pts = [self._to_screen(x, y) for x, y in sampled]
             if len(pts) < 2:
                 continue
             if self.fill_enabled:
                 poly = QtGui.QPolygonF(pts)
                 poly.append(QtCore.QPointF(pts[-1].x(), rect.bottom()))
                 poly.append(QtCore.QPointF(pts[0].x(), rect.bottom()))
-                fc = QtGui.QColor(line['color']); fc.setAlpha(18 if dense_view else 40)
+                fc = QtGui.QColor(line['color']); fc.setAlpha(self._fill_alpha(len(raw)))
                 painter.setBrush(fc); painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawPolygon(poly)
-            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
+            width = self._line_width(line)
+            painter.setPen(QtGui.QPen(line['color'], width))
             painter.drawPolyline(QtGui.QPolygonF(pts))
+        painter.restore()
+
+    def _line_width(self, line):
+        count = len(line['data'])
+        extra = min(1.4, math.log10(max(1, count)) * 0.25)
+        return line['linewidth'] + extra
+
+    def _fill_alpha(self, visible_count):
+        if visible_count <= 16:
+            return 64
+        if visible_count <= 128:
+            return 52
+        return 38
 
     def _draw_title(self, painter):
         painter.setPen(self.title_color)
@@ -1074,53 +1156,181 @@ class GraphPanel(QtWidgets.QWidget):
         f = painter.font(); f.setPixelSize(11); painter.setFont(f)
         for line in self.lines:
             if not line['data']: continue
-            painter.setPen(QtGui.QPen(line['color'], line['linewidth']))
+            painter.setPen(QtGui.QPen(line['color'], self._line_width(line)))
             painter.drawLine(lx, ly + 5, lx + 20, ly + 5)
             painter.setPen(self.text_color)
             painter.drawText(QtCore.QRect(lx + 25, ly, 80, 15),
                              QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, line['label'])
             ly += 20
 
+    def _draw_hover(self, painter, rect):
+        if not self.hover_point:
+            return
+        line, x, y, pt = self.hover_point
+        hc = QtGui.QColor(line['color'])
+        painter.setPen(QtGui.QPen(hc, 1))
+        painter.drawLine(QtCore.QPointF(pt.x(), rect.top()), QtCore.QPointF(pt.x(), rect.bottom()))
+        painter.drawLine(QtCore.QPointF(rect.left(), pt.y()), QtCore.QPointF(rect.right(), pt.y()))
+        painter.setBrush(hc)
+        painter.drawEllipse(pt, 4, 4)
+        text = f"{line['label']}  Step {int(x)}  {self._fmt(y)}"
+        fm = painter.fontMetrics()
+        w = fm.horizontalAdvance(text) + 16
+        h = 24
+        tx = min(max(rect.left() + 6, int(pt.x()) + 10), rect.right() - w - 6)
+        ty = max(rect.top() + 6, int(pt.y()) - h - 10)
+        box = QtCore.QRect(tx, ty, w, h)
+        painter.setPen(QtGui.QPen(self.grid_color, 1))
+        painter.setBrush(self.bg_color)
+        painter.drawRoundedRect(box, 4, 4)
+        painter.setPen(self.text_color)
+        painter.drawText(box.adjusted(8, 0, -8, 0), QtCore.Qt.AlignmentFlag.AlignVCenter, text)
+
     def _fmt(self, v):
         if abs(v) < 0.01 or abs(v) > 10000: return f"{v:.1e}"
         if abs(v) < 1: return f"{v:.4f}"
         return f"{v:.2f}"
 
-    def set_smoothing(self, v):
-        self.smoothing_level = v / 100.0
-        self._dirty_bounds = True
-        self.update()
     def set_fill(self, e): self.fill_enabled = e; self.update()
-    def set_zoom(self, v):
-        new_zoom = v / 100.0
-        if math.isclose(self.zoom_level, new_zoom):
-            return
-        self.zoom_level = new_zoom
-        self._dirty_bounds = True
-        self.update()
 
-    def set_pan(self, v):
-        if self.pan_offset == v:
+    def wheelEvent(self, event):
+        gr = self._graph_rect()
+        if not gr.contains(event.position().toPoint()):
+            event.ignore()
             return
-        self.pan_offset = v
+        if self.view_x_min is None or self.view_x_max is None:
+            self._fit_full_range()
+        steps = max(-4, min(4, event.angleDelta().y() / 120))
+        factor = 0.94 ** steps
+        center = self._from_screen_x(event.position().x())
+        span = max(1e-9, (self.view_x_max - self.view_x_min) * factor)
+        full_span = max(1e-9, self.data_x_max - self.data_x_min)
+        min_span = max(1, full_span / 1000000)
+        span = max(min_span, min(span, full_span))
+        rel = (center - self.view_x_min) / max(1e-9, self.view_x_max - self.view_x_min)
+        self.view_x_min = center - span * rel
+        self.view_x_max = self.view_x_min + span
+        self._clamp_view()
         self._dirty_bounds = True
-        self.update()
+        self._start_view_animation()
+        event.accept()
 
-    def get_pan_range(self):
-        if not self.lines or not self.lines[0]['data']: return 0, 0, 1
-        total = len(self.lines[0]['data'])
-        visible = max(2, int(total / self.zoom_level))
-        return 0, max(0, total - visible), 1
+    def mousePressEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton and self._graph_rect().contains(event.position().toPoint()):
+            self.drag_start_pos = event.position()
+            self.drag_start_range = (self.view_x_min, self.view_x_max)
+            self.setCursor(QtCore.Qt.CursorShape.ClosedHandCursor)
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        if self.drag_start_pos is not None and self.drag_start_range[0] is not None:
+            dx = event.position().x() - self.drag_start_pos.x()
+            span = self.drag_start_range[1] - self.drag_start_range[0]
+            shift = -dx / max(1, self._graph_rect().width()) * span
+            self.view_x_min = self.drag_start_range[0] + shift
+            self.view_x_max = self.drag_start_range[1] + shift
+            self._clamp_view()
+            self._dirty_bounds = True
+            self._start_view_animation()
+            event.accept()
+            return
+        self.hover_point = self._nearest_point(event.position())
+        self._schedule_repaint()
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == QtCore.Qt.MouseButton.LeftButton:
+            self.drag_start_pos = None
+            self.drag_start_range = None
+            self.setCursor(QtCore.Qt.CursorShape.ArrowCursor)
+            event.accept()
+
+    def leaveEvent(self, event):
+        self.hover_point = None
+        self._schedule_repaint()
+
+    def _nearest_point(self, pos):
+        gr = self._graph_rect()
+        if not gr.contains(pos.toPoint()):
+            return None
+        nearest = None
+        nearest_dist = 12 * 12
+        for line in self.lines:
+            for x, y in self._get_visible_slice(line):
+                pt = self._to_screen(x, y)
+                dist = (pt.x() - pos.x()) ** 2 + (pt.y() - pos.y()) ** 2
+                if dist < nearest_dist:
+                    nearest = (line, x, y, pt)
+                    nearest_dist = dist
+        return nearest
+
+    def _clamp_view(self):
+        if self.view_x_min is None or self.view_x_max is None:
+            return
+        span = self.view_x_max - self.view_x_min
+        full_span = self.data_x_max - self.data_x_min
+        if span >= full_span:
+            self.view_x_min = self.data_x_min
+            self.view_x_max = self.data_x_max
+        elif self.view_x_min < self.data_x_min:
+            self.view_x_min = self.data_x_min
+            self.view_x_max = self.data_x_min + span
+        elif self.view_x_max > self.data_x_max:
+            self.view_x_max = self.data_x_max
+            self.view_x_min = self.data_x_max - span
+
+    def _start_view_animation(self):
+        if self.render_x_min is None or self.render_x_max is None:
+            self.render_x_min = self.view_x_min
+            self.render_x_max = self.view_x_max
+        if not self.anim_timer.isActive():
+            self.anim_timer.start(16)
+        self._schedule_repaint()
+
+    def _animate_view(self):
+        if self.view_x_min is None or self.view_x_max is None:
+            self.anim_timer.stop()
+            return
+        if self.render_x_min is None or self.render_x_max is None:
+            self.render_x_min, self.render_x_max = self.view_x_min, self.view_x_max
+        self._dirty_bounds = True
+        self._update_bounds()
+        targets = [
+            (self.render_x_min, self.view_x_min),
+            (self.render_x_max, self.view_x_max),
+            (self.render_y_min, self.target_y_min),
+            (self.render_y_max, self.target_y_max),
+        ]
+        done = True
+        next_values = []
+        for current, target in targets:
+            if current is None:
+                current = target
+            delta = target - current
+            scale = max(1.0, abs(target))
+            if abs(delta) > scale * 0.001:
+                done = False
+            next_values.append(current + delta * 0.28)
+        self.render_x_min, self.render_x_max, self.render_y_min, self.render_y_max = next_values
+        if done:
+            self.render_x_min, self.render_x_max = self.view_x_min, self.view_x_max
+            self.render_y_min, self.render_y_max = self.target_y_min, self.target_y_max
+            self.anim_timer.stop()
+        self._dirty_bounds = True
+        self._schedule_repaint()
+
+    def _schedule_repaint(self):
+        if not self.repaint_timer.isActive():
+            self.repaint_timer.start(0)
 
 
 class LiveMetricsWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.max_points = 200000
+        self.max_points = 60000
         self.pending_update = False
-        self.update_timer = QtCore.QTimer()
+        self.update_timer = QtCore.QTimer(self)
+        self.update_timer.setSingleShot(True)
         self.update_timer.timeout.connect(self._perform_update)
-        self.update_interval_ms = 500
         self.pending_data = deque()
         self.max_pending_per_tick = 2000
         self.graphs = {}
@@ -1138,40 +1348,9 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         fill_chk.setChecked(True)
         fill_chk.stateChanged.connect(lambda s, g=graph: g.set_fill(s == QtCore.Qt.CheckState.Checked.value))
         ctrl.addWidget(fill_chk)
-        ctrl.addWidget(make_label("Smooth:"))
-        smooth_sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        smooth_sl.setRange(0, 100)
-        smooth_sl.valueChanged.connect(graph.set_smoothing)
-        ctrl.addWidget(smooth_sl, 1)
-        ctrl.addWidget(make_label("Zoom:"))
-        zoom_sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
-        zoom_sl.setRange(100, 1000)
-        zoom_sl.setValue(100)
-        ctrl.addWidget(zoom_sl, 1)
+        ctrl.addStretch()
         lay.addLayout(ctrl)
-
-        pan_sb = QtWidgets.QScrollBar(QtCore.Qt.Orientation.Horizontal)
-        pan_sb.setVisible(False)
-        pan_sb.valueChanged.connect(graph.set_pan)
-        lay.addWidget(pan_sb)
-        zoom_sl.valueChanged.connect(lambda v, g=graph, sb=pan_sb: self._sync_pan(g, sb, v))
-
-        self.graphs[name]['scrollbar'] = pan_sb
-        self.graphs[name]['zoom_slider'] = zoom_sl
         return gb
-
-    def _sync_pan(self, graph, scrollbar, zoom_value):
-        graph.set_zoom(zoom_value)
-        mn, mx, step = graph.get_pan_range()
-        scrollbar.blockSignals(True)
-        scrollbar.setRange(mn, mx)
-        scrollbar.setPageStep(step)
-        if scrollbar.value() > mx: scrollbar.setValue(mx)
-        scrollbar.blockSignals(False)
-        scrollbar.setVisible(zoom_value > 100)
-        graph.set_pan(scrollbar.value())
-        if graph._dirty_bounds:
-            graph.update()
 
     def _add_line(self, graph_name, line_name, color, linewidth=2):
         g = self.graphs[graph_name]
@@ -1186,12 +1365,9 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.clear_btn = make_btn("Clear Data", self.clear_data)
         self.pause_btn = QtWidgets.QPushButton("Pause Updates")
         self.pause_btn.setCheckable(True)
-        self.pause_btn.toggled.connect(lambda c: self.update_timer.stop() if c else (self.update_timer.start(self.update_interval_ms) if self.pending_update else None))
-        self.speed_combo = make_combo(["Fast (100ms)", "Normal (500ms)", "Slow (1000ms)", "Very Slow (2000ms)"])
-        self.speed_combo.setCurrentIndex(1)
-        self.speed_combo.currentIndexChanged.connect(self._on_speed_changed)
+        self.pause_btn.toggled.connect(self._on_pause_toggled)
         self.stats_label = make_label("No data yet", color=ACCENT2, bold=True)
-        for w in [self.clear_btn, self.pause_btn, make_label("Speed:"), self.speed_combo, None, self.stats_label]:
+        for w in [self.clear_btn, self.pause_btn, None, self.stats_label]:
             (ctrl.addStretch() if w is None else ctrl.addWidget(w))
         main.addLayout(ctrl)
 
@@ -1220,10 +1396,11 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
 
-    def _on_speed_changed(self, i):
-        self.update_interval_ms = [100, 500, 1000, 2000][i]
-        if self.update_timer.isActive():
-            self.update_timer.stop(); self.update_timer.start(self.update_interval_ms)
+    def _on_pause_toggled(self, paused):
+        if paused:
+            self.update_timer.stop()
+        elif self.pending_update:
+            self._queue_update()
 
     def parse_and_update(self, text):
         if self.pause_btn.isChecked(): return
@@ -1247,8 +1424,11 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             added = True
         if added:
             self.pending_update = True
-            if not self.update_timer.isActive() and not self.pause_btn.isChecked():
-                self.update_timer.start(self.update_interval_ms)
+            self._queue_update()
+
+    def _queue_update(self):
+        if not self.pause_btn.isChecked() and not self.update_timer.isActive():
+            self.update_timer.start(0)
 
     def _perform_update(self):
         if not self.pending_update or not self.pending_data:
@@ -1277,19 +1457,16 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             f"Step: {self.latest_global_step} | Loss: {self.latest_step_loss:.4f} | "
             f"Timestep: {self.latest_timestep} | Avg Loss: {self.latest_optim_loss:.4f} | "
             f"LR: {self.latest_lr:.2e} | Grad: {self.latest_grad:.4f}")
-        for name, gd in self.graphs.items():
-            self._sync_pan(gd['widget'], gd['scrollbar'], gd['zoom_slider'].value())
         self.pending_update = bool(self.pending_data)
-        if not self.pending_update:
-            self.update_timer.stop()
+        if self.pending_update:
+            self._queue_update()
 
     def clear_data(self):
         self.update_timer.stop()
         self.pending_update = False
         self.pending_data.clear()
-        for name, gd in self.graphs.items():
+        for gd in self.graphs.values():
             gd['widget'].clear_all_data()
-            self._sync_pan(gd['widget'], gd['scrollbar'], gd['zoom_slider'].value())
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
         self.stats_label.setText("No data yet")
@@ -1297,7 +1474,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
     def showEvent(self, e):
         super().showEvent(e)
         if self.pending_update and not self.pause_btn.isChecked():
-            self.update_timer.start(self.update_interval_ms)
+            self._queue_update()
 
     def hideEvent(self, e):
         super().hideEvent(e)
@@ -2259,10 +2436,12 @@ UI_DEFS = {
     "DIT_EXCLUDE_TARGETS":         ("Exclude DiT Layers", "Keywords or fnmatch patterns for DiT layers to exclude.", "textedit", 100),
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
+    "TIMESTEP_FORCE_IMAGE_BIN_SPREAD": ("Force Image-Bin Spread", "Avoid assigning the same image to the same active timestep bin again until it has covered every active bin.", "check"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
     "USE_GRADIENT_CHECKPOINTING":  ("DiT Gradient Checkpointing", "Use DiT gradient checkpointing when supported by the model.", "check"),
     "USE_GRADIENT_CHECKPOINTING_OFFLOAD": ("DiT Checkpoint Offload", "Offload DiT checkpoint activations when supported.", "check"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
+    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": ("Use Anima Bell Loss Weight", "Multiply Anima MSE by DiffSynth's built-in bell-shaped timestep loss weight.", "check"),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
@@ -2521,6 +2700,14 @@ class TrainingGUI(QtWidgets.QWidget):
         if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
             self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].setEnabled(True)
             self._update_text_conditioning_scale_controls()
+        if "ANIMA_USE_TIMESTEP_LOSS_WEIGHT" in self.widgets:
+            w = self.widgets["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"]
+            w.setEnabled(is_dit)
+            w.setToolTip(
+                UI_DEFS["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"][1]
+                if is_dit else
+                "Only applies to Anima DiT training. SDXL loss uses LOSS_TYPE instead."
+            )
 
         if not is_dit:
             self._update_vae_normalization_controls()
@@ -3244,7 +3431,7 @@ class TrainingGUI(QtWidgets.QWidget):
         return gb
 
     def _build_loss_group(self):
-        return self._vertical_form_group("Loss Configuration", ["LOSS_TYPE"])
+        return self._vertical_form_group("Loss Configuration", ["LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT"])
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -3389,6 +3576,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
         self.timestep_histogram.allocationChanged.connect(lambda _: self._sync_widget("TIMESTEP_ALLOCATION"))
         lay.addWidget(self.timestep_histogram)
+        self._add_vertical_widget_key(lay, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD")
 
         r1 = QtWidgets.QHBoxLayout()
         r1.addWidget(make_label("Bin Size:"))

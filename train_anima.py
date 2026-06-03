@@ -1099,6 +1099,7 @@ class AnimaCachedDataset(Dataset):
                 "t5xxl_ids": data_te["t5xxl_ids"],
                 "target_size": item["target_size"],
                 "latent_path": lat_path,
+                "image_key": item.get("relative_path", lat_path),
             }
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
@@ -1138,6 +1139,7 @@ def anima_collate_fn(batch):
         "t5xxl_ids": torch.stack(t5_ids),
         "target_size": [item["target_size"] for item in batch],
         "latent_path": [item["latent_path"] for item in batch],
+        "image_key": [item["image_key"] for item in batch],
     }
 
 
@@ -1169,6 +1171,11 @@ class AnimaTimestepSampler:
         self.total_timestep_count = total_timestep_count
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
+        self.force_image_bin_spread = bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False))
+        self.rng = np.random.Generator(np.random.PCG64(self.seed + 7919))
+        self.image_bin_history = defaultdict(set)
+        self.bin_ranges = []
+        self.bin_weights = []
         self.ticket_pool = self._build_ticket_pool(getattr(config, "TIMESTEP_ALLOCATION", None))
         self.pool_index = 0
 
@@ -1186,6 +1193,8 @@ class AnimaTimestepSampler:
         pool = []
         rng = np.random.Generator(np.random.PCG64(self.seed))
         scale_factor = self.total_timestep_count / 1000.0
+        self.bin_ranges = []
+        self.bin_weights = []
         for i, count in enumerate(counts):
             if count <= 0:
                 continue
@@ -1193,6 +1202,8 @@ class AnimaTimestepSampler:
             end_t = min(self.total_timestep_count, max(start_t + 1, int((i + 1) * bin_size * scale_factor)))
             if start_t >= self.total_timestep_count:
                 break
+            self.bin_ranges.append((start_t, end_t))
+            self.bin_weights.append(max(1, int(count)))
             pool.extend(rng.integers(start_t, end_t, size=max(1, int(count))).tolist())
 
         random.seed(self.seed)
@@ -1206,13 +1217,57 @@ class AnimaTimestepSampler:
     def set_current_step(self, micro_step):
         self.pool_index = (micro_step * self.config.BATCH_SIZE) % len(self.ticket_pool)
 
-    def sample(self, batch_size):
+    def _sample_from_pool(self):
+        if self.pool_index >= len(self.ticket_pool):
+            self.pool_index = 0
+        index = self.ticket_pool[self.pool_index]
+        self.pool_index += 1
+        return index
+
+    def _sample_for_image_key(self, image_key):
+        if not self.bin_ranges:
+            return self._sample_from_pool()
+
+        key = str(image_key)
+        used_bins = self.image_bin_history[key]
+        all_bins = list(range(len(self.bin_ranges)))
+        available_bins = [idx for idx in all_bins if idx not in used_bins]
+        if not available_bins:
+            used_bins.clear()
+            available_bins = all_bins
+
+        weights = np.array([self.bin_weights[idx] for idx in available_bins], dtype=np.float64)
+        weights = weights / weights.sum()
+        bin_idx = int(self.rng.choice(available_bins, p=weights))
+        used_bins.add(bin_idx)
+        start_t, end_t = self.bin_ranges[bin_idx]
+        return int(self.rng.integers(start_t, end_t))
+
+    def state_dict(self):
+        return {
+            "pool_index": self.pool_index,
+            "rng_state": self.rng.bit_generator.state,
+            "image_bin_history": {key: sorted(value) for key, value in self.image_bin_history.items()},
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return
+        self.pool_index = int(state.get("pool_index", self.pool_index)) % len(self.ticket_pool)
+        if state.get("rng_state"):
+            self.rng.bit_generator.state = state["rng_state"]
+        history = state.get("image_bin_history", {})
+        if isinstance(history, dict):
+            self.image_bin_history = defaultdict(set, {str(key): set(value) for key, value in history.items()})
+
+    def sample(self, batch_size, image_keys=None):
         indices = []
-        for _ in range(batch_size):
-            if self.pool_index >= len(self.ticket_pool):
-                self.pool_index = 0
-            indices.append(self.ticket_pool[self.pool_index])
-            self.pool_index += 1
+        if self.force_image_bin_spread and image_keys:
+            for image_key in image_keys:
+                indices.append(self._sample_for_image_key(image_key))
+        else:
+            for _ in range(batch_size):
+                indices.append(self._sample_from_pool())
         return torch.tensor(indices, dtype=torch.long), indices[0]
 
 
@@ -1355,6 +1410,7 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
         "optimizer_state": optim_state,
         "sampler_seed": sampler.seed,
         "sampler_pool_index": sampler.pool_index,
+        "timestep_sampler_state": sampler.state_dict() if hasattr(sampler, "state_dict") else None,
         "batch_sampler_epoch": max(batch_sampler.epoch - 1, 0) if batch_sampler is not None else 0,
         "random_state": random.getstate(),
         "numpy_state": np.random.get_state(),
@@ -1397,6 +1453,10 @@ def weighted_flowmatch_mse(model_pred, training_target, weights):
     return (per_sample_loss * weights.float()).mean()
 
 
+def flowmatch_mse(model_pred, training_target):
+    return (model_pred.float() - training_target.float()).pow(2).mean()
+
+
 
 def run_anima_dit_training(config):
     normalize_anima_config(config)
@@ -1420,6 +1480,7 @@ def run_anima_dit_training(config):
     micro_step = optimizer_step = 0
     optimizer_state = None
     saved_sampler_pool_index = None
+    saved_timestep_sampler_state = None
     saved_noise_generator_state = None
     saved_batch_sampler_epoch = 0
     if is_resuming:
@@ -1429,6 +1490,7 @@ def run_anima_dit_training(config):
         optimizer_step = micro_step // config.GRADIENT_ACCUMULATION_STEPS
         optimizer_state = training_state.get("optimizer_state")
         saved_sampler_pool_index = training_state.get("sampler_pool_index")
+        saved_timestep_sampler_state = training_state.get("timestep_sampler_state")
         saved_noise_generator_state = training_state.get("noise_generator_state")
         saved_batch_sampler_epoch = training_state.get("batch_sampler_epoch", 0)
         config.DIT_PATH = config.ANIMA_RESUME_MODEL_PATH
@@ -1495,7 +1557,9 @@ def run_anima_dit_training(config):
 
     total_scheduler_timesteps = len(pipe.scheduler.timesteps)
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
-    if saved_sampler_pool_index is not None:
+    if saved_timestep_sampler_state is not None:
+        timestep_sampler.load_state_dict(saved_timestep_sampler_state)
+    elif saved_sampler_pool_index is not None:
         timestep_sampler.pool_index = int(saved_sampler_pool_index) % len(timestep_sampler.ticket_pool)
     elif micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
@@ -1543,7 +1607,7 @@ def run_anima_dit_training(config):
         t5xxl_ids = batch["t5xxl_ids"].to(device=device, non_blocking=True)
 
         batch_size = input_latents.shape[0]
-        timestep_indices, timestep_str = timestep_sampler.sample(batch_size)
+        timestep_indices, timestep_str = timestep_sampler.sample(batch_size, batch.get("image_key"))
         timestep_indices = timestep_indices.to(device=device)
         timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
         sigmas = scheduler_sigmas[timestep_indices]
@@ -1552,7 +1616,10 @@ def run_anima_dit_training(config):
 
         noisy_latents, training_target = flowmatch_noise_and_target(input_latents, noise, sigmas)
         model_pred = run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config)
-        loss = weighted_flowmatch_mse(model_pred, training_target, loss_weights)
+        if getattr(config, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", True):
+            loss = weighted_flowmatch_mse(model_pred, training_target, loss_weights)
+        else:
+            loss = flowmatch_mse(model_pred, training_target)
         raw_loss_value = loss.detach().float().item()
         (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 

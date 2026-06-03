@@ -1778,7 +1778,8 @@ class ImageTextLatentDataset(Dataset):
                 "scaled_sizes": item_data.get("scaled_size", item_data["original_size"]),
                 "target_sizes": item_data["target_size"],
                 "crop_coords": item_data.get("crop_coords", (0, 0)), 
-                "latent_path": path_te
+                "latent_path": path_te,
+                "image_key": item_data.get("relative_path", path_lat),
             }
 
             if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
@@ -1803,6 +1804,11 @@ class TimestepSampler:
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
         self.is_rectified_flow = config.is_rectified_flow
+        self.force_image_bin_spread = bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False))
+        self.rng = np.random.Generator(np.random.PCG64(self.seed + 7919))
+        self.image_bin_history = defaultdict(set)
+        self.bin_ranges = []
+        self.bin_weights = []
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
@@ -1819,11 +1825,15 @@ class TimestepSampler:
         scale_factor = (self.total_tickets_needed / self.config.BATCH_SIZE) / sum(counts) if sum(counts) > 0 else 1.0
         pool = []
         rng = np.random.Generator(np.random.PCG64(self.seed))
+        self.bin_ranges = []
+        self.bin_weights = []
         for i, count in enumerate(counts):
             if count <= 0: continue
             start_t = i * self.bin_size
             end_t = min(1000, (i + 1) * self.bin_size)
             if start_t >= 1000: break
+            self.bin_ranges.append((start_t, end_t))
+            self.bin_weights.append(max(1, int(count)))
             num_tickets = max(1, int(count * scale_factor * self.config.BATCH_SIZE))
             pool.extend(rng.integers(start_t, end_t, size=num_tickets).tolist())
 
@@ -1837,12 +1847,56 @@ class TimestepSampler:
     def set_current_step(self, micro_step):
         self.pool_index = (micro_step * self.config.BATCH_SIZE) % len(self.ticket_pool)
 
-    def sample(self, batch_size):
+    def _sample_from_pool(self):
+        if self.pool_index >= len(self.ticket_pool): self.pool_index = 0
+        index = self.ticket_pool[self.pool_index]
+        self.pool_index += 1
+        return index
+
+    def _sample_for_image_key(self, image_key):
+        if not self.bin_ranges:
+            return self._sample_from_pool()
+
+        key = str(image_key)
+        used_bins = self.image_bin_history[key]
+        all_bins = list(range(len(self.bin_ranges)))
+        available_bins = [idx for idx in all_bins if idx not in used_bins]
+        if not available_bins:
+            used_bins.clear()
+            available_bins = all_bins
+
+        weights = np.array([self.bin_weights[idx] for idx in available_bins], dtype=np.float64)
+        weights = weights / weights.sum()
+        bin_idx = int(self.rng.choice(available_bins, p=weights))
+        used_bins.add(bin_idx)
+        start_t, end_t = self.bin_ranges[bin_idx]
+        return int(self.rng.integers(start_t, end_t))
+
+    def state_dict(self):
+        return {
+            "pool_index": self.pool_index,
+            "rng_state": self.rng.bit_generator.state,
+            "image_bin_history": {key: sorted(value) for key, value in self.image_bin_history.items()},
+        }
+
+    def load_state_dict(self, state):
+        if not isinstance(state, dict):
+            return
+        self.pool_index = int(state.get("pool_index", self.pool_index)) % len(self.ticket_pool)
+        if state.get("rng_state"):
+            self.rng.bit_generator.state = state["rng_state"]
+        history = state.get("image_bin_history", {})
+        if isinstance(history, dict):
+            self.image_bin_history = defaultdict(set, {str(key): set(value) for key, value in history.items()})
+
+    def sample(self, batch_size, image_keys=None):
         indices = []
-        for _ in range(batch_size):
-            if self.pool_index >= len(self.ticket_pool): self.pool_index = 0
-            indices.append(self.ticket_pool[self.pool_index])
-            self.pool_index += 1
+        if self.force_image_bin_spread and image_keys:
+            for image_key in image_keys:
+                indices.append(self._sample_for_image_key(image_key))
+        else:
+            for _ in range(batch_size):
+                indices.append(self._sample_from_pool())
         return torch.tensor(indices, dtype=torch.long, device=self.device), indices[0]
 
     def update(self, raw_grad_norm): pass
@@ -1996,7 +2050,7 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
     gc.collect()
     if torch.cuda.is_available(): torch.cuda.empty_cache()
 
-def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config):
+def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config, timestep_sampler=None):
     output_dir = Path(config.OUTPUT_DIR)
     model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
     state_filename = f"training_state_step_{global_step}.pt"
@@ -2006,6 +2060,7 @@ def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, opti
     training_state = {
         'global_step': global_step, 'micro_step': micro_step, 'optimizer_state': optim_state,
         'sampler_seed': sampler.seed, 'sampler_epoch': max(sampler.epoch - 1, 0),
+        'timestep_sampler_state': timestep_sampler.state_dict() if timestep_sampler is not None and hasattr(timestep_sampler, "state_dict") else None,
         'random_state': random.getstate(), 'numpy_state': np.random.get_state(),
         'torch_cpu_state': torch.get_rng_state(),
         'torch_cuda_state': torch.cuda.get_rng_state() if torch.cuda.is_available() else None,
@@ -2035,6 +2090,7 @@ def main():
     global_step, micro_step, optimizer_step = 0, 0, 0
     model_to_load = Path(config.SINGLE_FILE_CHECKPOINT_PATH)
     initial_sampler_seed, optimizer_state, initial_epoch = config.SEED, None, 0
+    initial_timestep_sampler_state = None
 
     if config.RESUME_TRAINING:
         print("\n" + "="*50 + "\n--- RESUMING TRAINING SESSION ---\n")
@@ -2044,6 +2100,7 @@ def main():
         optimizer_step      = micro_step // config.GRADIENT_ACCUMULATION_STEPS
         initial_sampler_seed = training_state['sampler_seed']
         initial_epoch       = training_state.get('sampler_epoch', 0)
+        initial_timestep_sampler_state = training_state.get('timestep_sampler_state')
         optimizer_state     = training_state['optimizer_state']
         model_to_load       = Path(config.RESUME_MODEL_PATH)
         if 'random_state'    in training_state: random.setstate(training_state['random_state'])
@@ -2142,7 +2199,9 @@ def main():
     reporter     = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param")
     
     timestep_sampler = TimestepSampler(config, device)
-    if config.RESUME_TRAINING and micro_step > 0:
+    if initial_timestep_sampler_state is not None:
+        timestep_sampler.load_state_dict(initial_timestep_sampler_state)
+    elif config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
 
     accumulated_latent_paths  = []
@@ -2187,7 +2246,7 @@ def main():
                 ]
                 time_ids = torch.tensor(time_ids_data, dtype=config.compute_dtype, device=device)
 
-                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0])
+                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0], batch.get("image_key"))
                 timestep_str = str(first_timestep_int)
                 noise = generate_noise(
                     latents=latents,
@@ -2287,7 +2346,7 @@ def main():
                     reason = "Emergency checkpoint requested" if force_save and not scheduled_save else "Saving checkpoint"
                     reporter.log_message(f"\n--- {reason} at optimizer step {optimizer_step} ---")
                     save_checkpoint_pt(optimizer_step, micro_step, unet, model_to_load,
-                                       optimizer, lr_scheduler, None, sampler, config)
+                                       optimizer, lr_scheduler, None, sampler, config, timestep_sampler)
 
             step_duration = time.time() - last_step_time
             global_step_times.append(step_duration)

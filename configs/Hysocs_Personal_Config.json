@@ -74,6 +74,7 @@
                 1000
             ]
         },
+        "sdxl_timestep_force_image_bin_spread": false,
         "sdxl_optimizer_type": "raven",
         "sdxl_raven_params": {
             "betas": [
@@ -104,6 +105,7 @@
             "eps": 1e-08
         },
         "sdxl_loss_type": "MSE",
+        "sdxl_anima_use_timestep_loss_weight": true,
         "sdxl_memory_efficient_attention": "sdpa",
         "sdxl_timestep_mode": "Wave",
         "sdxl_vae_normalization_mode": "scalar",
@@ -116,19 +118,20 @@
         "sdxl_resume_model_path": "",
         "sdxl_resume_state_path": "",
         "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*",
+        "sdxl_text_conditioning_scale_target": "Qwen",
         "sdxl_target_pixel_area": 1048576,
         "sdxl_max_area_tolerance": "1.0"
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
-        "anima_resume_training": true,
+        "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Ikusa Otome to Midara na Yousei no Machi",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by muru_(muru_zi)",
                 "repeats": 1
             }
         ],
@@ -140,20 +143,20 @@
         "anima_unconditional_dropout": false,
         "anima_unconditional_dropout_chance": 0.05,
         "anima_text_conditioning_scale_enabled": true,
-        "anima_text_conditioning_scale_min": 0.7500000000000001,
-        "anima_text_conditioning_scale_max": 1.25,
+        "anima_text_conditioning_scale_min": 0.9,
+        "anima_text_conditioning_scale_max": 1.1,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
         "anima_caption_source_type": "json",
-        "anima_caption_tags_percent": 65,
-        "anima_caption_nl_percent": 35,
+        "anima_caption_tags_percent": 70,
+        "anima_caption_nl_percent": 30,
         "anima_caption_tags_nl_percent": 0,
         "anima_caption_nl_tags_percent": 0,
         "anima_max_bucket_resolution": "1024",
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "101010",
+        "anima_max_train_steps": "2000",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -166,11 +169,11 @@
                 1e-08
             ],
             [
-                0.01583113,
+                0.05277045,
                 5e-06
             ],
             [
-                0.97889182,
+                0.95778364,
                 5e-06
             ],
             [
@@ -182,35 +185,21 @@
         "anima_lr_graph_min": "1.0e-8",
         "anima_lr_graph_max": "5e-6",
         "anima_timestep_allocation": {
-            "bin_size": 40,
+            "bin_size": 100,
             "counts": [
-                1656,
-                1739,
-                1987,
-                2381,
-                2894,
-                3493,
-                4136,
-                4779,
-                5378,
-                5893,
-                6289,
-                6538,
-                6624,
-                6540,
-                6293,
-                5899,
-                5385,
-                4786,
-                4144,
-                3501,
-                2901,
-                2386,
-                1991,
-                1741,
-                1656
+                85,
+                115,
+                190,
+                276,
+                333,
+                333,
+                277,
+                191,
+                115,
+                85
             ]
         },
+        "anima_timestep_force_image_bin_spread": false,
         "anima_optimizer_type": "raven",
         "anima_raven_params": {
             "betas": [
@@ -241,6 +230,7 @@
             "eps": 1e-08
         },
         "anima_loss_type": "MSE",
+        "anima_use_timestep_loss_weight": true,
         "anima_memory_efficient_attention": "sdpa",
         "anima_timestep_mode": "Wave",
         "anima_vae_normalization_mode": "scalar",
@@ -248,14 +238,14 @@
         "anima_vae_scaling_factor": 0.13025,
         "anima_vae_latent_channels": 4,
         "anima_rebuild_cache": false,
-        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/anima_baseV10.safetensors",
+        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezora_step_11602_000 - Release 50%.safetensors",
         "anima_vae_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/VAE/qwen_image_vae.safetensors",
         "anima_dit_save_prefix": "auto",
         "anima_text_encoder_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/TextEncoders/qwen_3_06b_base.safetensors",
         "anima_qwen_tokenizer": "C:/Users/Administrator/.cache/huggingface/Qwen/Qwen3-0.6B",
         "anima_t5xxl_tokenizer": "C:/Users/Administrator/.cache/huggingface/google/t5-v1_1-xxl",
-        "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/anima_baseV10_step_1946_step_4004_step_5624_step_7556_step_9541.safetensors",
-        "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_9541.pt",
+        "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezora_step_11602_000_step_13197.safetensors",
+        "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_13197.pt",
         "anima_dit_exclude_targets": "llm_adapter.*",
         "anima_use_gradient_checkpointing": true,
         "anima_use_gradient_checkpointing_offload": false,
@@ -269,6 +259,7 @@
             72,
             72
         ],
+        "anima_text_conditioning_scale_target": "T5XXL",
         "anima_target_pixel_area": 1048576,
         "anima_max_area_tolerance": "1.0"
     }
