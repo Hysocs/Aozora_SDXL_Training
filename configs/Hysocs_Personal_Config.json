@@ -17,9 +17,15 @@
         "sdxl_num_workers": 0,
         "sdxl_unconditional_dropout": false,
         "sdxl_unconditional_dropout_chance": 0.0,
+        "sdxl_qwen_null_dropout_chance": 0.0,
+        "sdxl_t5_null_dropout_chance": 0.0,
         "sdxl_text_conditioning_scale_enabled": true,
         "sdxl_text_conditioning_scale_min": 0.7499999999999998,
         "sdxl_text_conditioning_scale_max": 1.2500000000000002,
+        "sdxl_t5_token_dropout_enabled": false,
+        "sdxl_t5_token_dropout_chance": 0,
+        "sdxl_t5_token_dropout_min": 0,
+        "sdxl_t5_token_dropout_max": 0,
         "sdxl_caption_chunking_enabled": true,
         "sdxl_should_upscale": true,
         "sdxl_caption_source_type": "json",
@@ -127,11 +133,19 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Ikusa Otome to Midara na Yousei no Machi",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by capry",
                 "repeats": 1
             },
             {
                 "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by muru_(muru_zi)",
+                "repeats": 1
+            },
+            {
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Stigma of Corruption Nightbound Courier",
+                "repeats": 1
+            },
+            {
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Dead Space",
                 "repeats": 1
             }
         ],
@@ -141,10 +155,16 @@
         "anima_vae_cache_precision": "bfloat16",
         "anima_num_workers": 0,
         "anima_unconditional_dropout": false,
-        "anima_unconditional_dropout_chance": 0.05,
+        "anima_unconditional_dropout_chance": 0.9,
+        "anima_qwen_null_dropout_chance": 0.05,
+        "anima_t5_null_dropout_chance": 0.05,
         "anima_text_conditioning_scale_enabled": true,
         "anima_text_conditioning_scale_min": 0.9,
         "anima_text_conditioning_scale_max": 1.1,
+        "anima_t5_token_dropout_enabled": true,
+        "anima_t5_token_dropout_chance": 0.05,
+        "anima_t5_token_dropout_min": 0.05,
+        "anima_t5_token_dropout_max": 0.25,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
         "anima_caption_source_type": "json",
@@ -156,7 +176,7 @@
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "2000",
+        "anima_max_train_steps": "2200",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -169,12 +189,12 @@
                 1e-08
             ],
             [
-                0.05277045,
-                5e-06
+                0.0474934,
+                6e-06
             ],
             [
-                0.95778364,
-                5e-06
+                0.94986807,
+                6e-06
             ],
             [
                 1.0,
@@ -183,23 +203,23 @@
         ],
         "anima_learning_rate": 8e-07,
         "anima_lr_graph_min": "1.0e-8",
-        "anima_lr_graph_max": "5e-6",
+        "anima_lr_graph_max": "6e-6",
         "anima_timestep_allocation": {
             "bin_size": 100,
             "counts": [
-                85,
-                115,
-                190,
-                276,
-                333,
-                333,
-                277,
-                191,
-                115,
-                85
+                220,
+                220,
+                220,
+                220,
+                220,
+                220,
+                220,
+                220,
+                220,
+                220
             ]
         },
-        "anima_timestep_force_image_bin_spread": false,
+        "anima_timestep_force_image_bin_spread": true,
         "anima_optimizer_type": "raven",
         "anima_raven_params": {
             "betas": [
@@ -230,7 +250,7 @@
             "eps": 1e-08
         },
         "anima_loss_type": "MSE",
-        "anima_use_timestep_loss_weight": true,
+        "anima_use_timestep_loss_weight": false,
         "anima_memory_efficient_attention": "sdpa",
         "anima_timestep_mode": "Wave",
         "anima_vae_normalization_mode": "scalar",
@@ -246,7 +266,7 @@
         "anima_t5xxl_tokenizer": "C:/Users/Administrator/.cache/huggingface/google/t5-v1_1-xxl",
         "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezora_step_11602_000_step_13197.safetensors",
         "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_13197.pt",
-        "anima_dit_exclude_targets": "llm_adapter.*",
+        "anima_dit_exclude_targets": "",
         "anima_use_gradient_checkpointing": true,
         "anima_use_gradient_checkpointing_offload": false,
         "anima_cache_folder_name": ".precomputed_anima_dit_cache",

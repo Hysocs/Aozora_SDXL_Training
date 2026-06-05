@@ -2407,9 +2407,15 @@ UI_DEFS = {
     "NUM_WORKERS":                 ("Dataloader Workers", "Set to 0 on Windows if you have issues.", "spin", 0, 16),
     "UNCONDITIONAL_DROPOUT":       ("Use Null Conditioning Dropout", "At random, train a sample with empty-prompt conditioning instead of its caption.", "check"),
     "UNCONDITIONAL_DROPOUT_CHANCE":("Null Conditioning Chance", "Probability (0.0-1.0) of using empty-prompt conditioning for a sample.", "dspin", 0.0, 1.0, 0.05, 2),
+    "QWEN_NULL_DROPOUT_CHANCE":    ("Null Qwen Chance", "Per-sample probability (0.0-1.0) of replacing Qwen prompt embeddings with empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
+    "T5_NULL_DROPOUT_CHANCE":      ("Null T5 Chance", "Per-sample probability (0.0-1.0) of replacing T5 token IDs with empty-prompt token IDs.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_ENABLED": ("Use Soft Text Conditioning", "Randomly dull caption conditioning by interpolating caption embeddings toward empty-prompt embeddings.", "check"),
     "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Values above 1 extrapolate caption conditioning past full strength.", "dspin", 0.0, 2.0, 0.05, 2),
+    "T5_TOKEN_DROPOUT_ENABLED":    ("Use T5 Token Dropout", "During Anima text caching, randomly replace part of a caption's T5 tokens with pad tokens.", "check"),
+    "T5_TOKEN_DROPOUT_CHANCE":     ("T5 Dropout Chance", "Per-caption probability (0.0-1.0) of applying T5 token dropout during text caching.", "dspin", 0.0, 1.0, 0.05, 2),
+    "T5_TOKEN_DROPOUT_MIN":        ("T5 Dropout Min", "Minimum fraction (0.0-1.0) of eligible T5 tokens to replace when dropout triggers.", "dspin", 0.0, 1.0, 0.05, 2),
+    "T5_TOKEN_DROPOUT_MAX":        ("T5 Dropout Max", "Maximum fraction (0.0-1.0) of eligible T5 tokens to replace when dropout triggers.", "dspin", 0.0, 1.0, 0.05, 2),
     "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
     "CAPTION_SOURCE_TYPE":         ("Caption Type", "Use .txt sidecars or exact-format .json sidecars.", "combo", ["txt", "json"]),
     "CAPTION_TAGS_PERCENT":        ("Tags %", "Training-time chance to load the cached tags caption variant.", "spin", 0, 100),
@@ -2693,13 +2699,13 @@ class TrainingGUI(QtWidgets.QWidget):
 
         if "UNCONDITIONAL_DROPOUT" in self.widgets:
             self.widgets["UNCONDITIONAL_DROPOUT"].setEnabled(True)
-        if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
-            self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(
-                self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
-            )
+            self._update_null_conditioning_dropout_controls()
         if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
             self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].setEnabled(True)
             self._update_text_conditioning_scale_controls()
+        if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
+            self.widgets["T5_TOKEN_DROPOUT_ENABLED"].setEnabled(is_dit)
+            self._update_t5_token_dropout_controls()
         if "ANIMA_USE_TIMESTEP_LOSS_WEIGHT" in self.widgets:
             w = self.widgets["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"]
             w.setEnabled(is_dit)
@@ -2949,7 +2955,7 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_vae_group())
         for title, keys in [
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS"]),
-            ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]),
+            ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED", "T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
             ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
         ]:
@@ -2972,10 +2978,18 @@ class TrainingGUI(QtWidgets.QWidget):
         if "UNCONDITIONAL_DROPOUT_CHANCE" in self.widgets:
             self._connect_widget_signal("UNCONDITIONAL_DROPOUT", "stateChanged",
                                         lambda s: self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(bool(s)))
+        if "QWEN_NULL_DROPOUT_CHANCE" in self.widgets:
+            self._connect_widget_signal("UNCONDITIONAL_DROPOUT", "stateChanged",
+                                        lambda _: self._update_null_conditioning_dropout_controls())
+            self._update_null_conditioning_dropout_controls()
         if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
             self._connect_widget_signal("TEXT_CONDITIONING_SCALE_ENABLED", "stateChanged",
                                         lambda _: self._update_text_conditioning_scale_controls())
             self._update_text_conditioning_scale_controls()
+        if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
+            self._connect_widget_signal("T5_TOKEN_DROPOUT_ENABLED", "stateChanged",
+                                        lambda _: self._update_t5_token_dropout_controls())
+            self._update_t5_token_dropout_controls()
 
     def _build_caption_source_group(self):
         gb, lay = group_box("Caption Source", QtWidgets.QVBoxLayout)
@@ -3070,6 +3084,26 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].isChecked()
         )
         for key in ["TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(enabled)
+
+    def _update_null_conditioning_dropout_controls(self):
+        enabled = (
+            "UNCONDITIONAL_DROPOUT" in self.widgets and
+            self.widgets["UNCONDITIONAL_DROPOUT"].isEnabled() and
+            self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
+        )
+        for key in ["UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE"]:
+            if key in self.widgets:
+                self.widgets[key].setEnabled(enabled)
+
+    def _update_t5_token_dropout_controls(self):
+        enabled = (
+            "T5_TOKEN_DROPOUT_ENABLED" in self.widgets and
+            self.widgets["T5_TOKEN_DROPOUT_ENABLED"].isEnabled() and
+            self.widgets["T5_TOKEN_DROPOUT_ENABLED"].isChecked()
+        )
+        for key in ["T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]:
             if key in self.widgets:
                 self.widgets[key].setEnabled(enabled)
 
@@ -3826,9 +3860,11 @@ class TrainingGUI(QtWidgets.QWidget):
             if "MULTI_BUCKET_ENABLED" in self.widgets:
                 self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(self.widgets["MULTI_BUCKET_ENABLED"].isChecked())
             if "UNCONDITIONAL_DROPOUT" in self.widgets:
-                self.widgets["UNCONDITIONAL_DROPOUT_CHANCE"].setEnabled(self.widgets["UNCONDITIONAL_DROPOUT"].isChecked())
+                self._update_null_conditioning_dropout_controls()
             if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
                 self._update_text_conditioning_scale_controls()
+            if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
+                self._update_t5_token_dropout_controls()
             if "CAPTION_SOURCE_TYPE" in self.widgets:
                 self._update_caption_json_controls()
             if "VAE_PATH" in self.widgets:

@@ -1,5 +1,6 @@
 import gc
 import fnmatch
+import hashlib
 import math
 import os
 import random
@@ -281,6 +282,10 @@ def get_anima_cache_options(config):
         "vae_caching_tiled": bool(getattr(config, "VAE_CACHING_TILED", True)),
         "vae_caching_tile_size": list(getattr(config, "VAE_CACHING_TILE_SIZE", [96, 96])),
         "vae_caching_tile_stride": list(getattr(config, "VAE_CACHING_TILE_STRIDE", [72, 72])),
+        "t5_token_dropout_enabled": bool(getattr(config, "T5_TOKEN_DROPOUT_ENABLED", False)),
+        "t5_token_dropout_chance": float(getattr(config, "T5_TOKEN_DROPOUT_CHANCE", 0.0) or 0.0),
+        "t5_token_dropout_min": float(getattr(config, "T5_TOKEN_DROPOUT_MIN", 0.0) or 0.0),
+        "t5_token_dropout_max": float(getattr(config, "T5_TOKEN_DROPOUT_MAX", 0.0) or 0.0),
     }
 
 
@@ -571,8 +576,44 @@ def load_anima_pipe(config, device):
     return pipe
 
 
+def apply_anima_t5_token_dropout(t5xxl_ids, captions, config, pad_id=0):
+    if config is None or not getattr(config, "T5_TOKEN_DROPOUT_ENABLED", False):
+        return t5xxl_ids
+
+    chance = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
+    min_rate = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_MIN", 0.0) or 0.0), 0.0), 1.0)
+    max_rate = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_MAX", 0.0) or 0.0), 0.0), 1.0)
+    if max_rate < min_rate:
+        min_rate, max_rate = max_rate, min_rate
+    if chance <= 0.0 or max_rate <= 0.0:
+        return t5xxl_ids
+
+    out = t5xxl_ids.clone()
+    for batch_index, caption in enumerate(captions):
+        ids = out[batch_index]
+        candidates = torch.ones_like(ids, dtype=torch.bool)
+        candidates &= ids.ne(pad_id)
+        if not candidates.any():
+            continue
+        seed_base = int(getattr(config, "SEED", 42) or 42)
+        digest = hashlib.sha256(f"{seed_base}:t5:{caption}".encode("utf-8", errors="ignore")).digest()
+        seed = int.from_bytes(digest[:8], "little") % (2 ** 63)
+        generator = torch.Generator(device=ids.device)
+        generator.manual_seed(seed)
+        if torch.rand((), device=ids.device, generator=generator).item() >= chance:
+            continue
+        rate = min_rate + (max_rate - min_rate) * torch.rand((), device=ids.device, generator=generator).item()
+        candidate_indices = torch.nonzero(candidates, as_tuple=False).flatten()
+        drop_count = int(round(candidate_indices.numel() * rate))
+        if drop_count <= 0:
+            continue
+        perm = torch.randperm(candidate_indices.numel(), device=ids.device, generator=generator)
+        ids[candidate_indices[perm[:drop_count]]] = pad_id
+    return out
+
+
 @torch.no_grad()
-def encode_prompt_anima(pipe, caption, device):
+def encode_prompt_anima(pipe, caption, device, config=None):
     if isinstance(caption, str):
         caption = [caption]
 
@@ -597,7 +638,9 @@ def encode_prompt_anima(pipe, caption, device):
         truncation=True,
         return_tensors="pt",
     )
-    return prompt_embeds.to(pipe.torch_dtype), t5xxl_text_inputs.input_ids.to(device)
+    t5xxl_ids = t5xxl_text_inputs.input_ids.to(device)
+    t5xxl_ids = apply_anima_t5_token_dropout(t5xxl_ids, caption, config, pad_id=getattr(pipe.tokenizer_t5xxl, "pad_token_id", 0) or 0)
+    return prompt_embeds.to(pipe.torch_dtype), t5xxl_ids
 
 
 @torch.no_grad()
@@ -903,7 +946,7 @@ def precompute_and_cache_anima(config, pipe, device):
             with torch.no_grad():
                 with tqdm(total=len(text_jobs), desc=f"Caching Anima text {root.name}", unit="item") as pbar:
                     for m, caption_type, caption, te_path in text_jobs:
-                        prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption, device)
+                        prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption, device, config)
                         torch.save({
                             "prompt_emb": prompt_emb[0].to(dtype=text_cache_dtype).cpu(),
                             "t5xxl_ids": t5xxl_ids[0].to(dtype=torch.long).cpu(),
@@ -1011,9 +1054,16 @@ class AnimaCachedDataset(Dataset):
         self.null_t5xxl_ids = None
         self.cond_scale_min, self.cond_scale_max = get_text_conditioning_scale_range(config)
         self.cond_scale_enabled = self.cond_scale_min < 1.0 or self.cond_scale_max > 1.0
-        self.dropout_prob = (
-            min(max(float(getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0)), 0.0), 1.0)
-            if getattr(config, "UNCONDITIONAL_DROPOUT", False)
+        null_dropout_enabled = bool(getattr(config, "UNCONDITIONAL_DROPOUT", False))
+        legacy_dropout_prob = min(max(float(getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
+        self.qwen_null_dropout_prob = (
+            min(max(float(getattr(config, "QWEN_NULL_DROPOUT_CHANCE", legacy_dropout_prob) or 0.0), 0.0), 1.0)
+            if null_dropout_enabled
+            else 0.0
+        )
+        self.t5_null_dropout_prob = (
+            min(max(float(getattr(config, "T5_NULL_DROPOUT_CHANCE", legacy_dropout_prob) or 0.0), 0.0), 1.0)
+            if null_dropout_enabled
             else 0.0
         )
 
@@ -1038,7 +1088,7 @@ class AnimaCachedDataset(Dataset):
         self.items, self.bucket_keys = zip(*combined)
         self.items = list(self.items)
         self.bucket_keys = list(self.bucket_keys)
-        if self.dropout_prob > 0 or self.cond_scale_enabled:
+        if self.qwen_null_dropout_prob > 0 or self.t5_null_dropout_prob > 0 or self.cond_scale_enabled:
             try:
                 null_data = torch.load(
                     Path(config.INSTANCE_DATASETS[0]["path"]) / cache_name / "null_embeds.pt",
@@ -1046,9 +1096,15 @@ class AnimaCachedDataset(Dataset):
                     weights_only=True,
                 )
                 self.null_prompt_emb = null_data["prompt_emb"].squeeze(0) if null_data["prompt_emb"].dim() == 3 else null_data["prompt_emb"]
-                self.null_t5xxl_ids = null_data["t5xxl_ids"].squeeze(0)
+                null_t5xxl_ids = null_data["t5xxl_ids"]
+                if null_t5xxl_ids.dim() == 0:
+                    null_t5xxl_ids = null_t5xxl_ids.view(1)
+                elif null_t5xxl_ids.dim() > 1 and null_t5xxl_ids.shape[0] == 1:
+                    null_t5xxl_ids = null_t5xxl_ids.squeeze(0)
+                self.null_t5xxl_ids = null_t5xxl_ids.to(dtype=torch.long)
             except Exception:
-                self.dropout_prob = 0.0
+                self.qwen_null_dropout_prob = 0.0
+                self.t5_null_dropout_prob = 0.0
                 self.cond_scale_enabled = False
 
     def __len__(self):
@@ -1102,13 +1158,16 @@ class AnimaCachedDataset(Dataset):
                 "image_key": item.get("relative_path", lat_path),
             }
 
-            if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
+            qwen_dropped = False
+            if self.qwen_null_dropout_prob > 0 and self.worker_rng.random() < self.qwen_null_dropout_prob:
                 _, null_prompt_emb = self._align_null_prompt_emb(item_data["prompt_emb"])
                 if null_prompt_emb is not None:
                     item_data["prompt_emb"] = null_prompt_emb
-                if null_prompt_emb is not None and self.null_t5xxl_ids is not None:
+                    qwen_dropped = True
+            if self.t5_null_dropout_prob > 0 and self.worker_rng.random() < self.t5_null_dropout_prob:
+                if self.null_t5xxl_ids is not None:
                     item_data["t5xxl_ids"] = self.null_t5xxl_ids
-            elif self.cond_scale_enabled:
+            if not qwen_dropped and self.cond_scale_enabled:
                 scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
                 prompt_emb, null_prompt_emb = self._align_null_prompt_emb(item_data["prompt_emb"])
                 if null_prompt_emb is not None:
@@ -1125,6 +1184,9 @@ def anima_collate_fn(batch):
     if not batch:
         return {}
 
+    for item in batch:
+        if item["t5xxl_ids"].dim() == 0:
+            item["t5xxl_ids"] = item["t5xxl_ids"].view(1)
     max_t5_len = max(item["t5xxl_ids"].shape[0] for item in batch)
     t5_ids = []
     for item in batch:
