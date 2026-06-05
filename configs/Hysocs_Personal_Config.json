@@ -15,7 +15,7 @@
         "sdxl_text_cache_precision": "bfloat16",
         "sdxl_vae_cache_precision": "bfloat16",
         "sdxl_num_workers": 0,
-        "sdxl_unconditional_dropout": false,
+        "sdxl_unconditional_dropout": true,
         "sdxl_unconditional_dropout_chance": 0.0,
         "sdxl_qwen_null_dropout_chance": 0.0,
         "sdxl_t5_null_dropout_chance": 0.0,
@@ -111,7 +111,7 @@
             "eps": 1e-08
         },
         "sdxl_loss_type": "MSE",
-        "sdxl_anima_use_timestep_loss_weight": true,
+        "sdxl_use_timestep_loss_weight": true,
         "sdxl_memory_efficient_attention": "sdpa",
         "sdxl_timestep_mode": "Wave",
         "sdxl_vae_normalization_mode": "scalar",
@@ -124,6 +124,7 @@
         "sdxl_resume_model_path": "",
         "sdxl_resume_state_path": "",
         "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*",
+        "sdxl_anima_use_timestep_loss_weight": true,
         "sdxl_text_conditioning_scale_target": "Qwen",
         "sdxl_target_pixel_area": 1048576,
         "sdxl_max_area_tolerance": "1.0"
@@ -133,19 +134,11 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by capry",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by muru_(muru_zi)",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Stigma of Corruption Nightbound Courier",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Dead Space",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
                 "repeats": 1
             }
         ],
@@ -154,7 +147,7 @@
         "anima_text_cache_precision": "bfloat16",
         "anima_vae_cache_precision": "bfloat16",
         "anima_num_workers": 0,
-        "anima_unconditional_dropout": false,
+        "anima_unconditional_dropout": true,
         "anima_unconditional_dropout_chance": 0.9,
         "anima_qwen_null_dropout_chance": 0.05,
         "anima_t5_null_dropout_chance": 0.05,
@@ -164,7 +157,7 @@
         "anima_t5_token_dropout_enabled": true,
         "anima_t5_token_dropout_chance": 0.05,
         "anima_t5_token_dropout_min": 0.05,
-        "anima_t5_token_dropout_max": 0.25,
+        "anima_t5_token_dropout_max": 0.15000000000000002,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
         "anima_caption_source_type": "json",
@@ -176,7 +169,7 @@
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "2200",
+        "anima_max_train_steps": "150000",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -207,16 +200,16 @@
         "anima_timestep_allocation": {
             "bin_size": 100,
             "counts": [
-                220,
-                220,
-                220,
-                220,
-                220,
-                220,
-                220,
-                220,
-                220,
-                220
+                15000,
+                15000,
+                15000,
+                15000,
+                15000,
+                15000,
+                15000,
+                15000,
+                15000,
+                15000
             ]
         },
         "anima_timestep_force_image_bin_spread": true,

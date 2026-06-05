@@ -982,14 +982,17 @@ def get_caption_cache_options(config):
         "vae_source_mtime_ns": vae_source_mtime_ns,
     }
 
-def check_if_caching_needed(config):
+def check_if_caching_needed(config, include_null_cache=True):
     needs_caching = False
     cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
     expected_cache_options = get_caption_cache_options(config)
     json_caption_mode = json_caption_mode_enabled(config)
 
-    if null_conditioning_cache_needed(config):
-        if config.INSTANCE_DATASETS and not (Path(config.INSTANCE_DATASETS[0]["path"]) / cache_folder_name / "null_embeds.pt").exists():
+    if include_null_cache and null_conditioning_cache_needed(config):
+        if any(
+            ds.get("path") and not (Path(ds["path"]) / cache_folder_name / "null_embeds.pt").exists()
+            for ds in config.INSTANCE_DATASETS
+        ):
             needs_caching = True
 
     for dataset in config.INSTANCE_DATASETS:
@@ -1329,6 +1332,27 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             )
     else:
         null_embeds, null_pooled = None, None
+
+    if (
+        null_embeds is not None
+        and null_pooled is not None
+        and not check_if_caching_needed(config, include_null_cache=False)
+    ):
+        created = 0
+        for dataset in config.INSTANCE_DATASETS:
+            root = Path(dataset["path"])
+            cache_dir = root / cache_folder_name
+            if cache_index_exists(cache_dir) and not (cache_dir / "null_embeds.pt").exists():
+                torch.save(
+                    {
+                        "embeds": null_embeds.to(dtype=text_cache_dtype).cpu(),
+                        "pooled": null_pooled.to(dtype=text_cache_dtype).cpu(),
+                    },
+                    cache_dir / "null_embeds.pt",
+                )
+                created += 1
+        print(f"INFO: Created SDXL null conditioning cache for {created} dataset(s).")
+        return
 
     transform = transforms.Compose([transforms.ToTensor(), transforms.Normalize([0.5], [0.5])])
 
@@ -1953,6 +1977,15 @@ def create_optimizer(config, params_to_optimize):
         return VeloRMS(params_to_optimize, lr=initial_lr, weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
+def sdxl_bell_timestep_loss_weights(timesteps):
+    t = timesteps.float() / 999.0
+    return torch.exp(-((t - 0.5) ** 2) / (2 * 0.25 ** 2))
+
+def weighted_sdxl_mse_loss(pred, target, timesteps):
+    per_sample_loss = (pred.float() - target.float()).pow(2).flatten(1).mean(dim=1)
+    weights = sdxl_bell_timestep_loss_weights(timesteps).to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+    return (per_sample_loss * weights).mean()
+
 def _get_sdxl_unet_conversion_map():
     unet_conversion_map = [
         ("time_embed.0.weight", "time_embedding.linear_1.weight"), ("time_embed.0.bias", "time_embedding.linear_1.bias"),
@@ -2294,7 +2327,10 @@ def main():
 
                         loss = torch.stack(patch_losses).mean()
                 else:
-                    loss = F.mse_loss(pred.float(), target.float())
+                    if getattr(config, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", False):
+                        loss = weighted_sdxl_mse_loss(pred, target, timesteps)
+                    else:
+                        loss = F.mse_loss(pred.float(), target.float())
 
                 (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 

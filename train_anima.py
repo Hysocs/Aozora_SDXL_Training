@@ -282,10 +282,6 @@ def get_anima_cache_options(config):
         "vae_caching_tiled": bool(getattr(config, "VAE_CACHING_TILED", True)),
         "vae_caching_tile_size": list(getattr(config, "VAE_CACHING_TILE_SIZE", [96, 96])),
         "vae_caching_tile_stride": list(getattr(config, "VAE_CACHING_TILE_STRIDE", [72, 72])),
-        "t5_token_dropout_enabled": bool(getattr(config, "T5_TOKEN_DROPOUT_ENABLED", False)),
-        "t5_token_dropout_chance": float(getattr(config, "T5_TOKEN_DROPOUT_CHANCE", 0.0) or 0.0),
-        "t5_token_dropout_min": float(getattr(config, "T5_TOKEN_DROPOUT_MIN", 0.0) or 0.0),
-        "t5_token_dropout_max": float(getattr(config, "T5_TOKEN_DROPOUT_MAX", 0.0) or 0.0),
     }
 
 
@@ -301,6 +297,10 @@ def normalize_anima_cache_options(cache_options, expected_options=None):
         "text_encoder_path",
         "tokenizer_path",
         "tokenizer_t5xxl_path",
+        "t5_token_dropout_enabled",
+        "t5_token_dropout_chance",
+        "t5_token_dropout_min",
+        "t5_token_dropout_max",
     ):
         normalized.pop(key, None)
     return normalized
@@ -946,7 +946,7 @@ def precompute_and_cache_anima(config, pipe, device):
             with torch.no_grad():
                 with tqdm(total=len(text_jobs), desc=f"Caching Anima text {root.name}", unit="item") as pbar:
                     for m, caption_type, caption, te_path in text_jobs:
-                        prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption, device, config)
+                        prompt_emb, t5xxl_ids = encode_prompt_anima(pipe, caption, device)
                         torch.save({
                             "prompt_emb": prompt_emb[0].to(dtype=text_cache_dtype).cpu(),
                             "t5xxl_ids": t5xxl_ids[0].to(dtype=torch.long).cpu(),
@@ -1066,6 +1066,12 @@ class AnimaCachedDataset(Dataset):
             if null_dropout_enabled
             else 0.0
         )
+        self.t5_token_dropout_enabled = bool(getattr(config, "T5_TOKEN_DROPOUT_ENABLED", False))
+        self.t5_token_dropout_chance = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
+        self.t5_token_dropout_min = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_MIN", 0.0) or 0.0), 0.0), 1.0)
+        self.t5_token_dropout_max = min(max(float(getattr(config, "T5_TOKEN_DROPOUT_MAX", 0.0) or 0.0), 0.0), 1.0)
+        if self.t5_token_dropout_max < self.t5_token_dropout_min:
+            self.t5_token_dropout_min, self.t5_token_dropout_max = self.t5_token_dropout_max, self.t5_token_dropout_min
 
         for ds in getattr(config, "INSTANCE_DATASETS", []):
             root = Path(ds["path"])
@@ -1131,6 +1137,29 @@ class AnimaCachedDataset(Dataset):
             null_prompt_emb = torch.cat([null_prompt_emb, pad], dim=0)
         return prompt_emb, null_prompt_emb.to(dtype=prompt_emb.dtype)
 
+    def _apply_t5_token_dropout(self, ids):
+        if (
+            not self.t5_token_dropout_enabled
+            or self.t5_token_dropout_chance <= 0.0
+            or self.t5_token_dropout_max <= 0.0
+            or self.worker_rng.random() >= self.t5_token_dropout_chance
+        ):
+            return ids
+
+        candidates = torch.nonzero(ids.ne(0), as_tuple=False).flatten().tolist()
+        if not candidates:
+            return ids
+
+        rate = self.worker_rng.uniform(self.t5_token_dropout_min, self.t5_token_dropout_max)
+        drop_count = int(round(len(candidates) * rate))
+        if drop_count <= 0:
+            return ids
+
+        out = ids.clone()
+        for token_index in self.worker_rng.sample(candidates, min(drop_count, len(candidates))):
+            out[token_index] = 0
+        return out
+
     def __getitem__(self, i):
         try:
             if self.worker_rng is None:
@@ -1167,6 +1196,8 @@ class AnimaCachedDataset(Dataset):
             if self.t5_null_dropout_prob > 0 and self.worker_rng.random() < self.t5_null_dropout_prob:
                 if self.null_t5xxl_ids is not None:
                     item_data["t5xxl_ids"] = self.null_t5xxl_ids
+            else:
+                item_data["t5xxl_ids"] = self._apply_t5_token_dropout(item_data["t5xxl_ids"])
             if not qwen_dropped and self.cond_scale_enabled:
                 scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
                 prompt_emb, null_prompt_emb = self._align_null_prompt_emb(item_data["prompt_emb"])

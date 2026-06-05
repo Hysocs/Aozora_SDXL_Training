@@ -64,7 +64,6 @@ ANIMA_PATH_KEYS = {
 ANIMA_LOCKED_WIDGET_KEYS = {
     "PREDICTION_TYPE",
     "MEMORY_EFFICIENT_ATTENTION",
-    "LOSS_TYPE",
     "CAPTION_CHUNKING_ENABLED",
     "VAE_NORMALIZATION_MODE",
     "VAE_SHIFT_FACTOR",
@@ -2412,8 +2411,8 @@ UI_DEFS = {
     "TEXT_CONDITIONING_SCALE_ENABLED": ("Use Soft Text Conditioning", "Randomly dull caption conditioning by interpolating caption embeddings toward empty-prompt embeddings.", "check"),
     "TEXT_CONDITIONING_SCALE_MIN": ("Text Conditioning Min", "Lowest caption strength to train. Values below 1 interpolate caption embeddings toward empty-prompt embeddings.", "dspin", 0.0, 1.0, 0.05, 2),
     "TEXT_CONDITIONING_SCALE_MAX": ("Text Conditioning Max", "Highest caption strength to train. Values above 1 extrapolate caption conditioning past full strength.", "dspin", 0.0, 2.0, 0.05, 2),
-    "T5_TOKEN_DROPOUT_ENABLED":    ("Use T5 Token Dropout", "During Anima text caching, randomly replace part of a caption's T5 tokens with pad tokens.", "check"),
-    "T5_TOKEN_DROPOUT_CHANCE":     ("T5 Dropout Chance", "Per-caption probability (0.0-1.0) of applying T5 token dropout during text caching.", "dspin", 0.0, 1.0, 0.05, 2),
+    "T5_TOKEN_DROPOUT_ENABLED":    ("Use T5 Token Dropout", "During training, randomly replace part of a caption's T5 tokens with pad tokens.", "check"),
+    "T5_TOKEN_DROPOUT_CHANCE":     ("T5 Dropout Chance", "Per-sample probability (0.0-1.0) of applying T5 token dropout during training.", "dspin", 0.0, 1.0, 0.05, 2),
     "T5_TOKEN_DROPOUT_MIN":        ("T5 Dropout Min", "Minimum fraction (0.0-1.0) of eligible T5 tokens to replace when dropout triggers.", "dspin", 0.0, 1.0, 0.05, 2),
     "T5_TOKEN_DROPOUT_MAX":        ("T5 Dropout Max", "Maximum fraction (0.0-1.0) of eligible T5 tokens to replace when dropout triggers.", "dspin", 0.0, 1.0, 0.05, 2),
     "CAPTION_CHUNKING_ENABLED":    ("Allow Caption Chunking", "Encode full caption text in 77-token CLIP chunks and concatenate the cached embeddings.", "check"),
@@ -2447,7 +2446,7 @@ UI_DEFS = {
     "USE_GRADIENT_CHECKPOINTING":  ("DiT Gradient Checkpointing", "Use DiT gradient checkpointing when supported by the model.", "check"),
     "USE_GRADIENT_CHECKPOINTING_OFFLOAD": ("DiT Checkpoint Offload", "Offload DiT checkpoint activations when supported.", "check"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
-    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": ("Use Anima Bell Loss Weight", "Multiply Anima MSE by DiffSynth's built-in bell-shaped timestep loss weight.", "check"),
+    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": ("Use Bell Timestep Loss Weight", "Multiply MSE by a bell-shaped timestep loss weight.", "check"),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
@@ -2471,6 +2470,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.current_mode_key = default_config.MODE_SDXL
         self._applying_config = False
         self.keyed_groups = []
+        self.widget_rows = {}
         self.last_line_is_progress = False
         self.default_preset = default_config.default_preset()
         self.default_config = default_config.flatten_preset(self.default_preset, default_config.MODE_SDXL)
@@ -2646,11 +2646,26 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _add_to_form(self, form_layout, key):
         lbl, w = self._make_widget(key)
-        if w: form_layout.addRow(lbl, w) if lbl else form_layout.addRow(w)
+        if w:
+            if lbl:
+                form_layout.addRow(lbl, w)
+                self.widget_rows[key] = (lbl, w)
+            else:
+                form_layout.addRow(w)
+                self.widget_rows[key] = (w,)
 
     def _add_form_keys(self, form_layout, keys):
         for key in keys:
             self._add_to_form(form_layout, key)
+
+    def _set_widget_row_visible(self, key, visible):
+        row = self.widget_rows.get(key)
+        if not row:
+            if key in self.widgets:
+                self.widgets[key].setVisible(visible)
+            return
+        for widget in row:
+            widget.setVisible(visible)
 
     def _connect_widget_signal(self, key, signal_name, callback):
         if key in self.widgets:
@@ -2704,16 +2719,13 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].setEnabled(True)
             self._update_text_conditioning_scale_controls()
         if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
+            self._set_widget_row_visible("T5_TOKEN_DROPOUT_ENABLED", is_dit)
             self.widgets["T5_TOKEN_DROPOUT_ENABLED"].setEnabled(is_dit)
             self._update_t5_token_dropout_controls()
         if "ANIMA_USE_TIMESTEP_LOSS_WEIGHT" in self.widgets:
             w = self.widgets["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"]
-            w.setEnabled(is_dit)
-            w.setToolTip(
-                UI_DEFS["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"][1]
-                if is_dit else
-                "Only applies to Anima DiT training. SDXL loss uses LOSS_TYPE instead."
-            )
+            w.setEnabled(True)
+            w.setToolTip(UI_DEFS["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"][1])
 
         if not is_dit:
             self._update_vae_normalization_controls()
@@ -2955,7 +2967,7 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_vae_group())
         for title, keys in [
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS"]),
-            ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED", "T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]),
+            ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED", "T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
             ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
         ]:
@@ -3088,16 +3100,21 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets[key].setEnabled(enabled)
 
     def _update_null_conditioning_dropout_controls(self):
+        is_dit = self._is_dit_mode()
         enabled = (
             "UNCONDITIONAL_DROPOUT" in self.widgets and
             self.widgets["UNCONDITIONAL_DROPOUT"].isEnabled() and
             self.widgets["UNCONDITIONAL_DROPOUT"].isChecked()
         )
+        self._set_widget_row_visible("UNCONDITIONAL_DROPOUT_CHANCE", not is_dit)
+        self._set_widget_row_visible("QWEN_NULL_DROPOUT_CHANCE", is_dit)
+        self._set_widget_row_visible("T5_NULL_DROPOUT_CHANCE", is_dit)
         for key in ["UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE"]:
             if key in self.widgets:
-                self.widgets[key].setEnabled(enabled)
+                self.widgets[key].setEnabled(enabled and ((key == "UNCONDITIONAL_DROPOUT_CHANCE") != is_dit))
 
     def _update_t5_token_dropout_controls(self):
+        is_dit = self._is_dit_mode()
         enabled = (
             "T5_TOKEN_DROPOUT_ENABLED" in self.widgets and
             self.widgets["T5_TOKEN_DROPOUT_ENABLED"].isEnabled() and
@@ -3105,7 +3122,8 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         for key in ["T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]:
             if key in self.widgets:
-                self.widgets[key].setEnabled(enabled)
+                self._set_widget_row_visible(key, is_dit)
+                self.widgets[key].setEnabled(enabled and is_dit)
 
     def _build_architecture_group(self):
         mode_gb, mode_lay = group_box("Prediction", QtWidgets.QVBoxLayout)

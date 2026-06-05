@@ -241,6 +241,7 @@ NESTED_NAME_OVERRIDES = {
     "RESUME_STATE_PATH": "resume_state_path",
     "ANIMA_RESUME_MODEL_PATH": "resume_model_path",
     "ANIMA_RESUME_STATE_PATH": "resume_state_path",
+    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": "use_timestep_loss_weight",
 }
 
 
@@ -268,10 +269,13 @@ def mode_flat_keys(mode_key):
 
 def default_mode_config(mode_key):
     defaults = flat_defaults()
-    return {
+    config = {
         nested_key_for(mode_key, flat_key): copy.deepcopy(defaults.get(flat_key))
         for flat_key in mode_flat_keys(mode_key)
     }
+    if mode_key == MODE_SDXL:
+        config[nested_key_for(mode_key, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT")] = False
+    return config
 
 
 def default_preset():
@@ -309,6 +313,10 @@ def normalize_preset(config_data):
             if legacy_key in mode_data:
                 mode_data.setdefault(text_key, mode_data[legacy_key])
                 mode_data.setdefault(vae_key, mode_data[legacy_key])
+            legacy_loss_weight_key = f"{mode_key}_anima_use_timestep_loss_weight"
+            loss_weight_key = nested_key_for(mode_key, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT")
+            if legacy_loss_weight_key in mode_data:
+                mode_data.setdefault(loss_weight_key, mode_data[legacy_loss_weight_key])
             preset[mode_key].update(mode_data)
     return preset
 
