@@ -22,8 +22,15 @@ from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
 from training_cache import (
     CAPTION_JSON_PRIMARY_TYPE,
+    CACHE_IMAGE_LAYOUT_OPTION_KEYS,
+    cache_image_layout_options_match,
     cache_index_exists,
+    cache_latent_options_match,
+    cache_payload_options_match_for_index,
+    cache_payload_options_match_for_index_item,
     cache_stem_for_image,
+    cache_text_options_match,
+    cached_file_signatures_match,
     caption_file_signature_for_image,
     caption_source_type,
     caption_types_for_cache,
@@ -43,10 +50,10 @@ from train import (
     AsyncReporter,
     BucketBatchSampler,
     CustomCurveLRScheduler,
+    PrecomputedImageBatchSampler,
     TitanAdamW,
     TrainingDiagnostics,
-    cache_float_dtype,
-    cache_float_dtype_name,
+    build_image_batch_schedule,
     caption_signature_for_image,
     consume_force_save_flag,
     create_optimizer,
@@ -54,9 +61,9 @@ from train import (
     get_json_caption_weights,
     get_max_bucket_resolution_for_config,
     get_multi_bucket_resolutions,
+    get_vae_source_for_config,
     get_text_conditioning_scale_range,
     make_bucket_variant_metadata,
-    normalize_cache_options_for_image_cache,
     null_conditioning_cache_needed,
     set_seed,
     smart_resize,
@@ -87,11 +94,6 @@ configure_console_output()
 def normalize_anima_config(config):
     if getattr(config, "DIT_VAE_PATH", ""):
         config.VAE_PATH = config.DIT_VAE_PATH
-    if getattr(config, "RESUME_TRAINING", False):
-        if not getattr(config, "ANIMA_RESUME_MODEL_PATH", "") and getattr(config, "RESUME_MODEL_PATH", ""):
-            config.ANIMA_RESUME_MODEL_PATH = config.RESUME_MODEL_PATH
-        if not getattr(config, "ANIMA_RESUME_STATE_PATH", "") and getattr(config, "RESUME_STATE_PATH", ""):
-            config.ANIMA_RESUME_STATE_PATH = config.RESUME_STATE_PATH
     exclude_targets = getattr(config, "DIT_EXCLUDE_TARGETS", [])
     if isinstance(exclude_targets, str):
         config.DIT_EXCLUDE_TARGETS = [item.strip() for item in exclude_targets.split(",") if item.strip()]
@@ -103,14 +105,6 @@ def normalize_anima_config(config):
 
 def anima_cache_folder_name(config):
     return getattr(config, "ANIMA_CACHE_FOLDER_NAME", ".precomputed_anima_dit_cache")
-
-
-def anima_cache_float_dtype(config):
-    return cache_float_dtype(config)
-
-
-def anima_cache_float_dtype_name(config):
-    return cache_float_dtype_name(config)
 
 
 def anima_text_cache_float_dtype(config):
@@ -134,14 +128,7 @@ def anima_caption_types_for_cache(config, json_caption_mode=None):
         json_caption_mode = json_caption_mode_enabled(config)
     if not json_caption_mode:
         return ("txt",)
-
-    weights = get_json_caption_weights(config)
-    active_types = tuple(
-        caption_type
-        for caption_type in caption_types_for_cache(True)
-        if int(weights.get(caption_type, 0) or 0) > 0
-    )
-    return active_types or (CAPTION_JSON_PRIMARY_TYPE,)
+    return caption_types_for_cache(True)
 
 
 def anima_caption_variant_index(variant_paths):
@@ -179,7 +166,6 @@ def anima_text_cache_paths_for_index_item(item):
         item,
         path_key="te_path",
         primary_key="te_path",
-        fallback_key="cache_path",
     )
 
 
@@ -191,9 +177,7 @@ def anima_cache_paths_for_index_item(item):
 
 
 def anima_lat_path_for_item(item):
-    if item.get("lat_path"):
-        return item["lat_path"]
-    return item.get("cache_path")
+    return item.get("lat_path")
 
 
 def remove_anima_cache_file(cache_path):
@@ -230,7 +214,7 @@ def anima_metadata_matches(payload, meta, check_caption=True):
     )
 
 
-def anima_text_cache_valid(path, meta, caption_type, caption, text_cache_dtype):
+def anima_text_cache_valid(path, meta, caption_type, caption, text_cache_dtype, expected_options):
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         prompt_emb = payload.get("prompt_emb")
@@ -242,12 +226,13 @@ def anima_text_cache_valid(path, meta, caption_type, caption, text_cache_dtype):
             and payload.get("caption_type") == caption_type
             and payload.get("caption") == caption
             and anima_metadata_matches(payload, meta, check_caption=True)
+            and anima_text_cache_compatible_options(payload.get("cache_options"), expected_options)
         )
     except Exception:
         return False
 
 
-def anima_lat_cache_valid(path, meta, vae_cache_dtype):
+def anima_lat_cache_valid(path, meta, vae_cache_dtype, expected_options):
     try:
         payload = torch.load(path, map_location="cpu", weights_only=True)
         latents = payload.get("latents") if isinstance(payload, dict) else None
@@ -257,6 +242,7 @@ def anima_lat_cache_valid(path, meta, vae_cache_dtype):
             and not torch.isnan(latents).any()
             and not torch.isinf(latents).any()
             and anima_metadata_matches(payload, meta, check_caption=False)
+            and anima_lat_cache_compatible_options(payload.get("cache_options"), expected_options)
         )
     except Exception:
         return False
@@ -264,13 +250,30 @@ def anima_lat_cache_valid(path, meta, vae_cache_dtype):
 
 def get_anima_cache_options(config):
     multi_bucket_enabled = bool(getattr(config, "MULTI_BUCKET_ENABLED", False))
+    vae_source = get_vae_source_for_config(config)
+    vae_source_path = ""
+    vae_source_size = None
+    vae_source_mtime_ns = None
+    if vae_source:
+        try:
+            vae_source_resolved = Path(vae_source).resolve()
+            vae_source_path = str(vae_source_resolved)
+            if vae_source_resolved.exists():
+                stat = vae_source_resolved.stat()
+                vae_source_size = stat.st_size
+                vae_source_mtime_ns = stat.st_mtime_ns
+        except OSError:
+            vae_source_path = str(vae_source)
     return {
-        "version": 5,
+        "version": 6,
+        "cache_schema_version": 1,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
         "text_cache_float_dtype": anima_text_cache_float_dtype_name(config),
         "vae_cache_float_dtype": anima_vae_cache_float_dtype_name(config),
         "caption_source_type": caption_source_type(config),
         "caption_json_types": list(anima_caption_types_for_cache(config)),
+        "caption_chunking_enabled": False,
+        "caption_embedding_layout": "anima_qwen_t5_ids",
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
         "should_upscale": bool(getattr(config, "SHOULD_UPSCALE", False)),
         "multi_bucket_enabled": multi_bucket_enabled,
@@ -279,48 +282,44 @@ def get_anima_cache_options(config):
             if multi_bucket_enabled
             else 0
         ),
+        "vae_normalization_mode": getattr(config, "VAE_NORMALIZATION_MODE", "scalar"),
+        "vae_shift_factor": getattr(config, "VAE_SHIFT_FACTOR", None),
+        "vae_scaling_factor": getattr(config, "VAE_SCALING_FACTOR", None),
+        "vae_latent_channels": getattr(config, "VAE_LATENT_CHANNELS", None),
+        "vae_path": str(getattr(config, "VAE_PATH", "") or ""),
+        "vae_source_path": vae_source_path,
+        "vae_source_size": vae_source_size,
+        "vae_source_mtime_ns": vae_source_mtime_ns,
         "vae_caching_tiled": bool(getattr(config, "VAE_CACHING_TILED", True)),
         "vae_caching_tile_size": list(getattr(config, "VAE_CACHING_TILE_SIZE", [96, 96])),
         "vae_caching_tile_stride": list(getattr(config, "VAE_CACHING_TILE_STRIDE", [72, 72])),
     }
 
 
-def normalize_anima_cache_options(cache_options, expected_options=None):
-    if not isinstance(cache_options, dict):
-        return cache_options
-
-    normalized = normalize_cache_options_for_image_cache(cache_options)
-    for key in (
-        "dit_path",
-        "anima_base_dit_path",
-        "vae_path",
-        "text_encoder_path",
-        "tokenizer_path",
-        "tokenizer_t5xxl_path",
-        "t5_token_dropout_enabled",
-        "t5_token_dropout_chance",
-        "t5_token_dropout_min",
-        "t5_token_dropout_max",
-    ):
-        normalized.pop(key, None)
-    return normalized
-
-
-def anima_cache_options_match(cached_options, expected_options):
-    return (
-        normalize_anima_cache_options(cached_options, expected_options)
-        == normalize_anima_cache_options(expected_options)
+def anima_image_layout_options_match(cached_options, expected_options):
+    return cache_image_layout_options_match(
+        cached_options,
+        expected_options,
+        extra_keys=("caption_json_types",),
     )
 
 
-def anima_cached_file_signatures_match(item, image_path, caption_mode):
-    image_sig = item.get("image_file_signature")
-    caption_sig = item.get("caption_file_signature")
-    if not image_sig or not caption_sig:
-        return None
-    return (
-        image_sig == image_file_signature(image_path)
-        and caption_sig == caption_file_signature_for_image(image_path, caption_mode)
+def anima_text_cache_compatible_options(cached_options, expected_options):
+    return cache_text_options_match(
+        cached_options,
+        expected_options,
+    )
+
+
+def anima_lat_cache_compatible_options(cached_options, expected_options):
+    return cache_latent_options_match(
+        cached_options,
+        expected_options,
+        extra_keys=(
+            "vae_caching_tiled",
+            "vae_caching_tile_size",
+            "vae_caching_tile_stride",
+        ),
     )
 
 
@@ -340,15 +339,12 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
         image_paths = collect_anima_image_paths(root)
         current_cache_stems = {anima_cache_stem_for_image(root, p) for p in image_paths}
         cached_options = index_data.get("cache_options")
-        if not anima_cache_options_match(cached_options, expected_options):
+        if not anima_image_layout_options_match(cached_options, expected_options):
             print(f"INFO: Anima cache rebuild needed for {root}: cache options changed.")
-            cached_norm = normalize_anima_cache_options(cached_options, expected_options)
-            expected_norm = normalize_anima_cache_options(expected_options)
-            if isinstance(cached_norm, dict) and isinstance(expected_norm, dict):
-                all_keys = sorted(set(cached_norm) | set(expected_norm))
-                for key in all_keys:
-                    cached_value = cached_norm.get(key, "<missing>")
-                    expected_value = expected_norm.get(key, "<missing>")
+            if isinstance(cached_options, dict):
+                for key in CACHE_IMAGE_LAYOUT_OPTION_KEYS + ("caption_json_types",):
+                    cached_value = cached_options.get(key, "<missing>")
+                    expected_value = expected_options.get(key, "<missing>")
                     if cached_value != expected_value:
                         print(f"  - {key}: cached={cached_value!r}, expected={expected_value!r}")
             else:
@@ -380,11 +376,20 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
                 if not cache_path.exists():
                     print(f"INFO: Anima cache rebuild needed for {root}: missing cached item {cache_path}.")
                     return True
+            if not cache_payload_options_match_for_index_item(
+                item,
+                expected_options,
+                anima_cache_paths_for_index_item,
+                anima_text_cache_compatible_options,
+                anima_lat_cache_compatible_options,
+            ):
+                print(f"INFO: Anima cache rebuild needed for {root}: cache payload options changed.")
+                return True
             relative_path = item.get("relative_path")
             if relative_path:
                 try:
                     image_path = root / relative_path
-                    stat_match = anima_cached_file_signatures_match(item, image_path, caption_source_type(config))
+                    stat_match = cached_file_signatures_match(item, image_path, caption_source_type(config))
                     if stat_match is False:
                         print(f"INFO: Anima cache rebuild needed for {root}: image/caption file changed for {relative_path}.")
                         return True
@@ -468,13 +473,6 @@ def resolve_local_tokenizer_path(value, label, default_model_id=None, default_or
     if raw_value:
         direct = Path(raw_value).expanduser()
         candidates.append(direct.parent if direct.is_file() else direct)
-
-        # Backward compatibility for old configs that stored model_id:origin.
-        if ":" in raw_value and not direct.exists():
-            model_id, origin = raw_value.split(":", 1)
-            legacy_path = local_tokenizer_path(model_id, origin)
-            if legacy_path:
-                candidates.append(Path(legacy_path))
 
     if default_model_id:
         default_path = local_tokenizer_path(default_model_id, default_origin)
@@ -737,7 +735,7 @@ def precompute_and_cache_anima(config, pipe, device):
         if cache_index_exists(cache_dir) and not force_recaching:
             try:
                 existing_index = load_cache_index(cache_dir)
-                if not anima_cache_options_match(existing_index.get("cache_options"), expected_options):
+                if not anima_image_layout_options_match(existing_index.get("cache_options"), expected_options):
                     print(
                         f"INFO: Anima cache options changed for {root.name}; "
                         "reusing compatible cached files and filling only missing variants."
@@ -753,7 +751,7 @@ def precompute_and_cache_anima(config, pipe, device):
                 print(f"INFO: Removing {len(stale_files)} stale Anima cache item(s) because {root.name} has no images.")
             for f in stale_files:
                 remove_anima_cache_file(f)
-            save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": []})
+            save_cache_index(cache_dir, {"version": 6, "cache_options": expected_options, "files": []})
             print(f"WARNING: No images found in {root}")
             continue
 
@@ -776,7 +774,14 @@ def precompute_and_cache_anima(config, pipe, device):
         can_reuse_index_metadata = (
             existing_index is not None
             and not force_recaching
-            and anima_cache_options_match(existing_index.get("cache_options"), expected_options)
+            and anima_image_layout_options_match(existing_index.get("cache_options"), expected_options)
+            and cache_payload_options_match_for_index(
+                existing_index,
+                expected_options,
+                anima_cache_paths_for_index_item,
+                anima_text_cache_compatible_options,
+                anima_lat_cache_compatible_options,
+            )
         )
         if can_reuse_index_metadata:
             for item in existing_index.get("files", []):
@@ -790,7 +795,7 @@ def precompute_and_cache_anima(config, pipe, device):
             relative_path = str(image_path.relative_to(root))
             existing_items = existing_items_by_relative_path.get(relative_path, [])
             if existing_items:
-                signatures_match = anima_cached_file_signatures_match(
+                signatures_match = cached_file_signatures_match(
                     existing_items[0],
                     image_path,
                     caption_mode,
@@ -872,12 +877,12 @@ def precompute_and_cache_anima(config, pipe, device):
                 expected_cache_files.add(te_path.resolve())
                 variant_cache_paths[caption_type] = str(te_path)
                 caption = caption_variants[caption_type]
-                if te_path.exists() and anima_text_cache_valid(te_path, m, caption_type, caption, text_cache_dtype):
+                if te_path.exists() and anima_text_cache_valid(te_path, m, caption_type, caption, text_cache_dtype, expected_options):
                     reused_text_count += 1
                 else:
                     text_jobs.append((m, caption_type, caption, te_path))
 
-            if lat_path.exists() and anima_lat_cache_valid(lat_path, m, vae_cache_dtype):
+            if lat_path.exists() and anima_lat_cache_valid(lat_path, m, vae_cache_dtype, expected_options):
                 reused_lat_count += 1
             else:
                 lat_jobs.append((m, lat_path))
@@ -912,7 +917,7 @@ def precompute_and_cache_anima(config, pipe, device):
             remove_anima_cache_file(f)
 
         if not text_jobs and not lat_jobs:
-            save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": index_data})
+            save_cache_index(cache_dir, {"version": 6, "cache_options": expected_options, "files": index_data})
             print(f"INFO: Anima DiT cache current for {root.name}: {len(index_data)} item(s).")
             continue
 
@@ -1035,7 +1040,7 @@ def precompute_and_cache_anima(config, pipe, device):
             item for item in index_data
             if all(Path(path).exists() for path in anima_cache_paths_for_index_item(item))
         ]
-        save_cache_index(cache_dir, {"version": 5, "cache_options": expected_options, "files": valid_index_data})
+        save_cache_index(cache_dir, {"version": 6, "cache_options": expected_options, "files": valid_index_data})
         print(f"INFO: Cached {len(valid_index_data)} Anima DiT items to {cache_dir}")
 
     ensure_anima_null_conditioning_cache(config, pipe, device)
@@ -1055,14 +1060,13 @@ class AnimaCachedDataset(Dataset):
         self.cond_scale_min, self.cond_scale_max = get_text_conditioning_scale_range(config)
         self.cond_scale_enabled = self.cond_scale_min < 1.0 or self.cond_scale_max > 1.0
         null_dropout_enabled = bool(getattr(config, "UNCONDITIONAL_DROPOUT", False))
-        legacy_dropout_prob = min(max(float(getattr(config, "UNCONDITIONAL_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
         self.qwen_null_dropout_prob = (
-            min(max(float(getattr(config, "QWEN_NULL_DROPOUT_CHANCE", legacy_dropout_prob) or 0.0), 0.0), 1.0)
+            min(max(float(getattr(config, "QWEN_NULL_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
             if null_dropout_enabled
             else 0.0
         )
         self.t5_null_dropout_prob = (
-            min(max(float(getattr(config, "T5_NULL_DROPOUT_CHANCE", legacy_dropout_prob) or 0.0), 0.0), 1.0)
+            min(max(float(getattr(config, "T5_NULL_DROPOUT_CHANCE", 0.0) or 0.0), 0.0), 1.0)
             if null_dropout_enabled
             else 0.0
         )
@@ -1169,10 +1173,9 @@ class AnimaCachedDataset(Dataset):
                 item,
                 self.worker_rng,
                 self.caption_weights,
-                fallback_key="cache_path",
                 enabled=self.json_caption_mode,
             )
-            lat_path = item.get("lat_path", item.get("cache_path"))
+            lat_path = item["lat_path"]
             data_te = torch.load(te_path, map_location="cpu", weights_only=True)
             data_lat = torch.load(lat_path, map_location="cpu", weights_only=True)
             latents = data_lat["latents"]
@@ -1249,7 +1252,7 @@ def print_anima_dataset_resolution_sample(dataset, sample_count=5):
         targ_ar = targ_w / targ_h if targ_h else 1.0
         ar_error_pct = (abs(orig_ar - targ_ar) / orig_ar * 100) if orig_ar else 0.0
         target_area = targ_w * targ_h
-        stem = Path(item.get("lat_path", item.get("cache_path", ""))).stem.replace("_lat", "")
+        stem = Path(item["lat_path"]).stem.replace("_lat", "")
         variant_label = f", variant {item.get('bucket_variant_index', 0)}" if item.get("bucket_variant_index", 0) else ""
         print(
             f"INFO:   {stem}: original {orig_w}x{orig_h} (AR {orig_ar:.4f}) -> "
@@ -1264,11 +1267,7 @@ class AnimaTimestepSampler:
         self.total_timestep_count = total_timestep_count
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
-        self.force_image_bin_spread = bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False))
-        self.rng = np.random.Generator(np.random.PCG64(self.seed + 7919))
-        self.image_bin_history = defaultdict(set)
         self.bin_ranges = []
-        self.bin_weights = []
         self.ticket_pool = self._build_ticket_pool(getattr(config, "TIMESTEP_ALLOCATION", None))
         self.pool_index = 0
 
@@ -1287,7 +1286,6 @@ class AnimaTimestepSampler:
         rng = np.random.Generator(np.random.PCG64(self.seed))
         scale_factor = self.total_timestep_count / 1000.0
         self.bin_ranges = []
-        self.bin_weights = []
         for i, count in enumerate(counts):
             if count <= 0:
                 continue
@@ -1296,7 +1294,6 @@ class AnimaTimestepSampler:
             if start_t >= self.total_timestep_count:
                 break
             self.bin_ranges.append((start_t, end_t))
-            self.bin_weights.append(max(1, int(count)))
             pool.extend(rng.integers(start_t, end_t, size=max(1, int(count))).tolist())
 
         random.seed(self.seed)
@@ -1317,50 +1314,20 @@ class AnimaTimestepSampler:
         self.pool_index += 1
         return index
 
-    def _sample_for_image_key(self, image_key):
-        if not self.bin_ranges:
-            return self._sample_from_pool()
-
-        key = str(image_key)
-        used_bins = self.image_bin_history[key]
-        all_bins = list(range(len(self.bin_ranges)))
-        available_bins = [idx for idx in all_bins if idx not in used_bins]
-        if not available_bins:
-            used_bins.clear()
-            available_bins = all_bins
-
-        weights = np.array([self.bin_weights[idx] for idx in available_bins], dtype=np.float64)
-        weights = weights / weights.sum()
-        bin_idx = int(self.rng.choice(available_bins, p=weights))
-        used_bins.add(bin_idx)
-        start_t, end_t = self.bin_ranges[bin_idx]
-        return int(self.rng.integers(start_t, end_t))
-
     def state_dict(self):
         return {
             "pool_index": self.pool_index,
-            "rng_state": self.rng.bit_generator.state,
-            "image_bin_history": {key: sorted(value) for key, value in self.image_bin_history.items()},
         }
 
     def load_state_dict(self, state):
         if not isinstance(state, dict):
             return
         self.pool_index = int(state.get("pool_index", self.pool_index)) % len(self.ticket_pool)
-        if state.get("rng_state"):
-            self.rng.bit_generator.state = state["rng_state"]
-        history = state.get("image_bin_history", {})
-        if isinstance(history, dict):
-            self.image_bin_history = defaultdict(set, {str(key): set(value) for key, value in history.items()})
 
-    def sample(self, batch_size, image_keys=None):
+    def sample(self, batch_size):
         indices = []
-        if self.force_image_bin_spread and image_keys:
-            for image_key in image_keys:
-                indices.append(self._sample_for_image_key(image_key))
-        else:
-            for _ in range(batch_size):
-                indices.append(self._sample_from_pool())
+        for _ in range(batch_size):
+            indices.append(self._sample_from_pool())
         return torch.tensor(indices, dtype=torch.long), indices[0]
 
 
@@ -1530,8 +1497,8 @@ def run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config
         timesteps=timesteps / 1000,
         context=prompt_emb,
         t5xxl_ids=t5xxl_ids,
-        use_gradient_checkpointing=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING", True)),
-        use_gradient_checkpointing_offload=bool(getattr(config, "USE_GRADIENT_CHECKPOINTING_OFFLOAD", True)),
+        use_gradient_checkpointing=True,
+        use_gradient_checkpointing_offload=False,
     )
     return model_output.squeeze(2)
 
@@ -1631,23 +1598,6 @@ def run_anima_dit_training(config):
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
     print_anima_dataset_resolution_sample(dataset, sample_count=5)
-    batch_sampler = BucketBatchSampler(dataset, config.BATCH_SIZE, config.SEED, shuffle=True)
-    if is_resuming:
-        batch_sampler.set_epoch(saved_batch_sampler_epoch)
-    dataloader = DataLoader(
-        dataset,
-        batch_sampler=batch_sampler,
-        num_workers=config.NUM_WORKERS,
-        pin_memory=True,
-        collate_fn=anima_collate_fn,
-    )
-    resume_batch_index = 0
-    if is_resuming and len(dataloader) > 0:
-        resume_batch_index = micro_step % len(dataloader)
-        if resume_batch_index > 0 and hasattr(batch_sampler, "set_start_batch_index"):
-            batch_sampler.set_start_batch_index(resume_batch_index)
-            print(f"INFO: Fast-forwarding Anima dataloader to batch {resume_batch_index} without loading skipped cache items.")
-
     total_scheduler_timesteps = len(pipe.scheduler.timesteps)
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     if saved_timestep_sampler_state is not None:
@@ -1656,6 +1606,28 @@ def run_anima_dit_training(config):
         timestep_sampler.pool_index = int(saved_sampler_pool_index) % len(timestep_sampler.ticket_pool)
     elif micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
+
+    image_schedule = build_image_batch_schedule(
+        dataset,
+        config.MAX_TRAIN_STEPS,
+        config.BATCH_SIZE,
+        config.SEED if config.SEED else 42,
+        timestep_sampler.ticket_pool,
+        timestep_sampler.bin_ranges,
+        bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False)),
+    )
+    batch_sampler = PrecomputedImageBatchSampler(image_schedule, config.SEED if config.SEED else 42, micro_step if is_resuming else 0)
+    print(f"INFO: Precomputed Anima image batch schedule for {len(image_schedule):,} step(s).")
+    dataloader = DataLoader(
+        dataset,
+        batch_sampler=batch_sampler,
+        num_workers=config.NUM_WORKERS,
+        pin_memory=True,
+        collate_fn=anima_collate_fn,
+    )
+    if is_resuming and len(dataloader) <= 0:
+        print("WARNING: Resume requested but Anima dataloader is empty; starting without batch skipping.")
+
     scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
     scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     scheduler_weights = getattr(pipe.scheduler, "linear_timesteps_weights", torch.ones_like(pipe.scheduler.timesteps))
@@ -1675,11 +1647,6 @@ def run_anima_dit_training(config):
     last_optim_step_log_time = time.time()
     optimizer.zero_grad(set_to_none=True)
     dataloader_iter = iter(dataloader)
-    batches_to_skip = (
-        resume_batch_index
-        if is_resuming and len(dataloader) > 0 and not hasattr(batch_sampler, "set_start_batch_index")
-        else 0
-    )
 
     while micro_step < config.MAX_TRAIN_STEPS:
         try:
@@ -1687,12 +1654,10 @@ def run_anima_dit_training(config):
         except StopIteration:
             dataloader_iter = iter(dataloader)
             batch = next(dataloader_iter)
-        if batches_to_skip > 0:
-            batches_to_skip -= 1
-            continue
         if not batch:
             continue
 
+        micro_step += 1
         step_start = time.time()
         lr_scheduler.step(micro_step)
         input_latents = batch["latents"].to(device=device, dtype=config.compute_dtype, non_blocking=True)
@@ -1700,7 +1665,7 @@ def run_anima_dit_training(config):
         t5xxl_ids = batch["t5xxl_ids"].to(device=device, non_blocking=True)
 
         batch_size = input_latents.shape[0]
-        timestep_indices, timestep_str = timestep_sampler.sample(batch_size, batch.get("image_key"))
+        timestep_indices, timestep_str = timestep_sampler.sample(batch_size)
         timestep_indices = timestep_indices.to(device=device)
         timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
         sigmas = scheduler_sigmas[timestep_indices]
@@ -1720,7 +1685,7 @@ def run_anima_dit_training(config):
         accumulated_latent_paths.update(batch["latent_path"])
         diag_data_to_log = None
 
-        if (micro_step + 1) % config.GRADIENT_ACCUMULATION_STEPS == 0:
+        if micro_step % config.GRADIENT_ACCUMULATION_STEPS == 0:
             raw_grad_norm = (
                 optimizer.clip_grad_norm(config.CLIP_GRAD_NORM if config.CLIP_GRAD_NORM > 0 else float("inf"))
                 if isinstance(optimizer, TitanAdamW)
@@ -1764,7 +1729,7 @@ def run_anima_dit_training(config):
                 reporter.log_message(f"\n--- {reason} at optimizer step {optimizer_step} ---")
                 save_anima_checkpoint_pt(
                     optimizer_step,
-                    micro_step + 1,
+                    micro_step,
                     dit,
                     optimizer,
                     lr_scheduler,
@@ -1789,7 +1754,6 @@ def run_anima_dit_training(config):
             },
             diag_data=diag_data_to_log,
         )
-        micro_step += 1
 
     reporter.log_message("\nTraining complete.")
     reporter.shutdown()

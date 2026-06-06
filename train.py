@@ -47,7 +47,11 @@ from training_cache import (
     cache_index_exists,
     cache_item_stem_from_te_path,
     cache_metadata_matches,
+    cache_image_layout_options_match,
+    cache_latent_options_match,
     cache_stem_for_image,
+    cache_text_options_match,
+    cached_file_signatures_match,
     caption_file_signature_for_image,
     caption_source_type,
     caption_types_for_cache,
@@ -91,37 +95,11 @@ def get_json_caption_weights(config):
 
 
 def sdxl_text_cache_compatible_options(cached_options, expected_options):
-    cached = normalize_cache_options_for_image_cache(cached_options)
-    expected = normalize_cache_options_for_image_cache(expected_options)
-    if not isinstance(cached, dict) or not isinstance(expected, dict):
-        return False
-    text_keys = (
-        "text_cache_float_dtype",
-        "caption_source_type",
-        "caption_json_types",
-        "caption_chunking_enabled",
-        "caption_embedding_layout",
-    )
-    return all(cached.get(key) == expected.get(key) for key in text_keys)
+    return cache_text_options_match(cached_options, expected_options)
 
 
 def sdxl_lat_cache_compatible_options(cached_options, expected_options):
-    cached = normalize_cache_options_for_image_cache(cached_options)
-    expected = normalize_cache_options_for_image_cache(expected_options)
-    if not isinstance(cached, dict) or not isinstance(expected, dict):
-        return False
-    latent_keys = (
-        "vae_cache_float_dtype",
-        "vae_normalization_mode",
-        "vae_shift_factor",
-        "vae_scaling_factor",
-        "vae_latent_channels",
-        "vae_path",
-        "vae_source_path",
-        "vae_source_size",
-        "vae_source_mtime_ns",
-    )
-    return all(cached.get(key) == expected.get(key) for key in latent_keys)
+    return cache_latent_options_match(cached_options, expected_options)
 
 
 def sdxl_text_cache_valid(path, root, meta, caption_type, caption, text_cache_dtype, expected_options):
@@ -144,24 +122,16 @@ def sdxl_text_cache_valid(path, root, meta, caption_type, caption, text_cache_dt
         return False
 
 
-def sdxl_lat_cache_valid(path, primary_te_path, root, meta, vae_cache_dtype, expected_options):
+def sdxl_lat_cache_valid(path, root, meta, vae_cache_dtype, expected_options):
     try:
         lat_payload = torch.load(path, map_location="cpu", weights_only=True)
-        if isinstance(lat_payload, dict):
-            if not cache_metadata_matches(lat_payload, root, meta):
-                return False
-            if not sdxl_lat_cache_compatible_options(lat_payload.get("cache_options"), expected_options):
-                return False
-            latents = lat_payload.get("latents")
-        else:
-            if not Path(primary_te_path).exists():
-                return False
-            text_payload = torch.load(primary_te_path, map_location="cpu", weights_only=True)
-            if not cache_metadata_matches(text_payload, root, meta):
-                return False
-            if not sdxl_lat_cache_compatible_options(text_payload.get("cache_options"), expected_options):
-                return False
-            latents = lat_payload
+        if not isinstance(lat_payload, dict):
+            return False
+        if not cache_metadata_matches(lat_payload, root, meta):
+            return False
+        if not sdxl_lat_cache_compatible_options(lat_payload.get("cache_options"), expected_options):
+            return False
+        latents = lat_payload.get("latents")
         return (
             latents is not None
             and latents.dtype == vae_cache_dtype
@@ -171,24 +141,10 @@ def sdxl_lat_cache_valid(path, primary_te_path, root, meta, vae_cache_dtype, exp
     except Exception:
         return False
 CLIP_CHUNK_TOKEN_COUNT = 77
-CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS = {
-    "version",
-    "unconditional_dropout",
-    "null_conditioning_needed",
-    "text_conditioning_scale_enabled",
-    "caption_embedding_layout",
-}
 
 
-def _cache_precision_value(config, attr_name="CACHE_PRECISION"):
-    precision = getattr(config, attr_name, None)
-    if precision is None:
-        precision = getattr(config, "CACHE_PRECISION", "bfloat16")
-    return precision
-
-
-def cache_float_dtype(config, attr_name="CACHE_PRECISION"):
-    precision = str(_cache_precision_value(config, attr_name) or "bfloat16").strip().lower()
+def cache_float_dtype(config, attr_name):
+    precision = str(getattr(config, attr_name, "bfloat16") or "bfloat16").strip().lower()
     aliases = {
         "fp32": "float32",
         "float": "float32",
@@ -205,7 +161,7 @@ def cache_float_dtype(config, attr_name="CACHE_PRECISION"):
     return torch.bfloat16
 
 
-def cache_float_dtype_name(config, attr_name="CACHE_PRECISION"):
+def cache_float_dtype_name(config, attr_name):
     return str(cache_float_dtype(config, attr_name)).replace("torch.", "")
 
 
@@ -328,17 +284,12 @@ class TrainingConfig:
         if getattr(self, "RESUME_TRAINING", False):
             is_anima = str(getattr(self, "TRAINING_MODE", "")).lower().startswith("anima")
             resume_path_keys = (
-                [("ANIMA_RESUME_MODEL_PATH", "RESUME_MODEL_PATH"), ("ANIMA_RESUME_STATE_PATH", "RESUME_STATE_PATH")]
+                ["ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH"]
                 if is_anima
-                else [("RESUME_MODEL_PATH", None), ("RESUME_STATE_PATH", None)]
+                else ["RESUME_MODEL_PATH", "RESUME_STATE_PATH"]
             )
-            for key, fallback_key in resume_path_keys:
+            for key in resume_path_keys:
                 value = getattr(self, key, "")
-                if not value and fallback_key:
-                    fallback_value = getattr(self, fallback_key, "")
-                    if fallback_value:
-                        setattr(self, key, fallback_value)
-                        value = fallback_value
                 if not value or not Path(value).exists():
                     raise FileNotFoundError(f"RESUME_TRAINING is enabled, but {key}='{value}' is not a valid file path.")
 
@@ -568,6 +519,240 @@ class BucketBatchSampler(Sampler):
 
     def __len__(self):
         return math.ceil(self.total_images / self.batch_size)
+
+
+class PrecomputedImageBatchSampler(Sampler):
+    def __init__(self, image_batches, seed, start_step=0):
+        self.image_batches = image_batches
+        self.seed = seed
+        self.start_step = max(0, int(start_step or 0))
+        self.epoch = 0
+
+    def __iter__(self):
+        for step in range(self.start_step, len(self.image_batches)):
+            self.epoch = step + 1
+            batch = self.image_batches[step]
+            if isinstance(batch, np.ndarray):
+                yield [int(index) for index in batch.tolist()]
+            else:
+                yield [int(index) for index in batch]
+
+    def __len__(self):
+        return max(0, len(self.image_batches) - self.start_step)
+
+    def set_epoch(self, epoch):
+        self.epoch = int(epoch or 0)
+
+    def set_start_batch_index(self, batch_index):
+        self.start_step = max(0, int(batch_index or 0))
+
+
+def timestep_bin_ids(timesteps, bin_ranges):
+    bin_ids = np.zeros(len(timesteps), dtype=np.int32)
+    for step, timestep in enumerate(timesteps):
+        timestep = int(timestep)
+        for bin_id, (start_t, end_t) in enumerate(bin_ranges):
+            if start_t <= timestep < end_t:
+                bin_ids[step] = bin_id
+                break
+    return bin_ids
+
+
+def build_epoch_shuffle_image_schedule(total_images, total_steps, seed):
+    schedule = np.empty(total_steps, dtype=np.uint32)
+    offset = 0
+    epoch = 0
+    while offset < total_steps:
+        g = torch.Generator()
+        g.manual_seed(seed + epoch)
+        order = torch.randperm(total_images, generator=g).numpy().astype(np.uint32, copy=False)
+        take = min(total_images, total_steps - offset)
+        schedule[offset:offset + take] = order[:take]
+        offset += take
+        epoch += 1
+    return schedule
+
+
+def build_spread_image_schedule(total_images, total_steps, seed, bin_ids, bin_count):
+    if total_images <= 0 or total_steps <= 0:
+        return np.empty(0, dtype=np.uint32)
+    if bin_count <= 1:
+        return build_epoch_shuffle_image_schedule(total_images, total_steps, seed)
+
+    history_depth = max(1, min(bin_count, math.ceil(total_steps / total_images)))
+    sentinel = 255 if bin_count < 255 else 65535
+    history_dtype = np.uint8 if bin_count < 255 else np.uint16
+    recent_bins = np.full((total_images, history_depth), sentinel, dtype=history_dtype)
+    recent_pos = np.zeros(total_images, dtype=np.uint16)
+    schedule = np.empty(total_steps, dtype=np.uint32)
+    offset = 0
+    epoch = 0
+
+    while offset < total_steps:
+        epoch_steps = min(total_images, total_steps - offset)
+        remaining = np.ones(total_images, dtype=np.bool_)
+        queues = {}
+        positions = {}
+        rng = np.random.Generator(np.random.PCG64(seed + 104729 + epoch))
+
+        for local_step in range(epoch_steps):
+            step = offset + local_step
+            bin_id = int(bin_ids[step])
+            queue = queues.get(bin_id)
+            if queue is None:
+                queue = rng.permutation(total_images).astype(np.uint32, copy=False)
+                queues[bin_id] = queue
+                positions[bin_id] = 0
+
+            chosen = None
+            pos = positions[bin_id]
+            while pos < total_images:
+                candidate = int(queue[pos])
+                pos += 1
+                if remaining[candidate] and not np.any(recent_bins[candidate] == bin_id):
+                    chosen = candidate
+                    break
+            positions[bin_id] = pos
+
+            if chosen is None:
+                remaining_indices = np.flatnonzero(remaining)
+                if remaining_indices.size == 0:
+                    break
+                penalties = np.count_nonzero(recent_bins[remaining_indices] == bin_id, axis=1)
+                best_penalty = penalties.min()
+                best_indices = remaining_indices[penalties == best_penalty]
+                chosen = int(best_indices[int(rng.integers(0, len(best_indices)))])
+
+            schedule[step] = chosen
+            remaining[chosen] = False
+            pos_idx = int(recent_pos[chosen] % history_depth)
+            recent_bins[chosen, pos_idx] = bin_id
+            recent_pos[chosen] = (recent_pos[chosen] + 1) % history_depth
+
+        offset += epoch_steps
+        epoch += 1
+
+    return schedule
+
+
+def build_image_schedule(total_images, total_steps, seed, timesteps, bin_ranges, force_spread):
+    if not force_spread:
+        return build_epoch_shuffle_image_schedule(total_images, total_steps, seed)
+    return build_spread_image_schedule(
+        total_images,
+        total_steps,
+        seed,
+        timestep_bin_ids(timesteps, bin_ranges),
+        len(bin_ranges),
+    )
+
+
+def build_epoch_shuffle_batch_schedule(dataset, total_steps, batch_size, seed):
+    schedule = []
+    epoch = 0
+    while len(schedule) < total_steps:
+        sampler = BucketBatchSampler(dataset, batch_size, seed, shuffle=True)
+        sampler.set_epoch(epoch)
+        for batch in sampler:
+            schedule.append([int(index) for index in batch])
+            if len(schedule) >= total_steps:
+                break
+        epoch += 1
+    return schedule
+
+
+def build_spread_batch_schedule(dataset, total_steps, batch_size, seed, timesteps, bin_ranges):
+    total_images = len(dataset)
+    if total_images <= 0 or total_steps <= 0:
+        return []
+    if batch_size == 1:
+        image_schedule = build_image_schedule(total_images, total_steps, seed, timesteps, bin_ranges, True)
+        return [[int(index)] for index in image_schedule.tolist()]
+
+    bin_ids = timestep_bin_ids(timesteps, bin_ranges)
+    total_samples = min(len(timesteps), total_steps * batch_size)
+    bin_count = max(1, len(bin_ranges))
+    history_depth = max(1, min(bin_count, math.ceil(total_samples / total_images)))
+    sentinel = 255 if bin_count < 255 else 65535
+    history_dtype = np.uint8 if bin_count < 255 else np.uint16
+    recent_bins = np.full((total_images, history_depth), sentinel, dtype=history_dtype)
+    recent_pos = np.zeros(total_images, dtype=np.uint16)
+    bucket_indices = defaultdict(list)
+    for index, key in enumerate(dataset.bucket_keys):
+        bucket_indices[key].append(index)
+
+    schedule = []
+    sample_offset = 0
+    epoch = 0
+    while len(schedule) < total_steps:
+        base_sampler = BucketBatchSampler(dataset, batch_size, seed, shuffle=True)
+        base_sampler.set_epoch(epoch)
+        remaining = np.ones(total_images, dtype=np.bool_)
+        queues = {}
+        positions = {}
+        rng = np.random.Generator(np.random.PCG64(seed + 104729 + epoch))
+
+        for base_batch in base_sampler:
+            if len(schedule) >= total_steps:
+                break
+            batch_len = len(base_batch)
+            bucket_key = dataset.bucket_keys[base_batch[0]]
+            chosen_batch = []
+
+            for local_index in range(batch_len):
+                if sample_offset + local_index >= len(bin_ids):
+                    break
+                bin_id = int(bin_ids[sample_offset + local_index])
+                queue_key = (bucket_key, bin_id)
+                queue = queues.get(queue_key)
+                if queue is None:
+                    queue = np.array(bucket_indices[bucket_key], dtype=np.uint32)
+                    rng.shuffle(queue)
+                    queues[queue_key] = queue
+                    positions[queue_key] = 0
+
+                chosen = None
+                pos = positions[queue_key]
+                while pos < len(queue):
+                    candidate = int(queue[pos])
+                    pos += 1
+                    if remaining[candidate] and not np.any(recent_bins[candidate] == bin_id):
+                        chosen = candidate
+                        break
+                positions[queue_key] = pos
+
+                if chosen is None:
+                    remaining_indices = np.array(
+                        [index for index in bucket_indices[bucket_key] if remaining[index]],
+                        dtype=np.int64,
+                    )
+                    if remaining_indices.size == 0:
+                        break
+                    penalties = np.count_nonzero(recent_bins[remaining_indices] == bin_id, axis=1)
+                    best_penalty = penalties.min()
+                    best_indices = remaining_indices[penalties == best_penalty]
+                    chosen = int(best_indices[int(rng.integers(0, len(best_indices)))])
+
+                chosen_batch.append(chosen)
+                remaining[chosen] = False
+                pos_idx = int(recent_pos[chosen] % history_depth)
+                recent_bins[chosen, pos_idx] = bin_id
+                recent_pos[chosen] = (recent_pos[chosen] + 1) % history_depth
+
+            if chosen_batch:
+                schedule.append(chosen_batch)
+                sample_offset += len(chosen_batch)
+            if sample_offset >= len(bin_ids):
+                break
+
+        epoch += 1
+    return schedule
+
+
+def build_image_batch_schedule(dataset, total_steps, batch_size, seed, timesteps, bin_ranges, force_spread):
+    if not force_spread:
+        return build_epoch_shuffle_batch_schedule(dataset, total_steps, batch_size, seed)
+    return build_spread_batch_schedule(dataset, total_steps, batch_size, seed, timesteps, bin_ranges)
 
 
 STANDARD_SDXL_BUCKETS = [
@@ -920,30 +1105,6 @@ def text_conditioning_scale_enabled(config):
 def null_conditioning_cache_needed(config):
     return bool(getattr(config, "UNCONDITIONAL_DROPOUT", False)) or text_conditioning_scale_enabled(config)
 
-def normalize_cache_options_for_image_cache(cache_options):
-    if not isinstance(cache_options, dict):
-        return cache_options
-    normalized = {k: v for k, v in cache_options.items() if k not in CACHE_IMAGE_CACHE_IGNORED_OPTION_KEYS}
-    legacy_precision = normalized.pop("cache_float_dtype", None)
-    if legacy_precision is not None:
-        normalized.setdefault("text_cache_float_dtype", legacy_precision)
-        normalized.setdefault("vae_cache_float_dtype", legacy_precision)
-    return normalized
-
-def cache_options_match_for_image_cache(cached_options, expected_options):
-    return normalize_cache_options_for_image_cache(cached_options) == normalize_cache_options_for_image_cache(expected_options)
-
-
-def cached_file_signatures_match(item, image_path, caption_mode):
-    image_sig = item.get("image_file_signature")
-    caption_sig = item.get("caption_file_signature")
-    if not image_sig or not caption_sig:
-        return None
-    return (
-        image_sig == image_file_signature(image_path)
-        and caption_sig == caption_file_signature_for_image(image_path, caption_mode)
-    )
-
 def get_caption_cache_options(config):
     vae_source = get_vae_source_for_config(config)
     vae_source_path = ""
@@ -961,11 +1122,13 @@ def get_caption_cache_options(config):
             vae_source_path = str(vae_source)
 
     return {
-        "version": 12,
+        "version": 13,
+        "cache_schema_version": 1,
         "bucket_layout": BUCKET_LAYOUT_VERSION,
         "text_cache_float_dtype": text_cache_float_dtype_name(config),
         "vae_cache_float_dtype": vae_cache_float_dtype_name(config),
         "max_bucket_resolution": get_max_bucket_resolution_for_config(config),
+        "should_upscale": bool(getattr(config, "SHOULD_UPSCALE", False)),
         "caption_embedding_layout": "fixed_total_chunks",
         "caption_source_type": caption_source_type(config),
         "caption_json_types": list(CAPTION_JSON_TYPES),
@@ -1021,7 +1184,7 @@ def check_if_caching_needed(config, include_null_cache=True):
             needs_caching = True; continue
         try:
             index_data = load_cache_index(cache_dir)
-            if not cache_options_match_for_image_cache(index_data.get("cache_options"), expected_cache_options):
+            if not cache_image_layout_options_match(index_data.get("cache_options"), expected_cache_options):
                 needs_caching = True
             indexed_files = index_data.get("files", [])
             if any("scaled_size" not in item for item in indexed_files):
@@ -1042,6 +1205,27 @@ def check_if_caching_needed(config, include_null_cache=True):
                 te_paths = te_paths_for_index_item(item)
                 lat_path = item.get("lat_path")
                 if not te_paths or not lat_path or not Path(lat_path).exists() or any(not Path(p).exists() for p in te_paths):
+                    needs_caching = True
+                    break
+                try:
+                    text_payloads = [
+                        torch.load(p, map_location="cpu", weights_only=True)
+                        for p in te_paths
+                    ]
+                    if any(
+                        not sdxl_text_cache_compatible_options(payload.get("cache_options"), expected_cache_options)
+                        for payload in text_payloads
+                    ):
+                        needs_caching = True
+                        break
+                    lat_payload = torch.load(lat_path, map_location="cpu", weights_only=True)
+                    if not isinstance(lat_payload, dict):
+                        needs_caching = True
+                        break
+                    if not sdxl_lat_cache_compatible_options(lat_payload.get("cache_options"), expected_cache_options):
+                        needs_caching = True
+                        break
+                except Exception:
                     needs_caching = True
                     break
                 relative_path = item.get("relative_path")
@@ -1105,7 +1289,7 @@ def check_if_caching_needed(config, include_null_cache=True):
             for f in cached_te_files[: min(len(cached_te_files), 10)]:
                 try:
                     data_te = torch.load(f, map_location="cpu", weights_only=True)
-                    if not cache_options_match_for_image_cache(data_te.get("cache_options"), expected_cache_options):
+                    if not sdxl_text_cache_compatible_options(data_te.get("cache_options"), expected_cache_options):
                         needs_caching = True
                         break
                 except Exception:
@@ -1374,7 +1558,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
         if cache_index_exists(cache_dir) and not force_recaching:
             try:
                 existing_index = load_cache_index(cache_dir)
-                if not cache_options_match_for_image_cache(existing_index.get("cache_options"), expected_cache_options):
+                if not cache_image_layout_options_match(existing_index.get("cache_options"), expected_cache_options):
                     print(
                         f"INFO: SDXL cache options changed for {root.name}; "
                         "reusing compatible cached files and filling only missing variants."
@@ -1454,8 +1638,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
                     else:
                         text_jobs.append((m, caption_type, caption, te_path))
 
-                primary_te_path = text_paths.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(text_paths.values()))
-                if lat_path.exists() and sdxl_lat_cache_valid(lat_path, primary_te_path, root, m, vae_cache_dtype, expected_cache_options):
+                if lat_path.exists() and sdxl_lat_cache_valid(lat_path, root, m, vae_cache_dtype, expected_cache_options):
                     reused_lat_count += 1
                 else:
                     lat_jobs.append((m, lat_path))
@@ -1663,7 +1846,7 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
             except Exception as e:
                 print(f"WARNING: Could not index {f}: {e}")
                 
-        index_path = save_cache_index(cache_dir, {"version": 12, "cache_options": expected_cache_options, "files": index_data})
+        index_path = save_cache_index(cache_dir, {"version": 13, "cache_options": expected_cache_options, "files": index_data})
         print(f"INFO: Saved dataset index to {index_path}")
 
     te1.cpu(); te2.cpu(); gc.collect(); torch.cuda.empty_cache()
@@ -1828,11 +2011,7 @@ class TimestepSampler:
         self.total_tickets_needed = config.MAX_TRAIN_STEPS * config.BATCH_SIZE
         self.seed = config.SEED if config.SEED else 42
         self.is_rectified_flow = config.is_rectified_flow
-        self.force_image_bin_spread = bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False))
-        self.rng = np.random.Generator(np.random.PCG64(self.seed + 7919))
-        self.image_bin_history = defaultdict(set)
         self.bin_ranges = []
-        self.bin_weights = []
         allocation = getattr(config, 'TIMESTEP_ALLOCATION', None)
         self.ticket_pool = self._build_ticket_pool(allocation)
         self.pool_index = 0
@@ -1850,14 +2029,12 @@ class TimestepSampler:
         pool = []
         rng = np.random.Generator(np.random.PCG64(self.seed))
         self.bin_ranges = []
-        self.bin_weights = []
         for i, count in enumerate(counts):
             if count <= 0: continue
             start_t = i * self.bin_size
             end_t = min(1000, (i + 1) * self.bin_size)
             if start_t >= 1000: break
             self.bin_ranges.append((start_t, end_t))
-            self.bin_weights.append(max(1, int(count)))
             num_tickets = max(1, int(count * scale_factor * self.config.BATCH_SIZE))
             pool.extend(rng.integers(start_t, end_t, size=num_tickets).tolist())
 
@@ -1877,50 +2054,20 @@ class TimestepSampler:
         self.pool_index += 1
         return index
 
-    def _sample_for_image_key(self, image_key):
-        if not self.bin_ranges:
-            return self._sample_from_pool()
-
-        key = str(image_key)
-        used_bins = self.image_bin_history[key]
-        all_bins = list(range(len(self.bin_ranges)))
-        available_bins = [idx for idx in all_bins if idx not in used_bins]
-        if not available_bins:
-            used_bins.clear()
-            available_bins = all_bins
-
-        weights = np.array([self.bin_weights[idx] for idx in available_bins], dtype=np.float64)
-        weights = weights / weights.sum()
-        bin_idx = int(self.rng.choice(available_bins, p=weights))
-        used_bins.add(bin_idx)
-        start_t, end_t = self.bin_ranges[bin_idx]
-        return int(self.rng.integers(start_t, end_t))
-
     def state_dict(self):
         return {
             "pool_index": self.pool_index,
-            "rng_state": self.rng.bit_generator.state,
-            "image_bin_history": {key: sorted(value) for key, value in self.image_bin_history.items()},
         }
 
     def load_state_dict(self, state):
         if not isinstance(state, dict):
             return
         self.pool_index = int(state.get("pool_index", self.pool_index)) % len(self.ticket_pool)
-        if state.get("rng_state"):
-            self.rng.bit_generator.state = state["rng_state"]
-        history = state.get("image_bin_history", {})
-        if isinstance(history, dict):
-            self.image_bin_history = defaultdict(set, {str(key): set(value) for key, value in history.items()})
 
-    def sample(self, batch_size, image_keys=None):
+    def sample(self, batch_size):
         indices = []
-        if self.force_image_bin_spread and image_keys:
-            for image_key in image_keys:
-                indices.append(self._sample_for_image_key(image_key))
-        else:
-            for _ in range(batch_size):
-                indices.append(self._sample_from_pool())
+        for _ in range(batch_size):
+            indices.append(self._sample_from_pool())
         return torch.tensor(indices, dtype=torch.long, device=self.device), indices[0]
 
     def update(self, raw_grad_norm): pass
@@ -1978,8 +2125,13 @@ def create_optimizer(config, params_to_optimize):
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
 def sdxl_bell_timestep_loss_weights(timesteps):
-    t = timesteps.float() / 999.0
-    return torch.exp(-((t - 0.5) ** 2) / (2 * 0.25 ** 2))
+    t = timesteps.float()
+    steps = 1000
+    grid = torch.arange(steps, device=t.device, dtype=t.dtype)
+    y = torch.exp(-2.0 * ((grid - steps / 2) / steps).pow(2))
+    y_min = y.min()
+    scale = steps / (y - y_min).sum().clamp_min(1e-12)
+    return (torch.exp(-2.0 * ((t - steps / 2) / steps).pow(2)) - y_min).clamp_min(0.0) * scale
 
 def weighted_sdxl_mse_loss(pred, target, timesteps):
     per_sample_loss = (pred.float() - target.float()).pow(2).flatten(1).mean(dim=1)
@@ -2193,8 +2345,23 @@ def main():
     print("\n--- Initializing Dataset ---")
     dataset   = ImageTextLatentDataset(config)
     print_dataset_resolution_sample(dataset, sample_count=5)
-    sampler   = BucketBatchSampler(dataset, config.BATCH_SIZE, initial_sampler_seed, shuffle=True)
-    sampler.set_epoch(initial_epoch)
+    timestep_sampler = TimestepSampler(config, device)
+    if initial_timestep_sampler_state is not None:
+        timestep_sampler.load_state_dict(initial_timestep_sampler_state)
+    elif config.RESUME_TRAINING and micro_step > 0:
+        timestep_sampler.set_current_step(micro_step)
+
+    image_schedule = build_image_batch_schedule(
+        dataset,
+        config.MAX_TRAIN_STEPS,
+        config.BATCH_SIZE,
+        initial_sampler_seed,
+        timestep_sampler.ticket_pool,
+        timestep_sampler.bin_ranges,
+        bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False)),
+    )
+    sampler = PrecomputedImageBatchSampler(image_schedule, initial_sampler_seed, micro_step if config.RESUME_TRAINING else 0)
+    print(f"INFO: Precomputed image batch schedule for {len(image_schedule):,} step(s).")
     dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
     unet.enable_gradient_checkpointing()
@@ -2231,12 +2398,6 @@ def main():
     diagnostics  = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     reporter     = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param")
     
-    timestep_sampler = TimestepSampler(config, device)
-    if initial_timestep_sampler_state is not None:
-        timestep_sampler.load_state_dict(initial_timestep_sampler_state)
-    elif config.RESUME_TRAINING and micro_step > 0:
-        timestep_sampler.set_current_step(micro_step)
-
     accumulated_latent_paths  = []
     global_step_times         = deque(maxlen=50)
     optim_step_times          = deque(maxlen=20)
@@ -2245,17 +2406,12 @@ def main():
     last_optim_step_log_time  = time.time()
     done                      = False
     dataloader_len            = len(dataloader)
-    if config.RESUME_TRAINING and dataloader_len > 0:
-        batches_to_skip = micro_step % dataloader_len
-    else:
-        if config.RESUME_TRAINING and dataloader_len <= 0:
-            reporter.log_message("WARNING: Resume requested but dataloader is empty; starting without batch skipping.")
-        batches_to_skip = 0
+    if config.RESUME_TRAINING and dataloader_len <= 0:
+        reporter.log_message("WARNING: Resume requested but dataloader is empty; starting without batch skipping.")
     noise_generator = torch.Generator(device=device)
 
     while not done:
         for batch in dataloader:
-            if batches_to_skip > 0: batches_to_skip -= 1; continue
             if micro_step >= config.MAX_TRAIN_STEPS: done = True; break
             if not batch: continue
 
@@ -2279,7 +2435,7 @@ def main():
                 ]
                 time_ids = torch.tensor(time_ids_data, dtype=config.compute_dtype, device=device)
 
-                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0], batch.get("image_key"))
+                timesteps, first_timestep_int = timestep_sampler.sample(latents.shape[0])
                 timestep_str = str(first_timestep_int)
                 noise = generate_noise(
                     latents=latents,

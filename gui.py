@@ -2441,10 +2441,8 @@ UI_DEFS = {
     "DIT_EXCLUDE_TARGETS":         ("Exclude DiT Layers", "Keywords or fnmatch patterns for DiT layers to exclude.", "textedit", 100),
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
-    "TIMESTEP_FORCE_IMAGE_BIN_SPREAD": ("Force Image-Bin Spread", "Avoid assigning the same image to the same active timestep bin again until it has covered every active bin.", "check"),
+    "TIMESTEP_FORCE_IMAGE_BIN_SPREAD": ("Force Image-Bin Spread", "Preplan batch-1 image order so images avoid repeating recent timestep bins while timestep sampling stays unchanged.", "check"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
-    "USE_GRADIENT_CHECKPOINTING":  ("DiT Gradient Checkpointing", "Use DiT gradient checkpointing when supported by the model.", "check"),
-    "USE_GRADIENT_CHECKPOINTING_OFFLOAD": ("DiT Checkpoint Offload", "Offload DiT checkpoint activations when supported.", "check"),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
     "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": ("Use Bell Timestep Loss Weight", "Multiply MSE by a bell-shaped timestep loss weight.", "check"),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
@@ -2704,8 +2702,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.dit_exclusion_group.setVisible(is_dit)
         if hasattr(self, "advanced_group"):
             self.advanced_group.setVisible(not is_dit)
-        if hasattr(self, "dit_runtime_group"):
-            self.dit_runtime_group.setVisible(is_dit)
+        self._update_loss_controls()
 
         for key in ANIMA_LOCKED_WIDGET_KEYS:
             if key in self.widgets:
@@ -3154,18 +3151,13 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_training_length_group())
         settings_lay.addWidget(self._build_batching_group())
         settings_lay.addWidget(self._build_runtime_group())
+        settings_lay.addWidget(self._build_loss_group())
         self.unet_exclusion_group = self._vertical_form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"])
         self.dit_exclusion_group = self._vertical_form_group("DiT Layer Exclusion", ["DIT_EXCLUDE_TARGETS"])
         settings_lay.addWidget(self.unet_exclusion_group)
         settings_lay.addWidget(self.dit_exclusion_group)
-        settings_lay.addWidget(self._build_loss_group())
         self.advanced_group = self._build_advanced_group()
-        self.dit_runtime_group = self._vertical_form_group(
-            "DiT Runtime",
-            ["USE_GRADIENT_CHECKPOINTING", "USE_GRADIENT_CHECKPOINTING_OFFLOAD"],
-        )
         settings_lay.addWidget(self.advanced_group)
-        settings_lay.addWidget(self.dit_runtime_group)
         settings_lay.addStretch(1)
         split.addWidget(self._make_scroll_panel(settings_panel, 380, 500))
 
@@ -3484,6 +3476,25 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_loss_group(self):
         return self._vertical_form_group("Loss Configuration", ["LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT"])
+
+    def _update_loss_controls(self):
+        if "LOSS_TYPE" not in self.widgets:
+            return
+        is_dit = self._is_dit_mode()
+        combo = self.widgets["LOSS_TYPE"]
+        allowed = ["MSE"] if is_dit else ["MSE", "PatchMSE"]
+        current = combo.currentText()
+        desired = self.current_config.get("LOSS_TYPE", current)
+        if desired not in allowed:
+            desired = "MSE"
+
+        combo.blockSignals(True)
+        if [combo.itemText(i) for i in range(combo.count())] != allowed:
+            combo.clear()
+            combo.addItems(allowed)
+        combo.setCurrentText(desired)
+        combo.blockSignals(False)
+        self.current_config["LOSS_TYPE"] = desired
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -3832,13 +3843,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.current_config = default_config.flatten_preset(self.current_preset, default_config.MODE_SDXL)
             self.current_mode_key = default_config.mode_key_from_label(mode)
             self.current_preset["active_mode"] = self.current_mode_key
-            if "DIT_VAE_PATH" not in self.current_config and self.current_config.get("VAE_PATH"):
-                self.current_config["DIT_VAE_PATH"] = self.current_config.get("VAE_PATH")
-            if mode == TRAINING_MODE_ANIMA_DIT:
-                if not self.current_config.get("ANIMA_RESUME_MODEL_PATH") and self.current_config.get("RESUME_MODEL_PATH"):
-                    self.current_config["ANIMA_RESUME_MODEL_PATH"] = self.current_config.get("RESUME_MODEL_PATH")
-                if not self.current_config.get("ANIMA_RESUME_STATE_PATH") and self.current_config.get("RESUME_STATE_PATH"):
-                    self.current_config["ANIMA_RESUME_STATE_PATH"] = self.current_config.get("RESUME_STATE_PATH")
             self.training_mode_combo.blockSignals(True)
             self.training_mode_combo.setCurrentText(mode)
             self.training_mode_combo.blockSignals(False)
@@ -3938,7 +3942,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
-        cfg["LOSS_TYPE"] = self.widgets["LOSS_TYPE"].currentText()
+        cfg["LOSS_TYPE"] = "MSE" if is_dit else self.widgets["LOSS_TYPE"].currentText()
         cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
@@ -4030,15 +4034,11 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def get_current_cache_folder_names(self):
         if self._is_dit_mode():
-            return [".precomputed_anima_dit_cache"]
+            return [self.current_config.get("ANIMA_CACHE_FOLDER_NAME", ".precomputed_anima_dit_cache")]
         pred_type = self.widgets["PREDICTION_TYPE"].currentText() if "PREDICTION_TYPE" in self.widgets else ""
         if pred_type == "rectified_flow":
-            return [".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
-        for ds in self.dataset_manager.datasets:
-            for name in [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache"]:
-                if (Path(ds["path"]) / name).exists():
-                    return [name, ".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
-        return [".precomputed_embeddings_cache_standard_sdxl", ".precomputed_embeddings_cache", ".precomputed_embeddings_cache_rf", ".precomputed_embeddings_cache_rf_noobai"]
+            return [".precomputed_embeddings_cache_rf"]
+        return [".precomputed_embeddings_cache_standard_sdxl"]
 
     def start_training(self):
         self.save_config()

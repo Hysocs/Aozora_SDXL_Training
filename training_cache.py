@@ -1,4 +1,3 @@
-import json
 import os
 import random
 import re
@@ -12,53 +11,90 @@ CAPTION_JSON_TYPES = ("tags", "nl", "tags_nl", "nl_tags")
 CAPTION_JSON_PRIMARY_TYPE = "tags_nl"
 CAPTION_JSON_VARIANT_RE = re.compile(r"_json_(tags|nl|tags_nl|nl_tags)$")
 CACHE_INDEX_NAME = "dataset_index.pt"
-LEGACY_CACHE_INDEX_NAME = "dataset_index.json"
+CACHE_IMAGE_LAYOUT_OPTION_KEYS = (
+    "cache_schema_version",
+    "bucket_layout",
+    "max_bucket_resolution",
+    "should_upscale",
+    "multi_bucket_enabled",
+    "multi_bucket_extra_buckets",
+    "caption_source_type",
+)
+CACHE_TEXT_OPTION_KEYS = (
+    "cache_schema_version",
+    "text_cache_float_dtype",
+    "caption_source_type",
+    "caption_json_types",
+    "caption_chunking_enabled",
+    "caption_embedding_layout",
+)
+CACHE_LATENT_OPTION_KEYS = (
+    "cache_schema_version",
+    "vae_cache_float_dtype",
+    "vae_normalization_mode",
+    "vae_shift_factor",
+    "vae_scaling_factor",
+    "vae_latent_channels",
+    "vae_path",
+    "vae_source_path",
+    "vae_source_size",
+    "vae_source_mtime_ns",
+)
+
+
+def cache_options_match_for_keys(cached_options, expected_options, keys):
+    if not isinstance(cached_options, dict) or not isinstance(expected_options, dict):
+        return False
+    return all(cached_options.get(key) == expected_options.get(key) for key in keys)
+
+
+def cache_image_layout_options_match(cached_options, expected_options, extra_keys=()):
+    return cache_options_match_for_keys(
+        cached_options,
+        expected_options,
+        CACHE_IMAGE_LAYOUT_OPTION_KEYS + tuple(extra_keys or ()),
+    )
+
+
+def cache_text_options_match(cached_options, expected_options, extra_keys=()):
+    return cache_options_match_for_keys(
+        cached_options,
+        expected_options,
+        CACHE_TEXT_OPTION_KEYS + tuple(extra_keys or ()),
+    )
+
+
+def cache_latent_options_match(cached_options, expected_options, extra_keys=()):
+    return cache_options_match_for_keys(
+        cached_options,
+        expected_options,
+        CACHE_LATENT_OPTION_KEYS + tuple(extra_keys or ()),
+    )
 
 
 def cache_index_path(cache_dir):
     return Path(cache_dir) / CACHE_INDEX_NAME
 
 
-def legacy_cache_index_path(cache_dir):
-    return Path(cache_dir) / LEGACY_CACHE_INDEX_NAME
-
-
 def cache_index_exists(cache_dir):
-    return cache_index_path(cache_dir).exists() or legacy_cache_index_path(cache_dir).exists()
+    return cache_index_path(cache_dir).exists()
 
 
 def load_cache_index(cache_dir_or_path):
     path = Path(cache_dir_or_path)
     if path.is_dir():
-        pt_path = cache_index_path(path)
-        json_path = legacy_cache_index_path(path)
-        path = pt_path if pt_path.exists() else json_path
+        path = cache_index_path(path)
 
-    if path.suffix.lower() == ".pt":
-        return torch.load(path, map_location="cpu", weights_only=False)
-
-    with open(path, "r", encoding="utf-8") as f:
-        return json.load(f)
+    return torch.load(path, map_location="cpu", weights_only=False)
 
 
-def save_cache_index(cache_dir, payload, keep_legacy_json=False):
+def save_cache_index(cache_dir, payload):
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     path = cache_index_path(cache_dir)
     tmp_path = path.with_suffix(path.suffix + ".tmp")
     torch.save(payload, tmp_path)
     tmp_path.replace(path)
-
-    json_path = legacy_cache_index_path(cache_dir)
-    if keep_legacy_json:
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(payload, f)
-    else:
-        try:
-            if json_path.exists():
-                json_path.unlink()
-        except OSError as e:
-            print(f"WARNING: Could not remove legacy cache index {json_path}: {e}")
     return path
 
 
@@ -97,6 +133,17 @@ def caption_file_signature_for_image(image_path, caption_mode="txt"):
     signature = file_stat_signature(sidecar)
     signature["mode"] = caption_source_type(caption_mode)
     return signature
+
+
+def cached_file_signatures_match(item, image_path, caption_mode):
+    image_sig = item.get("image_file_signature")
+    caption_sig = item.get("caption_file_signature")
+    if not image_sig or not caption_sig:
+        return None
+    return (
+        image_sig == image_file_signature(image_path)
+        and caption_sig == caption_file_signature_for_image(image_path, caption_mode)
+    )
 
 
 def cache_stem_for_image(root, image_path):
@@ -173,7 +220,7 @@ def caption_variant_index(variant_paths, path_key="te_path"):
     }
 
 
-def selected_caption_variant_path(item, rng, weights, path_key="te_path", primary_key="te_path", fallback_key=None, enabled=True):
+def selected_caption_variant_path(item, rng, weights, path_key="te_path", primary_key="te_path", enabled=True):
     variants = item.get("caption_variants")
     if enabled and isinstance(variants, dict):
         available_weights = {key: weights.get(key, 0) for key in variants}
@@ -181,7 +228,7 @@ def selected_caption_variant_path(item, rng, weights, path_key="te_path", primar
         variant = variants.get(caption_type) or variants.get(CAPTION_JSON_PRIMARY_TYPE) or next(iter(variants.values()))
         if isinstance(variant, dict) and variant.get(path_key):
             return variant[path_key]
-    return item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
+    return item.get(primary_key)
 
 
 def lat_path_for_te_path(te_path):
@@ -194,7 +241,7 @@ def lat_path_for_te_path(te_path):
     return te_path.with_name(f"{stem}_lat.pt")
 
 
-def text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path", fallback_key=None):
+def text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_path"):
     variants = item.get("caption_variants")
     if isinstance(variants, dict):
         return [
@@ -202,8 +249,43 @@ def text_cache_paths_for_index_item(item, path_key="te_path", primary_key="te_pa
             for value in variants.values()
             if isinstance(value, dict) and value.get(path_key)
         ]
-    path = item.get(primary_key) or (item.get(fallback_key) if fallback_key else None)
+    path = item.get(primary_key)
     return [path] if path else []
+
+
+def cache_payload_options_match_for_index_item(item, expected_options, cache_paths_for_item, text_options_match, latent_options_match):
+    for cache_path in cache_paths_for_item(item):
+        cache_path = Path(cache_path)
+        if not cache_path.exists():
+            return False
+        try:
+            payload = torch.load(cache_path, map_location="cpu", weights_only=True)
+        except Exception:
+            return False
+        if cache_path.name.endswith("_te.pt"):
+            if not text_options_match(payload.get("cache_options"), expected_options):
+                return False
+        elif cache_path.name.endswith("_lat.pt"):
+            if not isinstance(payload, dict):
+                return False
+            if not latent_options_match(payload.get("cache_options"), expected_options):
+                return False
+    return True
+
+
+def cache_payload_options_match_for_index(index_data, expected_options, cache_paths_for_item, text_options_match, latent_options_match):
+    if not isinstance(index_data, dict):
+        return False
+    return all(
+        cache_payload_options_match_for_index_item(
+            item,
+            expected_options,
+            cache_paths_for_item,
+            text_options_match,
+            latent_options_match,
+        )
+        for item in index_data.get("files", [])
+    )
 
 
 def te_paths_for_index_item(item):

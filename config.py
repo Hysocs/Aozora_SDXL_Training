@@ -4,7 +4,7 @@ import copy
 # DEFAULT CONFIGURATION
 # ====================================================================================
 
-CONFIG_VERSION = 2
+CONFIG_VERSION = 3
 MODE_SDXL = "sdxl"
 MODE_ANIMA = "anima"
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
@@ -45,7 +45,6 @@ INSTANCE_DATASETS = [
 
 # --- Caching & Data Loaders ---
 CACHING_BATCH_SIZE = 2
-CACHE_PRECISION = "bfloat16"
 TEXT_CACHE_PRECISION = "bfloat16"
 VAE_CACHE_PRECISION = "bfloat16"
 NUM_WORKERS = 0
@@ -145,9 +144,6 @@ SEMANTIC_ENTROPY_WEIGHT = 0.2
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "sdpa"
 TIMESTEP_MODE = "Wave"
-USE_GRADIENT_CHECKPOINTING = True
-USE_GRADIENT_CHECKPOINTING_OFFLOAD = True
-
 # --- DiT / Anima Cache Configuration ---
 ANIMA_CACHE_FOLDER_NAME = ".precomputed_anima_dit_cache"
 VAE_CACHING_TILED = True
@@ -168,8 +164,8 @@ FLAT_KEYS = [
     "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
     "RESUME_TRAINING", "RESUME_MODEL_PATH", "RESUME_STATE_PATH",
     "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH", "INSTANCE_DATASETS",
-    "CACHING_BATCH_SIZE", "CACHE_PRECISION", "TEXT_CACHE_PRECISION",
-    "VAE_CACHE_PRECISION", "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
+    "CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION",
+    "NUM_WORKERS", "UNCONDITIONAL_DROPOUT",
     "UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE",
     "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED",
     "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX",
@@ -186,7 +182,6 @@ FLAT_KEYS = [
     "VELORMS_PARAMS", "LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", "SEMANTIC_SEP_WEIGHT",
     "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT",
     "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
-    "USE_GRADIENT_CHECKPOINTING", "USE_GRADIENT_CHECKPOINTING_OFFLOAD",
     "ANIMA_CACHE_FOLDER_NAME", "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE",
     "VAE_CACHING_TILE_STRIDE", "REBUILD_CACHE", "VAE_NORMALIZATION_MODE",
     "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR", "VAE_LATENT_CHANNELS",
@@ -194,8 +189,8 @@ FLAT_KEYS = [
 
 PER_MODE_FLAT_KEYS = [
     "OUTPUT_DIR", "RESUME_TRAINING", "INSTANCE_DATASETS", "CACHING_BATCH_SIZE",
-    "CACHE_PRECISION", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION",
-    "NUM_WORKERS", "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
+    "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS",
+    "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
     "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE",
     "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN",
     "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED",
@@ -223,8 +218,7 @@ MODE_SPECIFIC_FLAT_KEYS = {
         "DIT_PATH", "DIT_VAE_PATH", "ANIMA_DIT_SAVE_PREFIX",
         "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
         "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH",
-        "DIT_EXCLUDE_TARGETS", "USE_GRADIENT_CHECKPOINTING",
-        "USE_GRADIENT_CHECKPOINTING_OFFLOAD", "ANIMA_CACHE_FOLDER_NAME",
+        "DIT_EXCLUDE_TARGETS", "ANIMA_CACHE_FOLDER_NAME",
         "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE", "VAE_CACHING_TILE_STRIDE",
     ],
 }
@@ -306,18 +300,15 @@ def normalize_preset(config_data):
     preset["active_mode"] = mode_key_from_label(config_data.get("active_mode"))
     for mode_key in (MODE_SDXL, MODE_ANIMA):
         if isinstance(config_data.get(mode_key), dict):
-            mode_data = copy.deepcopy(config_data[mode_key])
-            legacy_key = nested_key_for(mode_key, "CACHE_PRECISION")
-            text_key = nested_key_for(mode_key, "TEXT_CACHE_PRECISION")
-            vae_key = nested_key_for(mode_key, "VAE_CACHE_PRECISION")
-            if legacy_key in mode_data:
-                mode_data.setdefault(text_key, mode_data[legacy_key])
-                mode_data.setdefault(vae_key, mode_data[legacy_key])
-            legacy_loss_weight_key = f"{mode_key}_anima_use_timestep_loss_weight"
-            loss_weight_key = nested_key_for(mode_key, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT")
-            if legacy_loss_weight_key in mode_data:
-                mode_data.setdefault(loss_weight_key, mode_data[legacy_loss_weight_key])
-            preset[mode_key].update(mode_data)
+            valid_keys = {
+                nested_key_for(mode_key, flat_key)
+                for flat_key in mode_flat_keys(mode_key)
+            }
+            preset[mode_key].update({
+                key: copy.deepcopy(value)
+                for key, value in config_data[mode_key].items()
+                if key in valid_keys
+            })
     return preset
 
 

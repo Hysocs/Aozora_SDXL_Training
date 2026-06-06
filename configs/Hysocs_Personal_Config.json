@@ -1,5 +1,5 @@
 {
-    "config_version": 2,
+    "config_version": 3,
     "active_mode": "anima",
     "sdxl": {
         "sdxl_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
@@ -11,7 +11,6 @@
             }
         ],
         "sdxl_caching_batch_size": 1,
-        "sdxl_cache_precision": "bfloat16",
         "sdxl_text_cache_precision": "bfloat16",
         "sdxl_vae_cache_precision": "bfloat16",
         "sdxl_num_workers": 0,
@@ -123,27 +122,22 @@
         "sdxl_vae_path": "",
         "sdxl_resume_model_path": "",
         "sdxl_resume_state_path": "",
-        "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*",
-        "sdxl_anima_use_timestep_loss_weight": true,
-        "sdxl_text_conditioning_scale_target": "Qwen",
-        "sdxl_target_pixel_area": 1048576,
-        "sdxl_max_area_tolerance": "1.0"
+        "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*"
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by gileu",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from ASTELLA SAGA",
                 "repeats": 1
             }
         ],
         "anima_caching_batch_size": 1,
-        "anima_cache_precision": "bfloat16",
         "anima_text_cache_precision": "bfloat16",
         "anima_vae_cache_precision": "bfloat16",
         "anima_num_workers": 0,
@@ -169,7 +163,7 @@
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "150000",
+        "anima_max_train_steps": "4000",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -200,16 +194,16 @@
         "anima_timestep_allocation": {
             "bin_size": 100,
             "counts": [
-                15000,
-                15000,
-                15000,
-                15000,
-                15000,
-                15000,
-                15000,
-                15000,
-                15000,
-                15000
+                400,
+                400,
+                400,
+                400,
+                400,
+                400,
+                400,
+                400,
+                400,
+                400
             ]
         },
         "anima_timestep_force_image_bin_spread": true,
@@ -260,8 +254,6 @@
         "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezora_step_11602_000_step_13197.safetensors",
         "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_13197.pt",
         "anima_dit_exclude_targets": "",
-        "anima_use_gradient_checkpointing": true,
-        "anima_use_gradient_checkpointing_offload": false,
         "anima_cache_folder_name": ".precomputed_anima_dit_cache",
         "anima_vae_caching_tiled": true,
         "anima_vae_caching_tile_size": [
@@ -271,9 +263,6 @@
         "anima_vae_caching_tile_stride": [
             72,
             72
-        ],
-        "anima_text_conditioning_scale_target": "T5XXL",
-        "anima_target_pixel_area": 1048576,
-        "anima_max_area_tolerance": "1.0"
+        ]
     }
 }
