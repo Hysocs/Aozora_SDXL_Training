@@ -765,8 +765,15 @@ STANDARD_SDXL_BUCKETS = [
     (1600, 512), (512, 1600),
     (896, 896), (768, 768),
 ]
+LOW_RES_ASPECT_BUCKETS = [
+    (1152, 512), (512, 1152),
+    (1024, 576), (576, 1024),
+    (960, 640), (640, 960),
+    (896, 704), (704, 896),
+    (768, 768),
+]
 MAX_BUCKET_RESOLUTION_CHOICES = (896, 1024, 1152, 1536)
-BUCKET_LAYOUT_VERSION = "preset_ladder_v1"
+BUCKET_LAYOUT_VERSION = "preset_ladder_v3"
 
 
 def resolve_max_bucket_resolution(value=None):
@@ -801,9 +808,10 @@ def get_bucket_ladder(max_bucket_resolution=None):
     for tier in tiers:
         if tier == 1024:
             buckets.update(STANDARD_SDXL_BUCKETS)
+            buckets.update(LOW_RES_ASPECT_BUCKETS)
             continue
         scale = tier / 1024
-        for width, height in STANDARD_SDXL_BUCKETS:
+        for width, height in STANDARD_SDXL_BUCKETS + LOW_RES_ASPECT_BUCKETS:
             scaled_w = max(64, int(round((width * scale) / 64)) * 64)
             scaled_h = max(64, int(round((height * scale) / 64)) * 64)
             buckets.add((scaled_w, scaled_h))
@@ -832,7 +840,9 @@ def get_optimal_bucket(orig_w, orig_h, target_area=None, stride=64, should_upsca
         if fitting_buckets:
             best_bucket = max(fitting_buckets, key=lambda b: b[0] * b[1])
         else:
-            best_bucket = min(candidate_buckets, key=lambda b: b[0] * b[1])
+            min_area = min(w * h for w, h in candidate_buckets)
+            floor_buckets = [(w, h) for w, h in candidate_buckets if w * h <= min_area * 1.1]
+            best_bucket = min(floor_buckets, key=lambda b: bucket_score(b[0], b[1]))
 
     return best_bucket
 
@@ -2124,18 +2134,56 @@ def create_optimizer(config, params_to_optimize):
         return VeloRMS(params_to_optimize, lr=initial_lr, weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
-def sdxl_bell_timestep_loss_weights(timesteps):
-    t = timesteps.float()
-    steps = 1000
-    grid = torch.arange(steps, device=t.device, dtype=t.dtype)
+def bell_timestep_loss_curve(total_timestep_count, device=None, dtype=torch.float32):
+    steps = int(total_timestep_count)
+    grid = torch.arange(steps, device=device, dtype=dtype)
     y = torch.exp(-2.0 * ((grid - steps / 2) / steps).pow(2))
     y_min = y.min()
     scale = steps / (y - y_min).sum().clamp_min(1e-12)
-    return (torch.exp(-2.0 * ((t - steps / 2) / steps).pow(2)) - y_min).clamp_min(0.0) * scale
+    return (y - y_min).clamp_min(0.0) * scale
 
-def weighted_sdxl_mse_loss(pred, target, timesteps):
+
+def sdxl_bell_timestep_loss_weights(timesteps):
+    curve = bell_timestep_loss_curve(1000, device=timesteps.device, dtype=timesteps.float().dtype)
+    indices = timesteps.long().clamp(0, curve.shape[0] - 1)
+    return curve[indices]
+
+
+def sampler_aware_timestep_loss_weights(ticket_pool, total_timestep_count, target_weights=None, device=None, dtype=torch.float32):
+    steps = int(total_timestep_count)
+    if steps <= 0:
+        return torch.ones(1, device=device, dtype=dtype)
+    if target_weights is None:
+        target = bell_timestep_loss_curve(steps, dtype=torch.float32)
+    else:
+        target = target_weights.detach().float().cpu().flatten()
+        if target.numel() != steps:
+            resized = torch.ones(steps, dtype=torch.float32)
+            size = min(steps, target.numel())
+            resized[:size] = target[:size]
+            target = resized
+    target = target / target.mean().clamp_min(1e-12)
+    tickets = torch.as_tensor(ticket_pool, dtype=torch.long).flatten()
+    tickets = tickets[(tickets >= 0) & (tickets < steps)]
+    if tickets.numel() == 0:
+        return target.to(device=device, dtype=dtype)
+    counts = torch.bincount(tickets, minlength=steps).float()
+    sample_prob = counts / counts.sum().clamp_min(1.0)
+    weights = torch.zeros(steps, dtype=torch.float32)
+    covered = sample_prob > 0
+    weights[covered] = target[covered] / (steps * sample_prob[covered])
+    weights = weights / (weights * sample_prob).sum().clamp_min(1e-12)
+    return weights.to(device=device, dtype=dtype)
+
+
+def weighted_sdxl_mse_loss(pred, target, timesteps, timestep_loss_weights=None):
     per_sample_loss = (pred.float() - target.float()).pow(2).flatten(1).mean(dim=1)
-    weights = sdxl_bell_timestep_loss_weights(timesteps).to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+    if timestep_loss_weights is None:
+        weights = sdxl_bell_timestep_loss_weights(timesteps).to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+    else:
+        curve = timestep_loss_weights.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+        indices = timesteps.long().clamp(0, curve.shape[0] - 1)
+        weights = curve[indices]
     return (per_sample_loss * weights).mean()
 
 def _get_sdxl_unet_conversion_map():
@@ -2350,6 +2398,12 @@ def main():
         timestep_sampler.load_state_dict(initial_timestep_sampler_state)
     elif config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
+    timestep_loss_weights = sampler_aware_timestep_loss_weights(
+        timestep_sampler.ticket_pool,
+        1000,
+        device=device,
+        dtype=torch.float32,
+    )
 
     image_schedule = build_image_batch_schedule(
         dataset,
@@ -2484,7 +2538,7 @@ def main():
                         loss = torch.stack(patch_losses).mean()
                 else:
                     if getattr(config, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", False):
-                        loss = weighted_sdxl_mse_loss(pred, target, timesteps)
+                        loss = weighted_sdxl_mse_loss(pred, target, timesteps, timestep_loss_weights)
                     else:
                         loss = F.mse_loss(pred.float(), target.float())
 

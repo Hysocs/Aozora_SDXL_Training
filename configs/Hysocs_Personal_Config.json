@@ -129,11 +129,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\by gileu",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from ASTELLA SAGA",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\from Shinseki no Onnanoko ga Isshoni Sumu Koto ni Nattara",
                 "repeats": 1
             }
         ],
@@ -141,14 +137,14 @@
         "anima_text_cache_precision": "bfloat16",
         "anima_vae_cache_precision": "bfloat16",
         "anima_num_workers": 0,
-        "anima_unconditional_dropout": true,
+        "anima_unconditional_dropout": false,
         "anima_unconditional_dropout_chance": 0.9,
         "anima_qwen_null_dropout_chance": 0.05,
         "anima_t5_null_dropout_chance": 0.05,
-        "anima_text_conditioning_scale_enabled": true,
+        "anima_text_conditioning_scale_enabled": false,
         "anima_text_conditioning_scale_min": 0.9,
         "anima_text_conditioning_scale_max": 1.1,
-        "anima_t5_token_dropout_enabled": true,
+        "anima_t5_token_dropout_enabled": false,
         "anima_t5_token_dropout_chance": 0.05,
         "anima_t5_token_dropout_min": 0.05,
         "anima_t5_token_dropout_max": 0.15000000000000002,
@@ -163,7 +159,7 @@
         "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "4000",
+        "anima_max_train_steps": "1500",
         "anima_batch_size": 1,
         "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
@@ -176,12 +172,12 @@
                 1e-08
             ],
             [
-                0.0474934,
-                6e-06
+                0.05013193,
+                5e-06
             ],
             [
                 0.94986807,
-                6e-06
+                5e-06
             ],
             [
                 1.0,
@@ -190,20 +186,30 @@
         ],
         "anima_learning_rate": 8e-07,
         "anima_lr_graph_min": "1.0e-8",
-        "anima_lr_graph_max": "6e-6",
+        "anima_lr_graph_max": "5e-6",
         "anima_timestep_allocation": {
-            "bin_size": 100,
+            "bin_size": 50,
             "counts": [
-                400,
-                400,
-                400,
-                400,
-                400,
-                400,
-                400,
-                400,
-                400,
-                400
+                4,
+                11,
+                19,
+                26,
+                34,
+                41,
+                49,
+                56,
+                64,
+                71,
+                79,
+                86,
+                94,
+                101,
+                109,
+                116,
+                124,
+                131,
+                139,
+                146
             ]
         },
         "anima_timestep_force_image_bin_spread": true,
@@ -239,13 +245,13 @@
         "anima_loss_type": "MSE",
         "anima_use_timestep_loss_weight": false,
         "anima_memory_efficient_attention": "sdpa",
-        "anima_timestep_mode": "Wave",
+        "anima_timestep_mode": "Beta",
         "anima_vae_normalization_mode": "scalar",
         "anima_vae_shift_factor": 0.0,
         "anima_vae_scaling_factor": 0.13025,
         "anima_vae_latent_channels": 4,
         "anima_rebuild_cache": false,
-        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezora_step_11602_000 - Release 50%.safetensors",
+        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/anima_baseV10.safetensors",
         "anima_vae_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/VAE/qwen_image_vae.safetensors",
         "anima_dit_save_prefix": "auto",
         "anima_text_encoder_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/TextEncoders/qwen_3_06b_base.safetensors",

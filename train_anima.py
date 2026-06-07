@@ -65,6 +65,7 @@ from train import (
     get_text_conditioning_scale_range,
     make_bucket_variant_metadata,
     null_conditioning_cache_needed,
+    sampler_aware_timestep_loss_weights,
     set_seed,
     smart_resize,
     text_cache_float_dtype,
@@ -1631,7 +1632,13 @@ def run_anima_dit_training(config):
     scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
     scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     scheduler_weights = getattr(pipe.scheduler, "linear_timesteps_weights", torch.ones_like(pipe.scheduler.timesteps))
-    scheduler_weights = scheduler_weights.to(device=device, dtype=torch.float32)
+    timestep_loss_weights = sampler_aware_timestep_loss_weights(
+        timestep_sampler.ticket_pool,
+        total_scheduler_timesteps,
+        scheduler_weights,
+        device=device,
+        dtype=torch.float32,
+    )
 
     reporter = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="dit")
     diagnostics = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
@@ -1669,7 +1676,7 @@ def run_anima_dit_training(config):
         timestep_indices = timestep_indices.to(device=device)
         timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
         sigmas = scheduler_sigmas[timestep_indices]
-        loss_weights = scheduler_weights[timestep_indices]
+        loss_weights = timestep_loss_weights[timestep_indices]
         noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
 
         noisy_latents, training_target = flowmatch_noise_and_target(input_latents, noise, sigmas)
