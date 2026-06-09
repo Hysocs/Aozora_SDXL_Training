@@ -2962,6 +2962,7 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(make_label("Dataset Settings", color=ACCENT, bold=True, size=12))
         settings_lay.addWidget(self._build_caption_source_group())
         settings_lay.addWidget(self._build_vae_group())
+        settings_lay.addWidget(self._vertical_form_group("Image Scheduling", ["TIMESTEP_FORCE_IMAGE_BIN_SPREAD"]))
         for title, keys in [
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS"]),
             ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED", "T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]),
@@ -3639,7 +3640,6 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
         self.timestep_histogram.allocationChanged.connect(lambda _: self._sync_widget("TIMESTEP_ALLOCATION"))
         lay.addWidget(self.timestep_histogram)
-        self._add_vertical_widget_key(lay, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD")
 
         r1 = QtWidgets.QHBoxLayout()
         r1.addWidget(make_label("Bin Size:"))
