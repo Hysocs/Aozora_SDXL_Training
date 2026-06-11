@@ -129,11 +129,11 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
                 "repeats": 1
             },
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)",
+                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
                 "repeats": 1
             }
         ],
@@ -155,8 +155,8 @@
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
         "anima_caption_source_type": "json",
-        "anima_caption_tags_percent": 70,
-        "anima_caption_nl_percent": 30,
+        "anima_caption_tags_percent": 80,
+        "anima_caption_nl_percent": 20,
         "anima_caption_tags_nl_percent": 0,
         "anima_caption_nl_tags_percent": 0,
         "anima_max_bucket_resolution": "1024",
@@ -165,7 +165,7 @@
         "anima_prediction_type": "epsilon",
         "anima_max_train_steps": "150000",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "4",
+        "anima_gradient_accumulation_steps": "8",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",

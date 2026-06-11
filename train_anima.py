@@ -377,15 +377,16 @@ def anima_cache_rebuild_needed_for_root(config, root, expected_options=None, cac
                 if not cache_path.exists():
                     print(f"INFO: Anima cache rebuild needed for {root}: missing cached item {cache_path}.")
                     return True
-            if not cache_payload_options_match_for_index_item(
-                item,
-                expected_options,
-                anima_cache_paths_for_index_item,
-                anima_text_cache_compatible_options,
-                anima_lat_cache_compatible_options,
-            ):
-                print(f"INFO: Anima cache rebuild needed for {root}: cache payload options changed.")
-                return True
+            if bool(getattr(config, "ANIMA_DEEP_CACHE_VALIDATE", False)):
+                if not cache_payload_options_match_for_index_item(
+                    item,
+                    expected_options,
+                    anima_cache_paths_for_index_item,
+                    anima_text_cache_compatible_options,
+                    anima_lat_cache_compatible_options,
+                ):
+                    print(f"INFO: Anima cache rebuild needed for {root}: cache payload options changed.")
+                    return True
             relative_path = item.get("relative_path")
             if relative_path:
                 try:
@@ -772,18 +773,20 @@ def precompute_and_cache_anima(config, pipe, device):
         max_bucket_resolution = get_max_bucket_resolution_for_config(config)
         max_bucket_area = max_bucket_resolution * max_bucket_resolution
         existing_items_by_relative_path = defaultdict(list)
+        deep_cache_validate = bool(getattr(config, "ANIMA_DEEP_CACHE_VALIDATE", False))
         can_reuse_index_metadata = (
             existing_index is not None
             and not force_recaching
             and anima_image_layout_options_match(existing_index.get("cache_options"), expected_options)
-            and cache_payload_options_match_for_index(
+        )
+        if can_reuse_index_metadata and deep_cache_validate:
+            can_reuse_index_metadata = cache_payload_options_match_for_index(
                 existing_index,
                 expected_options,
                 anima_cache_paths_for_index_item,
                 anima_text_cache_compatible_options,
                 anima_lat_cache_compatible_options,
             )
-        )
         if can_reuse_index_metadata:
             for item in existing_index.get("files", []):
                 relative_path = item.get("relative_path")
