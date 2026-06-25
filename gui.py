@@ -2441,6 +2441,7 @@ UI_DEFS = {
     "DIT_EXCLUDE_TARGETS":         ("Exclude DiT Layers", "Keywords or fnmatch patterns for DiT layers to exclude.", "textedit", 100),
     "LR_GRAPH_MIN":                ("Graph Min LR", "Minimum learning rate displayed on the Y-axis.", "line"),
     "LR_GRAPH_MAX":                ("Graph Max LR", "Maximum learning rate displayed on the Y-axis.", "line"),
+    "TIMESTEP_STRATIFIED_SAMPLING": ("Stratified Timestep Coverage", "Balance bin order locally and draw each bin's timestep values from shuffled no-repeat decks.", "check"),
     "TIMESTEP_FORCE_IMAGE_BIN_SPREAD": ("Force Image-Bin Spread", "Preplan batch-1 image order so images avoid repeating recent timestep bins while timestep sampling stays unchanged.", "check"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
     "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
@@ -2962,12 +2963,12 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(make_label("Dataset Settings", color=ACCENT, bold=True, size=12))
         settings_lay.addWidget(self._build_caption_source_group())
         settings_lay.addWidget(self._build_vae_group())
-        settings_lay.addWidget(self._vertical_form_group("Image Scheduling", ["TIMESTEP_FORCE_IMAGE_BIN_SPREAD"]))
         for title, keys in [
             ("Batching & DataLoaders", ["CACHING_BATCH_SIZE", "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS"]),
             ("Conditioning Regularization", ["UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE", "TEXT_CONDITIONING_SCALE_ENABLED", "TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX", "T5_TOKEN_DROPOUT_ENABLED", "T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]),
             ("Caption Cache Options", ["CAPTION_CHUNKING_ENABLED"]),
             ("Aspect Ratio Bucketing", ["MAX_BUCKET_RESOLUTION", "SHOULD_UPSCALE", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS"]),
+            ("Image Scheduling", ["TIMESTEP_FORCE_IMAGE_BIN_SPREAD"]),
         ]:
             settings_lay.addWidget(self._form_group(title, keys))
         settings_lay.addStretch(1)
@@ -3696,6 +3697,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(lambda _: self._update_timestep_distribution())
+        coverage_form = QtWidgets.QFormLayout()
+        coverage_form.setContentsMargins(0, 0, 0, 0)
+        self._add_form_keys(coverage_form, ["TIMESTEP_STRATIFIED_SAMPLING"])
+        lay.addLayout(coverage_form)
         return gb
 
     def _add_slider_row(self, layout, label_text, min_val, max_val, default_val, divider):

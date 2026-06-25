@@ -62,6 +62,7 @@
             "bin_size": 100,
             "counts": []
         },
+        "sdxl_timestep_stratified_sampling": false,
         "sdxl_timestep_force_image_bin_spread": false,
         "sdxl_optimizer_type": "raven",
         "sdxl_raven_params": {
@@ -173,6 +174,7 @@
             "bin_size": 100,
             "counts": []
         },
+        "anima_timestep_stratified_sampling": false,
         "anima_timestep_force_image_bin_spread": false,
         "anima_optimizer_type": "raven",
         "anima_raven_params": {

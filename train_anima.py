@@ -53,6 +53,7 @@ from train import (
     PrecomputedImageBatchSampler,
     TitanAdamW,
     TrainingDiagnostics,
+    build_timestep_ticket_pool,
     build_image_batch_schedule,
     caption_signature_for_image,
     consume_force_save_flag,
@@ -724,6 +725,8 @@ def precompute_and_cache_anima(config, pipe, device):
         if getattr(config, "MULTI_BUCKET_ENABLED", False)
         else 0
     )
+    if multi_bucket_extra > 0:
+        print(f"INFO: Multi-bucket cache enabled: up to {multi_bucket_extra} extra bucket(s) per image.")
 
     for root in roots_to_rebuild:
         if not root.exists():
@@ -1276,37 +1279,14 @@ class AnimaTimestepSampler:
         self.pool_index = 0
 
     def _build_ticket_pool(self, allocation):
-        if not allocation or "counts" not in allocation or "bin_size" not in allocation or sum(allocation["counts"]) == 0:
-            bin_size = max(1, self.total_timestep_count // 10)
-            bins = max(1, math.ceil(self.total_timestep_count / bin_size))
-            counts = [self.total_tickets_needed // bins] * bins
-            for i in range(self.total_tickets_needed % bins):
-                counts[i] += 1
-        else:
-            bin_size = max(1, int(allocation["bin_size"]))
-            counts = allocation["counts"]
-
-        pool = []
-        rng = np.random.Generator(np.random.PCG64(self.seed))
-        scale_factor = self.total_timestep_count / 1000.0
-        self.bin_ranges = []
-        for i, count in enumerate(counts):
-            if count <= 0:
-                continue
-            start_t = int(i * bin_size * scale_factor)
-            end_t = min(self.total_timestep_count, max(start_t + 1, int((i + 1) * bin_size * scale_factor)))
-            if start_t >= self.total_timestep_count:
-                break
-            self.bin_ranges.append((start_t, end_t))
-            pool.extend(rng.integers(start_t, end_t, size=max(1, int(count))).tolist())
-
-        random.seed(self.seed)
-        random.shuffle(pool)
-        if not pool:
-            pool = [random.randint(0, self.total_timestep_count - 1) for _ in range(self.total_tickets_needed)]
-        while len(pool) < self.total_tickets_needed:
-            pool.extend(pool[: self.total_tickets_needed - len(pool)])
-        return pool[:self.total_tickets_needed]
+        pool, self.bin_ranges = build_timestep_ticket_pool(
+            allocation,
+            self.total_tickets_needed,
+            self.total_timestep_count,
+            self.seed,
+            bool(getattr(self.config, "TIMESTEP_STRATIFIED_SAMPLING", False)),
+        )
+        return pool
 
     def set_current_step(self, micro_step):
         self.pool_index = (micro_step * self.config.BATCH_SIZE) % len(self.ticket_pool)

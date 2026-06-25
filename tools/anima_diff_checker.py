@@ -36,7 +36,52 @@ except Exception:
 
 # ─── Constants ────────────────────────────────────────────────────────────────
 
-MODEL_EXTS = (".safetensors", ".pt", ".pth", ".bin", ".ckpt")
+MODEL_EXTS = (".safetensors", ".safetensor", ".pt", ".pth", ".bin", ".ckpt")
+MODEL_FILE_PATTERN = "*.safetensors *.safetensor *.pt *.pth *.bin *.ckpt"
+
+ANIMA_MERGE_TARGET_SUFFIXES = (
+    ".adaln_modulation_cross_attn.1.weight",
+    ".adaln_modulation_cross_attn.2.weight",
+    ".adaln_modulation_mlp.1.weight",
+    ".adaln_modulation_mlp.2.weight",
+    ".adaln_modulation_self_attn.1.weight",
+    ".adaln_modulation_self_attn.2.weight",
+    ".cross_attn.k_proj.weight",
+    ".cross_attn.o_proj.weight",
+    ".cross_attn.output_proj.weight",
+    ".cross_attn.q_proj.weight",
+    ".cross_attn.v_proj.weight",
+    ".self_attn.k_proj.weight",
+    ".self_attn.o_proj.weight",
+    ".self_attn.output_proj.weight",
+    ".self_attn.q_proj.weight",
+    ".self_attn.v_proj.weight",
+    ".mlp.0.weight",
+    ".mlp.layer1.weight",
+    ".mlp.layer2.weight",
+    ".mlp.2.weight",
+)
+
+ANIMA_MERGE_TARGET_PREFIXES = (
+    "net.blocks.",
+    "blocks.",
+    "llm_adapter.blocks.",
+)
+
+ANIMA_PROTECTED_HINTS = (
+    ".norm.",
+    "_norm.",
+    ".adaln_modulation_",
+    ".final_layer.",
+    ".llm_adapter.",
+    ".t_embedder.",
+    ".t_embedding_norm.",
+    ".x_embedder.",
+    ".patch_embed.",
+    ".embed.",
+    ".embedding.",
+    ".bias",
+)
 
 # DiT-specific LoRA targets (FLUX, SD3, Wan, HunYuan, CogVideoX, SDXL UNet)
 LORA_TARGET_HINTS = (
@@ -98,7 +143,10 @@ DARK_ORANGE  = "#fb923c"
 # ─── IO helpers ───────────────────────────────────────────────────────────────
 
 def is_safetensors(path: str) -> bool:
-    return str(path).lower().endswith(".safetensors")
+    return str(path).lower().endswith((".safetensors", ".safetensor"))
+
+def clean_path(value):
+    return str(value or "").strip().strip("\"'")
 
 def parse_prefixes(text: str):
     return [p.strip() for p in text.split(",") if p.strip()]
@@ -116,6 +164,32 @@ def layer_name(key: str, depth: int):
 def looks_like_lora_target(key: str) -> bool:
     k = key.lower()
     return any(h in k for h in LORA_TARGET_HINTS)
+
+def looks_like_anima_merge_target(key: str) -> bool:
+    k = key.lower()
+    return any(k.startswith(prefix) for prefix in ANIMA_MERGE_TARGET_PREFIXES) and any(k.endswith(suffix) for suffix in ANIMA_MERGE_TARGET_SUFFIXES)
+
+def looks_like_anima_protected_area(key: str) -> bool:
+    if looks_like_anima_merge_target(key):
+        return False
+    k = f".{key.lower()}"
+    return any(h in k for h in ANIMA_PROTECTED_HINTS)
+
+def looks_like_llm_adapter_area(key: str) -> bool:
+    return key.lower().startswith("llm_adapter.")
+
+def looks_like_anchor_area(key: str) -> bool:
+    k = f".{key.lower()}"
+    return any(h in k for h in (
+        ".final_layer.",
+        ".t_embedder.",
+        ".t_embedding_norm.",
+        ".x_embedder.",
+        ".patch_embed.",
+        ".embed.",
+        ".embedding.",
+        ".bias",
+    ))
 
 def looks_like_non_lora_area(key: str) -> bool:
     k = key.lower()
@@ -347,219 +421,394 @@ def lora_likelihood_label(score):
     return "Very low"
 
 
+def diffcheck_comment_block(result):
+    raw_result_type = result["likely_update_type"]
+    if raw_result_type == "Classic LoRA merge":
+        result_type = "LoRA merge"
+    elif raw_result_type == "LoKR/LyCORIS merge":
+        result_type = "LoKR merge"
+    else:
+        result_type = raw_result_type
+    merge_chance = float(result.get("lora_likelihood_score", 0.0))
+    changed = int(result.get("changed_tensors", 0))
+    total = int(result.get("base_tensors", 0))
+    changed_target = int(result.get("changed_anima_merge_target_tensors", 0))
+    total_target = int(result.get("anima_merge_target_tensors", 0))
+    changed_protected = int(result.get("changed_anima_protected_tensors", 0))
+    total_protected = int(result.get("anima_protected_tensors", 0))
+    stats = [
+        f"- Changed tensors: {changed:,} / {total:,}",
+        f"- Adapter-target changes: {changed_target:,} / {total_target:,}",
+        f"- Protected-layer changes: {changed_protected:,} / {total_protected:,}",
+        f"- LLM adapter drift: {result.get('llm_adapter_changed_ratio', 0.0):.3f}",
+        f"- Final/embed/bias drift: {result.get('anchor_changed_ratio', 0.0):.3f}",
+        f"- Base mismatch: {result.get('base_mismatch_score', 0.0):.1f}/100",
+        f"- Model merge score: {result.get('model_merge_score', 0.0):.1f}/100",
+        f"- Embedded adapter signal: {result.get('embedded_adapter_score', 0.0):.1f}/100",
+    ]
+    return "\n".join([
+        "[DiffCheck]",
+        "",
+        f"Result: {result_type}",
+        f"Merge likelihood: {merge_chance:.1f}%",
+        "",
+        "Stats:",
+        "",
+        *stats,
+        "",
+        "Note: using this as a Training base or stacking other LoRAs on top may cause LoRAs to behave differently, require different strengths, or not work as intended.",
+        "",
+        "Suggestion: this should be labeled as a merge/merged model rather than trained/fine-tuned to avoid confusion.",
+        "",
+        "- (If you disagree with this please let me know)",
+    ])
+
+
 # ─── Scoring ──────────────────────────────────────────────────────────────────
 
 def build_lora_score(lora_stats, totals):
-    """
-    Build detection scores using all signals including the new ones:
-      - avg_delta_per_element (baked merges have 3-4x higher per-element delta)
-      - merge_artifact_score  (singular value cliff from B@A structure)
-      - same_tensor_ratio     (>55% untouched = narrow update / merge-like pattern)
-      - cautious caps on full_tune when rank evidence is very strong
-    """
-    changed    = lora_stats["changed_tensors"]
+    changed = lora_stats["changed_tensors"]
     base_total = lora_stats["base_tensors"]
     changed_percent = (changed / max(base_total, 1)) * 100.0
-
-    target_ratio   = lora_stats["changed_lora_target_tensors"]  / max(changed, 1)
-    non_lora_ratio = lora_stats["changed_non_lora_area_tensors"] / max(changed, 1)
-
-    rank_ratios      = lora_stats["rank_ratio_95_values"]
-    top8_values      = lora_stats["top8_energy_values"]
-    decay_values     = lora_stats.get("spectral_decay_values", [])
-    artifact_values  = lora_stats.get("merge_artifact_scores", [])
-
-    avg_rank_ratio   = sum(rank_ratios)     / max(len(rank_ratios),     1) if rank_ratios     else 1.0
-    avg_top8         = sum(top8_values)     / max(len(top8_values),     1) if top8_values     else 0.0
-    avg_decay        = sum(decay_values)    / max(len(decay_values),    1) if decay_values    else 1.0
-    avg_artifact     = sum(artifact_values) / max(len(artifact_values), 1) if artifact_values else 0.0
-
-    low_rank_ratio   = lora_stats["low_rank_like_tensors"] / max(lora_stats["svd_tested_tensors"], 1)
-
-    # ── New signal: avg_delta_per_element ────────────────────────────────────
-    # Calibrated from real data:
-    #   genuine 1k-step train:  ~7.1e-5
-    #   genuine 11k-step train: ~1.1e-4
-    #   caught merge (model1):  ~3.2e-4  (4.5x higher than 11k train)
-    #   weaker merge (model4):  ~9.4e-5  (similar to 11k train — harder case)
-    total_abs_diff   = totals.get("total_abs_diff", 0.0)
+    generic_target_ratio = lora_stats["changed_lora_target_tensors"] / max(changed, 1)
+    anima_target_ratio = lora_stats["changed_anima_merge_target_tensors"] / max(changed, 1)
+    protected_ratio = lora_stats["changed_anima_protected_tensors"] / max(changed, 1)
+    non_lora_ratio = max(lora_stats["changed_non_lora_area_tensors"] / max(changed, 1), protected_ratio)
+    target_ratio = anima_target_ratio if lora_stats.get("anima_merge_target_tensors", 0) else generic_target_ratio
+    rank_ratios = lora_stats["rank_ratio_95_values"]
+    top8_values = lora_stats["top8_energy_values"]
+    decay_values = lora_stats.get("spectral_decay_values", [])
+    artifact_values = lora_stats.get("merge_artifact_scores", [])
+    avg_rank_ratio = sum(rank_ratios) / max(len(rank_ratios), 1) if rank_ratios else 1.0
+    avg_top8 = sum(top8_values) / max(len(top8_values), 1) if top8_values else 0.0
+    avg_decay = sum(decay_values) / max(len(decay_values), 1) if decay_values else 1.0
+    avg_artifact = sum(artifact_values) / max(len(artifact_values), 1) if artifact_values else 0.0
+    low_rank_ratio = lora_stats["low_rank_like_tensors"] / max(lora_stats["svd_tested_tensors"], 1)
+    total_abs_diff = totals.get("total_abs_diff", 0.0)
     changed_elements = totals.get("changed_elements", 1)
+    base_elements = totals.get("base_elements", 1)
     avg_delta_per_el = total_abs_diff / max(changed_elements, 1)
-
-    # ── New signal: same_tensor_ratio ────────────────────────────────────────
-    # Your genuine trains: ~28-40% same tensors (195/685, 189/685)
-    # Caught merges:       ~59%   same tensors (405/685)
     same_tensor_ratio = totals.get("same_tensors", 0) / max(totals.get("base_tensors", 1), 1)
+    changed_element_percent = (changed_elements / max(base_elements, 1)) * 100.0
+    zero_norm_changes = lora_stats["changed_anima_protected_tensors"] == 0 and changed > 0
+    llm_adapter_changed_ratio = lora_stats.get("changed_llm_adapter_tensors", 0) / max(lora_stats.get("llm_adapter_tensors", 0), 1)
+    llm_adapter_changed_element_ratio = lora_stats.get("changed_llm_adapter_elements", 0) / max(lora_stats.get("llm_adapter_elements", 0), 1)
+    anchor_changed_ratio = lora_stats.get("changed_anchor_tensors", 0) / max(lora_stats.get("anchor_tensors", 0), 1)
+    anchor_changed_element_ratio = lora_stats.get("changed_anchor_elements", 0) / max(lora_stats.get("anchor_elements", 0), 1)
 
-    # ── New signal: norm/embed completely untouched ───────────────────────────
-    # Real fine-tunes always drift norms/embeds slightly — even 1k steps.
-    # If zero non-lora-area tensors changed, that's a merge tell.
-    zero_norm_changes = (lora_stats["changed_non_lora_area_tensors"] == 0 and changed > 0)
+    if changed == 0 or changed_elements == 0:
+        return {
+            "lora_likelihood_score": 0.0,
+            "lora_likelihood": lora_likelihood_label(0.0),
+            "likely_update_type": "No tensor changes detected",
+            "classic_lora_score": 0.0,
+            "lokr_lycoris_score": 0.0,
+            "merge_scope_score": 0.0,
+            "full_tune_score": 0.0,
+            "model_merge_score": 0.0,
+            "base_mismatch_score": 0.0,
+            "changed_percent": changed_percent,
+            "changed_element_percent": changed_element_percent,
+            "changed_lora_target_ratio": target_ratio,
+            "changed_non_lora_area_ratio": non_lora_ratio,
+            "changed_anima_merge_target_ratio": anima_target_ratio,
+            "changed_anima_protected_ratio": protected_ratio,
+            "low_rank_like_ratio": low_rank_ratio,
+            "avg_rank_ratio_95": avg_rank_ratio,
+            "avg_top8_energy": avg_top8,
+            "avg_spectral_decay": avg_decay,
+            "avg_merge_artifact_score": avg_artifact,
+            "embedded_adapter_score": 0.0,
+            "avg_delta_per_element": avg_delta_per_el,
+            "same_tensor_ratio": same_tensor_ratio,
+            "zero_norm_embed_changes": False,
+            "llm_adapter_changed_ratio": llm_adapter_changed_ratio,
+            "llm_adapter_changed_element_ratio": llm_adapter_changed_element_ratio,
+            "anchor_changed_ratio": anchor_changed_ratio,
+            "anchor_changed_element_ratio": anchor_changed_element_ratio,
+            "flags": ["No tensors changed; merge likely failed or files are identical"],
+        }
 
-    # ── Classic LoRA score ───────────────────────────────────────────────────
+    base_mismatch = 0.0
+    if changed_percent >= 85:
+        base_mismatch += 30
+    elif changed_percent >= 78:
+        base_mismatch += 15
+    if changed_element_percent >= 82:
+        base_mismatch += 25
+    elif changed_element_percent >= 78:
+        base_mismatch += 10
+    if same_tensor_ratio <= 0.15:
+        base_mismatch += 25
+    elif same_tensor_ratio <= 0.25:
+        base_mismatch += 10
+    if protected_ratio >= 0.20:
+        base_mismatch += 20
+    elif protected_ratio >= 0.10:
+        base_mismatch += 10
+    if llm_adapter_changed_ratio >= 0.60:
+        base_mismatch += 25
+    elif llm_adapter_changed_ratio >= 0.35:
+        base_mismatch += 12
+    if same_tensor_ratio <= 0.15 and anchor_changed_ratio >= 0.70:
+        base_mismatch += 15
+    elif same_tensor_ratio <= 0.20 and anchor_changed_ratio >= 0.40:
+        base_mismatch += 8
+    if avg_delta_per_el >= 4.0e-4:
+        base_mismatch += 10
+    base_mismatch = max(0.0, min(100.0, base_mismatch))
+
+    embedded_adapter = 0.0
+    if target_ratio >= 0.85:
+        embedded_adapter += 20
+    elif target_ratio >= 0.55:
+        embedded_adapter += 12
+    elif target_ratio >= 0.35:
+        embedded_adapter += 6
+    if low_rank_ratio >= 0.75:
+        embedded_adapter += 25
+    elif low_rank_ratio >= 0.45:
+        embedded_adapter += 15
+    elif low_rank_ratio >= 0.30:
+        embedded_adapter += 8
+    if avg_rank_ratio <= 0.08:
+        embedded_adapter += 20
+    elif avg_rank_ratio <= 0.18:
+        embedded_adapter += 12
+    elif avg_rank_ratio <= 0.35:
+        embedded_adapter += 6
+    if avg_top8 >= 0.78:
+        embedded_adapter += 15
+    elif avg_top8 >= 0.60:
+        embedded_adapter += 8
+    elif avg_top8 >= 0.42:
+        embedded_adapter += 4
+    if avg_artifact >= 70:
+        embedded_adapter += 10
+    elif avg_artifact >= 45:
+        embedded_adapter += 6
+    if protected_ratio <= 0.10:
+        embedded_adapter += 10
+    elif protected_ratio >= 0.45 and base_mismatch >= 75:
+        embedded_adapter = min(embedded_adapter, 55.0)
+    embedded_adapter = max(0.0, min(100.0, embedded_adapter))
+
+    merge_scope = 0.0
+    if anima_target_ratio >= 0.98:
+        merge_scope += 35
+    elif anima_target_ratio >= 0.90:
+        merge_scope += 25
+    if protected_ratio <= 0.01:
+        merge_scope += 25
+    elif protected_ratio <= 0.05:
+        merge_scope += 10
+    if same_tensor_ratio >= 0.55:
+        merge_scope += 20
+    elif same_tensor_ratio >= 0.45:
+        merge_scope += 10
+    if 30 <= changed_percent <= 55:
+        merge_scope += 15
+    elif 20 <= changed_percent <= 70:
+        merge_scope += 8
+    if zero_norm_changes:
+        merge_scope += 5
+    if base_mismatch >= 75:
+        merge_scope = min(merge_scope, 20.0)
+    merge_scope = max(0.0, min(100.0, merge_scope))
+
+    model_merge = 0.0
+    if 55 <= changed_percent <= 70:
+        model_merge += 25
+    elif 45 <= changed_percent < 55 or 70 < changed_percent <= 82:
+        model_merge += 15
+    if target_ratio >= 0.90:
+        model_merge += 25
+    elif target_ratio >= 0.75:
+        model_merge += 15
+    if 0.02 <= protected_ratio <= 0.12:
+        model_merge += 20
+    elif protected_ratio <= 0.20:
+        model_merge += 8
+    if 0.32 <= same_tensor_ratio <= 0.48:
+        model_merge += 15
+    elif 0.25 <= same_tensor_ratio < 0.32 or 0.48 < same_tensor_ratio <= 0.55:
+        model_merge += 8
+    if 0.08 <= avg_rank_ratio <= 0.24:
+        model_merge += 10
+    elif avg_rank_ratio <= 0.35:
+        model_merge += 5
+    if low_rank_ratio >= 0.45:
+        model_merge += 8
+    if avg_delta_per_el >= 2.5e-4:
+        model_merge += 7
+    if changed_element_percent >= 65 and avg_decay <= 0.35:
+        model_merge += 20
+    elif changed_element_percent >= 55 and avg_decay <= 0.42:
+        model_merge += 10
+    if low_rank_ratio >= 0.30 and avg_top8 >= 0.40:
+        model_merge += 10
+    if llm_adapter_changed_ratio == 0.0 and anchor_changed_ratio <= 0.05 and changed_element_percent >= 55:
+        model_merge += 10
+    if changed_element_percent >= 75 and low_rank_ratio >= 0.30 and avg_rank_ratio <= 0.32:
+        model_merge += 10
+    if changed_element_percent <= 35 and low_rank_ratio <= 0.15 and avg_top8 <= 0.35:
+        model_merge = min(model_merge, 30.0)
+    if base_mismatch >= 75:
+        model_merge = min(model_merge, 35.0)
+    if merge_scope >= 90 and protected_ratio <= 0.01:
+        model_merge = min(model_merge, 25.0)
+    model_merge = max(0.0, min(100.0, model_merge))
+
     classic = 0.0
-
-    if changed_percent <= 15:    classic += 25
-    elif changed_percent <= 30:  classic += 22
-    elif changed_percent <= 50:  classic += 12
-
-    classic += min(target_ratio * 28.0, 28.0)
-    classic += min(low_rank_ratio * 35.0, 35.0)
-
-    if avg_rank_ratio <= 0.08:   classic += 18
-    elif avg_rank_ratio <= 0.15: classic += 12
-    elif avg_rank_ratio <= 0.25: classic +=  6
-
-    if avg_decay <= 0.05:        classic += 10
-    elif avg_decay <= 0.15:      classic +=  5
-
-    if avg_top8 >= 0.95:         classic += 10
-    elif avg_top8 >= 0.80:       classic +=  5
-
-    # Merge artifact bonus (cliff in singular values)
-    if avg_artifact >= 80:       classic += 12
-    elif avg_artifact >= 50:     classic +=  6
-
-    # avg_delta_per_element: high value = large structured delta = merge signal
-    if avg_delta_per_el >= 2.5e-4:  classic += 10
-    elif avg_delta_per_el >= 1.8e-4: classic += 5
-
-    if zero_norm_changes:        classic += 8
-
-    classic -= min(non_lora_ratio * 25.0, 25.0)
+    if merge_scope >= 80:
+        classic += 35
+    elif merge_scope >= 60:
+        classic += 20
+    if low_rank_ratio >= 0.80:
+        classic += 30
+    elif low_rank_ratio >= 0.50:
+        classic += 15
+    if avg_rank_ratio <= 0.05:
+        classic += 20
+    elif avg_rank_ratio <= 0.12:
+        classic += 10
+    if avg_top8 >= 0.80:
+        classic += 15
+    elif avg_top8 >= 0.60:
+        classic += 8
+    if base_mismatch >= 75:
+        classic = min(classic, 20.0)
     classic = max(0.0, min(100.0, classic))
 
-    # ── LoKR / LyCORIS score ─────────────────────────────────────────────────
     lokr = 0.0
-
-    if 20 <= changed_percent <= 70:     lokr += 25
-    elif 10 <= changed_percent < 20:    lokr += 15
-    elif 70 < changed_percent <= 90:    lokr += 10
-
-    if target_ratio >= 0.85:            lokr += 50
-    elif target_ratio >= 0.75:          lokr += 40
-    elif target_ratio >= 0.65:          lokr += 28
-    elif target_ratio >= 0.55:          lokr += 16
-
-    if non_lora_ratio <= 0.08:          lokr += 15
-    elif non_lora_ratio <= 0.18:        lokr += 8
-
-    if avg_rank_ratio <= 0.50:          lokr += 10
-    elif avg_rank_ratio <= 0.70:        lokr += 5
-
-    # same_tensor_ratio: >55% untouched tensors suggests narrow update scope / merge-like pattern
-    if same_tensor_ratio >= 0.55:       lokr += 15
-    elif same_tensor_ratio >= 0.45:     lokr += 8
-
-    if zero_norm_changes:               lokr += 10
-
-    if avg_artifact >= 60:              lokr += 8
-
+    if merge_scope >= 80:
+        lokr += 45
+    elif merge_scope >= 60:
+        lokr += 25
+    if low_rank_ratio <= 0.20:
+        lokr += 20
+    elif low_rank_ratio <= 0.45:
+        lokr += 8
+    if avg_rank_ratio >= 0.25:
+        lokr += 20
+    elif avg_rank_ratio >= 0.16:
+        lokr += 8
+    if avg_top8 <= 0.40:
+        lokr += 15
+    elif avg_top8 <= 0.60:
+        lokr += 6
+    if base_mismatch >= 75:
+        lokr = min(lokr, 20.0)
+    if merge_scope < 60:
+        classic = min(classic, 40.0)
+        lokr = min(lokr, 40.0)
     lokr = max(0.0, min(100.0, lokr))
 
-    # ── Full fine-tune score ─────────────────────────────────────────────────
     full = 0.0
-
-    if changed_percent >= 80:    full += 35
-    elif changed_percent >= 65:  full += 25
-    elif changed_percent >= 50:  full += 15
-
-    if target_ratio <= 0.60:     full += 25
-    elif target_ratio <= 0.72:   full += 12
-
-    if non_lora_ratio >= 0.25:   full += 20
-    elif non_lora_ratio >= 0.12: full += 10
-
-    if avg_rank_ratio >= 0.45:   full += 15
-
-    # avg_delta_per_element: real trains have small per-element change
-    if avg_delta_per_el <= 1.2e-4: full += 8
-
+    if protected_ratio >= 0.30:
+        full += 40
+    elif protected_ratio >= 0.12:
+        full += 25
+    if same_tensor_ratio <= 0.35:
+        full += 25
+    elif same_tensor_ratio <= 0.45:
+        full += 10
+    if changed_percent >= 65:
+        full += 20
+    elif changed_percent >= 50:
+        full += 10
+    if not zero_norm_changes:
+        full += 15
+    if base_mismatch >= 75 or merge_scope >= 80:
+        full = min(full, 30.0)
     full = max(0.0, min(100.0, full))
 
-    # ── Hard caps from calibrated evidence ──────────────────────────────────
-    #
-    # These override the additive scores when the math is unambiguous.
-    # Calibration source: your own ground-truth trains vs caught merges.
-    #
-    # 1. Low rank + high low_rank_ratio: no real fine-tune looks like this
-    if avg_rank_ratio < 0.25 and low_rank_ratio > 0.30:
-        full = min(full, 20.0)
-        classic = max(classic, 55.0)  # floor it into at least Medium
-
-    # 2. >55% same tensors: narrower update scope than broad full-model fine-tune
-    if same_tensor_ratio > 0.55:
-        full = min(full, 30.0)
-        lokr = max(lokr, 50.0)
-
-    # 3. Zero norm/embed changes: adapter merge or frozen-module training signal
-    if zero_norm_changes:
-        full = min(full, 40.0)
-
-    # 4. Extreme merge artifact score: the cliff is unmistakable
-    if avg_artifact >= 85:
-        full = min(full, 15.0)
-        classic = max(classic, 70.0)
-
-    # ── Verdict ──────────────────────────────────────────────────────────────
     adapter_score = max(classic, lokr)
-
-    # Broad drift plus low-rank structure is often not a clean LoRA-only case.
-    # It can be a hybrid recipe, checkpoint merge, adapter merge on top of a tune,
-    # or a structured/frozen fine-tune. Label it cautiously instead of accusing.
-    broad_drift = changed_percent >= 65 and same_tensor_ratio < 0.35
-    structured_delta = (low_rank_ratio >= 0.30 and avg_rank_ratio <= 0.30) or avg_top8 >= 0.50
-    narrow_scope = same_tensor_ratio > 0.55 or zero_norm_changes
-
-    if broad_drift and structured_delta and adapter_score >= 50 and full <= 35:
-        likely_type = "Hybrid/ambiguous: broad drift with adapter-like structure"
-    elif narrow_scope and adapter_score >= 50:
-        likely_type = "Adapter merge-like or heavily frozen-scope tune"
-    elif classic >= 80 and classic >= lokr and avg_rank_ratio < 0.10:
-        likely_type = "Classic LoRA-like adapter merge"
-    elif lokr >= 80 and lokr >= classic:
-        likely_type = "LoKR/LyCORIS-like adapter merge"
-    elif full >= adapter_score and full >= 45:
-        likely_type = "Full/partial fine-tune-like"
-    elif adapter_score >= 50:
-        likely_type = "Adapter/merge-like but not conclusive"
+    detection_score = max(adapter_score, model_merge)
+    low_change_finetune = (
+        base_mismatch < 50
+        and changed_element_percent <= 35
+        and low_rank_ratio <= 0.15
+        and avg_top8 <= 0.35
+        and avg_rank_ratio >= 0.40
+    )
+    if base_mismatch >= 75:
+        if embedded_adapter >= 30:
+            adapter_score = max(adapter_score, min(max(embedded_adapter, 35.0), 55.0))
+            detection_score = max(detection_score, adapter_score)
+        if embedded_adapter >= 30:
+            likely_type = "Wrong base/version, possible adapter merge"
+        else:
+            likely_type = "Likely different Anima base/version mismatch"
+    elif classic >= 80 and classic >= lokr:
+        likely_type = "Classic LoRA merge"
+    elif lokr >= 80 and lokr > classic:
+        likely_type = "LoKR/LyCORIS merge"
+    elif model_merge >= 70 and model_merge >= adapter_score:
+        likely_type = "Structured model merge / hybrid adapter merge"
+    elif model_merge >= 60 and changed_element_percent >= 55 and (low_rank_ratio >= 0.30 or avg_rank_ratio <= 0.30 or avg_top8 >= 0.40):
+        likely_type = "Structured model merge / hybrid adapter merge"
+    elif merge_scope >= 80 and adapter_score >= 60:
+        likely_type = "Adapter merge, rank type ambiguous"
+    elif low_change_finetune and full >= 55:
+        likely_type = "Fine-tune or non-adapter edit"
+    elif full >= 65 and full >= adapter_score:
+        likely_type = "Fine-tune or non-adapter edit"
+    elif adapter_score >= 45:
+        likely_type = "Weak adapter-merge signal"
     else:
-        likely_type = "Partial/frozen fine-tune-like or inconclusive"
+        likely_type = "Inconclusive"
 
-    # Confidence flags for the UI (shown as explicit warnings)
     flags = []
-    if same_tensor_ratio > 0.55:
-        flags.append(f"⚑ {same_tensor_ratio*100:.1f}% tensors untouched — narrower update scope than broad full-model fine-tune")
-    if zero_norm_changes:
-        flags.append("⚑ Norms/embeds unchanged — consistent with adapter merge or frozen-module training")
-    if broad_drift and structured_delta:
-        flags.append("⚑ Broad tensor drift with low-rank structure — possible hybrid merge/adaptor recipe, not proof")
-    if avg_artifact >= 70:
-        flags.append(f"⚑ Singular value cliff detected (merge artifact score {avg_artifact:.0f}/100) — adapter-merge-like SVD pattern")
-    if avg_rank_ratio < 0.10 and low_rank_ratio > 0.5:
-        flags.append(f"⚑ Extremely low rank ratio ({avg_rank_ratio:.4f}) — strong LoRA-style delta signal")
-    if avg_delta_per_el >= 2.0e-4:
-        flags.append(f"⚑ Large concentrated delta ({avg_delta_per_el:.2e}) — more consistent with merged adapter weights than diffuse gradient drift")
+    if base_mismatch >= 75:
+        flags.append(f"Likely wrong base/version: {changed_percent:.1f}% tensors changed, {changed_element_percent:.1f}% elements changed, {same_tensor_ratio*100:.1f}% tensors identical")
+    if base_mismatch >= 75 and embedded_adapter >= 30:
+        flags.append(f"Adapter-like rank signal remains under base mismatch: embedded score {embedded_adapter:.1f}/100")
+    if merge_scope >= 80:
+        flags.append("Only Anima mergeable block weights changed")
+    if model_merge >= 70:
+        flags.append(f"Structured model-merge pattern: target-heavy changes with protected drift {protected_ratio:.3f} and same tensor ratio {same_tensor_ratio:.3f}")
+    if llm_adapter_changed_ratio >= 0.35:
+        flags.append(f"LLM adapter drift: {llm_adapter_changed_ratio:.3f} of tensors changed")
+    if anchor_changed_ratio >= 0.40:
+        flags.append(f"Final/embed/bias drift: {anchor_changed_ratio:.3f} of tensors changed")
+    if protected_ratio >= 0.10:
+        flags.append("Protected/non-mergeable tensors changed")
+    if classic >= 80:
+        flags.append(f"Classic LoRA rank pattern: low-rank tensors {low_rank_ratio:.3f}, avg rank ratio {avg_rank_ratio:.4f}, top-8 energy {avg_top8:.3f}")
+    if lokr >= 80 and lokr > classic:
+        flags.append(f"LoKR/LyCORIS rank pattern: low-rank tensors {low_rank_ratio:.3f}, avg rank ratio {avg_rank_ratio:.4f}, top-8 energy {avg_top8:.3f}")
 
     return {
-        "lora_likelihood_score":      max(classic, lokr),
-        "lora_likelihood":            lora_likelihood_label(max(classic, lokr)),
-        "likely_update_type":         likely_type,
-        "classic_lora_score":         classic,
-        "lokr_lycoris_score":         lokr,
-        "full_tune_score":            full,
-        "changed_percent":            changed_percent,
-        "changed_lora_target_ratio":  target_ratio,
+        "lora_likelihood_score": detection_score,
+        "lora_likelihood": lora_likelihood_label(detection_score),
+        "likely_update_type": likely_type,
+        "classic_lora_score": classic,
+        "lokr_lycoris_score": lokr,
+        "merge_scope_score": merge_scope,
+        "full_tune_score": full,
+        "model_merge_score": model_merge,
+        "base_mismatch_score": base_mismatch,
+        "changed_percent": changed_percent,
+        "changed_element_percent": changed_element_percent,
+        "changed_lora_target_ratio": target_ratio,
         "changed_non_lora_area_ratio": non_lora_ratio,
-        "low_rank_like_ratio":        low_rank_ratio,
-        "avg_rank_ratio_95":          avg_rank_ratio,
-        "avg_top8_energy":            avg_top8,
-        "avg_spectral_decay":         avg_decay,
-        "avg_merge_artifact_score":   avg_artifact,
-        "avg_delta_per_element":      avg_delta_per_el,
-        "same_tensor_ratio":          same_tensor_ratio,
-        "zero_norm_embed_changes":    zero_norm_changes,
-        "flags":                      flags,
+        "changed_anima_merge_target_ratio": anima_target_ratio,
+        "changed_anima_protected_ratio": protected_ratio,
+        "low_rank_like_ratio": low_rank_ratio,
+        "avg_rank_ratio_95": avg_rank_ratio,
+        "avg_top8_energy": avg_top8,
+        "avg_spectral_decay": avg_decay,
+        "avg_merge_artifact_score": avg_artifact,
+        "embedded_adapter_score": embedded_adapter,
+        "avg_delta_per_element": avg_delta_per_el,
+        "same_tensor_ratio": same_tensor_ratio,
+        "zero_norm_embed_changes": zero_norm_changes,
+        "llm_adapter_changed_ratio": llm_adapter_changed_ratio,
+        "llm_adapter_changed_element_ratio": llm_adapter_changed_element_ratio,
+        "anchor_changed_ratio": anchor_changed_ratio,
+        "anchor_changed_element_ratio": anchor_changed_element_ratio,
+        "flags": flags,
     }
 
 
@@ -603,6 +852,12 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
         "model": label, "base_tensors": len(base_keys),
         "changed_tensors": 0,
         "changed_lora_target_tensors": 0, "changed_non_lora_area_tensors": 0,
+        "anima_merge_target_tensors": 0, "changed_anima_merge_target_tensors": 0,
+        "anima_protected_tensors": 0, "changed_anima_protected_tensors": 0,
+        "llm_adapter_tensors": 0, "changed_llm_adapter_tensors": 0,
+        "llm_adapter_elements": 0, "changed_llm_adapter_elements": 0,
+        "anchor_tensors": 0, "changed_anchor_tensors": 0,
+        "anchor_elements": 0, "changed_anchor_elements": 0,
         "svd_tested_tensors": 0, "low_rank_like_tensors": 0,
         "rank_ratio_95_values": [], "top8_energy_values": [],
         "spectral_decay_values": [], "merge_artifact_scores": [],
@@ -618,6 +873,19 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
         stats       = compare_tensors(base_tensor, tune_tensor, atol, rtol, compute_diff)
         lyr         = layer_name(key, depth)
         blk_label, blk_color = get_block_group(key)
+        is_anima_target = looks_like_anima_merge_target(key)
+        is_anima_protected = looks_like_anima_protected_area(key)
+        is_llm_adapter = looks_like_llm_adapter_area(key)
+        is_anchor = looks_like_anchor_area(key)
+        if detect_lora:
+            if is_anima_target:
+                lora_stats["anima_merge_target_tensors"] += 1
+            if is_anima_protected:
+                lora_stats["anima_protected_tensors"] += 1
+            if is_llm_adapter:
+                lora_stats["llm_adapter_tensors"] += 1
+            if is_anchor:
+                lora_stats["anchor_tensors"] += 1
 
         row = {"model": label, "key": key, "layer": lyr, "block_group": blk_label, **stats}
 
@@ -626,6 +894,12 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
         blocks[blk_label]["total"]   += 1
         blocks[blk_label]["elements"] += int(stats["numel"] or 0)
         totals["base_elements"]       += int(stats["numel"] or 0)
+        if detect_lora:
+            numel = int(stats["numel"] or 0)
+            if is_llm_adapter:
+                lora_stats["llm_adapter_elements"] += numel
+            if is_anchor:
+                lora_stats["anchor_elements"] += numel
 
         if stats["status"] == "same":
             totals["same_tensors"]         += 1
@@ -658,6 +932,14 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
                 is_non_lora_area = looks_like_non_lora_area(key)
                 if is_lora_target:   lora_stats["changed_lora_target_tensors"]  += 1
                 if is_non_lora_area: lora_stats["changed_non_lora_area_tensors"] += 1
+                if is_anima_target: lora_stats["changed_anima_merge_target_tensors"] += 1
+                if is_anima_protected: lora_stats["changed_anima_protected_tensors"] += 1
+                if is_llm_adapter:
+                    lora_stats["changed_llm_adapter_tensors"] += 1
+                    lora_stats["changed_llm_adapter_elements"] += changed
+                if is_anchor:
+                    lora_stats["changed_anchor_tensors"] += 1
+                    lora_stats["changed_anchor_elements"] += changed
 
                 rank_stats = lora_delta_rank_stats(base_tensor, tune_tensor)
                 if rank_stats is not None:
@@ -676,6 +958,8 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
                         "model": label, "key": key, "layer": lyr,
                         "is_lora_target_name": is_lora_target,
                         "is_non_lora_area_name": is_non_lora_area,
+                        "is_anima_merge_target": is_anima_target,
+                        "is_anima_protected_area": is_anima_protected,
                         **rank_stats,
                     })
 
@@ -731,7 +1015,6 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
 
     lora_summary = None
     if detect_lora:
-        # Pass totals into scorer so new signals (avg_delta_per_el, same_tensor_ratio) work
         score_data = build_lora_score(lora_stats, totals)
         lora_summary = {
             "model":                       label,
@@ -740,10 +1023,30 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
             "likely_update_type":          score_data["likely_update_type"],
             "classic_lora_score":          score_data["classic_lora_score"],
             "lokr_lycoris_score":          score_data["lokr_lycoris_score"],
+            "merge_scope_score":           score_data["merge_scope_score"],
             "full_tune_score":             score_data["full_tune_score"],
+            "model_merge_score":           score_data["model_merge_score"],
+            "base_mismatch_score":         score_data["base_mismatch_score"],
+            "base_tensors":                lora_stats["base_tensors"],
+            "changed_tensors":             lora_stats["changed_tensors"],
             "changed_tensor_percent":      score_data["changed_percent"],
+            "changed_element_percent":     score_data["changed_element_percent"],
             "changed_lora_target_ratio":   score_data["changed_lora_target_ratio"],
             "changed_non_lora_area_ratio": score_data["changed_non_lora_area_ratio"],
+            "changed_anima_merge_target_ratio": score_data["changed_anima_merge_target_ratio"],
+            "changed_anima_protected_ratio": score_data["changed_anima_protected_ratio"],
+            "anima_merge_target_tensors": lora_stats["anima_merge_target_tensors"],
+            "changed_anima_merge_target_tensors": lora_stats["changed_anima_merge_target_tensors"],
+            "anima_protected_tensors": lora_stats["anima_protected_tensors"],
+            "changed_anima_protected_tensors": lora_stats["changed_anima_protected_tensors"],
+            "llm_adapter_tensors": lora_stats["llm_adapter_tensors"],
+            "changed_llm_adapter_tensors": lora_stats["changed_llm_adapter_tensors"],
+            "llm_adapter_changed_ratio": score_data["llm_adapter_changed_ratio"],
+            "llm_adapter_changed_element_ratio": score_data["llm_adapter_changed_element_ratio"],
+            "anchor_tensors": lora_stats["anchor_tensors"],
+            "changed_anchor_tensors": lora_stats["changed_anchor_tensors"],
+            "anchor_changed_ratio": score_data["anchor_changed_ratio"],
+            "anchor_changed_element_ratio": score_data["anchor_changed_element_ratio"],
             "svd_tested_tensors":          lora_stats["svd_tested_tensors"],
             "projected_tensor_count":      lora_stats["projected_tensor_count"],
             "low_rank_like_tensors":       lora_stats["low_rank_like_tensors"],
@@ -752,11 +1055,12 @@ def compare_one_model(base_reader, tune_reader, label, atol, rtol, depth,
             "avg_top8_energy":             score_data["avg_top8_energy"],
             "avg_spectral_decay":          score_data["avg_spectral_decay"],
             "avg_merge_artifact_score":    score_data["avg_merge_artifact_score"],
+            "embedded_adapter_score":      score_data["embedded_adapter_score"],
             "avg_delta_per_element":       score_data["avg_delta_per_element"],
             "same_tensor_ratio":           score_data["same_tensor_ratio"],
             "zero_norm_embed_changes":     score_data["zero_norm_embed_changes"],
             "flags":                       " | ".join(score_data["flags"]),
-            "note": "Probabilistic. Adapter-like signals can also come from frozen-module or hybrid training; not proof by itself.",
+            "note": "Scope-calibrated from known Anima base, fine-tune, and LoKR samples. Base mismatch warnings mean retry against the other known base before judging adapter merges.",
         }
 
     block_data = [dict(v, label=k) for k, v in sorted(blocks.items())]
@@ -912,7 +1216,7 @@ class BlockDiagram(tk.Canvas):
 class App(tk.Tk):
     def __init__(self):
         super().__init__()
-        self.title("Model Layer Compare  ·  DiT LoRA Detector  v3")
+        self.title("Model Layer Compare - DiT LoRA Detector v3")
         self.geometry("1100x800")
         self.minsize(920, 660)
         self.configure(bg=DARK_BG)
@@ -979,7 +1283,7 @@ class App(tk.Tk):
         header = tk.Frame(self, bg=DARK_BG2, height=42)
         header.pack(fill="x", side="top")
         header.pack_propagate(False)
-        tk.Label(header, text="◈  MODEL LAYER COMPARE  v3", bg=DARK_BG2, fg=DARK_ACCENT2,
+        tk.Label(header, text="MODEL LAYER COMPARE  v3", bg=DARK_BG2, fg=DARK_ACCENT2,
                  font=("Courier New", 13, "bold")).pack(side="left", padx=16, pady=8)
         if not HAS_SAFETENSORS:
             tk.Label(header, text="⚠ safetensors not installed", bg=DARK_BG2, fg=DARK_YELLOW,
@@ -1075,7 +1379,7 @@ class App(tk.Tk):
         bar = tk.Frame(self, bg=DARK_BG2, height=26)
         bar.pack(fill="x", side="bottom")
         bar.pack_propagate(False)
-        self.status_var = tk.StringVar(value="Ready  ·  load models and press Compare")
+        self.status_var = tk.StringVar(value="Ready - load models and press Compare")
         tk.Label(bar, textvariable=self.status_var, bg=DARK_BG2, fg=DARK_FG_MUT,
                  font=("Courier New", 9)).pack(side="left", padx=10)
         self.tensor_count_var = tk.StringVar(value="")
@@ -1093,7 +1397,7 @@ class App(tk.Tk):
 
     def _pick_file(self, var):
         path = filedialog.askopenfilename(title="Select model checkpoint",
-            filetypes=[("Model checkpoints", "*.safetensors *.pt *.pth *.bin *.ckpt"), ("All files", "*.*")])
+            filetypes=[("Model checkpoints", MODEL_FILE_PATTERN), ("All files", "*.*")])
         if path: var.set(path)
 
     def _pick_folder(self, var):
@@ -1113,10 +1417,10 @@ class App(tk.Tk):
     # ── Validation ────────────────────────────────────────────────────────────
 
     def _validate(self):
-        base_path  = self.base_var.get().strip()
-        tune1_path = self.tune1_var.get().strip()
-        tune2_path = self.tune2_var.get().strip()
-        output_dir = self.output_var.get().strip()
+        base_path  = clean_path(self.base_var.get())
+        tune1_path = clean_path(self.tune1_var.get())
+        tune2_path = clean_path(self.tune2_var.get())
+        output_dir = clean_path(self.output_var.get())
 
         if not base_path:                                    raise ValueError("Select a base model file.")
         if not Path(base_path).exists():                     raise ValueError(f"Base model not found: {base_path}")
@@ -1160,14 +1464,14 @@ class App(tk.Tk):
         self.run_btn.configure(state="disabled")
         self.progress.configure(value=0, maximum=100)
         self.log.delete("1.0", "end")
-        self._log("◈ MODEL LAYER COMPARE  v3", "header")
+        self._log("MODEL LAYER COMPARE  v3", "header")
         self._log("─" * 60, "muted")
         self._log(f"Base:   {args['base_path']}", "muted")
         if args['tune1_path']: self._log(f"Tune 1: {args['tune1_path']}", "muted")
         if args['tune2_path']: self._log(f"Tune 2: {args['tune2_path']}", "muted")
         self._log("─" * 60, "muted")
         if args["detect_lora"]:
-            self._log("LoRA detection: SVD + projection + merge artifact + delta calibration", "info")
+            self._log("LoRA detection: scope + base mismatch guard + optional SVD signals", "info")
         self.status_var.set("Comparing…")
 
         def progress_cb(label, done, total, key):
@@ -1231,12 +1535,25 @@ class App(tk.Tk):
                             self._log(f"│  likelihood          : {r['lora_likelihood']}  ({score:.1f}/100)", score_tag)
                             self._log(f"│  classic LoRA        : {r['classic_lora_score']:.1f}")
                             self._log(f"│  LoKR/LyCORIS        : {r['lokr_lycoris_score']:.1f}")
+                            self._log(f"│  merge scope         : {r.get('merge_scope_score', 0.0):.1f}")
                             self._log(f"│  full fine-tune      : {r['full_tune_score']:.1f}")
+                            self._log(f"│  model merge         : {r.get('model_merge_score', 0.0):.1f}")
+                            self._log(f"│  base mismatch       : {r.get('base_mismatch_score', 0.0):.1f}",
+                                      "warn" if r.get("base_mismatch_score", 0.0) >= 75 else None)
+                            self._log(f"│  embedded adapter    : {r.get('embedded_adapter_score', 0.0):.1f}")
                             self._log(f"│  ── tensor stats ──────────────────────────")
                             self._log(f"│  changed tensors     : {r['changed_tensor_percent']:.1f}%")
+                            self._log(f"│  changed elements    : {r.get('changed_element_percent', 0.0):.1f}%")
                             self._log(f"│  same tensor ratio   : {r['same_tensor_ratio']:.3f}",
                                       "warn" if r["same_tensor_ratio"] > 0.55 else None)
                             self._log(f"│  target ratio        : {r['changed_lora_target_ratio']:.3f}")
+                            self._log(f"│  Anima merge targets : {r.get('changed_anima_merge_target_ratio', 0.0):.3f}")
+                            self._log(f"│  protected drift     : {r.get('changed_anima_protected_ratio', 0.0):.3f}",
+                                      "warn" if r.get("changed_anima_protected_ratio", 0.0) >= 0.10 else None)
+                            self._log(f"│  LLM adapter drift   : {r.get('llm_adapter_changed_ratio', 0.0):.3f}",
+                                      "warn" if r.get("llm_adapter_changed_ratio", 0.0) >= 0.35 else None)
+                            self._log(f"│  final/embed/bias    : {r.get('anchor_changed_ratio', 0.0):.3f}",
+                                      "warn" if r.get("anchor_changed_ratio", 0.0) >= 0.40 else None)
                             self._log(f"│  zero norm changes   : {r['zero_norm_embed_changes']}",
                                       "warn" if r["zero_norm_embed_changes"] else None)
                             self._log(f"│  ── SVD signals ───────────────────────────")
@@ -1265,6 +1582,10 @@ class App(tk.Tk):
                                         self._log(f"│  {flag}", "flag")
 
                             self._log("└")
+                            self._log("")
+                            self._log("─── DiffCheck Copy Block ─────────────────────", "header")
+                            for line in diffcheck_comment_block(r).splitlines():
+                                self._log(line)
                             self._log("")
 
                     blk_viz = report.get("block_visualization") or []

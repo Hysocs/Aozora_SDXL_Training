@@ -558,6 +558,117 @@ def timestep_bin_ids(timesteps, bin_ranges):
     return bin_ids
 
 
+def _scale_timestep_counts(counts, target_total):
+    target_total = max(0, int(target_total))
+    counts = [max(0, int(count or 0)) for count in counts]
+    total = sum(counts)
+    if target_total <= 0 or total <= 0:
+        return [0 for _ in counts]
+    raw = [(count / total) * target_total for count in counts]
+    scaled = [int(value) for value in raw]
+    diff = target_total - sum(scaled)
+    if diff > 0:
+        fractions = sorted(
+            range(len(raw)),
+            key=lambda index: raw[index] - scaled[index],
+            reverse=True,
+        )
+        for index in fractions[:diff]:
+            scaled[index] += 1
+    return scaled
+
+
+def _build_timestep_bin_counts(allocation, total_tickets_needed, total_timestep_count):
+    if not allocation or "counts" not in allocation or "bin_size" not in allocation or sum(allocation["counts"]) == 0:
+        bin_size = max(1, int(1000 / 10))
+        bins = max(1, math.ceil(1000 / bin_size))
+        counts = [total_tickets_needed // bins] * bins
+        for index in range(total_tickets_needed % bins):
+            counts[index] += 1
+    else:
+        bin_size = max(1, int(allocation["bin_size"]))
+        counts = _scale_timestep_counts(allocation["counts"], total_tickets_needed)
+
+    scale_factor = total_timestep_count / 1000.0
+    bin_counts = []
+    bin_ranges = []
+    for index, count in enumerate(counts):
+        if count <= 0:
+            continue
+        start_t = int(index * bin_size * scale_factor)
+        end_t = min(total_timestep_count, max(start_t + 1, int((index + 1) * bin_size * scale_factor)))
+        if start_t >= total_timestep_count:
+            break
+        bin_counts.append(int(count))
+        bin_ranges.append((start_t, end_t))
+    return bin_counts, bin_ranges
+
+
+def _build_balanced_timestep_bin_order(bin_counts, seed):
+    if not bin_counts:
+        return []
+    rng = np.random.Generator(np.random.PCG64(seed + 7919))
+    positions = []
+    bins = []
+    jitter = []
+    for bin_id, count in enumerate(bin_counts):
+        if count <= 0:
+            continue
+        positions.append((np.arange(count, dtype=np.float64) + rng.random(count)) / count)
+        bins.append(np.full(count, bin_id, dtype=np.int32))
+        jitter.append(rng.random(count))
+    if not positions:
+        return []
+    all_positions = np.concatenate(positions)
+    all_bins = np.concatenate(bins)
+    all_jitter = np.concatenate(jitter)
+    order = np.lexsort((all_jitter, all_positions))
+    return all_bins[order].tolist()
+
+
+def _build_stratified_timestep_pool(bin_counts, bin_ranges, seed):
+    rng = np.random.Generator(np.random.PCG64(seed))
+    value_decks = []
+    for count, (start_t, end_t) in zip(bin_counts, bin_ranges):
+        values = np.arange(start_t, end_t, dtype=np.int64)
+        deck = []
+        while len(deck) < count:
+            shuffled = rng.permutation(values).tolist()
+            deck.extend(shuffled[: count - len(deck)])
+        value_decks.append(deck)
+
+    positions = [0 for _ in value_decks]
+    pool = []
+    for bin_id in _build_balanced_timestep_bin_order(bin_counts, seed):
+        pos = positions[bin_id]
+        pool.append(int(value_decks[bin_id][pos]))
+        positions[bin_id] = pos + 1
+    return pool
+
+
+def build_timestep_ticket_pool(allocation, total_tickets_needed, total_timestep_count=1000, seed=42, stratified=False):
+    total_tickets_needed = max(0, int(total_tickets_needed))
+    total_timestep_count = max(1, int(total_timestep_count))
+    seed = int(seed if seed else 42)
+    bin_counts, bin_ranges = _build_timestep_bin_counts(allocation, total_tickets_needed, total_timestep_count)
+
+    if stratified:
+        pool = _build_stratified_timestep_pool(bin_counts, bin_ranges, seed)
+    else:
+        rng = np.random.Generator(np.random.PCG64(seed))
+        pool = []
+        for count, (start_t, end_t) in zip(bin_counts, bin_ranges):
+            pool.extend(rng.integers(start_t, end_t, size=max(1, int(count))).tolist())
+        random.Random(seed).shuffle(pool)
+
+    if not pool:
+        fallback_rng = random.Random(seed)
+        pool = [fallback_rng.randint(0, total_timestep_count - 1) for _ in range(total_tickets_needed)]
+    while len(pool) < total_tickets_needed:
+        pool.extend(pool[: total_tickets_needed - len(pool)])
+    return pool[:total_tickets_needed], bin_ranges
+
+
 def build_epoch_shuffle_image_schedule(total_images, total_steps, seed):
     schedule = np.empty(total_steps, dtype=np.uint32)
     offset = 0
@@ -2027,33 +2138,14 @@ class TimestepSampler:
         self.pool_index = 0
 
     def _build_ticket_pool(self, allocation):
-        if not allocation or "counts" not in allocation or "bin_size" not in allocation or sum(allocation["counts"]) == 0:
-            self.bin_size = 100
-            counts = [self.total_tickets_needed // (1000 // 100) // self.config.BATCH_SIZE] * (1000 // 100)
-            for i in range((self.total_tickets_needed // self.config.BATCH_SIZE) % (1000 // 100)): counts[i] += 1
-        else:
-            self.bin_size = allocation["bin_size"]
-            counts = allocation["counts"]
-
-        scale_factor = (self.total_tickets_needed / self.config.BATCH_SIZE) / sum(counts) if sum(counts) > 0 else 1.0
-        pool = []
-        rng = np.random.Generator(np.random.PCG64(self.seed))
-        self.bin_ranges = []
-        for i, count in enumerate(counts):
-            if count <= 0: continue
-            start_t = i * self.bin_size
-            end_t = min(1000, (i + 1) * self.bin_size)
-            if start_t >= 1000: break
-            self.bin_ranges.append((start_t, end_t))
-            num_tickets = max(1, int(count * scale_factor * self.config.BATCH_SIZE))
-            pool.extend(rng.integers(start_t, end_t, size=num_tickets).tolist())
-
-        random.seed(self.seed)
-        random.shuffle(pool)
-        if len(pool) == 0: pool = [random.randint(0, 999) for _ in range(self.total_tickets_needed)]
-        elif len(pool) < self.total_tickets_needed:
-            while len(pool) < self.total_tickets_needed: pool.extend(pool[:self.total_tickets_needed - len(pool)])
-        return pool[:self.total_tickets_needed]
+        pool, self.bin_ranges = build_timestep_ticket_pool(
+            allocation,
+            self.total_tickets_needed,
+            1000,
+            self.seed,
+            bool(getattr(self.config, "TIMESTEP_STRATIFIED_SAMPLING", False)),
+        )
+        return pool
 
     def set_current_step(self, micro_step):
         self.pool_index = (micro_step * self.config.BATCH_SIZE) % len(self.ticket_pool)
