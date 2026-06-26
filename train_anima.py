@@ -564,9 +564,21 @@ def load_anima_pipe(config, device):
     else:
         loaded_prefix = detect_anima_dit_key_prefix(original_dit_path)
 
-    for attr in ("dit", "vae", "text_encoder"):
-        if hasattr(pipe, attr):
-            getattr(pipe, attr).cpu()
+    required_components = {
+        "dit": original_dit_path,
+        "vae": config.VAE_PATH,
+        "text_encoder": config.TEXT_ENCODER_PATH,
+    }
+    missing_components = [name for name in required_components if getattr(pipe, name, None) is None]
+    if missing_components:
+        details = ", ".join(f"{name} from {required_components[name]}" for name in missing_components)
+        raise RuntimeError(
+            "DiffSynth loaded the Anima pipeline, but one or more required components are missing: "
+            f"{details}. Check that each selected file is the correct Anima component type."
+        )
+
+    for attr in required_components:
+        getattr(pipe, attr).cpu()
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()

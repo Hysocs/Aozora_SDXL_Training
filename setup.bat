@@ -110,26 +110,8 @@ ECHO.
 
 :: --- Attention Backend (Mutual Exclusive) ---
 IF "%INSTALL_MODE%"=="FLASH" (
-    ECHO [INFO] Installing Flash Attention 2.8.3 - mutual exclusive, no xformers...
-    IF NOT EXIST "%WHEELS_DIR%" MKDIR "%WHEELS_DIR%"
-    
-    SET FLASH_PATH=%WHEELS_DIR%\%FLASH_ATTN_FILENAME%
-    IF NOT EXIST "%FLASH_PATH%" (
-        ECHO [INFO] Downloading Flash Attention wheel...
-        curl -L --progress-bar -o "%FLASH_PATH%" %FLASH_ATTN_URL%
-        IF ERRORLEVEL 1 (
-            ECHO [ERROR] Download failed. Check internet or URL validity.
-            GOTO FATAL_ERROR
-        )
-        ECHO [OK] Flash Attention wheel downloaded.
-    ) ELSE (
-        ECHO [INFO] Using cached Flash Attention wheel.
-    )
-    
-    ECHO [INFO] Installing Flash Attention...
-    python -m pip install "%FLASH_PATH%"
-    IF ERRORLEVEL 1 GOTO FATAL_ERROR
-    ECHO [OK] Flash Attention 2.8.3 installed.
+    ECHO [INFO] Flash Attention selected.
+    ECHO [INFO] Deferring Flash Attention install until after requirements.txt.
     ECHO.
 ) ELSE (
     ECHO [INFO] Installing xformers %XFORMERS_VERSION% - mutual exclusive, no Flash Attention...
@@ -151,6 +133,22 @@ IF ERRORLEVEL 1 (
 )
 ECHO [OK] All dependencies installed.
 ECHO.
+
+:: --- Deferred Flash Attention install ---
+IF "%INSTALL_MODE%"=="FLASH" (
+    ECHO [INFO] Running standalone Flash Attention installer as final dependency step...
+    IF NOT EXIST install_flash_attn.bat (
+        ECHO [ERROR] install_flash_attn.bat not found.
+        GOTO FATAL_ERROR
+    )
+    CALL install_flash_attn.bat NOPAUSE
+    IF ERRORLEVEL 1 (
+        ECHO [ERROR] Flash Attention standalone installer failed.
+        GOTO FATAL_ERROR
+    )
+    ECHO [OK] Flash Attention standalone installer completed.
+    ECHO.
+)
 
 :: --- Final Verification ---
 ECHO [INFO] Verifying installation...
