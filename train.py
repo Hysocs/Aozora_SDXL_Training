@@ -252,6 +252,15 @@ def generate_noise(latents, generator, device, dtype=None, step=None, seed=None)
     return torch.randn(latents.shape, device=device, dtype=torch.float32, generator=generator)
 
 
+def seeded_torch_generator(device, seed, *parts):
+    value = int(seed if seed else 42) & 0xFFFFFFFFFFFFFFFF
+    for part in parts:
+        value = (value * 6364136223846793005 + int(part) + 1442695040888963407) & 0xFFFFFFFFFFFFFFFF
+    generator = torch.Generator(device=device)
+    generator.manual_seed(value % (2**63 - 1))
+    return generator
+
+
 class TrainingConfig:
     def __init__(self):
         for key, value in default_config.flat_defaults().items():
@@ -1974,11 +1983,13 @@ def precompute_and_cache_latents(config, t1, t2, te1, te2, vae, device):
 
 
 class ImageTextLatentDataset(Dataset):
+    SAMPLE_INDEX_BITS = 32
+    SAMPLE_INDEX_MASK = (1 << SAMPLE_INDEX_BITS) - 1
+
     def __init__(self, config):
         self.items = []
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
-        self.worker_rng = None
         self.json_caption_mode = json_caption_mode_enabled(config)
         self.caption_weights = get_json_caption_weights(config)
         cache_folder_name = ".precomputed_embeddings_cache_rf" if config.is_rectified_flow else ".precomputed_embeddings_cache_standard_sdxl"
@@ -1999,7 +2010,7 @@ class ImageTextLatentDataset(Dataset):
         if not self.items: raise ValueError("No cached files found.")
 
         combined = list(zip(self.items, self.bucket_keys))
-        random.shuffle(combined)
+        random.Random(self.seed).shuffle(combined)
         self.items, self.bucket_keys = zip(*combined)
         self.items = list(self.items)
         self.bucket_keys = list(self.bucket_keys)
@@ -2023,9 +2034,25 @@ class ImageTextLatentDataset(Dataset):
 
     def __len__(self): return len(self.items)
 
-    def _init_worker_rng(self):
-        worker_info = torch.utils.data.get_worker_info()
-        self.worker_rng = random.Random(self.seed + (worker_info.id if worker_info else 0))
+    @classmethod
+    def pack_sample_index(cls, dataset_index, sample_index):
+        dataset_index = int(dataset_index)
+        sample_index = int(sample_index)
+        if dataset_index < 0 or dataset_index > cls.SAMPLE_INDEX_MASK:
+            raise ValueError(f"Dataset index is too large to pack deterministically: {dataset_index}")
+        return (sample_index << cls.SAMPLE_INDEX_BITS) | dataset_index
+
+    @classmethod
+    def unpack_sample_index(cls, packed_index):
+        packed_index = int(packed_index)
+        dataset_index = packed_index & cls.SAMPLE_INDEX_MASK
+        sample_index = packed_index >> cls.SAMPLE_INDEX_BITS
+        return dataset_index, sample_index
+
+    def _rng_for_sample(self, dataset_index, sample_index):
+        payload = f"{self.seed}:sdxl-sample:{int(sample_index)}:{int(dataset_index)}".encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        return random.Random(int.from_bytes(digest[:8], "little"))
 
     def _load_tensor(self, path):
         if not path: return None
@@ -2081,12 +2108,12 @@ class ImageTextLatentDataset(Dataset):
 
     def __getitem__(self, i):
         try:
-            if self.worker_rng is None: self._init_worker_rng()
-            
-            item_data = self.items[i]
+            dataset_index, sample_index = self.unpack_sample_index(i)
+            rng = self._rng_for_sample(dataset_index, sample_index)
+            item_data = self.items[dataset_index]
             path_te = selected_caption_variant_path(
                 item_data,
-                self.worker_rng,
+                rng,
                 self.caption_weights,
                 enabled=self.json_caption_mode,
             )
@@ -2110,11 +2137,11 @@ class ImageTextLatentDataset(Dataset):
                 "image_key": item_data.get("relative_path", path_lat),
             }
 
-            if self.dropout_prob > 0 and self.worker_rng.random() < self.dropout_prob:
+            if self.dropout_prob > 0 and rng.random() < self.dropout_prob:
                 _, null_embeds = self._align_null_embeds(item["embeds"])
                 item["embeds"], item["pooled"] = null_embeds, self.null_pooled
             elif self.cond_scale_enabled:
-                scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
+                scale = rng.uniform(self.cond_scale_min, self.cond_scale_max)
                 embeds, null_embeds = self._align_null_embeds(item["embeds"])
                 item["embeds"] = null_embeds + (embeds - null_embeds) * scale
                 item["pooled"] = self.null_pooled + (item["pooled"] - self.null_pooled) * scale
@@ -2205,6 +2232,18 @@ def print_dataset_resolution_sample(dataset, sample_count=5):
             f"target {targ_w}x{targ_h} (AR {targ_ar:.4f}){variant_label}, "
             f"AR diff {ar_error_pct:.2f}%, cropped not stretched"
         )
+
+
+def pack_sdxl_sample_schedule(image_schedule, batch_size):
+    packed_schedule = []
+    batch_size = max(1, int(batch_size or 1))
+    for batch_index, batch in enumerate(image_schedule):
+        packed_batch = []
+        for local_index, dataset_index in enumerate(batch):
+            sample_index = batch_index * batch_size + local_index
+            packed_batch.append(ImageTextLatentDataset.pack_sample_index(dataset_index, sample_index))
+        packed_schedule.append(packed_batch)
+    return packed_schedule
 
 
 def create_optimizer(config, params_to_optimize):
@@ -2506,8 +2545,10 @@ def main():
         timestep_sampler.bin_ranges,
         bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False)),
     )
+    image_schedule = pack_sdxl_sample_schedule(image_schedule, config.BATCH_SIZE)
     sampler = PrecomputedImageBatchSampler(image_schedule, initial_sampler_seed, micro_step if config.RESUME_TRAINING else 0)
     print(f"INFO: Precomputed image batch schedule for {len(image_schedule):,} step(s).")
+    print("INFO: SDXL dataset conditioning is keyed by seed and absolute sample position.")
     dataloader = DataLoader(dataset, batch_sampler=sampler, collate_fn=custom_collate_fn, num_workers=config.NUM_WORKERS)
 
     unet.enable_gradient_checkpointing()
@@ -2592,7 +2633,8 @@ def main():
                     seed=config.SEED
                 )
                 if config.is_rectified_flow:
-                    jitter = torch.rand(timesteps.shape, device=device, dtype=torch.float32)
+                    jitter_generator = seeded_torch_generator(device, config.SEED, micro_step, 0x5D1)
+                    jitter = torch.rand(timesteps.shape, device=device, dtype=torch.float32, generator=jitter_generator)
                     t_continuous = ((timesteps.float() + jitter) / 1000.0).clamp(0.0, 1.0)
 
                     t_exp = t_continuous.view(-1, 1, 1, 1)
@@ -2621,9 +2663,10 @@ def main():
                         patch_losses = []
 
                         for sample_index in range(batch_size):
-                            crop_side = int(torch.randint(min_crop, max_crop + 1, (1,), device=error.device).item())
-                            top = int(torch.randint(0, height - crop_side + 1, (1,), device=error.device).item())
-                            left = int(torch.randint(0, width - crop_side + 1, (1,), device=error.device).item())
+                            crop_generator = seeded_torch_generator(error.device, config.SEED, micro_step, sample_index, 0xC20F)
+                            crop_side = int(torch.randint(min_crop, max_crop + 1, (1,), device=error.device, generator=crop_generator).item())
+                            top = int(torch.randint(0, height - crop_side + 1, (1,), device=error.device, generator=crop_generator).item())
+                            left = int(torch.randint(0, width - crop_side + 1, (1,), device=error.device, generator=crop_generator).item())
                             patch = error[sample_index, :, top:top + crop_side, left:left + crop_side]
                             patch_losses.append(patch.square().mean())
 

@@ -2400,6 +2400,7 @@ UI_DEFS = {
     "TOKENIZER_PATH":              ("Qwen Tokenizer Folder", "Local folder containing the Qwen tokenizer files for Anima.", "path", "folder"),
     "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer Folder", "Local folder containing the T5XXL tokenizer files for Anima.", "path", "folder"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
+    "ANIMA_STREAMING_SAVE":        ("Low-RAM Anima Save", "Save Anima DiT safetensors one tensor at a time to reduce peak system RAM during checkpoint saves.", "check"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "TEXT_CACHE_PRECISION":        ("Text Cache Precision", "Floating-point dtype used for cached text embeddings on disk.", "combo", ["float32", "bfloat16", "float16"]),
     "VAE_CACHE_PRECISION":         ("VAE Cache Precision", "Floating-point dtype used for VAE latent caching. Anima VAE encoding also uses this dtype.", "combo", ["float32", "bfloat16", "float16"]),
@@ -2705,24 +2706,17 @@ class TrainingGUI(QtWidgets.QWidget):
             self.advanced_group.setVisible(not is_dit)
         self._update_loss_controls()
 
-        for key in ANIMA_LOCKED_WIDGET_KEYS:
-            if key in self.widgets:
-                self.widgets[key].setEnabled(not is_dit)
         self._update_mode_locked_group_states()
 
         if "UNCONDITIONAL_DROPOUT" in self.widgets:
-            self.widgets["UNCONDITIONAL_DROPOUT"].setEnabled(True)
             self._update_null_conditioning_dropout_controls()
         if "TEXT_CONDITIONING_SCALE_ENABLED" in self.widgets:
-            self.widgets["TEXT_CONDITIONING_SCALE_ENABLED"].setEnabled(True)
             self._update_text_conditioning_scale_controls()
         if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
             self._set_widget_row_visible("T5_TOKEN_DROPOUT_ENABLED", is_dit)
-            self.widgets["T5_TOKEN_DROPOUT_ENABLED"].setEnabled(is_dit)
             self._update_t5_token_dropout_controls()
         if "ANIMA_USE_TIMESTEP_LOSS_WEIGHT" in self.widgets:
             w = self.widgets["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"]
-            w.setEnabled(True)
             w.setToolTip(UI_DEFS["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"][1])
 
         if not is_dit:
@@ -2755,6 +2749,8 @@ class TrainingGUI(QtWidgets.QWidget):
             self.dit_model_path_row.setVisible(is_dit and not is_resume)
         if hasattr(self, "anima_resume_paths_widget"):
             self.anima_resume_paths_widget.setVisible(is_dit and is_resume)
+        if "ANIMA_STREAMING_SAVE" in self.widgets:
+            self.widgets["ANIMA_STREAMING_SAVE"].setVisible(is_dit)
 
     def _add_vertical_field(self, layout, label, widget, tooltip=None):
         if tooltip:
@@ -2836,11 +2832,17 @@ class TrainingGUI(QtWidgets.QWidget):
         self.keyed_groups.append((group, set(keys)))
 
     def _update_mode_locked_group_states(self):
-        locked_keys = ANIMA_LOCKED_WIDGET_KEYS if self._is_dit_mode() else set()
+        hidden_keys = set(ANIMA_LOCKED_WIDGET_KEYS) if self._is_dit_mode() else set()
+        if self._is_dit_mode():
+            hidden_keys.add("UNET_EXCLUDE_TARGETS")
+        else:
+            hidden_keys.add("DIT_EXCLUDE_TARGETS")
         for group, keys in self.keyed_groups:
             if not keys:
                 continue
-            group.setEnabled(not keys.issubset(locked_keys))
+            group.setVisible(not keys.issubset(hidden_keys))
+        for key in ANIMA_LOCKED_WIDGET_KEYS:
+            self._set_widget_row_visible(key, key not in hidden_keys)
 
     def _make_scroll_panel(self, widget, min_width=None, max_width=None):
         scroll = QtWidgets.QScrollArea()
@@ -3096,7 +3098,7 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         for key in ["TEXT_CONDITIONING_SCALE_MIN", "TEXT_CONDITIONING_SCALE_MAX"]:
             if key in self.widgets:
-                self.widgets[key].setEnabled(enabled)
+                self._set_widget_row_visible(key, enabled)
 
     def _update_null_conditioning_dropout_controls(self):
         is_dit = self._is_dit_mode()
@@ -3110,7 +3112,8 @@ class TrainingGUI(QtWidgets.QWidget):
         self._set_widget_row_visible("T5_NULL_DROPOUT_CHANCE", is_dit)
         for key in ["UNCONDITIONAL_DROPOUT_CHANCE", "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE"]:
             if key in self.widgets:
-                self.widgets[key].setEnabled(enabled and ((key == "UNCONDITIONAL_DROPOUT_CHANCE") != is_dit))
+                mode_matches = (key == "UNCONDITIONAL_DROPOUT_CHANCE") != is_dit
+                self._set_widget_row_visible(key, enabled and mode_matches)
 
     def _update_t5_token_dropout_controls(self):
         is_dit = self._is_dit_mode()
@@ -3121,8 +3124,7 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         for key in ["T5_TOKEN_DROPOUT_CHANCE", "T5_TOKEN_DROPOUT_MIN", "T5_TOKEN_DROPOUT_MAX"]:
             if key in self.widgets:
-                self._set_widget_row_visible(key, is_dit)
-                self.widgets[key].setEnabled(enabled and is_dit)
+                self._set_widget_row_visible(key, enabled and is_dit)
 
     def _build_architecture_group(self):
         mode_gb, mode_lay = group_box("Prediction", QtWidgets.QVBoxLayout)
@@ -3265,6 +3267,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.output_paths_group, output_paths_lay = self._make_path_subgroup("Output")
         output_paths_lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
+        self._add_vertical_widget_key(output_paths_lay, "ANIMA_STREAMING_SAVE")
         lay.addWidget(self.output_paths_group)
 
         self.model_load_strategy_combo.currentIndexChanged.connect(lambda _: self._update_path_mode_controls())

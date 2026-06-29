@@ -1,10 +1,12 @@
 import gc
 import fnmatch
 import hashlib
+import json
 import math
 import os
 import random
 import re
+import struct
 import sys
 import time
 import traceback
@@ -1066,11 +1068,13 @@ def precompute_and_cache_anima(config, pipe, device):
 
 
 class AnimaCachedDataset(Dataset):
+    SAMPLE_INDEX_BITS = 32
+    SAMPLE_INDEX_MASK = (1 << SAMPLE_INDEX_BITS) - 1
+
     def __init__(self, config):
         self.items = []
         self.bucket_keys = []
         self.seed = config.SEED if config.SEED else 42
-        self.worker_rng = None
         self.json_caption_mode = json_caption_mode_enabled(config)
         self.caption_weights = get_json_caption_weights(config)
         cache_name = anima_cache_folder_name(config)
@@ -1139,9 +1143,25 @@ class AnimaCachedDataset(Dataset):
     def __len__(self):
         return len(self.items)
 
-    def _init_worker_rng(self):
-        worker_info = torch.utils.data.get_worker_info()
-        self.worker_rng = random.Random(self.seed + (worker_info.id if worker_info else 0))
+    @classmethod
+    def pack_sample_index(cls, dataset_index, sample_index):
+        dataset_index = int(dataset_index)
+        sample_index = int(sample_index)
+        if dataset_index < 0 or dataset_index > cls.SAMPLE_INDEX_MASK:
+            raise ValueError(f"Dataset index is too large to pack deterministically: {dataset_index}")
+        return (sample_index << cls.SAMPLE_INDEX_BITS) | dataset_index
+
+    @classmethod
+    def unpack_sample_index(cls, packed_index):
+        packed_index = int(packed_index)
+        dataset_index = packed_index & cls.SAMPLE_INDEX_MASK
+        sample_index = packed_index >> cls.SAMPLE_INDEX_BITS
+        return dataset_index, sample_index
+
+    def _rng_for_sample(self, dataset_index, sample_index):
+        payload = f"{self.seed}:anima-sample:{int(sample_index)}:{int(dataset_index)}".encode("utf-8")
+        digest = hashlib.sha256(payload).digest()
+        return random.Random(int.from_bytes(digest[:8], "little"))
 
     def _align_null_prompt_emb(self, prompt_emb):
         null_prompt_emb = self.null_prompt_emb
@@ -1160,12 +1180,12 @@ class AnimaCachedDataset(Dataset):
             null_prompt_emb = torch.cat([null_prompt_emb, pad], dim=0)
         return prompt_emb, null_prompt_emb.to(dtype=prompt_emb.dtype)
 
-    def _apply_t5_token_dropout(self, ids):
+    def _apply_t5_token_dropout(self, ids, rng):
         if (
             not self.t5_token_dropout_enabled
             or self.t5_token_dropout_chance <= 0.0
             or self.t5_token_dropout_max <= 0.0
-            or self.worker_rng.random() >= self.t5_token_dropout_chance
+            or rng.random() >= self.t5_token_dropout_chance
         ):
             return ids
 
@@ -1173,24 +1193,24 @@ class AnimaCachedDataset(Dataset):
         if not candidates:
             return ids
 
-        rate = self.worker_rng.uniform(self.t5_token_dropout_min, self.t5_token_dropout_max)
+        rate = rng.uniform(self.t5_token_dropout_min, self.t5_token_dropout_max)
         drop_count = int(round(len(candidates) * rate))
         if drop_count <= 0:
             return ids
 
         out = ids.clone()
-        for token_index in self.worker_rng.sample(candidates, min(drop_count, len(candidates))):
+        for token_index in rng.sample(candidates, min(drop_count, len(candidates))):
             out[token_index] = 0
         return out
 
     def __getitem__(self, i):
         try:
-            if self.worker_rng is None:
-                self._init_worker_rng()
-            item = self.items[i]
+            dataset_index, sample_index = self.unpack_sample_index(i)
+            rng = self._rng_for_sample(dataset_index, sample_index)
+            item = self.items[dataset_index]
             te_path = selected_caption_variant_path(
                 item,
-                self.worker_rng,
+                rng,
                 self.caption_weights,
                 enabled=self.json_caption_mode,
             )
@@ -1210,18 +1230,18 @@ class AnimaCachedDataset(Dataset):
             }
 
             qwen_dropped = False
-            if self.qwen_null_dropout_prob > 0 and self.worker_rng.random() < self.qwen_null_dropout_prob:
+            if self.qwen_null_dropout_prob > 0 and rng.random() < self.qwen_null_dropout_prob:
                 _, null_prompt_emb = self._align_null_prompt_emb(item_data["prompt_emb"])
                 if null_prompt_emb is not None:
                     item_data["prompt_emb"] = null_prompt_emb
                     qwen_dropped = True
-            if self.t5_null_dropout_prob > 0 and self.worker_rng.random() < self.t5_null_dropout_prob:
+            if self.t5_null_dropout_prob > 0 and rng.random() < self.t5_null_dropout_prob:
                 if self.null_t5xxl_ids is not None:
                     item_data["t5xxl_ids"] = self.null_t5xxl_ids
             else:
-                item_data["t5xxl_ids"] = self._apply_t5_token_dropout(item_data["t5xxl_ids"])
+                item_data["t5xxl_ids"] = self._apply_t5_token_dropout(item_data["t5xxl_ids"], rng)
             if not qwen_dropped and self.cond_scale_enabled:
-                scale = self.worker_rng.uniform(self.cond_scale_min, self.cond_scale_max)
+                scale = rng.uniform(self.cond_scale_min, self.cond_scale_max)
                 prompt_emb, null_prompt_emb = self._align_null_prompt_emb(item_data["prompt_emb"])
                 if null_prompt_emb is not None:
                     item_data["prompt_emb"] = null_prompt_emb + (prompt_emb - null_prompt_emb) * scale
@@ -1278,6 +1298,18 @@ def print_anima_dataset_resolution_sample(dataset, sample_count=5):
             f"target {targ_w}x{targ_h} ({target_area:,} px, AR {targ_ar:.4f})"
             f"{variant_label}, AR diff {ar_error_pct:.2f}%, cropped not stretched"
         )
+
+
+def pack_anima_sample_schedule(image_schedule, batch_size):
+    packed_schedule = []
+    batch_size = max(1, int(batch_size or 1))
+    for batch_index, batch in enumerate(image_schedule):
+        packed_batch = []
+        for local_index, dataset_index in enumerate(batch):
+            sample_index = batch_index * batch_size + local_index
+            packed_batch.append(AnimaCachedDataset.pack_sample_index(dataset_index, sample_index))
+        packed_schedule.append(packed_batch)
+    return packed_schedule
 
 
 class AnimaTimestepSampler:
@@ -1347,7 +1379,87 @@ def freeze_dit_layers(dit, exclude_patterns):
     print("=" * 56)
 
 
-def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
+SAFETENSORS_DTYPE_NAMES = {
+    torch.float64: "F64",
+    torch.float32: "F32",
+    torch.float16: "F16",
+    torch.bfloat16: "BF16",
+    torch.int64: "I64",
+    torch.int32: "I32",
+    torch.int16: "I16",
+    torch.int8: "I8",
+    torch.uint8: "U8",
+    torch.bool: "BOOL",
+}
+for _name, _code in (
+    ("float8_e4m3fn", "F8_E4M3"),
+    ("float8_e4m3fnuz", "F8_E4M3FNUZ"),
+    ("float8_e5m2", "F8_E5M2"),
+    ("float8_e5m2fnuz", "F8_E5M2FNUZ"),
+    ("complex64", "C64"),
+    ("uint64", "U64"),
+    ("uint32", "U32"),
+    ("uint16", "U16"),
+):
+    _dtype = getattr(torch, _name, None)
+    if _dtype is not None:
+        SAFETENSORS_DTYPE_NAMES[_dtype] = _code
+
+
+def _safetensors_dtype_name(dtype):
+    name = SAFETENSORS_DTYPE_NAMES.get(dtype)
+    if name is None:
+        raise TypeError(f"Cannot save tensor with unsupported safetensors dtype: {dtype}")
+    return name
+
+
+def _dtype_element_size(dtype):
+    return torch.empty((), dtype=dtype).element_size()
+
+
+def _stream_tensor_to_file(handle, tensor):
+    tensor.reshape(-1).view(torch.uint8).numpy().tofile(handle)
+
+
+def save_safetensors_streaming(output_path, tensor_records):
+    output_path = Path(output_path)
+    tmp_path = output_path.with_name(f".{output_path.name}.{uuid.uuid4().hex}.tmp")
+    header = {}
+    offset = 0
+    for key, source_tensor, save_dtype in tensor_records:
+        nbytes = source_tensor.numel() * _dtype_element_size(save_dtype)
+        header[key] = {
+            "dtype": _safetensors_dtype_name(save_dtype),
+            "shape": list(source_tensor.shape),
+            "data_offsets": [offset, offset + nbytes],
+        }
+        offset += nbytes
+
+    header_bytes = json.dumps(header, separators=(",", ":")).encode("utf-8")
+    header_bytes += b" " * ((8 - (len(header_bytes) % 8)) % 8)
+
+    try:
+        with open(tmp_path, "wb") as f:
+            f.write(struct.pack("<Q", len(header_bytes)))
+            f.write(header_bytes)
+            for _, source_tensor, save_dtype in tensor_records:
+                tensor_cpu = (
+                    source_tensor.detach().to(device="cpu", dtype=save_dtype).contiguous()
+                    if torch.is_floating_point(source_tensor)
+                    else source_tensor.detach().cpu().contiguous()
+                )
+                _stream_tensor_to_file(f, tensor_cpu)
+                del tensor_cpu
+        os.replace(tmp_path, output_path)
+    except Exception:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+        raise
+
+
+def save_dit_model(output_path, dit, compute_dtype, key_prefix="", streaming_save=True):
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     print(f"\nINFO: Saving DiT to: {output_path.name}")
@@ -1360,9 +1472,9 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
     trainable_param_count = sum(p.numel() for p in named_params.values() if p.requires_grad)
     frozen_param_count = total_param_count - trainable_param_count
 
-    state = {}
     key_prefix = "" if str(key_prefix).lower() == "auto" else str(key_prefix or "")
     raw_state = dit.state_dict()
+    tensor_records = []
     saved_param_count = 0
     saved_trainable_param_count = 0
     saved_frozen_param_count = 0
@@ -1371,20 +1483,21 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
     dtype_counts = defaultdict(lambda: {"tensors": 0, "elements": 0})
     for k, v in raw_state.items():
         out_key = f"{key_prefix}{k}"
-        tensor_cpu = v.detach().cpu().to(dtype=compute_dtype) if torch.is_floating_point(v) else v.detach().cpu()
-        state[out_key] = tensor_cpu
-        saved_bytes += tensor_cpu.numel() * tensor_cpu.element_size()
-        dtype_key = str(tensor_cpu.dtype).replace("torch.", "")
+        save_dtype = compute_dtype if torch.is_floating_point(v) else v.dtype
+        _safetensors_dtype_name(save_dtype)
+        tensor_records.append((out_key, v, save_dtype))
+        saved_bytes += v.numel() * _dtype_element_size(save_dtype)
+        dtype_key = str(save_dtype).replace("torch.", "")
         dtype_counts[dtype_key]["tensors"] += 1
-        dtype_counts[dtype_key]["elements"] += tensor_cpu.numel()
+        dtype_counts[dtype_key]["elements"] += v.numel()
         if k in param_keys:
-            saved_param_count += tensor_cpu.numel()
+            saved_param_count += v.numel()
             if named_params[k].requires_grad:
-                saved_trainable_param_count += tensor_cpu.numel()
+                saved_trainable_param_count += v.numel()
             else:
-                saved_frozen_param_count += tensor_cpu.numel()
+                saved_frozen_param_count += v.numel()
         elif k in buffer_keys:
-            saved_buffer_count += tensor_cpu.numel()
+            saved_buffer_count += v.numel()
 
     missing_params = sorted(param_keys - set(raw_state.keys()))
     missing_trainable_params = [k for k in missing_params if named_params[k].requires_grad]
@@ -1396,7 +1509,7 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
     print(f"- Trainable saved:        {saved_trainable_param_count:,} / {trainable_param_count:,} ({(saved_trainable_param_count / max(trainable_param_count, 1)) * 100:.2f}%)")
     print(f"- Frozen saved:           {saved_frozen_param_count:,} / {frozen_param_count:,} ({(saved_frozen_param_count / max(frozen_param_count, 1)) * 100:.2f}%)")
     print(f"- Buffer elements saved:  {saved_buffer_count:,}")
-    print(f"- State tensors saved:    {len(state):,}")
+    print(f"- State tensors saved:    {len(tensor_records):,}")
     print(f"- Estimated tensor bytes: {saved_bytes / (1024 ** 2):.2f} MiB")
     if dtype_counts:
         dtype_summary = ", ".join(
@@ -1422,12 +1535,28 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix=""):
             print(f"  ... and {len(extra_state_keys) - 5:,} more")
     if key_prefix:
         print(f"INFO: Saved DiT keys with prefix: {key_prefix}")
-    save_file(state, str(output_path))
+    if streaming_save:
+        print("INFO: Using streaming safetensors save.")
+        save_safetensors_streaming(output_path, tensor_records)
+    else:
+        print("INFO: Using legacy safetensors save.")
+        state = {}
+        for out_key, source_tensor, save_dtype in tensor_records:
+            tensor_cpu = (
+                source_tensor.detach().to(device="cpu", dtype=save_dtype).contiguous()
+                if torch.is_floating_point(source_tensor)
+                else source_tensor.detach().cpu().contiguous()
+            )
+            state[out_key] = tensor_cpu
+        save_file(state, str(output_path))
+        del state
+    del tensor_records
+    gc.collect()
     file_size = output_path.stat().st_size if output_path.exists() else 0
     try:
         with safe_open(str(output_path), framework="pt", device="cpu") as f:
             disk_keys = set(f.keys())
-        expected_keys = set(state.keys())
+        expected_keys = {f"{key_prefix}{k}" for k in raw_state.keys()}
         missing_disk_keys = sorted(expected_keys - disk_keys)
         unexpected_disk_keys = sorted(disk_keys - expected_keys)
         print(f"INFO: Safetensors file keys: {len(disk_keys):,} / expected {len(expected_keys):,}")
@@ -1458,6 +1587,7 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
         dit,
         config.compute_dtype,
         getattr(config, "ANIMA_DIT_SAVE_PREFIX", ""),
+        getattr(config, "ANIMA_STREAMING_SAVE", True),
     )
     optim_state = optimizer.save_cpu_state() if hasattr(optimizer, "save_cpu_state") else optimizer.state_dict()
     torch.save({
@@ -1612,8 +1742,10 @@ def run_anima_dit_training(config):
         timestep_sampler.bin_ranges,
         bool(getattr(config, "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", False)),
     )
+    image_schedule = pack_anima_sample_schedule(image_schedule, config.BATCH_SIZE)
     batch_sampler = PrecomputedImageBatchSampler(image_schedule, config.SEED if config.SEED else 42, micro_step if is_resuming else 0)
     print(f"INFO: Precomputed Anima image batch schedule for {len(image_schedule):,} step(s).")
+    print("INFO: Anima dataset conditioning is keyed by seed and absolute sample position.")
     dataloader = DataLoader(
         dataset,
         batch_sampler=batch_sampler,
@@ -1760,7 +1892,13 @@ def run_anima_dit_training(config):
     reporter.log_message("\nTraining complete.")
     reporter.shutdown()
     final_path = output_dir / f"{Path(config.DIT_PATH).stem}_trained_full_{str(uuid.uuid4())[:4]}.safetensors"
-    save_dit_model(final_path, dit, config.compute_dtype, getattr(config, "ANIMA_DIT_SAVE_PREFIX", ""))
+    save_dit_model(
+        final_path,
+        dit,
+        config.compute_dtype,
+        getattr(config, "ANIMA_DIT_SAVE_PREFIX", ""),
+        getattr(config, "ANIMA_STREAMING_SAVE", True),
+    )
     print("All tasks complete. Final DiT saved.")
 
 

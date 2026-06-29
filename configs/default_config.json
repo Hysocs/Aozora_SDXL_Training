@@ -217,6 +217,7 @@
         "anima_dit_model_path": "",
         "anima_vae_path": "",
         "anima_dit_save_prefix": "auto",
+        "anima_streaming_save": true,
         "anima_text_encoder_path": "",
         "anima_qwen_tokenizer": "",
         "anima_t5xxl_tokenizer": "",
