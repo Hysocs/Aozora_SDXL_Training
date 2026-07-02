@@ -2031,7 +2031,7 @@ class TimestepLossWeightCurveWidget(QtWidgets.QWidget):
         self.set_points({"preset": "bell"})
         self.pointsChanged.emit(self.get_points())
 
-    def apply_min_snr_gamma5_preset(self):
+    def apply_min_snr_like_preset(self):
         self.apply_preset([
             [0.0, 0.0043],
             [0.025025, 0.1198],
@@ -3767,19 +3767,20 @@ class TrainingGUI(QtWidgets.QWidget):
         preset_row.setSpacing(8)
         for idx, (label, points) in enumerate([
             ("Uniform", [[0.0, 1.0], [1.0, 1.0]]),
-            ("Left Hill", [[0.0, 2.0], [0.5, 1.0], [1.0, 0.0]]),
-            ("Right Hill", [[0.0, 0.0], [0.5, 1.0], [1.0, 2.0]]),
-            ("Bell", None),
-            ("Min-SNR g5", "min_snr_gamma5"),
+            ("Mid Boost", [[0.0, 1.0], [0.5, 2.0], [1.0, 1.0]]),
+            ("Soft Bell", None),
+            ("Early Suppress", [[0.0, 0.5], [0.2, 1.0], [1.0, 1.0]]),
+            ("Late Suppress", [[0.0, 1.0], [0.8, 1.0], [1.0, 0.5]]),
+            ("Min-SNR-like", "min_snr_like"),
         ]):
-            if label == "Bell":
+            if label == "Soft Bell":
                 b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_bell_preset())
-            elif points == "min_snr_gamma5":
-                b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_min_snr_gamma5_preset())
+            elif points == "min_snr_like":
+                b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_min_snr_like_preset())
             else:
                 b = make_btn(label, lambda _, pts=points: self.timestep_loss_curve.apply_preset(pts))
             b.setStyleSheet("padding: 4px; font-size: 8pt;")
-            preset_row.addWidget(b, idx // 2, idx % 2)
+            preset_row.addWidget(b, idx // 3, idx % 3)
         lay.addLayout(preset_row)
         return gb
 
