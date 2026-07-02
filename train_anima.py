@@ -68,9 +68,9 @@ from train import (
     get_text_conditioning_scale_range,
     make_bucket_variant_metadata,
     null_conditioning_cache_needed,
-    sampler_aware_timestep_loss_weights,
     set_seed,
     smart_resize,
+    timestep_loss_curve_from_config,
     text_cache_float_dtype,
     text_cache_float_dtype_name,
     validate_and_assign_resolution,
@@ -1639,11 +1639,6 @@ def weighted_flowmatch_mse(model_pred, training_target, weights):
     return (per_sample_loss * weights.float()).mean()
 
 
-def flowmatch_mse(model_pred, training_target):
-    return (model_pred.float() - training_target.float()).pow(2).mean()
-
-
-
 def run_anima_dit_training(config):
     normalize_anima_config(config)
 
@@ -1758,11 +1753,9 @@ def run_anima_dit_training(config):
 
     scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
     scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
-    scheduler_weights = getattr(pipe.scheduler, "linear_timesteps_weights", torch.ones_like(pipe.scheduler.timesteps))
-    timestep_loss_weights = sampler_aware_timestep_loss_weights(
-        timestep_sampler.ticket_pool,
+    timestep_loss_weights = timestep_loss_curve_from_config(
+        config,
         total_scheduler_timesteps,
-        scheduler_weights,
         device=device,
         dtype=torch.float32,
     )
@@ -1808,10 +1801,7 @@ def run_anima_dit_training(config):
 
         noisy_latents, training_target = flowmatch_noise_and_target(input_latents, noise, sigmas)
         model_pred = run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config)
-        if getattr(config, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", True):
-            loss = weighted_flowmatch_mse(model_pred, training_target, loss_weights)
-        else:
-            loss = flowmatch_mse(model_pred, training_target)
+        loss = weighted_flowmatch_mse(model_pred, training_target, loss_weights)
         raw_loss_value = loss.detach().float().item()
         (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 

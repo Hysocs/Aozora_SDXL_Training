@@ -110,6 +110,10 @@ TIMESTEP_ALLOCATION = {
 }
 TIMESTEP_STRATIFIED_SAMPLING = False
 TIMESTEP_FORCE_IMAGE_BIN_SPREAD = False
+TIMESTEP_LOSS_WEIGHT_CURVE = [
+    [0.0, 1.0],
+    [1.0, 1.0],
+]
 
 # --- Optimizer Configuration ---
 OPTIMIZER_TYPE = "raven"
@@ -138,10 +142,6 @@ VELORMS_PARAMS = {
 
 # --- Loss Configuration ---
 LOSS_TYPE = "MSE"
-ANIMA_USE_TIMESTEP_LOSS_WEIGHT = True
-SEMANTIC_SEP_WEIGHT = 0.7
-SEMANTIC_DETAIL_WEIGHT = 0.5
-SEMANTIC_ENTROPY_WEIGHT = 0.2
 
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "sdpa"
@@ -180,9 +180,8 @@ FLAT_KEYS = [
     "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM",
     "SEED", "SAVE_EVERY_N_STEPS", "ANIMA_STREAMING_SAVE", "UNET_EXCLUDE_TARGETS", "DIT_EXCLUDE_TARGETS",
     "LR_CUSTOM_CURVE", "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX",
-    "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS",
-    "VELORMS_PARAMS", "LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", "SEMANTIC_SEP_WEIGHT",
-    "SEMANTIC_DETAIL_WEIGHT", "SEMANTIC_ENTROPY_WEIGHT",
+    "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "TIMESTEP_LOSS_WEIGHT_CURVE", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS",
+    "VELORMS_PARAMS", "LOSS_TYPE",
     "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
     "ANIMA_CACHE_FOLDER_NAME", "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE",
     "VAE_CACHING_TILE_STRIDE", "REBUILD_CACHE", "VAE_NORMALIZATION_MODE",
@@ -204,9 +203,9 @@ PER_MODE_FLAT_KEYS = [
     "MULTI_BUCKET_EXTRA_BUCKETS", "PREDICTION_TYPE", "MAX_TRAIN_STEPS",
     "BATCH_SIZE", "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION",
     "CLIP_GRAD_NORM", "SEED", "SAVE_EVERY_N_STEPS", "LR_CUSTOM_CURVE",
-    "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX", "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD",
+    "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX", "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "TIMESTEP_LOSS_WEIGHT_CURVE",
     "OPTIMIZER_TYPE", "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
-    "LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
+    "LOSS_TYPE", "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE",
     "VAE_NORMALIZATION_MODE", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR",
     "VAE_LATENT_CHANNELS", "REBUILD_CACHE",
 ]
@@ -237,7 +236,6 @@ NESTED_NAME_OVERRIDES = {
     "RESUME_STATE_PATH": "resume_state_path",
     "ANIMA_RESUME_MODEL_PATH": "resume_model_path",
     "ANIMA_RESUME_STATE_PATH": "resume_state_path",
-    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": "use_timestep_loss_weight",
 }
 
 
@@ -269,8 +267,6 @@ def default_mode_config(mode_key):
         nested_key_for(mode_key, flat_key): copy.deepcopy(defaults.get(flat_key))
         for flat_key in mode_flat_keys(mode_key)
     }
-    if mode_key == MODE_SDXL:
-        config[nested_key_for(mode_key, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT")] = False
     return config
 
 
@@ -306,6 +302,13 @@ def normalize_preset(config_data):
                 nested_key_for(mode_key, flat_key)
                 for flat_key in mode_flat_keys(mode_key)
             }
+            legacy_timestep_loss_key = f"{mode_key}_use_timestep_loss_weight"
+            curve_key = nested_key_for(mode_key, "TIMESTEP_LOSS_WEIGHT_CURVE")
+            if (
+                config_data[mode_key].get(legacy_timestep_loss_key)
+                and curve_key not in config_data[mode_key]
+            ):
+                preset[mode_key][curve_key] = {"preset": "bell"}
             preset[mode_key].update({
                 key: copy.deepcopy(value)
                 for key, value in config_data[mode_key].items()

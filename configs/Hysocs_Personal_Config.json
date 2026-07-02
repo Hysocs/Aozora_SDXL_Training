@@ -81,6 +81,9 @@
         },
         "sdxl_timestep_stratified_sampling": false,
         "sdxl_timestep_force_image_bin_spread": false,
+        "sdxl_timestep_loss_weight_curve": {
+            "preset": "bell"
+        },
         "sdxl_optimizer_type": "raven",
         "sdxl_raven_params": {
             "betas": [
@@ -111,7 +114,6 @@
             "eps": 1e-08
         },
         "sdxl_loss_type": "MSE",
-        "sdxl_use_timestep_loss_weight": true,
         "sdxl_memory_efficient_attention": "sdpa",
         "sdxl_timestep_mode": "Wave",
         "sdxl_vae_normalization_mode": "scalar",
@@ -130,7 +132,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists\\azunyart",
+                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\Doukyuusei Remake - H Scene Append DLC",
                 "repeats": 1
             }
         ],
@@ -160,9 +162,9 @@
         "anima_multi_bucket_enabled": false,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "1200",
+        "anima_max_train_steps": "1000",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "4",
+        "anima_gradient_accumulation_steps": "3",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
@@ -191,30 +193,44 @@
         "anima_timestep_allocation": {
             "bin_size": 50,
             "counts": [
-                0,
-                0,
-                0,
-                0,
-                12,
-                12,
-                24,
-                24,
-                36,
-                36,
-                48,
-                60,
-                72,
-                84,
-                96,
-                108,
-                120,
-                144,
-                156,
-                168
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50,
+                50
             ]
         },
         "anima_timestep_stratified_sampling": true,
         "anima_timestep_force_image_bin_spread": true,
+        "anima_timestep_loss_weight_curve": [
+            [
+                0.0,
+                1.0
+            ],
+            [
+                0.50143266,
+                2.0
+            ],
+            [
+                1.0,
+                1.0
+            ]
+        ],
         "anima_optimizer_type": "raven",
         "anima_raven_params": {
             "betas": [
@@ -245,9 +261,8 @@
             "eps": 1e-08
         },
         "anima_loss_type": "MSE",
-        "anima_use_timestep_loss_weight": false,
         "anima_memory_efficient_attention": "sdpa",
-        "anima_timestep_mode": "Beta",
+        "anima_timestep_mode": "Wave",
         "anima_vae_normalization_mode": "scalar",
         "anima_vae_shift_factor": 0.0,
         "anima_vae_scaling_factor": 0.13025,

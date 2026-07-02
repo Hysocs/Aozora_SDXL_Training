@@ -2274,43 +2274,58 @@ def bell_timestep_loss_curve(total_timestep_count, device=None, dtype=torch.floa
     return (y - y_min).clamp_min(0.0) * scale
 
 
-def sdxl_bell_timestep_loss_weights(timesteps):
-    curve = bell_timestep_loss_curve(1000, device=timesteps.device, dtype=timesteps.float().dtype)
-    indices = timesteps.long().clamp(0, curve.shape[0] - 1)
-    return curve[indices]
-
-
-def sampler_aware_timestep_loss_weights(ticket_pool, total_timestep_count, target_weights=None, device=None, dtype=torch.float32):
+def timestep_loss_curve_from_config(config, total_timestep_count, device=None, dtype=torch.float32):
     steps = int(total_timestep_count)
     if steps <= 0:
         return torch.ones(1, device=device, dtype=dtype)
-    if target_weights is None:
-        target = bell_timestep_loss_curve(steps, dtype=torch.float32)
+
+    points = getattr(config, "TIMESTEP_LOSS_WEIGHT_CURVE", None)
+    if not points:
+        return torch.ones(steps, device=device, dtype=dtype)
+    if isinstance(points, dict):
+        preset = str(points.get("preset", "")).lower()
+        if preset == "bell":
+            return bell_timestep_loss_curve(steps, device=device, dtype=dtype)
+        return torch.ones(steps, device=device, dtype=dtype)
+
+    cleaned = []
+    for point in points:
+        try:
+            x = max(0.0, min(1.0, float(point[0])))
+            y = max(0.0, float(point[1]))
+            cleaned.append((x, y))
+        except (TypeError, ValueError, IndexError):
+            continue
+    if len(cleaned) < 2:
+        return torch.ones(steps, device=device, dtype=dtype)
+
+    cleaned.sort(key=lambda p: p[0])
+    if cleaned[0][0] > 0.0:
+        cleaned.insert(0, (0.0, cleaned[0][1]))
     else:
-        target = target_weights.detach().float().cpu().flatten()
-        if target.numel() != steps:
-            resized = torch.ones(steps, dtype=torch.float32)
-            size = min(steps, target.numel())
-            resized[:size] = target[:size]
-            target = resized
-    target = target / target.mean().clamp_min(1e-12)
-    tickets = torch.as_tensor(ticket_pool, dtype=torch.long).flatten()
-    tickets = tickets[(tickets >= 0) & (tickets < steps)]
-    if tickets.numel() == 0:
-        return target.to(device=device, dtype=dtype)
-    counts = torch.bincount(tickets, minlength=steps).float()
-    sample_prob = counts / counts.sum().clamp_min(1.0)
-    weights = torch.zeros(steps, dtype=torch.float32)
-    covered = sample_prob > 0
-    weights[covered] = target[covered] / (steps * sample_prob[covered])
-    weights = weights / (weights * sample_prob).sum().clamp_min(1e-12)
-    return weights.to(device=device, dtype=dtype)
+        cleaned[0] = (0.0, cleaned[0][1])
+    if cleaned[-1][0] < 1.0:
+        cleaned.append((1.0, cleaned[-1][1]))
+    else:
+        cleaned[-1] = (1.0, cleaned[-1][1])
+
+    xp = torch.tensor([p[0] for p in cleaned], dtype=torch.float32)
+    yp = torch.tensor([p[1] for p in cleaned], dtype=torch.float32)
+    grid = torch.linspace(0.0, 1.0, steps, dtype=torch.float32)
+    indices = torch.searchsorted(xp, grid, right=True).clamp(1, len(cleaned) - 1)
+    x0 = xp[indices - 1]
+    x1 = xp[indices]
+    y0 = yp[indices - 1]
+    y1 = yp[indices]
+    blend = ((grid - x0) / (x1 - x0).clamp_min(1e-12)).clamp(0.0, 1.0)
+    curve = y0 + (y1 - y0) * blend
+    return curve.to(device=device, dtype=dtype)
 
 
 def weighted_sdxl_mse_loss(pred, target, timesteps, timestep_loss_weights=None):
     per_sample_loss = (pred.float() - target.float()).pow(2).flatten(1).mean(dim=1)
     if timestep_loss_weights is None:
-        weights = sdxl_bell_timestep_loss_weights(timesteps).to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
+        weights = torch.ones_like(per_sample_loss)
     else:
         curve = timestep_loss_weights.to(device=per_sample_loss.device, dtype=per_sample_loss.dtype)
         indices = timesteps.long().clamp(0, curve.shape[0] - 1)
@@ -2529,8 +2544,8 @@ def main():
         timestep_sampler.load_state_dict(initial_timestep_sampler_state)
     elif config.RESUME_TRAINING and micro_step > 0:
         timestep_sampler.set_current_step(micro_step)
-    timestep_loss_weights = sampler_aware_timestep_loss_weights(
-        timestep_sampler.ticket_pool,
+    timestep_loss_weights = timestep_loss_curve_from_config(
+        config,
         1000,
         device=device,
         dtype=torch.float32,
@@ -2650,32 +2665,7 @@ def main():
                 pred = unet(noisy_latents.to(config.compute_dtype), timesteps_conditioning, embeds,
                             added_cond_kwargs={"text_embeds": pooled, "time_ids": time_ids}).sample
 
-                if getattr(config, "LOSS_TYPE", "MSE") == "PatchMSE" and config.is_rectified_flow:
-                    error = pred.float() - target.float()
-                    batch_size, _, height, width = error.shape
-
-                    if height <= 1 or width <= 1:
-                        loss = error.square().mean()
-                    else:
-                        min_side = min(height, width)
-                        min_crop = max(1, int(min_side * 0.15))
-                        max_crop = max(min_crop, int(min_side * 0.75))
-                        patch_losses = []
-
-                        for sample_index in range(batch_size):
-                            crop_generator = seeded_torch_generator(error.device, config.SEED, micro_step, sample_index, 0xC20F)
-                            crop_side = int(torch.randint(min_crop, max_crop + 1, (1,), device=error.device, generator=crop_generator).item())
-                            top = int(torch.randint(0, height - crop_side + 1, (1,), device=error.device, generator=crop_generator).item())
-                            left = int(torch.randint(0, width - crop_side + 1, (1,), device=error.device, generator=crop_generator).item())
-                            patch = error[sample_index, :, top:top + crop_side, left:left + crop_side]
-                            patch_losses.append(patch.square().mean())
-
-                        loss = torch.stack(patch_losses).mean()
-                else:
-                    if getattr(config, "ANIMA_USE_TIMESTEP_LOSS_WEIGHT", False):
-                        loss = weighted_sdxl_mse_loss(pred, target, timesteps, timestep_loss_weights)
-                    else:
-                        loss = F.mse_loss(pred.float(), target.float())
+                loss = weighted_sdxl_mse_loss(pred, target, timesteps, timestep_loss_weights)
 
                 (loss / config.GRADIENT_ACCUMULATION_STEPS).backward()
 

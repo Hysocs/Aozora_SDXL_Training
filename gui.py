@@ -1497,7 +1497,7 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.epoch_data = []
         self.epoch_step_interval = 0
         self.epoch_marker_count = 0
-        self.padding = {'top': 40, 'bottom': 60, 'left': 60, 'right': 20}
+        self.padding = {'top': 40, 'bottom': 78, 'left': 78, 'right': 20}
         self.point_radius = 8
         self._dragging_point_index = -1
         self._selected_point_index = -1
@@ -1585,7 +1585,7 @@ class LRCurveWidget(QtWidgets.QWidget):
         painter.setPen(self.grid_color)
         log_max, log_min = self._log_range()
         log_range = log_max - log_min
-        f = self.font(); f.setPixelSize(13); painter.setFont(f)
+        f = self.font(); f.setPixelSize(11); painter.setFont(f)
         for i in range(5):
             y = rect.top() + (i / 4) * rect.height()
             painter.setPen(self.grid_color)
@@ -1603,8 +1603,19 @@ class LRCurveWidget(QtWidgets.QWidget):
         self._draw_epoch_markers(painter, rect)
 
         painter.setPen(self.text_color)
-        f3 = self.font(); f3.setBold(True); f3.setPixelSize(13); painter.setFont(f3)
-        painter.drawText(self.rect().adjusted(0, 5, 0, 0),
+        axis_font = self.font(); axis_font.setPixelSize(11); painter.setFont(axis_font)
+        painter.save()
+        painter.translate(14, rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(QtCore.QRect(-70, -9, 140, 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, "Learning Rate")
+        painter.restore()
+        painter.drawText(QtCore.QRect(rect.left(), rect.bottom() + 44, rect.width(), 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, "Training Step")
+
+        painter.setPen(self.text_color)
+        f3 = self.font(); f3.setBold(True); f3.setPixelSize(12); painter.setFont(f3)
+        painter.drawText(QtCore.QRect(rect.left(), 5, rect.width(), 25),
                          QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
                          "Learning Rate Schedule")
 
@@ -1783,7 +1794,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMinimumHeight(300)
-        self.padding = {'top': 40, 'bottom': 50, 'left': 35, 'right': 20}
+        self.padding = {'top': 40, 'bottom': 58, 'left': 58, 'right': 20}
         self.bin_size = 100
         self.max_tickets = 1000
         self.counts = []
@@ -1872,8 +1883,8 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         enabled = self.isEnabled()
         self._paint_grid(painter, rect, enabled)
         self._paint_bars(painter, rect, enabled)
-        self._paint_labels(painter, enabled)
-        self._paint_header(painter, enabled)
+        self._paint_labels(painter, rect, enabled)
+        self._paint_header(painter, rect, enabled)
 
     def _paint_grid(self, painter, rect, enabled):
         gc = self.grid_color if enabled else self.disabled_text_color
@@ -1904,21 +1915,24 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
                 if ty < rect.top(): ty = br.top() + 5 if br.height() > 40 else rect.top() + 5
                 painter.drawText(QtCore.QRectF(br.left(), ty, br.width(), 20), QtCore.Qt.AlignmentFlag.AlignCenter, str(count))
 
-    def _paint_labels(self, painter, enabled):
+    def _paint_labels(self, painter, rect, enabled):
         painter.setPen(self.text_color if enabled else self.disabled_text_color)
+        label_font = painter.font()
+        label_font.setPixelSize(11)
+        painter.setFont(label_font)
         painter.save()
-        painter.translate(12, self.height() / 2)
+        painter.translate(14, self.height() / 2)
         painter.rotate(-90)
-        painter.drawText(QtCore.QRect(-100, -10, 200, 20), QtCore.Qt.AlignmentFlag.AlignCenter, "Tickets Count")
+        painter.drawText(QtCore.QRect(-70, -9, 140, 18), QtCore.Qt.AlignmentFlag.AlignCenter, "Tickets")
         painter.restore()
-        painter.drawText(QtCore.QRect(0, self.height() - 20, self.width(), 20),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "Timestep Range")
+        painter.drawText(QtCore.QRect(rect.left(), rect.bottom() + 30, rect.width(), 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, "Timestep (0-1000)")
 
-    def _paint_header(self, painter, enabled):
+    def _paint_header(self, painter, rect, enabled):
         used, total = sum(self.counts), self.max_tickets
-        f = painter.font(); f.setBold(True); f.setPixelSize(13); painter.setFont(f)
+        f = painter.font(); f.setBold(True); f.setPixelSize(12); painter.setFont(f)
         painter.setPen(QtGui.QColor(SUCCESS if used == total else DANGER if used > total else TEXT_PRI))
-        painter.drawText(self.rect().adjusted(0, 5, 0, 0),
+        painter.drawText(QtCore.QRect(rect.left(), 5, rect.width(), 25),
                          QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
                          f"Tickets Used: {used} / {total}")
 
@@ -1953,6 +1967,229 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
 
     def mouseReleaseEvent(self, event):
         self._dragging_bin_index = -1; self.update()
+
+
+class TimestepLossWeightCurveWidget(QtWidgets.QWidget):
+    pointsChanged = QtCore.pyqtSignal(list)
+    selectionChanged = QtCore.pyqtSignal(int)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(190)
+        self.padding = {'top': 30, 'bottom': 56, 'left': 74, 'right': 18}
+        self.point_radius = 7
+        self.min_weight = 0.0
+        self.max_weight = 2.0
+        self._points = [[0.0, 1.0], [1.0, 1.0]]
+        self._preset = None
+        self._dragging_point_index = -1
+        self._drag_had_motion = False
+        self._selected_point_index = -1
+        self.bg_color = QtGui.QColor(GRAPH_BG)
+        self.grid_color = QtGui.QColor(BORDER)
+        self.line_color = QtGui.QColor(ACCENT2)
+        self.point_color = QtGui.QColor(TEXT_PRI)
+        self.point_fill_color = QtGui.QColor(ACCENT2)
+        self.selected_point_color = QtGui.QColor(WARN)
+        self.text_color = QtGui.QColor(TEXT_PRI)
+        self.setMouseTracking(True)
+
+    def set_points(self, points):
+        self._preset = None
+        if isinstance(points, dict) and str(points.get("preset", "")).lower() == "bell":
+            self._preset = "bell"
+            points = self._bell_preview_points()
+        cleaned = []
+        for p in points or []:
+            try:
+                x = max(0.0, min(1.0, float(p[0])))
+                y = max(self.min_weight, min(self.max_weight, float(p[1])))
+                cleaned.append([x, y])
+            except (TypeError, ValueError, IndexError):
+                continue
+        if len(cleaned) < 2:
+            cleaned = [[0.0, 1.0], [1.0, 1.0]]
+        cleaned.sort(key=lambda p: p[0])
+        cleaned[0][0] = 0.0
+        cleaned[-1][0] = 1.0
+        self._points = cleaned
+        self._selected_point_index = -1
+        self.selectionChanged.emit(-1)
+        self.update()
+
+    def get_points(self):
+        if self._preset == "bell":
+            return {"preset": "bell"}
+        return [[round(p[0], 8), round(p[1], 4)] for p in self._points]
+
+    def apply_preset(self, points):
+        self._preset = None
+        self.set_points(points)
+        self.pointsChanged.emit(self.get_points())
+
+    def apply_bell_preset(self):
+        self.set_points({"preset": "bell"})
+        self.pointsChanged.emit(self.get_points())
+
+    @staticmethod
+    def _bell_preview_points():
+        steps = 1000
+        values = [math.exp(-2.0 * ((i - steps / 2) / steps) ** 2) for i in range(steps)]
+        y_min = min(values)
+        denom = sum(v - y_min for v in values) or 1.0
+        scale = steps / denom
+        sample_indices = [0, 125, 250, 375, 500, 625, 750, 875, 999]
+        return [[i / (steps - 1), (values[i] - y_min) * scale] for i in sample_indices]
+
+    def add_point(self):
+        self._preset = None
+        if len(self._points) < 2:
+            return
+        max_gap, insert_idx = 0.0, -1
+        for i in range(len(self._points) - 1):
+            gap = self._points[i + 1][0] - self._points[i][0]
+            if gap > max_gap:
+                max_gap, insert_idx = gap, i + 1
+        if insert_idx == -1:
+            return
+        prev, nxt = self._points[insert_idx - 1], self._points[insert_idx]
+        self._points.insert(insert_idx, [(prev[0] + nxt[0]) / 2, (prev[1] + nxt[1]) / 2])
+        self.set_points(self._points)
+        self.pointsChanged.emit(self.get_points())
+
+    def remove_selected_point(self):
+        self._preset = None
+        i = self._selected_point_index
+        if 0 < i < len(self._points) - 1:
+            self._points.pop(i)
+            self.set_points(self._points)
+            self.pointsChanged.emit(self.get_points())
+
+    def _graph_rect(self):
+        return QtCore.QRect(
+            self.padding['left'],
+            self.padding['top'],
+            self.width() - self.padding['left'] - self.padding['right'],
+            self.height() - self.padding['top'] - self.padding['bottom'],
+        )
+
+    def _to_pixel(self, x, y):
+        rect = self._graph_rect()
+        px = rect.left() + x * rect.width()
+        ny = (y - self.min_weight) / max(self.max_weight - self.min_weight, 1e-9)
+        py = rect.bottom() - ny * rect.height()
+        return QtCore.QPointF(px, py)
+
+    def _to_data(self, px, py):
+        rect = self._graph_rect()
+        x = (px - rect.left()) / max(rect.width(), 1)
+        ny = 1.0 - ((max(rect.top(), min(py, rect.bottom())) - rect.top()) / max(rect.height(), 1))
+        y = self.min_weight + ny * (self.max_weight - self.min_weight)
+        return max(0.0, min(1.0, x)), max(self.min_weight, min(self.max_weight, y))
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), self.bg_color)
+        rect = self._graph_rect()
+        font = painter.font()
+        font.setPixelSize(11)
+        painter.setFont(font)
+        for i in range(5):
+            y = rect.top() + (i / 4) * rect.height()
+            value = self.max_weight - (i / 4) * (self.max_weight - self.min_weight)
+            painter.setPen(self.grid_color)
+            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
+            painter.setPen(self.text_color)
+            painter.drawText(QtCore.QRect(0, int(y - 10), self.padding['left'] - 5, 20),
+                             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                             f"{value:.1f}")
+        for i in range(6):
+            x = rect.left() + (i / 5) * rect.width()
+            painter.setPen(self.grid_color)
+            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
+            painter.setPen(self.text_color)
+            painter.drawText(QtCore.QRect(int(x - 30), rect.bottom() + 4, 60, 18),
+                             QtCore.Qt.AlignmentFlag.AlignCenter, str(int(i / 5 * 1000)))
+        painter.setPen(self.text_color)
+        axis_font = painter.font()
+        axis_font.setPixelSize(11)
+        painter.setFont(axis_font)
+        painter.save()
+        painter.translate(14, rect.center().y())
+        painter.rotate(-90)
+        painter.drawText(QtCore.QRect(-70, -9, 140, 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter,
+                         "Loss Weight")
+        painter.restore()
+        painter.drawText(QtCore.QRect(rect.left(), rect.bottom() + 24, rect.width(), 18),
+                         QtCore.Qt.AlignmentFlag.AlignCenter,
+                         "Timestep (0-1000)")
+        painter.setPen(self.text_color)
+        title_font = painter.font()
+        title_font.setBold(True)
+        title_font.setPixelSize(12)
+        painter.setFont(title_font)
+        painter.drawText(QtCore.QRect(rect.left(), 4, rect.width(), 22),
+                         QtCore.Qt.AlignmentFlag.AlignHCenter | QtCore.Qt.AlignmentFlag.AlignTop,
+                         "Loss Weight")
+
+        pts = [self._to_pixel(p[0], p[1]) for p in self._points]
+        painter.setPen(QtGui.QPen(self.line_color, 2))
+        painter.drawPolyline(QtGui.QPolygonF(pts))
+        for i, point in enumerate(self._points):
+            pos = self._to_pixel(point[0], point[1])
+            painter.setBrush(self.selected_point_color if i == self._selected_point_index else self.point_fill_color)
+            painter.setPen(self.point_color)
+            painter.drawEllipse(pos, self.point_radius, self.point_radius)
+            if i == self._selected_point_index or i == self._dragging_point_index:
+                painter.drawText(QtCore.QRectF(pos.x() - 42, pos.y() - 27, 84, 18),
+                                 QtCore.Qt.AlignmentFlag.AlignCenter,
+                                 f"{point[1]:.2f}")
+
+    def mousePressEvent(self, event):
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        new_sel = -1
+        for i, point in enumerate(self._points):
+            if (QtCore.QPointF(event.pos()) - self._to_pixel(point[0], point[1])).manhattanLength() < self.point_radius * 1.8:
+                self._dragging_point_index = i
+                self._drag_had_motion = False
+                new_sel = i
+                break
+        if self._selected_point_index != new_sel:
+            self._selected_point_index = new_sel
+            self.selectionChanged.emit(new_sel)
+        self.update()
+
+    def mouseMoveEvent(self, event):
+        if self._dragging_point_index != -1:
+            self._preset = None
+            self._drag_had_motion = True
+            x, y = self._to_data(event.pos().x(), event.pos().y())
+            i = self._dragging_point_index
+            if i == 0 or i == len(self._points) - 1:
+                x = 0.0 if i == 0 else 1.0
+            else:
+                x = max(self._points[i - 1][0] + 1e-4, min(self._points[i + 1][0] - 1e-4, x))
+            self._points[i] = [x, y]
+            self.pointsChanged.emit(self.get_points())
+            self.update()
+            return
+        on_point = any(
+            (QtCore.QPointF(event.pos()) - self._to_pixel(p[0], p[1])).manhattanLength() < self.point_radius * 1.8
+            for p in self._points
+        )
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor if on_point else QtCore.Qt.CursorShape.ArrowCursor)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() != QtCore.Qt.MouseButton.LeftButton:
+            return
+        self._dragging_point_index = -1
+        if self._drag_had_motion:
+            self.set_points(self._points)
+            self.pointsChanged.emit(self.get_points())
+        self._drag_had_motion = False
 
 
 class ProcessRunner(QThread):
@@ -2445,8 +2682,7 @@ UI_DEFS = {
     "TIMESTEP_STRATIFIED_SAMPLING": ("Stratified Timestep Coverage", "Balance bin order locally and draw each bin's timestep values from shuffled no-repeat decks.", "check"),
     "TIMESTEP_FORCE_IMAGE_BIN_SPREAD": ("Force Image-Bin Spread", "Preplan batch-1 image order so images avoid repeating recent timestep bins while timestep sampling stays unchanged.", "check"),
     "MEMORY_EFFICIENT_ATTENTION":  ("Attention Backend", "Select the attention mechanism to use.", "combo", ["sdpa", "cudnn", "xformers (Only if no Flash)", "pytorch29_optimized"]),
-    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE", "PatchMSE"]),
-    "ANIMA_USE_TIMESTEP_LOSS_WEIGHT": ("Use Bell Timestep Loss Weight", "Multiply MSE by a bell-shaped timestep loss weight.", "check"),
+    "LOSS_TYPE":                   ("Loss Type", "Select the loss function strategy.", "combo", ["MSE"]),
     "VAE_NORMALIZATION_MODE":      ("VAE Normalization", "scalar uses shift/scale, flux_bn32 uses the ComfyUI Flux 32ch BN layout.", "combo", ["scalar", "flux_bn32 (Comfy Flux BN)"]),
     "VAE_SHIFT_FACTOR":            ("VAE Shift Factor", "Latent shift mean.", "dspin", -10.0, 10.0, 0.0001, 4),
     "VAE_SCALING_FACTOR":          ("VAE Scaling Factor", "Latent scaling factor.", "dspin", 0.0, 10.0, 0.0001, 5),
@@ -2715,10 +2951,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
             self._set_widget_row_visible("T5_TOKEN_DROPOUT_ENABLED", is_dit)
             self._update_t5_token_dropout_controls()
-        if "ANIMA_USE_TIMESTEP_LOSS_WEIGHT" in self.widgets:
-            w = self.widgets["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"]
-            w.setToolTip(UI_DEFS["ANIMA_USE_TIMESTEP_LOSS_WEIGHT"][1])
-
         if not is_dit:
             self._update_vae_normalization_controls()
         if hasattr(self, "dataset_manager"):
@@ -2777,6 +3009,7 @@ class TrainingGUI(QtWidgets.QWidget):
         elif isinstance(w, QtWidgets.QSlider): self.current_config[key] = w.value()
         elif isinstance(w, (QtWidgets.QSpinBox, QtWidgets.QDoubleSpinBox)): self.current_config[key] = w.value()
         elif isinstance(w, LRCurveWidget): self.current_config[key] = w.get_points()
+        elif isinstance(w, TimestepLossWeightCurveWidget): self.current_config[key] = w.get_points()
         elif isinstance(w, TimestepHistogramWidget): self.current_config[key] = w.get_allocation()
         if key == "VAE_NORMALIZATION_MODE":
             self._update_vae_normalization_controls()
@@ -3155,7 +3388,6 @@ class TrainingGUI(QtWidgets.QWidget):
         settings_lay.addWidget(self._build_training_length_group())
         settings_lay.addWidget(self._build_batching_group())
         settings_lay.addWidget(self._build_runtime_group())
-        settings_lay.addWidget(self._build_loss_group())
         self.unet_exclusion_group = self._vertical_form_group("UNet Layer Exclusion", ["UNET_EXCLUDE_TARGETS"])
         self.dit_exclusion_group = self._vertical_form_group("DiT Layer Exclusion", ["DIT_EXCLUDE_TARGETS"])
         settings_lay.addWidget(self.unet_exclusion_group)
@@ -3180,7 +3412,8 @@ class TrainingGUI(QtWidgets.QWidget):
         optimizer_row = QtWidgets.QHBoxLayout()
         optimizer_row.setSpacing(20)
         optimizer_row.addWidget(self._build_optimizer_group(), 1)
-        optimizer_row.addStretch(1)
+        self.loss_group = self._build_loss_group()
+        optimizer_row.addWidget(self.loss_group, 1)
         main_lay.addLayout(optimizer_row)
         main_lay.addStretch(1)
         split.addWidget(main_panel)
@@ -3444,7 +3677,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         btn_row = QtWidgets.QHBoxLayout()
         self.add_point_btn = make_btn("Add Point", self.lr_curve_widget.add_point)
-        self.remove_point_btn = make_btn("Remove Selected", self.lr_curve_widget.remove_selected_point)
+        self.remove_point_btn = make_btn("Remove Point", self.lr_curve_widget.remove_selected_point)
         btn_row.addWidget(self.add_point_btn); btn_row.addWidget(self.remove_point_btn); btn_row.addStretch()
         lay.addLayout(btn_row)
 
@@ -3479,15 +3712,11 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return gb
 
-    def _build_loss_group(self):
-        return self._vertical_form_group("Loss Configuration", ["LOSS_TYPE", "ANIMA_USE_TIMESTEP_LOSS_WEIGHT"])
-
     def _update_loss_controls(self):
         if "LOSS_TYPE" not in self.widgets:
             return
-        is_dit = self._is_dit_mode()
         combo = self.widgets["LOSS_TYPE"]
-        allowed = ["MSE"] if is_dit else ["MSE", "PatchMSE"]
+        allowed = ["MSE"]
         current = combo.currentText()
         desired = self.current_config.get("LOSS_TYPE", current)
         if desired not in allowed:
@@ -3500,6 +3729,44 @@ class TrainingGUI(QtWidgets.QWidget):
         combo.setCurrentText(desired)
         combo.blockSignals(False)
         self.current_config["LOSS_TYPE"] = desired
+
+    def _build_loss_group(self):
+        gb, lay = group_box("Loss Configuration")
+        loss_form = QtWidgets.QFormLayout()
+        loss_form.setContentsMargins(0, 0, 0, 0)
+        self._add_form_keys(loss_form, ["LOSS_TYPE"])
+        lay.addLayout(loss_form)
+
+        self.timestep_loss_curve = TimestepLossWeightCurveWidget()
+        self.widgets["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve
+        self.timestep_loss_curve.pointsChanged.connect(lambda _: self._sync_widget("TIMESTEP_LOSS_WEIGHT_CURVE"))
+        self.timestep_loss_curve.selectionChanged.connect(self._update_timestep_loss_button_states)
+        lay.addWidget(self.timestep_loss_curve)
+
+        loss_btn_row = QtWidgets.QHBoxLayout()
+        self.loss_weight_add_btn = make_btn("Add Point", self.timestep_loss_curve.add_point)
+        self.loss_weight_remove_btn = make_btn("Remove Point", self.timestep_loss_curve.remove_selected_point)
+        self.loss_weight_remove_btn.setEnabled(False)
+        loss_btn_row.addWidget(self.loss_weight_add_btn)
+        loss_btn_row.addWidget(self.loss_weight_remove_btn)
+        lay.addLayout(loss_btn_row)
+
+        preset_row = QtWidgets.QGridLayout()
+        preset_row.setSpacing(8)
+        for idx, (label, points) in enumerate([
+            ("Uniform", [[0.0, 1.0], [1.0, 1.0]]),
+            ("Left Hill", [[0.0, 2.0], [0.5, 1.0], [1.0, 0.0]]),
+            ("Right Hill", [[0.0, 0.0], [0.5, 1.0], [1.0, 2.0]]),
+            ("Bell", None),
+        ]):
+            if label == "Bell":
+                b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_bell_preset())
+            else:
+                b = make_btn(label, lambda _, pts=points: self.timestep_loss_curve.apply_preset(pts))
+            b.setStyleSheet("padding: 4px; font-size: 8pt;")
+            preset_row.addWidget(b, idx // 2, idx % 2)
+        lay.addLayout(preset_row)
+        return gb
 
     def _build_optimizer_group(self):
         gb, lay = group_box("Optimizer")
@@ -3706,6 +3973,10 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addLayout(coverage_form)
         return gb
 
+    def _update_timestep_loss_button_states(self, idx):
+        if hasattr(self, "loss_weight_remove_btn"):
+            self.loss_weight_remove_btn.setEnabled(idx > 0 and idx < len(self.timestep_loss_curve._points) - 1)
+
     def _add_slider_row(self, layout, label_text, min_val, max_val, default_val, divider):
         container = QtWidgets.QWidget()
         h = QtWidgets.QHBoxLayout(container); h.setContentsMargins(0, 0, 0, 0)
@@ -3858,7 +4129,7 @@ class TrainingGUI(QtWidgets.QWidget):
             is_resuming = self.current_config.get("RESUME_TRAINING", False)
             self.model_load_strategy_combo.setCurrentIndex(1 if is_resuming else 0)
 
-            skip = {"OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
+            skip = {"OPTIMIZER_TYPE", "LR_CUSTOM_CURVE", "LOSS_TYPE", "TIMESTEP_ALLOCATION", "TIMESTEP_LOSS_WEIGHT_CURVE"}
             skip |= {k for k in self.widgets if k.startswith(("RAVEN_", "TITAN_", "VELORMS_"))}
             for key, w in self.widgets.items():
                 if key in skip: continue
@@ -3885,7 +4156,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self._toggle_optimizer_widgets()
 
             loss_type = self.current_config.get("LOSS_TYPE", "MSE")
-            self.widgets["LOSS_TYPE"].setCurrentText(loss_type if loss_type in {"MSE", "PatchMSE"} else "MSE")
+            self.widgets["LOSS_TYPE"].setCurrentText("MSE" if loss_type not in {"MSE"} else loss_type)
 
             if "MULTI_BUCKET_ENABLED" in self.widgets:
                 self.widgets["MULTI_BUCKET_EXTRA_BUCKETS"].setEnabled(self.widgets["MULTI_BUCKET_ENABLED"].isChecked())
@@ -3910,6 +4181,9 @@ class TrainingGUI(QtWidgets.QWidget):
                     self.bin_size_combo.setCurrentText(str(alloc["bin_size"]))
                     self.bin_size_combo.blockSignals(False)
                 self.timestep_histogram.set_allocation(alloc)
+            loss_curve = self.current_config.get("TIMESTEP_LOSS_WEIGHT_CURVE")
+            if hasattr(self, "timestep_loss_curve"):
+                self.timestep_loss_curve.set_points(loss_curve or [[0.0, 1.0], [1.0, 1.0]])
             ts_mode = self.current_config.get("TIMESTEP_MODE", "Wave")
             self.ts_mode_combo.blockSignals(True)
             self.ts_mode_combo.setCurrentText(ts_mode)
@@ -3934,7 +4208,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg = {}
         skip_keys = {"RESUME_TRAINING", "INSTANCE_DATASETS", "OPTIMIZER_TYPE",
                      "RAVEN_PARAMS", "TITAN_PARAMS", "VELORMS_PARAMS",
-                     "LOSS_TYPE", "TIMESTEP_ALLOCATION"}
+                     "LOSS_TYPE", "TIMESTEP_ALLOCATION", "TIMESTEP_LOSS_WEIGHT_CURVE"}
         mode_key = mode_key or default_config.mode_key_from_label(self.training_mode_combo.currentText())
         cfg["TRAINING_MODE"] = default_config.MODE_LABELS[mode_key]
         is_dit = mode_key == default_config.MODE_ANIMA
@@ -3950,10 +4224,11 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
         cfg["OPTIMIZER_TYPE"] = self.widgets["OPTIMIZER_TYPE"].currentData()
-        cfg["LOSS_TYPE"] = "MSE" if is_dit else self.widgets["LOSS_TYPE"].currentText()
+        cfg["LOSS_TYPE"] = "MSE"
         cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
+        if hasattr(self, 'timestep_loss_curve'): cfg["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve.get_points()
 
         for prefix, key in [("RAVEN", "RAVEN_PARAMS"), ("TITAN", "TITAN_PARAMS")]:
             try:
