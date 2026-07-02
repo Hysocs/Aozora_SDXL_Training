@@ -2031,6 +2031,18 @@ class TimestepLossWeightCurveWidget(QtWidgets.QWidget):
         self.set_points({"preset": "bell"})
         self.pointsChanged.emit(self.get_points())
 
+    def apply_min_snr_gamma5_preset(self):
+        self.apply_preset([
+            [0.0, 0.0043],
+            [0.025025, 0.1198],
+            [0.05005, 0.2544],
+            [0.075075, 0.4107],
+            [0.1001, 0.5914],
+            [0.125125, 0.7999],
+            [0.15015, 1.0],
+            [1.0, 1.0],
+        ])
+
     @staticmethod
     def _bell_preview_points():
         steps = 1000
@@ -3758,9 +3770,12 @@ class TrainingGUI(QtWidgets.QWidget):
             ("Left Hill", [[0.0, 2.0], [0.5, 1.0], [1.0, 0.0]]),
             ("Right Hill", [[0.0, 0.0], [0.5, 1.0], [1.0, 2.0]]),
             ("Bell", None),
+            ("Min-SNR g5", "min_snr_gamma5"),
         ]):
             if label == "Bell":
                 b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_bell_preset())
+            elif points == "min_snr_gamma5":
+                b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_min_snr_gamma5_preset())
             else:
                 b = make_btn(label, lambda _, pts=points: self.timestep_loss_curve.apply_preset(pts))
             b.setStyleSheet("padding: 4px; font-size: 8pt;")
