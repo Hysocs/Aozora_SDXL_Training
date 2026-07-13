@@ -87,7 +87,7 @@ from train import (
 AnimaImagePipeline = None
 ModelConfig = None
 
-# Experimental repair/QAT controls. Kept local so normal config and GUI are unaffected.
+
 ANIMA_QAT_TARGET_FORMAT = "bfp16"  # bf16/bfp16, nvfp4, int8, e4m3, or e5m2
 ANIMA_QAT_NVFP4_SCALE_MULTIPLIER = 1.0
 ANIMA_REPAIR_LINEART_LOSS_ENABLED = True
@@ -564,7 +564,7 @@ def _prepare_quantized_training_view(config, quant_path):
     """Dequantize supported Comfy quantized weights for DiffSynth computation."""
     if not _anima_checkpoint_has_comfy_quant(quant_path):
         raise ValueError("train_anima_repair.py expects a Comfy-quantized DIT_PATH/resume checkpoint.")
-    from tools.convert_anima_fp8 import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight, dequantize_nvfp4_tensor, write_streaming_safetensors
+    from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight, dequantize_nvfp4_tensor, write_streaming_safetensors
     quant_path = Path(quant_path)
     view_dir = Path(config.OUTPUT_DIR) / ".aozora_projected_quant_view"
     view_dir.mkdir(parents=True, exist_ok=True)
@@ -1493,7 +1493,7 @@ def _anima_qat_scale_multiplier(config):
 class AnimaProjectedQuantController:
     """Owns projected quantized state and floating error-feedback residuals."""
     def __init__(self, dit, config):
-        from tools.convert_anima_fp8 import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
+        from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
         self.format = _anima_qat_target_format(config)
         self.scale_multiplier = _anima_qat_scale_multiplier(config)
         self.source_path = Path(getattr(config, "ANIMA_PROJECTED_QUANT_SOURCE", config.DIT_PATH))
@@ -1547,7 +1547,7 @@ class AnimaProjectedQuantController:
 
     @torch.no_grad()
     def project_after_step(self):
-        from tools.convert_anima_fp8 import comfy_quant_info_tensor, dequantize_nvfp4_tensor, quantize_nvfp4_tensor, scaled_quant_tensor
+        from tools.convert_anima_to_quants import comfy_quant_info_tensor, dequantize_nvfp4_tensor, quantize_nvfp4_tensor, scaled_quant_tensor
         changed = total = 0
         for name, module in self.modules.items():
             residual_gpu = self.residuals[name].to(device=module.weight.device, dtype=module.weight.dtype)
@@ -1597,7 +1597,7 @@ class AnimaProjectedQuantController:
                 self.residuals[name].copy_(value.to(self.residuals[name].device, self.residuals[name].dtype))
 
     def save_quantized(self, output_path, dit, key_prefix=""):
-        from tools.convert_anima_fp8 import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
+        from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
         output_path = Path(output_path)
         key_prefix = "" if str(key_prefix).lower() == "auto" else str(key_prefix or "")
         print(f"SAVE [1/4] Preparing exact packed checkpoint: {output_path}", flush=True)
