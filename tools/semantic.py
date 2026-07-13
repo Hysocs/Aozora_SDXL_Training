@@ -186,6 +186,38 @@ def generate_entropy_map(pil_image: Image.Image, target_w: int, target_h: int) -
     return result.astype(np.float32)
 
 
+def generate_lineart_loss_map(pil_image: Image.Image, latent_h: int, latent_w: int, oversample: int = 4) -> torch.Tensor:
+    """Return a cached [1,H,W] stroke/line confidence map for repair loss weighting."""
+    image = pil_image.convert("RGB")
+    rgb = np.asarray(image, dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
+
+    # Canny catches clean contours; the black-hat response also catches dark ink
+    # and narrow strokes that have weak outer contours. Adaptive thresholds make
+    # this work for both high-key line art and normally shaded illustrations.
+    median = float(np.median(gray))
+    lower = int(max(0.0, 0.66 * median))
+    upper = int(min(255.0, max(lower + 1.0, 1.33 * median)))
+    edges = cv2.Canny(gray, lower, upper, L2gradient=True).astype(np.float32) / 255.0
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    dark_strokes = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
+    stroke_max = float(dark_strokes.max())
+    if stroke_max > 1.0e-6:
+        dark_strokes /= stroke_max
+    line_map = np.maximum(edges, dark_strokes)
+    # Keep strokes narrow. The previous dilation expanded adjacent contours into
+    # overlapping blocks, especially after latent-grid max pooling.
+    line_map = cv2.GaussianBlur(line_map, (3, 3), 0)
+    line_map = np.clip(line_map, 0.0, 1.0)
+
+    # Cache above latent resolution. The loss reduces this soft mask to the model
+    # grid with area sampling, avoiding the oversized blocks produced by max pool.
+    oversample = max(1, int(oversample))
+    target_h = int(latent_h) * oversample
+    target_w = int(latent_w) * oversample
+    resized = cv2.resize(line_map, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    return torch.from_numpy(resized).unsqueeze(0).to(dtype=torch.float16).contiguous()
+
 # Module-level flag to suppress repeated skimage import warnings
 _entropy_import_ok = None
 

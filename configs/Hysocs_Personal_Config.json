@@ -6,8 +6,12 @@
         "sdxl_resume_training": false,
         "sdxl_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\Dan Artists",
+                "path": "C:/Users/Administrator/Pictures\\Gwen",
                 "repeats": 1
+            },
+            {
+                "path": "C:/Users/Administrator/Pictures\\Gwen Lucky Girl",
+                "repeats": 2
             }
         ],
         "sdxl_caching_batch_size": 1,
@@ -26,7 +30,7 @@
         "sdxl_t5_token_dropout_min": 0,
         "sdxl_t5_token_dropout_max": 0,
         "sdxl_caption_chunking_enabled": true,
-        "sdxl_should_upscale": true,
+        "sdxl_should_upscale": false,
         "sdxl_caption_source_type": "json",
         "sdxl_caption_tags_percent": 40,
         "sdxl_caption_nl_percent": 10,
@@ -34,9 +38,9 @@
         "sdxl_caption_nl_tags_percent": 25,
         "sdxl_max_bucket_resolution": 1024,
         "sdxl_multi_bucket_enabled": true,
-        "sdxl_multi_bucket_extra_buckets": 2,
+        "sdxl_multi_bucket_extra_buckets": 1,
         "sdxl_prediction_type": "epsilon",
-        "sdxl_max_train_steps": "10000",
+        "sdxl_max_train_steps": "1500",
         "sdxl_batch_size": 1,
         "sdxl_gradient_accumulation_steps": 4,
         "sdxl_mixed_precision": "bfloat16",
@@ -53,7 +57,7 @@
                 5e-05
             ],
             [
-                0.83641161,
+                0.90027701,
                 5e-05
             ],
             [
@@ -67,23 +71,34 @@
         "sdxl_timestep_allocation": {
             "bin_size": 100,
             "counts": [
-                1000,
-                1000,
-                1000,
-                1000,
-                1000,
-                1000,
-                1000,
-                1000,
-                1000,
-                1000
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150,
+                150
             ]
         },
         "sdxl_timestep_stratified_sampling": false,
         "sdxl_timestep_force_image_bin_spread": false,
-        "sdxl_timestep_loss_weight_curve": {
-            "preset": "bell"
-        },
+        "sdxl_timestep_loss_weight_curve": [
+            [
+                0.0,
+                1.0
+            ],
+            [
+                0.49570201,
+                2.0
+            ],
+            [
+                1.0,
+                1.0
+            ]
+        ],
         "sdxl_optimizer_type": "raven",
         "sdxl_raven_params": {
             "betas": [
@@ -125,14 +140,14 @@
         "sdxl_vae_path": "",
         "sdxl_resume_model_path": "",
         "sdxl_resume_state_path": "",
-        "sdxl_unet_exclude_targets": "down_blocks.2.*.transformer_blocks.*.ff.net.2.*, mid_block.*.transformer_blocks.*.ff.net.2.*, up_blocks.0.*.transformer_blocks.*.ff.net.2.*"
+        "sdxl_unet_exclude_targets": ""
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\CG(ai_tagged)\\Doukyuusei Remake - H Scene Append DLC",
+                "path": "C:/Users/Administrator/Pictures\\otokakoto",
                 "repeats": 1
             }
         ],
@@ -144,7 +159,7 @@
         "anima_unconditional_dropout_chance": 0.9,
         "anima_qwen_null_dropout_chance": 0.05,
         "anima_t5_null_dropout_chance": 0.05,
-        "anima_text_conditioning_scale_enabled": false,
+        "anima_text_conditioning_scale_enabled": true,
         "anima_text_conditioning_scale_min": 0.9,
         "anima_text_conditioning_scale_max": 1.1,
         "anima_t5_token_dropout_enabled": false,
@@ -158,29 +173,29 @@
         "anima_caption_nl_percent": 0,
         "anima_caption_tags_nl_percent": 0,
         "anima_caption_nl_tags_percent": 0,
-        "anima_max_bucket_resolution": "1024",
+        "anima_max_bucket_resolution": "1152",
         "anima_multi_bucket_enabled": false,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "1000",
+        "anima_max_train_steps": "515",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "3",
+        "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
-        "anima_save_every_n_steps": "1500",
+        "anima_save_every_n_steps": "650",
         "anima_lr_custom_curve": [
             [
                 0.0,
                 1e-08
             ],
             [
-                0.07387863,
-                9.5e-06
+                0.06648199,
+                1e-06
             ],
             [
-                0.95514512,
-                9.5e-06
+                0.97506925,
+                1e-06
             ],
             [
                 1.0,
@@ -189,30 +204,30 @@
         ],
         "anima_learning_rate": 8e-07,
         "anima_lr_graph_min": "1.0e-8",
-        "anima_lr_graph_max": "9.5e-6",
+        "anima_lr_graph_max": "1.0e-06",
         "anima_timestep_allocation": {
             "bin_size": 50,
             "counts": [
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50,
-                50
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                26,
+                25,
+                25,
+                25,
+                25,
+                25
             ]
         },
         "anima_timestep_stratified_sampling": true,
@@ -223,8 +238,8 @@
                 1.0
             ],
             [
-                0.5,
-                2.0
+                0.29799427,
+                1.5
             ],
             [
                 1.0,
@@ -268,16 +283,16 @@
         "anima_vae_scaling_factor": 0.13025,
         "anima_vae_latent_channels": 4,
         "anima_rebuild_cache": false,
-        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/anima_baseV10.safetensors",
+        "anima_dit_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/Akanezorav0.65B.safetensors",
         "anima_vae_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/VAE/qwen_image_vae.safetensors",
         "anima_dit_save_prefix": "auto",
         "anima_streaming_save": true,
-        "anima_text_encoder_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/TextEncoders/anima_baseV10_txt.safetensors",
+        "anima_text_encoder_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/TextEncoders/Qwen3-0.6B_txt.safetensors",
         "anima_qwen_tokenizer": "C:/Users/Administrator/.cache/huggingface/Qwen/Qwen3-0.6B",
         "anima_t5xxl_tokenizer": "C:/Users/Administrator/.cache/huggingface/google/t5-v1_1-xxl",
         "anima_resume_model_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/anima_baseV10_step_1217.safetensors",
         "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_1217.pt",
-        "anima_dit_exclude_targets": "",
+        "anima_dit_exclude_targets": "llm_adapter.*",
         "anima_cache_folder_name": ".precomputed_anima_dit_cache",
         "anima_vae_caching_tiled": true,
         "anima_vae_caching_tile_size": [

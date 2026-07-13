@@ -842,7 +842,9 @@ class GraphPanel(QtWidgets.QWidget):
         self.title = title
         self.y_label = y_label
         self.lines = []
-        self.padding = {'top': 35, 'bottom': 40, 'left': 70, 'right': 20}
+        # The top band is a compact, Chart.js-style series legend.
+        # It replaces the centered title and stays outside the plot area.
+        self.padding = {'top': 42, 'bottom': 40, 'left': 70, 'right': 20}
         self.bg_color = QtGui.QColor(PANEL_BG)
         self.graph_bg_color = QtGui.QColor(GRAPH_BG)
         self.grid_color = QtGui.QColor(BORDER)
@@ -851,7 +853,7 @@ class GraphPanel(QtWidgets.QWidget):
         self.x_min, self.x_max = 0, 100
         self.y_min, self.y_max = 0, 1
         self.data_x_min, self.data_x_max = 0, 100
-        self.fill_enabled = True
+        self.fill_enabled = False
         self.view_x_min = None
         self.view_x_max = None
         self.render_x_min = None
@@ -877,7 +879,7 @@ class GraphPanel(QtWidgets.QWidget):
                             self.width() - self.padding['left'] - self.padding['right'],
                             self.height() - self.padding['top'] - self.padding['bottom'])
 
-    def add_line(self, color, label, max_points=2000, linewidth=2):
+    def add_line(self, color, label, max_points=2000, linewidth=2, line_style="solid"):
         self.lines.append({
             'data': [],
             'x_values': [],
@@ -886,8 +888,16 @@ class GraphPanel(QtWidgets.QWidget):
             'color': QtGui.QColor(color),
             'label': label,
             'linewidth': linewidth,
+            'line_style': line_style,
+            'visible': True,
         })
         return len(self.lines) - 1
+
+    def set_line_visible(self, line_index, visible):
+        if 0 <= line_index < len(self.lines):
+            self.lines[line_index]['visible'] = bool(visible)
+            self._dirty_bounds = True
+            self.update()
 
     def append_data(self, line_index, x, y):
         if 0 <= line_index < len(self.lines):
@@ -1029,6 +1039,7 @@ class GraphPanel(QtWidgets.QWidget):
             self.render_x_min, self.render_x_max = target_x_min, target_x_max
         self.x_min, self.x_max = self.render_x_min, self.render_x_max
         for line in self.lines:
+            if not line.get('visible', True): continue
             raw = self._get_visible_slice(line)
             if raw:
                 all_x.extend(x for x, _ in raw)
@@ -1076,7 +1087,6 @@ class GraphPanel(QtWidgets.QWidget):
         painter.fillRect(gr, self.graph_bg_color)
         self._draw_grid(painter, gr)
         self._draw_lines(painter, gr)
-        self._draw_title(painter)
         self._draw_legend(painter)
         self._draw_hover(painter, gr)
 
@@ -1093,7 +1103,6 @@ class GraphPanel(QtWidgets.QWidget):
             painter.setPen(QtGui.QPen(self.grid_color, 1))
         for i in range(6):
             x = rect.left() + (i / 5) * rect.width()
-            painter.drawLine(int(x), rect.top(), int(x), rect.bottom())
             x_val = self.x_min + (i / 5) * (self.x_max - self.x_min)
             painter.setPen(self.text_color)
             painter.drawText(QtCore.QRect(int(x - 30), rect.bottom() + 5, 60, 20),
@@ -1114,6 +1123,7 @@ class GraphPanel(QtWidgets.QWidget):
         painter.setClipRect(rect)
         max_points = max(128, rect.width() * 2)
         for line in self.lines:
+            if not line.get('visible', True): continue
             raw = self._get_visible_slice(line)
             if len(raw) < 2: continue
             sampled = self._sample_visible_points(raw, max_points)
@@ -1128,9 +1138,21 @@ class GraphPanel(QtWidgets.QWidget):
                 painter.setBrush(fc); painter.setPen(QtCore.Qt.PenStyle.NoPen)
                 painter.drawPolygon(poly)
             width = self._line_width(line)
-            painter.setPen(QtGui.QPen(line['color'], width))
+            painter.setPen(self._line_pen(line, width))
             painter.drawPolyline(QtGui.QPolygonF(pts))
         painter.restore()
+
+    def _line_pen(self, line, width=None):
+        pen = QtGui.QPen(line['color'], width if width is not None else self._line_width(line))
+        style = line.get('line_style', 'solid')
+        if style == 'dotted':
+            pen.setStyle(QtCore.Qt.PenStyle.CustomDashLine)
+            pen.setDashPattern([1.0, 3.0])
+            pen.setCapStyle(QtCore.Qt.PenCapStyle.RoundCap)
+        elif style == 'dashed':
+            pen.setStyle(QtCore.Qt.PenStyle.CustomDashLine)
+            pen.setDashPattern([6.0, 3.0])
+        return pen
 
     def _line_width(self, line):
         count = len(line['data'])
@@ -1144,23 +1166,21 @@ class GraphPanel(QtWidgets.QWidget):
             return 52
         return 38
 
-    def _draw_title(self, painter):
-        painter.setPen(self.title_color)
-        f = painter.font(); f.setPixelSize(15); f.setBold(True); painter.setFont(f)
-        painter.drawText(QtCore.QRect(0, 5, self.width(), 25), QtCore.Qt.AlignmentFlag.AlignCenter, self.title)
 
     def _draw_legend(self, painter):
-        lx = self.width() - self.padding['right'] - 120
-        ly = self.padding['top'] + 10
-        f = painter.font(); f.setPixelSize(11); painter.setFont(f)
+        lx = self.padding['left']
+        ly = 13
+        f = painter.font(); f.setPixelSize(12); f.setBold(False); painter.setFont(f)
         for line in self.lines:
-            if not line['data']: continue
-            painter.setPen(QtGui.QPen(line['color'], self._line_width(line)))
-            painter.drawLine(lx, ly + 5, lx + 20, ly + 5)
+            if not line.get('visible', True): continue
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            painter.setBrush(line['color'])
+            painter.drawRoundedRect(QtCore.QRectF(lx, ly, 10, 10), 2, 2)
             painter.setPen(self.text_color)
-            painter.drawText(QtCore.QRect(lx + 25, ly, 80, 15),
+            label_width = painter.fontMetrics().horizontalAdvance(line['label'])
+            painter.drawText(QtCore.QRect(lx + 16, ly - 3, label_width + 2, 16),
                              QtCore.Qt.AlignmentFlag.AlignLeft | QtCore.Qt.AlignmentFlag.AlignVCenter, line['label'])
-            ly += 20
+            lx += 16 + label_width + 22
 
     def _draw_hover(self, painter, rect):
         if not self.hover_point:
@@ -1322,6 +1342,126 @@ class GraphPanel(QtWidgets.QWidget):
             self.repaint_timer.start(0)
 
 
+class LiveTimestepHistogram(QtWidgets.QWidget):
+    def __init__(self, bin_count=20, parent=None):
+        super().__init__(parent)
+        self.counts = [0] * bin_count
+        self.y_axis_label = "Samples"
+        self.padding = {'top': 42, 'bottom': 40, 'left': 70, 'right': 20}
+        self.setMinimumHeight(220)
+
+    def append_value(self, value):
+        index = min(len(self.counts) - 1, max(0, int(float(value) / 1000.0 * len(self.counts))))
+        self.counts[index] += 1
+        self.update()
+
+    def clear_all_data(self):
+        self.counts = [0] * len(self.counts)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), QtGui.QColor(PANEL_BG))
+        rect = QtCore.QRect(self.padding['left'], self.padding['top'],
+                            self.width() - self.padding['left'] - self.padding['right'],
+                            self.height() - self.padding['top'] - self.padding['bottom'])
+        painter.fillRect(rect, QtGui.QColor(GRAPH_BG))
+        maximum = max(1, max(self.counts, default=0))
+        painter.setPen(QtGui.QPen(QtGui.QColor(BORDER), 1))
+        for value in self.y_grid_values(maximum):
+            y = rect.bottom() - (value / maximum) * rect.height()
+            painter.drawLine(rect.left(), int(y), rect.right(), int(y))
+            painter.setPen(QtGui.QColor(TEXT_PRI))
+            painter.drawText(QtCore.QRect(5, int(y - 10), self.padding['left'] - 10, 20),
+                             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignVCenter,
+                             self.format_y_tick(value))
+            painter.setPen(QtGui.QPen(QtGui.QColor(BORDER), 1))
+        width = rect.width() / len(self.counts)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        for index, count in enumerate(self.counts):
+            height = count / maximum * rect.height()
+            bar = QtCore.QRectF(rect.left() + index * width + 1, rect.bottom() - height,
+                                max(1, width - 2), height)
+            color = QtGui.QColor(ACCENT if index % 2 == 0 else "#5839b0")
+            color.setAlpha(210)
+            painter.setBrush(color)
+            painter.drawRoundedRect(bar, 2, 2)
+        painter.setPen(QtGui.QColor(TEXT_PRI))
+        for i in range(6):
+            x = rect.left() + i / 5 * rect.width()
+            painter.drawText(QtCore.QRect(int(x - 30), rect.bottom() + 5, 60, 20),
+                             QtCore.Qt.AlignmentFlag.AlignCenter, str(i * 200))
+        painter.save(); painter.translate(15, self.height() / 2); painter.rotate(-90)
+        painter.drawText(QtCore.QRect(-50, -10, 100, 20), QtCore.Qt.AlignmentFlag.AlignCenter, self.y_axis_label)
+        painter.restore()
+        painter.drawText(QtCore.QRect(0, self.height() - 20, self.width(), 20),
+                         QtCore.Qt.AlignmentFlag.AlignCenter, "Timestep")
+        swatch = QtCore.QRectF(self.padding['left'], 13, 10, 10)
+        clip_path = QtGui.QPainterPath()
+        clip_path.addRoundedRect(swatch, 2, 2)
+        painter.save()
+        painter.setClipPath(clip_path)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        top_right = QtGui.QPolygonF([
+            swatch.topLeft(), swatch.topRight(), swatch.bottomRight()
+        ])
+        bottom_left = QtGui.QPolygonF([
+            swatch.topLeft(), swatch.bottomRight(), swatch.bottomLeft()
+        ])
+        painter.setBrush(QtGui.QColor(ACCENT))
+        painter.drawPolygon(top_right)
+        painter.setBrush(QtGui.QColor("#5839b0"))
+        painter.drawPolygon(bottom_left)
+        painter.restore()
+        painter.setPen(QtGui.QColor(TEXT_PRI))
+        painter.drawText(QtCore.QRect(self.padding['left'] + 16, 10, 280, 16),
+                         QtCore.Qt.AlignmentFlag.AlignVCenter,
+                         self.legend_text())
+
+    def y_grid_values(self, maximum):
+        if maximum <= 4:
+            return list(range(int(maximum) + 1))
+        return [maximum * i / 4 for i in range(5)]
+
+    def format_y_tick(self, value):
+        return str(round(value))
+
+    def legend_text(self):
+        return f"Timestep Samples ({sum(self.counts):,} total)"
+
+
+class LiveTimestepMeanLossHistogram(LiveTimestepHistogram):
+    def __init__(self, bin_count=20, parent=None):
+        super().__init__(bin_count, parent)
+        self.loss_sums = [0.0] * bin_count
+        self.sample_counts = [0] * bin_count
+        self.y_axis_label = "Mean Loss"
+
+    def append_sample(self, timestep, loss):
+        index = min(len(self.counts) - 1, max(0, int(float(timestep) / 1000.0 * len(self.counts))))
+        self.loss_sums[index] += float(loss)
+        self.sample_counts[index] += 1
+        self.counts[index] = self.loss_sums[index] / self.sample_counts[index]
+        self.update()
+
+    def clear_all_data(self):
+        size = len(self.counts)
+        self.counts = [0.0] * size
+        self.loss_sums = [0.0] * size
+        self.sample_counts = [0] * size
+        self.update()
+
+    def y_grid_values(self, maximum):
+        return [maximum * i / 4 for i in range(5)]
+
+    def format_y_tick(self, value):
+        return f"{value:.4f}" if value < 1 else f"{value:.3f}"
+
+    def legend_text(self):
+        return f"Mean Loss by Timestep ({sum(self.sample_counts):,} samples)"
+
+
 class LiveMetricsWidget(QtWidgets.QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1336,25 +1476,44 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self._setup_ui()
 
     def _make_graph_container(self, name, title, y_label):
-        gb, lay = group_box(title)
-        gb.setStyleSheet(f"QGroupBox {{ margin-top: 10px; }} QGroupBox::title {{ subcontrol-position: top center; }}")
-        graph = GraphPanel(title, y_label)
+        gb, lay = group_box("")
+        gb.setStyleSheet("QGroupBox { margin-top: 0px; }")
+        if name == "timestep":
+            graph = LiveTimestepHistogram()
+        elif name == "timestep_loss":
+            graph = LiveTimestepMeanLossHistogram()
+        else:
+            graph = GraphPanel(title, y_label)
         self.graphs[name] = {'widget': graph, 'lines': {}}
         lay.addWidget(graph, 1)
 
         ctrl = QtWidgets.QHBoxLayout()
         fill_chk = QtWidgets.QCheckBox("Fill")
-        fill_chk.setChecked(True)
-        fill_chk.stateChanged.connect(lambda s, g=graph: g.set_fill(s == QtCore.Qt.CheckState.Checked.value))
-        ctrl.addWidget(fill_chk)
+        fill_chk.setChecked(False)
+        if name not in ("timestep", "timestep_loss"):
+            fill_chk.stateChanged.connect(lambda s, g=graph: g.set_fill(s == QtCore.Qt.CheckState.Checked.value))
+            ctrl.addWidget(fill_chk)
+        else:
+            fill_chk.hide()
+        if name in ("step_loss", "optim_loss"):
+            raw_chk = QtWidgets.QCheckBox("Show raw loss")
+            raw_chk.toggled.connect(lambda checked, n=name: self._set_loss_raw_mode(n, checked))
+            ctrl.addWidget(raw_chk)
         ctrl.addStretch()
         lay.addLayout(ctrl)
         return gb
 
-    def _add_line(self, graph_name, line_name, color, linewidth=2):
+    def _add_line(self, graph_name, line_name, color, linewidth=2, line_style="solid"):
         g = self.graphs[graph_name]
-        idx = g['widget'].add_line(color, line_name, self.max_points, linewidth)
+        idx = g['widget'].add_line(color, line_name, self.max_points, linewidth, line_style)
         g['lines'][line_name] = idx
+
+    def _set_loss_raw_mode(self, graph_name, show_raw):
+        graph = self.graphs[graph_name]
+        raw_name = "Step Loss" if graph_name == "step_loss" else "Optimizer Loss"
+        ema_name = "Loss EMA" if graph_name == "step_loss" else "Optimizer Loss EMA"
+        graph['widget'].set_line_visible(graph['lines'][raw_name], show_raw)
+        graph['widget'].set_line_visible(graph['lines'][ema_name], not show_raw)
 
     def _setup_ui(self):
         main = QtWidgets.QVBoxLayout(self)
@@ -1375,22 +1534,28 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         for name, title, y_label, row, col, row_span, col_span in [
             ("step_loss", "Per-Step Loss", "Loss", 0, 0, 1, 1),
             ("timestep", "Timestep", "Value", 0, 1, 1, 1),
-            ("optim_loss", "Optimizer Loss (Avg)", "Loss", 1, 0, 1, 1),
+            ("optim_loss", "Optimizer Loss", "Loss", 1, 0, 1, 1),
             ("lr", "Learning Rate", "LR", 1, 1, 1, 1),
-            ("grad_norm", "Gradient Norms", "Norm", 2, 0, 1, 2),
+            ("timestep_loss", "Mean Loss by Timestep", "Mean Loss", 2, 0, 1, 1),
+            ("grad_norm", "Gradient Norms", "Norm", 2, 1, 1, 1),
         ]:
             grid.addWidget(self._make_graph_container(name, title, y_label), row, col, row_span, col_span)
         main.addLayout(grid)
 
-        for graph_name, line_name, color, width in [
-            ("step_loss", "Step Loss", "#4CAF50", 2),
-            ("timestep", "Timestep", ACCENT2, 2),
-            ("optim_loss", "Avg Loss", ACCENT, 2),
-            ("lr", "LR", "#6a48d7", 2),
-            ("grad_norm", "Raw", DANGER, 3),
-            ("grad_norm", "Clipped", WARN, 2),
+        for graph_name, line_name, color, width, line_style in [
+            ("step_loss", "Step Loss", "#4CAF50", 2, "solid"),
+            ("step_loss", "Loss EMA", "#4CAF50", 3, "solid"),
+            ("optim_loss", "Optimizer Loss", ACCENT, 2, "solid"),
+            ("optim_loss", "Optimizer Loss EMA", ACCENT, 3, "solid"),
+            ("lr", "LR", "#6a48d7", 2, "solid"),
+            ("grad_norm", "Raw", DANGER, 3, "solid"),
+            ("grad_norm", "Clipped", WARN, 2, "dotted"),
         ]:
-            self._add_line(graph_name, line_name, color, width)
+            self._add_line(graph_name, line_name, color, width, line_style)
+        self.graphs['step_loss']['widget'].set_line_visible(self.graphs['step_loss']['lines']['Step Loss'], False)
+        self.graphs['optim_loss']['widget'].set_line_visible(self.graphs['optim_loss']['lines']['Optimizer Loss'], False)
+        self.loss_ema_beta = 0.98
+        self.step_loss_ema = self.optim_loss_ema = None
 
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
@@ -1441,11 +1606,16 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             if t == 'progress_step':
                 _, step, loss, ts = data
                 self.graphs['step_loss']['widget'].append_data(self.graphs['step_loss']['lines']['Step Loss'], step, loss)
-                self.graphs['timestep']['widget'].append_data(self.graphs['timestep']['lines']['Timestep'], step, ts)
+                self.step_loss_ema = loss if self.step_loss_ema is None else self.loss_ema_beta * self.step_loss_ema + (1.0 - self.loss_ema_beta) * loss
+                self.graphs['step_loss']['widget'].append_data(self.graphs['step_loss']['lines']['Loss EMA'], step, self.step_loss_ema)
+                self.graphs['timestep']['widget'].append_value(ts)
+                self.graphs['timestep_loss']['widget'].append_sample(ts, loss)
             elif t == 'optim_step':
                 _, step, avg_loss, lr = data
                 last_optim_step = step
-                self.graphs['optim_loss']['widget'].append_data(self.graphs['optim_loss']['lines']['Avg Loss'], step, avg_loss)
+                self.graphs['optim_loss']['widget'].append_data(self.graphs['optim_loss']['lines']['Optimizer Loss'], step, avg_loss)
+                self.optim_loss_ema = avg_loss if self.optim_loss_ema is None else self.loss_ema_beta * self.optim_loss_ema + (1.0 - self.loss_ema_beta) * avg_loss
+                self.graphs['optim_loss']['widget'].append_data(self.graphs['optim_loss']['lines']['Optimizer Loss EMA'], step, self.optim_loss_ema)
                 self.graphs['lr']['widget'].append_data(self.graphs['lr']['lines']['LR'], step, lr)
             elif t == 'grad' and last_optim_step is not None:
                 _, raw, clipped = data
@@ -1454,7 +1624,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.latest_optim_step = last_optim_step
         self.stats_label.setText(
             f"Step: {self.latest_global_step} | Loss: {self.latest_step_loss:.4f} | "
-            f"Timestep: {self.latest_timestep} | Avg Loss: {self.latest_optim_loss:.4f} | "
+            f"Timestep: {self.latest_timestep} | Optimizer Loss: {self.latest_optim_loss:.4f} | "
             f"LR: {self.latest_lr:.2e} | Grad: {self.latest_grad:.4f}")
         self.pending_update = bool(self.pending_data)
         if self.pending_update:
@@ -1468,6 +1638,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             gd['widget'].clear_all_data()
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
+        self.step_loss_ema = self.optim_loss_ema = None
         self.stats_label.setText("No data yet")
 
     def showEvent(self, e):
