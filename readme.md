@@ -291,6 +291,8 @@ This is important for long training runs, unstable beta testing, or recovering f
 
 ## Quick Start
 
+### Windows
+
 1. Put your images in a dataset folder.
 2. Add matching `.txt` caption files next to the images.
 3. Run `setup.bat`.
@@ -300,6 +302,20 @@ This is important for long training runs, unstable beta testing, or recovering f
 7. Pick or adjust a preset.
 8. **(Important)** set a vae config matching your model!
 9. Press **Train**.
+
+### Linux
+
+Linux support expects an NVIDIA driver and a CUDA-compatible PyTorch installation.
+
+1. Create and activate a virtual environment (for example, `.venv`).
+2. Install the PyTorch build appropriate for your CUDA/driver combination.
+3. Run `python -m pip install -r requirements.txt`.
+4. Launch with `bash start_gui.sh`.
+5. Select Linux-native model, dataset, tokenizer, and output paths in the GUI.
+
+Absolute paths are OS-specific. A config copied from Windows can still be opened on
+Linux, but paths such as `C:\\models\\model.safetensors` must be selected again on
+the Linux filesystem (and vice versa).
 
 Checkpoints are saved to:
 
@@ -344,13 +360,17 @@ Supported image formats include:
 
 Recommended:
 
-* Windows 10/11
+* Windows 10/11 or a modern Linux distribution
 * Python 3.10
 * NVIDIA GPU with 12 GB+ VRAM
 * 32 GB system RAM
 * 20 GB+ free disk space for the environment
 * additional disk space for latent/text cache files
 * recent NVIDIA drivers
+
+The training code is OS-neutral, but Linux support has not yet received the same
+amount of hardware testing as Windows. The provided `setup.bat` remains
+Windows-only; Linux environments use the manual setup steps above.
 
 A 12 GB GPU is the main target, but actual memory use depends on:
 

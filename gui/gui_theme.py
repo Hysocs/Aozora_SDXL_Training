@@ -64,7 +64,7 @@ def make_stylesheet(theme: Theme = THEME) -> str:
 QWidget {{
     background-color: transparent;
     color: {t.text};
-    font-family: 'Consolas', 'Segoe UI', monospace;
+    font-family: 'Segoe UI', 'Noto Sans', 'DejaVu Sans', sans-serif;
     font-size: 10pt;
 }}
 #TrainingGUI, QDialog, QMessageBox {{ background-color: {t.window}; }}
@@ -141,7 +141,7 @@ QLineEdit, QPlainTextEdit, QTextEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
 }}
 QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:on,
 QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {t.accent}; }}
-QPlainTextEdit, QTextEdit {{ font-family: 'Consolas', monospace; padding: 4px; }}
+QPlainTextEdit, QTextEdit {{ font-family: 'Cascadia Mono', 'Consolas', 'DejaVu Sans Mono', 'Liberation Mono', monospace; padding: 4px; }}
 QPlainTextEdit[uiRole="consoleText"] {{ background: #11141d; color: {t.text}; }}
 QTextEdit[uiRole="caption"] {{ background: transparent; border: none; font-size: 9pt; }}
 QComboBox {{ min-height: 28px; max-height: 36px; }}

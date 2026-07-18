@@ -10,6 +10,7 @@ import shutil
 import ctypes
 import zlib
 import importlib.util
+import signal
 from pathlib import Path
 from collections import deque
 from datetime import datetime
@@ -54,6 +55,28 @@ TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
 TRAINING_MODE_ANIMA_DIT = "Anima DiT"
 DIT_AVAILABLE = importlib.util.find_spec("diffsynth") is not None
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+IS_WINDOWS = os.name == "nt"
+IS_LINUX = sys.platform.startswith("linux")
+
+
+def platform_path(value):
+    """Normalize a user/config path for the host OS without resolving symlinks."""
+    text = os.path.expandvars(os.path.expanduser(str(value or "").strip()))
+    if not text:
+        return ""
+    if not IS_WINDOWS:
+        text = text.replace("\\", "/")
+    return os.path.normpath(text)
+
+
+def usable_dialog_start(value, fallback=None):
+    candidate = platform_path(value)
+    if candidate and os.path.exists(candidate):
+        return candidate if os.path.isdir(candidate) else os.path.dirname(candidate)
+    fallback = platform_path(fallback)
+    if fallback and os.path.isdir(fallback):
+        return fallback
+    return QtCore.QStandardPaths.writableLocation(QtCore.QStandardPaths.StandardLocation.HomeLocation) or str(Path.home())
 
 
 def report_gui_exception(context, exc):
@@ -89,18 +112,61 @@ BORDER_MUTED = THEME.border_muted
 
 STYLESHEET = make_stylesheet()
 
+_sleep_inhibitor_process = None
+
 
 def prevent_sleep(enable=True):
+    """Toggle OS sleep inhibition while a training process is active."""
+    global _sleep_inhibitor_process
     try:
-        if os.name == 'nt':
+        if IS_WINDOWS:
             ES_CONTINUOUS = 0x80000000
             ES_SYSTEM_REQUIRED = 0x00000001
             ES_DISPLAY_REQUIRED = 0x00000002
             kernel32 = ctypes.windll.kernel32
             state = (ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED) if enable else ES_CONTINUOUS
-            kernel32.SetThreadExecutionState(state)
-    except Exception:
-        pass
+            return bool(kernel32.SetThreadExecutionState(state))
+
+        if IS_LINUX:
+            if not enable:
+                if _sleep_inhibitor_process and _sleep_inhibitor_process.poll() is None:
+                    _sleep_inhibitor_process.terminate()
+                    try:
+                        _sleep_inhibitor_process.wait(timeout=2)
+                    except subprocess.TimeoutExpired:
+                        _sleep_inhibitor_process.kill()
+                        _sleep_inhibitor_process.wait()
+                _sleep_inhibitor_process = None
+                return True
+
+            if _sleep_inhibitor_process and _sleep_inhibitor_process.poll() is None:
+                return True
+            inhibitor = shutil.which("systemd-inhibit")
+            sleeper = shutil.which("sleep")
+            if not inhibitor or not sleeper:
+                return False
+            _sleep_inhibitor_process = subprocess.Popen(
+                [inhibitor, "--what=sleep:idle", "--mode=block",
+                 "--why=Aozora model training is active", sleeper, "infinity"],
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+            return _sleep_inhibitor_process.poll() is None
+        return False
+    except Exception as exc:
+        report_gui_exception("could not change OS sleep inhibition", exc)
+        _sleep_inhibitor_process = None
+        return False
+
+
+def fixed_width_font(point_size=9, bold=False):
+    font = QtGui.QFontDatabase.systemFont(QtGui.QFontDatabase.SystemFont.FixedFont)
+    font.setPointSize(point_size)
+    if bold:
+        font.setWeight(QtGui.QFont.Weight.Bold)
+    return font
 
 
 class NoScrollSpinBox(QtWidgets.QSpinBox):
@@ -602,8 +668,7 @@ class CustomFolderDialog(QtWidgets.QDialog):
         self.history_idx = -1
         self.is_navigating_history = False
         self.icon_provider = QFileIconProvider()
-        self.current_path = (str(Path(start_path).parent) if start_path and os.path.isfile(start_path)
-                             else (start_path if start_path and os.path.exists(start_path) else os.getcwd()))
+        self.current_path = usable_dialog_start(start_path)
         self._build_ui()
         self.load_directory(self.current_path)
 
@@ -714,7 +779,7 @@ class CustomFolderDialog(QtWidgets.QDialog):
                 self.sidebar.addItem(item)
 
     def _on_path_entered(self):
-        p = self.path_edit.text()
+        p = platform_path(self.path_edit.text())
         if os.path.isdir(p): self.load_directory(p)
         else: QtWidgets.QMessageBox.warning(self, "Invalid Path", "Path does not exist or is not a directory.")
 
@@ -747,7 +812,7 @@ class CustomFolderDialog(QtWidgets.QDialog):
                     ci = NumericTableWidgetItem(str(count))
                     ci.setTextAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
                     ci.setForeground(QtGui.QColor(ACCENT if count > 0 else TEXT_SEC))
-                    if count > 0: ci.setFont(QtGui.QFont("Consolas", 9, QtGui.QFont.Weight.Bold))
+                    if count > 0: ci.setFont(fixed_width_font(9, bold=True))
                     self.table.setItem(row, 1, ci)
                 except PermissionError:
                     self.table.setItem(row, 1, NumericTableWidgetItem("-1"))
@@ -2353,13 +2418,18 @@ class ProcessRunner(QThread):
     def run(self):
         try:
             flags = self.creation_flags
-            if os.name == 'nt':
+            popen_options = {}
+            if IS_WINDOWS:
                 flags |= (subprocess.CREATE_NEW_PROCESS_GROUP | subprocess.HIGH_PRIORITY_CLASS)
+                popen_options["creationflags"] = flags
+            else:
+                # Keep the trainer and any data-loader children in one stoppable group.
+                popen_options["start_new_session"] = True
             self.process = subprocess.Popen(
                 [self.executable] + self.args,
                 cwd=self.working_dir, env=self.env,
                 stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                universal_newlines=True, bufsize=1, creationflags=flags)
+                universal_newlines=True, bufsize=1, **popen_options)
             self.logSignal.emit(f"INFO: Started subprocess (PID: {self.process.pid})")
             for line in iter(self.process.stdout.readline, ''):
                 line = self._clean_output_line(line.strip())
@@ -2382,9 +2452,18 @@ class ProcessRunner(QThread):
 
     def stop(self):
         if self.process and self.process.poll() is None:
-            self.process.terminate()
-            try: self.process.wait(timeout=3)
-            except subprocess.TimeoutExpired: self.process.kill(); self.process.wait()
+            if IS_WINDOWS:
+                self.process.terminate()
+            else:
+                os.killpg(self.process.pid, signal.SIGTERM)
+            try:
+                self.process.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                if IS_WINDOWS:
+                    self.process.kill()
+                else:
+                    os.killpg(self.process.pid, signal.SIGKILL)
+                self.process.wait()
             self.logSignal.emit("Process stopped.")
 
 
@@ -2729,12 +2808,16 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.loader_threads = []
         self.repopulate_dataset_grid()
         for d in datasets_config:
-            p = d.get("path")
+            p = platform_path(d.get("path"))
             if p and os.path.exists(p): self._start_loading_path(p, d.get("repeats", 1))
 
     def add_dataset_folder_native(self):
-        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", self.parent_gui.last_browsed_path)
-        if p: self.parent_gui.last_browsed_path = p; self._start_loading_path(p, 1)
+        start = usable_dialog_start(self.parent_gui.last_browsed_path)
+        p = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Dataset Folder", start)
+        if p:
+            p = platform_path(p)
+            self.parent_gui.last_browsed_path = p
+            self._start_loading_path(p, 1)
 
     def add_dataset_folder_custom(self):
         dialog = CustomFolderDialog(self.parent_gui.last_browsed_path, self)
@@ -3170,7 +3253,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.setWindowTitle("AOZORA SDXL Trainer")
         self.setMinimumSize(1000, 800)
         self.resize(1500, 1000)
-        self.config_dir = "configs"
+        self.config_dir = str(PROJECT_ROOT / "configs")
         self.state_file = os.path.join(self.config_dir, "gui_state.json")
         self.widgets = {}
         self.process_runner = None
@@ -3184,7 +3267,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.default_preset = default_config.default_preset()
         self.default_config = default_config.flatten_preset(self.default_preset, default_config.MODE_SDXL)
         self.presets = {}
-        self.last_browsed_path = os.getcwd()
+        self.last_browsed_path = usable_dialog_start("")
 
         self._initialize_configs()
         self._setup_ui()
@@ -3507,6 +3590,8 @@ class TrainingGUI(QtWidgets.QWidget):
     def _set_widget(self, key, value):
         w = self.widgets.get(key)
         if not w or value is None: return
+        if UI_DEFS.get(key, (None, None, None))[2] == "path":
+            value = platform_path(value)
         w.blockSignals(True)
         if isinstance(w, QtWidgets.QLineEdit): w.setText(str(value))
         elif isinstance(w, QtWidgets.QPlainTextEdit): w.setPlainText(str(value))
@@ -3527,14 +3612,14 @@ class TrainingGUI(QtWidgets.QWidget):
         w.blockSignals(False)
 
     def _browse_path(self, entry, file_type):
-        start = entry.text() if entry.text() else self.last_browsed_path
-        if not os.path.exists(start): start = self.last_browsed_path
+        start = usable_dialog_start(entry.text(), self.last_browsed_path)
         if file_type == "folder": path = QtWidgets.QFileDialog.getExistingDirectory(self, "Select Directory", start)
         elif file_type == "file_safetensors": path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select Model", start, "Safetensors (*.safetensors)")
         elif file_type == "file_pt": path, _ = QtWidgets.QFileDialog.getOpenFileName(self, "Select State", start, "PyTorch State (*.pt)")
         else: path = ""
         if path:
-            entry.setText(path.replace('\\', '/'))
+            path = platform_path(path)
+            entry.setText(path)
             self.last_browsed_path = os.path.dirname(path) if os.path.isfile(path) else path
 
     def _form_group(self, title, keys, layout_cls=QtWidgets.QFormLayout):
@@ -4505,10 +4590,6 @@ class TrainingGUI(QtWidgets.QWidget):
         ]):
             preset_grid.addWidget(make_btn(label, lambda _, a=args: self._apply_vae_preset(*a)), idx // 2, idx % 2)
         lay.addLayout(preset_grid)
-        lay.addWidget(make_separator())
-        detect_btn = make_btn("Run VAE Diagnostics", self.launch_vae_detector)
-        set_role(detect_btn, "accent")
-        lay.addWidget(detect_btn)
         return gb
 
     def _apply_vae_preset(self, shift, scale, channels, mode="scalar"):
@@ -4531,24 +4612,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.widgets[key].setToolTip(
                 UI_DEFS[key][1] if uses_scalar else "Ignored unless VAE normalization is scalar."
             )
-
-    def launch_vae_detector(self):
-        idx = self.config_dropdown.currentIndex()
-        if idx < 0: QtWidgets.QMessageBox.warning(self, "No Config Selected", "Please select a configuration first."); return
-        key = self.config_dropdown.itemData(idx)
-        cfg_path = os.path.join(self.config_dir, f"{key}.json")
-        if not os.path.exists(cfg_path):
-            QtWidgets.QMessageBox.critical(self, "Config Not Found", f"Save the configuration first.\n{cfg_path}"); return
-        script_dir = str(PROJECT_ROOT)
-        target = next((p for p in [os.path.join(script_dir, "vae_diagnostics.py"),
-                                    os.path.join(script_dir, "tools", "vae_diagnostics.py")] if os.path.exists(p)), None)
-        if not target: self.log("Error: 'vae_diagnostics.py' not found."); return
-        try:
-            cmd = [sys.executable, target, "--config", os.path.abspath(cfg_path)]
-            kw = {"creationflags": subprocess.CREATE_NEW_CONSOLE} if os.name == 'nt' else {}
-            subprocess.Popen(cmd, cwd=os.path.dirname(target), **kw)
-            self.log(f"Launched VAE Diagnostics with config: {key}.json")
-        except Exception as e: self.log(f"Error launching tool: {e}")
 
     def _build_advanced_group(self):
         return self._vertical_form_group("Miscellaneous", ["MEMORY_EFFICIENT_ATTENTION"])
@@ -5047,7 +5110,7 @@ class TrainingGUI(QtWidgets.QWidget):
         if not os.path.exists(config_path): self.log(f"CRITICAL: Config not found: {config_path}"); return
         is_dit = self.training_mode_combo.currentText() == TRAINING_MODE_ANIMA_DIT
         train_script = "train_anima.py" if is_dit else "train.py"
-        train_py_path = os.path.abspath(train_script)
+        train_py_path = str(PROJECT_ROOT / train_script)
         if not os.path.exists(train_py_path): self.log(f"CRITICAL: {train_script} not found."); return
 
         self.start_button.setVisible(False); self.stop_button.setVisible(True); self.force_save_button.setVisible(True)
@@ -5063,10 +5126,14 @@ class TrainingGUI(QtWidgets.QWidget):
 
         env = os.environ.copy()
         python_dir = os.path.dirname(sys.executable)
-        env["PATH"] = f"{python_dir};{os.path.join(python_dir, 'Scripts')};{env.get('PATH', '')}"
-        env["PYTHONPATH"] = f"{script_dir};{env.get('PYTHONPATH', '')}"
+        executable_dirs = [python_dir]
+        windows_scripts = os.path.join(python_dir, "Scripts")
+        if IS_WINDOWS and os.path.isdir(windows_scripts):
+            executable_dirs.append(windows_scripts)
+        env["PATH"] = os.pathsep.join([*executable_dirs, env.get("PATH", "")])
+        env["PYTHONPATH"] = os.pathsep.join([script_dir, env.get("PYTHONPATH", "")])
 
-        flags = subprocess.CREATE_NEW_PROCESS_GROUP if os.name == 'nt' else 0
+        flags = subprocess.CREATE_NEW_PROCESS_GROUP if IS_WINDOWS else 0
         self.process_runner = ProcessRunner(sys.executable, ["-u", train_py_path, "--config", config_path],
                                             script_dir, env, flags)
         self.process_runner.logSignal.connect(self.log)
@@ -5075,7 +5142,8 @@ class TrainingGUI(QtWidgets.QWidget):
         self.process_runner.errorSignal.connect(self.log)
         self.process_runner.metricsSignal.connect(self.live_metrics_widget.parse_and_update)
         self.process_runner.cacheCreatedSignal.connect(self.dataset_manager.refresh_cache_buttons)
-        if os.name == 'nt': prevent_sleep(True)
+        if not prevent_sleep(True):
+            self.log("WARNING: Could not inhibit system sleep on this platform.")
         self.process_runner.start()
         self.log(f"INFO: Starting {train_script} with config: {config_path}")
 
@@ -5101,7 +5169,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.log("\n" + "=" * 50 + f"\nTraining finished {status}.\n" + "=" * 50)
         self.start_button.setVisible(True); self.stop_button.setVisible(False); self.force_save_button.setVisible(False)
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
-        if os.name == 'nt': prevent_sleep(False)
+        prevent_sleep(False)
 
     def log(self, message):
         self.append_log(str(message).strip(), replace=False)
@@ -5129,14 +5197,14 @@ class TrainingGUI(QtWidgets.QWidget):
             if reply == QtWidgets.QMessageBox.StandardButton.Yes:
                 self.stop_training()
                 if self.process_runner: self.process_runner.quit(); self.process_runner.wait(2000)
-                if os.name == 'nt': prevent_sleep(False)
+                prevent_sleep(False)
                 event.accept()
             else:
                 event.ignore(); return
         if hasattr(self, 'dataset_manager'):
             for t in self.dataset_manager.loader_threads:
                 if t.isRunning(): t.quit(); t.wait(1000)
-        if os.name == 'nt': prevent_sleep(False)
+        prevent_sleep(False)
         event.accept()
 
     def paintEvent(self, event):

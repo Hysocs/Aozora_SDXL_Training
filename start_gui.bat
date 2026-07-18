@@ -1,5 +1,6 @@
 @ECHO OFF
 CLS
+CD /D "%~dp0"
 
 :: Path to your virtual environment's Scripts folder
 SET VENV_PATH=.\portable_Venv\Scripts
