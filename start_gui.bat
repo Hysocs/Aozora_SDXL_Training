@@ -17,7 +17,7 @@ IF ERRORLEVEL 1 (
 ECHO [INFO] Starting the Training GUI...
 
 :: Start GUI without showing console (pythonw instead of python)
-START /B pythonw.exe gui.py
+START /B pythonw.exe -m gui
 
 :: Exit the batch file immediately
 EXIT

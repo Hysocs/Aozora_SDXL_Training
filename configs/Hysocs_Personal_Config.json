@@ -131,6 +131,8 @@
         "sdxl_loss_type": "MSE",
         "sdxl_memory_efficient_attention": "sdpa",
         "sdxl_timestep_mode": "Wave",
+        "sdxl_anima_sigma_shift_enabled": true,
+        "sdxl_anima_sigma_shift": 3.0,
         "sdxl_vae_normalization_mode": "scalar",
         "sdxl_vae_shift_factor": 0.0,
         "sdxl_vae_scaling_factor": 0.13025,
@@ -147,7 +149,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:/Users/Administrator/Pictures\\otokakoto",
+                "path": "C:/Users/Administrator/Pictures/Game CG(ai_tagged)/Tsundere Shoujo wa Oshiete Hoshiitsu",
                 "repeats": 1
             }
         ],
@@ -160,8 +162,8 @@
         "anima_qwen_null_dropout_chance": 0.05,
         "anima_t5_null_dropout_chance": 0.05,
         "anima_text_conditioning_scale_enabled": true,
-        "anima_text_conditioning_scale_min": 0.9,
-        "anima_text_conditioning_scale_max": 1.1,
+        "anima_text_conditioning_scale_min": 0.85,
+        "anima_text_conditioning_scale_max": 1.25,
         "anima_t5_token_dropout_enabled": false,
         "anima_t5_token_dropout_chance": 0.1,
         "anima_t5_token_dropout_min": 0.05,
@@ -177,25 +179,25 @@
         "anima_multi_bucket_enabled": false,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "515",
+        "anima_max_train_steps": "500",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "4",
+        "anima_gradient_accumulation_steps": "1",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
-        "anima_save_every_n_steps": "650",
+        "anima_save_every_n_steps": "1000",
         "anima_lr_custom_curve": [
             [
                 0.0,
                 1e-08
             ],
             [
-                0.06648199,
-                1e-06
+                0.03601108,
+                5e-06
             ],
             [
-                0.97506925,
-                1e-06
+                0.95567867,
+                5e-06
             ],
             [
                 1.0,
@@ -204,25 +206,25 @@
         ],
         "anima_learning_rate": 8e-07,
         "anima_lr_graph_min": "1.0e-8",
-        "anima_lr_graph_max": "1.0e-06",
+        "anima_lr_graph_max": "5.0e-06",
         "anima_timestep_allocation": {
             "bin_size": 50,
             "counts": [
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
-                26,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
                 25,
                 25,
                 25,
@@ -235,15 +237,103 @@
         "anima_timestep_loss_weight_curve": [
             [
                 0.0,
-                1.0
+                0.4583
             ],
             [
-                0.29799427,
-                1.5
+                0.025,
+                0.4583
+            ],
+            [
+                0.075,
+                0.5174
+            ],
+            [
+                0.125,
+                0.6021
+            ],
+            [
+                0.175,
+                0.6956
+            ],
+            [
+                0.225,
+                0.8013
+            ],
+            [
+                0.275,
+                0.9109
+            ],
+            [
+                0.325,
+                1.0093
+            ],
+            [
+                0.375,
+                1.0737
+            ],
+            [
+                0.425,
+                1.1336
+            ],
+            [
+                0.475,
+                1.2181
+            ],
+            [
+                0.525,
+                1.3103
+            ],
+            [
+                0.575,
+                1.3843
+            ],
+            [
+                0.625,
+                1.4146
+            ],
+            [
+                0.675,
+                1.4054
+            ],
+            [
+                0.725,
+                1.3916
+            ],
+            [
+                0.775,
+                1.3926
+            ],
+            [
+                0.825,
+                1.3309
+            ],
+            [
+                0.875,
+                1.1222
+            ],
+            [
+                0.9,
+                0.95
+            ],
+            [
+                0.925,
+                0.85
+            ],
+            [
+                0.95,
+                0.7
+            ],
+            [
+                0.97,
+                0.55
+            ],
+            [
+                0.98,
+                0.25
             ],
             [
                 1.0,
-                1.0
+                0.14
             ]
         ],
         "anima_optimizer_type": "raven",
@@ -278,6 +368,8 @@
         "anima_loss_type": "MSE",
         "anima_memory_efficient_attention": "sdpa",
         "anima_timestep_mode": "Wave",
+        "anima_sigma_shift_enabled": false,
+        "anima_sigma_shift": 2.0,
         "anima_vae_normalization_mode": "scalar",
         "anima_vae_shift_factor": 0.0,
         "anima_vae_scaling_factor": 0.13025,

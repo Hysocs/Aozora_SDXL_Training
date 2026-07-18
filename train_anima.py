@@ -1606,15 +1606,25 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
     }, output_dir / state_filename)
 
 
-def safe_set_anima_scheduler_training(pipe):
+def safe_set_anima_scheduler_training(pipe, config):
+    shift_enabled = bool(getattr(config, "ANIMA_SIGMA_SHIFT_ENABLED", True))
+    shift = max(0.01, float(getattr(config, "ANIMA_SIGMA_SHIFT", 3.0) or 3.0))
+    effective_shift = shift if shift_enabled else 1.0
+
+    # Let DiffSynth build the Z-Image training grid so sigma, timestep, and
+    # scheduler training-weight behavior remain identical to its inference path.
     try:
-        pipe.scheduler.set_timesteps(1000, training=True)
-    except TypeError:
-        pipe.scheduler.set_timesteps(1000)
-        try:
-            pipe.scheduler.training = True
-        except Exception:
-            pass
+        pipe.scheduler.set_timesteps(1000, training=True, shift=effective_shift)
+    except TypeError as exc:
+        raise RuntimeError(
+            "The installed Anima scheduler cannot accept an explicit shift. "
+            "Update DiffSynth before using the physical sigma-shift control."
+        ) from exc
+
+    print(
+        f"INFO: Anima physical sigma shift: "
+        f"{'enabled' if shift_enabled else 'disabled'} (effective shift={effective_shift:.4g})."
+    )
 
 
 def run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config):
@@ -1688,7 +1698,7 @@ def run_anima_dit_training(config):
 
     print("INFO: Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
+    safe_set_anima_scheduler_training(pipe, config)
 
     print("INFO: Precomputing Anima DiT cache if needed...")
     precompute_and_cache_anima(config, pipe, device)

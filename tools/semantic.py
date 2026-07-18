@@ -1,306 +1,187 @@
-"""
-semantic.py  —  Semantic loss weight map generator for SDXL trainer
-Latent-Space Edition: Maps are computed directly from the encoded VAE latents.
+"""Unified illustration-detail detector and standalone preview GUI."""
 
-All maps are computed at native latent resolution (image_size / 8).
-Sub-8px pixel detail is invisible to the VAE, so there is no loss of useful
-information by working at this scale — and it is far cheaper.
-"""
+from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from pathlib import Path
 from PIL import Image
-import torch.nn.functional as F
 
 
-SEMANTIC_NOISE_CACHE_FOLDER_NAME = ".semantic_maps_cache"
+def generate_illustration_detail_map(pil_image: Image.Image, sensitivity: float = 0.55) -> np.ndarray:
+    """Return a fast [H,W] map of illustration lines and fine texture.
 
-
-def semantic_noise_enabled(config) -> bool:
-    return bool(getattr(config, "USE_SEMANTIC_NOISE", False))
-
-
-def semantic_noise_strength(config) -> float:
-    return max(0.0, float(getattr(config, "SEMANTIC_NOISE_STRENGTH", 1.0)))
-
-
-def get_semantic_noise_cache_dir(root) -> Path:
-    return Path(root) / SEMANTIC_NOISE_CACHE_FOLDER_NAME
-
-
-def semantic_noise_map_path(semantic_cache_dir, safe_stem: str) -> Path:
-    return Path(semantic_cache_dir) / f"{safe_stem}_sem.pt"
-
-
-def apply_semantic_noise(noise, semantic_map, device, dtype, enabled=False, strength=2.0):
-    if not enabled or semantic_map is None or strength <= 0:
-        return noise
-
-    semantic_map = semantic_map.to(device=device, dtype=dtype)
-    base_std = noise.std(dim=(-3, -2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
-
-    # Build a spatial weight map with average 1.0 so we redistribute the same
-    # total noise budget instead of injecting extra noise into the sample.
-    semantic_weights = semantic_map.clamp_min(0.0)
-    semantic_weights = semantic_weights.amax(dim=(-2, -1), keepdim=True) - semantic_weights
-    semantic_weights = semantic_weights / semantic_weights.mean(dim=(-2, -1), keepdim=True).clamp_min(1e-6)
-
-    # Strength is a blend from uniform noise (0.0) toward fully semantic-weighted
-    # redistribution (1.0). Values above 1.0 exaggerate the contrast but are
-    # clamped to keep the weights non-negative.
-    redistribution = 1.0 + (semantic_weights - 1.0) * strength
-    redistribution = redistribution.clamp_min(0.0)
-
-    redistributed_noise = noise * redistribution
-    redistributed_std = redistributed_noise.std(dim=(-3, -2, -1), keepdim=True, unbiased=False).clamp_min(1e-6)
-
-    return redistributed_noise * (base_std / redistributed_std)
-
-
-def generate_semantic_noise_maps(latents, images, config):
-    if not semantic_noise_enabled(config) or not images:
-        return None
-
-    return generate_latent_semantic_map_batch(
-        latents=latents,
-        images=images,
-        sep_weight=getattr(config, "SEMANTIC_SEP_WEIGHT", 1.0),
-        detail_weight=getattr(config, "SEMANTIC_DETAIL_WEIGHT", 1.0),
-        entropy_weight=getattr(config, "SEMANTIC_ENTROPY_WEIGHT", 0.0),
-        device="cpu",
-        dtype=torch.float32
-    ).cpu()
-
-def generate_latent_seperation_map(latent_np: np.ndarray) -> np.ndarray:
-    """Derives saliency by measuring per-pixel deviation from the mean across latent channels."""
-    deviation = np.abs(latent_np - latent_np.mean(axis=(0, 1), keepdims=True))
-    sal = deviation.mean(axis=2)
-    mx = sal.max()
-    if mx > 1e-6:
-        sal /= mx
-    return cv2.GaussianBlur(sal.astype(np.float32), (3, 3), 0)
-
-
-def generate_latent_detail_map(latent_np: np.ndarray) -> np.ndarray:
-    """Measures edge magnitude directly across all latent channels."""
-    num_channels = latent_np.shape[2]
-    mag_total = np.zeros(latent_np.shape[:2], dtype=np.float32)
-    for c in range(num_channels):
-        ch = latent_np[:, :, c].astype(np.float64)
-        sx = cv2.Sobel(ch, cv2.CV_64F, 1, 0, ksize=3)
-        sy = cv2.Sobel(ch, cv2.CV_64F, 0, 1, ksize=3)
-        mag_total += np.sqrt(sx**2 + sy**2).astype(np.float32)
-    mag_total /= num_channels
-    mx = mag_total.max()
-    if mx > 1e-6:
-        mag_total /= mx
-    return cv2.GaussianBlur(mag_total, (3, 3), 0)
-
-
-def _pick_disk_radius(dim: int) -> int:
+    Lines and texture are both local high-frequency changes, so one Laplacian
+    response detects them together. A small neighbourhood average favors useful
+    coherent detail over isolated pixel noise.
     """
-    Pick a disk radius appropriate for the given image dimension.
-    Keeps the neighbourhood proportional regardless of latent size.
-      < 48px  -> radius 1
-      < 80px  -> radius 2
-      < 128px -> radius 3
-      >= 128px -> radius 4
-    """
-    if dim < 48:
-        return 1
-    elif dim < 80:
-        return 2
-    elif dim < 128:
-        return 3
-    return 4
+    rgb = np.asarray(pil_image.convert("RGB"), dtype=np.uint8)
+    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY).astype(np.float32) / 255.0
+    gray = cv2.GaussianBlur(gray, (3, 3), 0.55)
+    detail = np.abs(cv2.Laplacian(gray, cv2.CV_32F, ksize=3))
+
+    # Coherence gently raises clustered detail without erasing a clean contour.
+    coherence = cv2.blur(detail, (5, 5))
+    coherence /= max(float(np.percentile(coherence, 99.0)), 1.0e-6)
+    detail *= 0.65 + 0.35 * np.clip(coherence, 0.0, 1.0)
+
+    # One robust scaling pass. Higher sensitivity lowers the acceptance floor.
+    sensitivity = float(np.clip(sensitivity, 0.0, 1.0))
+    floor = float(np.percentile(detail, 88.0 - sensitivity * 48.0))
+    ceiling = float(np.percentile(detail, 99.5))
+    detail = np.clip((detail - floor) / max(ceiling - floor, 1.0e-6), 0.0, 1.0)
+    return np.clip(detail, 0.0, 1.0).astype(np.float32)
 
 
-def generate_entropy_map(pil_image: Image.Image, target_w: int, target_h: int) -> np.ndarray:
-    """Texture complexity via local entropy, computed at native latent resolution.
-
-    The image is resized to (target_w, target_h) — exactly the latent spatial
-    dims — before any processing.  This means:
-      - One resize, to the exact size needed, done once.
-      - Entropy is computed only on pixels that the VAE can actually represent.
-      - Disk radii are chosen dynamically based on the shorter latent dimension
-        so they stay proportional for non-square images.
-      - The caller does NOT need to resize the output.
-    """
-    if pil_image.mode != "RGB":
-        pil_image = pil_image.convert("RGB")
-
-    pil_image = pil_image.resize((target_w, target_h), Image.Resampling.BILINEAR)
-
-    from skimage.filters.rank import entropy as sk_entropy
-    from skimage.morphology import disk
-
-    np_bgr = cv2.cvtColor(np.array(pil_image), cv2.COLOR_RGB2BGR)
-    lab    = cv2.cvtColor(np_bgr, cv2.COLOR_BGR2LAB)
-    l_ch   = lab[:, :, 0].astype(np.float32)
-    a_ch   = lab[:, :, 1].astype(np.float32)
-
-    l_u8 = cv2.normalize(l_ch, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-    a_u8 = cv2.normalize(a_ch, None, 0, 255, cv2.NORM_MINMAX).astype(np.uint8)
-
-    # Dynamic radii based on the shorter latent dimension
-    short_dim   = min(target_w, target_h)
-    r_fine      = _pick_disk_radius(short_dim)
-    r_coarse    = r_fine * 2 + 1   # e.g. 3->7, 2->5, 1->3
-
-    ent_fine_l   = sk_entropy(l_u8, disk(r_fine)).astype(np.float32)
-    ent_fine_a   = sk_entropy(a_u8, disk(r_fine)).astype(np.float32)
-    ent_coarse_l = sk_entropy(l_u8, disk(r_coarse)).astype(np.float32)
-
-    ent_combined = (ent_fine_l * 0.45 + ent_fine_a * 0.20 + ent_coarse_l * 0.35)
-
-    mx = ent_combined.max()
-    if mx > 1e-6:
-        ent_combined /= mx
-
-    sx       = cv2.Sobel(l_ch, cv2.CV_64F, 1, 0, ksize=3)
-    sy       = cv2.Sobel(l_ch, cv2.CV_64F, 0, 1, ksize=3)
-    edge_mag = np.sqrt(sx**2 + sy**2).astype(np.float32)
-    mx = edge_mag.max()
-    if mx > 1e-6:
-        edge_mag /= mx
-    edge_bin = (edge_mag > 0.3).astype(np.uint8)
-    dil_r    = max(3, r_fine * 2 - 1)   # also scale the dilation kernel
-    edge_dil = cv2.dilate(edge_bin, cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (dil_r, dil_r)))
-    not_edge = 1.0 - edge_dil.astype(np.float32)
-
-    result = ent_combined * not_edge
-    mx = result.max()
-    if mx > 1e-6:
-        result /= mx
-
-    blur_k = max(3, r_fine * 2 + 1)   # must be odd
-    if blur_k % 2 == 0:
-        blur_k += 1
-    result = cv2.GaussianBlur(result, (blur_k, blur_k), 0)
-    mx = result.max()
-    if mx > 1e-6:
-        result /= mx
-
-    return result.astype(np.float32)
-
-
-def generate_lineart_loss_map(pil_image: Image.Image, latent_h: int, latent_w: int, oversample: int = 4) -> torch.Tensor:
-    """Return a cached [1,H,W] stroke/line confidence map for repair loss weighting."""
-    image = pil_image.convert("RGB")
-    rgb = np.asarray(image, dtype=np.uint8)
-    gray = cv2.cvtColor(rgb, cv2.COLOR_RGB2GRAY)
-
-    # Canny catches clean contours; the black-hat response also catches dark ink
-    # and narrow strokes that have weak outer contours. Adaptive thresholds make
-    # this work for both high-key line art and normally shaded illustrations.
-    median = float(np.median(gray))
-    lower = int(max(0.0, 0.66 * median))
-    upper = int(min(255.0, max(lower + 1.0, 1.33 * median)))
-    edges = cv2.Canny(gray, lower, upper, L2gradient=True).astype(np.float32) / 255.0
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    dark_strokes = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel).astype(np.float32)
-    stroke_max = float(dark_strokes.max())
-    if stroke_max > 1.0e-6:
-        dark_strokes /= stroke_max
-    line_map = np.maximum(edges, dark_strokes)
-    # Keep strokes narrow. The previous dilation expanded adjacent contours into
-    # overlapping blocks, especially after latent-grid max pooling.
-    line_map = cv2.GaussianBlur(line_map, (3, 3), 0)
-    line_map = np.clip(line_map, 0.0, 1.0)
-
-    # Cache above latent resolution. The loss reduces this soft mask to the model
-    # grid with area sampling, avoiding the oversized blocks produced by max pool.
+def generate_lineart_loss_map(
+    pil_image: Image.Image,
+    latent_h: int,
+    latent_w: int,
+    oversample: int = 4,
+) -> torch.Tensor:
+    """Compatibility entry point used by the quantized repair trainer."""
+    detail = generate_illustration_detail_map(pil_image, sensitivity=0.55)
     oversample = max(1, int(oversample))
-    target_h = int(latent_h) * oversample
-    target_w = int(latent_w) * oversample
-    resized = cv2.resize(line_map, (target_w, target_h), interpolation=cv2.INTER_AREA)
+    resized = cv2.resize(
+        detail,
+        (int(latent_w) * oversample, int(latent_h) * oversample),
+        interpolation=cv2.INTER_AREA,
+    )
     return torch.from_numpy(resized).unsqueeze(0).to(dtype=torch.float16).contiguous()
 
-# Module-level flag to suppress repeated skimage import warnings
-_entropy_import_ok = None
 
+def _run_semantic_preview_gui():
+    import tkinter as tk
+    from tkinter import filedialog, messagebox, ttk
+    from PIL import ImageTk
 
-def generate_latent_semantic_map_batch(latents, images, sep_weight, detail_weight, entropy_weight, device, dtype):
-    batch_maps = []
-    B, C, H, W = latents.shape  # latent dims — this is our target size
+    class SemanticPreviewApp:
+        def __init__(self, root):
+            self.root = root
+            self.root.title("Aozora Semantic Detail Preview")
+            self.root.geometry("1480x760")
+            self.source_image = None
+            self.source_path = None
+            self.preview_refs = []
+            self.pending_update = None
 
-    for i in range(B):
-        pil_img = images[i]
-        if pil_img.mode != "RGB":
-            pil_img = pil_img.convert("RGB")
+            toolbar = ttk.Frame(root, padding=8)
+            toolbar.pack(fill="x")
+            ttk.Button(toolbar, text="Load image", command=self.load_image).pack(side="left")
+            ttk.Button(toolbar, text="Save map", command=self.save_map).pack(side="left", padx=(8, 18))
 
-        # Compute at full native resolution — no downscale before processing
-        # This preserves thin lines that would vanish at latent resolution
-        img_np = np.array(pil_img).astype(np.float32) / 255.0
-        proc_h, proc_w = img_np.shape[:2]
+            self.sensitivity_var = tk.DoubleVar(value=0.55)
+            self.overlay_var = tk.DoubleVar(value=0.62)
+            self._add_slider(toolbar, "Detail sensitivity", self.sensitivity_var)
+            self._add_slider(toolbar, "Overlay", self.overlay_var)
 
-        combined = np.zeros((proc_h, proc_w), dtype=np.float32)
+            self.status = tk.StringVar(value="Load an image to inspect its line and detail importance map.")
+            ttk.Label(root, textvariable=self.status, padding=(10, 0, 10, 8)).pack(fill="x")
 
-        if detail_weight > 0.0:
-            gray = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2GRAY).astype(np.float64)
-            sx = cv2.Sobel(gray, cv2.CV_64F, 1, 0, ksize=3)
-            sy = cv2.Sobel(gray, cv2.CV_64F, 0, 1, ksize=3)
-            detail_map = np.sqrt(sx**2 + sy**2).astype(np.float32)
-            mx = detail_map.max()
-            if mx > 1e-6:
-                detail_map /= mx
-            detail_map = cv2.GaussianBlur(detail_map, (3, 3), 0)
-            combined += detail_map * detail_weight
+            previews = ttk.Frame(root, padding=(8, 0, 8, 8))
+            previews.pack(fill="both", expand=True)
+            self.panels = []
+            for title in ("Original", "Semantic importance", "Overlay"):
+                frame = ttk.LabelFrame(previews, text=title, padding=5)
+                frame.pack(side="left", fill="both", expand=True, padx=4)
+                label = ttk.Label(frame, anchor="center")
+                label.pack(fill="both", expand=True)
+                label.bind("<Configure>", lambda _event: self.schedule_update())
+                self.panels.append(label)
 
-        if sep_weight > 0.0:
-            img_bgr = cv2.cvtColor((img_np * 255).astype(np.uint8), cv2.COLOR_RGB2BGR)
-            hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV).astype(np.float32)
-            sat = hsv[:, :, 1] / 255.0
-            gray_f = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY).astype(np.float32) / 255.0
-            local_var = cv2.blur(gray_f**2, (5, 5)) - cv2.blur(gray_f, (5, 5))**2
-            local_var = np.clip(local_var * 10.0, 0.0, 1.0)
-            sep_map = np.clip(sat * 0.6 + local_var * 0.4, 0.0, 1.0)
-            sep_map = cv2.GaussianBlur(sep_map, (5, 5), 0)
-            mx = sep_map.max()
-            if mx > 1e-6:
-                sep_map /= mx
-            combined += sep_map * sep_weight
+        def _add_slider(self, parent, title, variable):
+            frame = ttk.Frame(parent)
+            frame.pack(side="left", padx=8)
+            ttk.Label(frame, text=title).pack(anchor="w")
+            ttk.Scale(frame, variable=variable, from_=0.0, to=1.0, length=180,
+                      command=lambda _value: self.schedule_update()).pack(side="left")
+            value_label = ttk.Label(frame, width=5)
+            value_label.pack(side="left", padx=(4, 0))
 
-        if entropy_weight > 0.0:
+            def refresh(*_args):
+                value_label.configure(text=f"{variable.get():.2f}")
+            variable.trace_add("write", refresh)
+            refresh()
+
+        def load_image(self):
+            path = filedialog.askopenfilename(
+                title="Select an image",
+                filetypes=[("Images", "*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff"), ("All files", "*.*")],
+            )
+            if not path:
+                return
             try:
-                entropy_np = generate_entropy_map(pil_img, target_w=proc_w, target_h=proc_h)
-                combined += entropy_np * entropy_weight
-            except Exception as e:
-                print(f"WARNING: entropy map failed: {e}")
+                with Image.open(path) as loaded:
+                    self.source_image = loaded.convert("RGB").copy()
+                self.source_path = Path(path)
+                self.update_previews()
+            except Exception as exc:
+                messagebox.showerror("Could not load image", str(exc))
 
-        mx = combined.max()
-        if mx > 1e-6:
-            combined /= mx
-        combined = np.clip(combined, 0.0, 1.0)
+        def make_map(self):
+            return generate_illustration_detail_map(self.source_image, self.sensitivity_var.get())
 
-        # Downsample using max pooling via torch to preserve thin feature signal
-        # A 1px line at full res must survive as a nonzero weight at latent res
-        # Area averaging would dilute it to near zero — max pooling keeps it alive
-        combined_tensor = torch.from_numpy(combined).unsqueeze(0).unsqueeze(0)  # 1,1,H,W
-        
-        # Calculate the exact kernel size needed to go from image res to latent res
-        scale_h = proc_h / H
-        scale_w = proc_w / W
-        kernel_h = int(np.ceil(scale_h))
-        kernel_w = int(np.ceil(scale_w))
-        
-        # Max pool preserves any nonzero signal within each latent cell
-        combined_latent = F.max_pool2d(
-            combined_tensor,
-            kernel_size=(kernel_h, kernel_w),
-            stride=(kernel_h, kernel_w),
-            padding=0
-        )
-        
-        # Crop to exact latent size in case of rounding
-        combined_latent = combined_latent[:, :, :H, :W]
-        combined_latent = combined_latent.squeeze(0).squeeze(0)
+        def schedule_update(self):
+            if self.source_image is None:
+                return
+            if self.pending_update is not None:
+                self.root.after_cancel(self.pending_update)
+            self.pending_update = self.root.after(100, self.update_previews)
 
-        batch_maps.append(combined_latent.to(dtype))
+        @staticmethod
+        def heatmap_from_map(detail_map):
+            map_u8 = np.clip(detail_map * 255.0, 0, 255).astype(np.uint8)
+            heat_bgr = cv2.applyColorMap(map_u8, cv2.COLORMAP_TURBO)
+            return Image.fromarray(cv2.cvtColor(heat_bgr, cv2.COLOR_BGR2RGB))
 
-    final_map_batch = torch.stack(batch_maps).to(device)
-    final_map_batch = final_map_batch.unsqueeze(1).expand(-1, C, -1, -1)
+        @staticmethod
+        def fit_panel(image, label):
+            fitted = image.copy()
+            fitted.thumbnail(
+                (max(200, label.winfo_width() - 10), max(200, label.winfo_height() - 10)),
+                Image.Resampling.LANCZOS,
+            )
+            return fitted
 
-    return final_map_batch
+        def update_previews(self):
+            self.pending_update = None
+            if self.source_image is None:
+                return
+            try:
+                detail_map = self.make_map()
+                heat = self.heatmap_from_map(detail_map)
+                overlay = Image.blend(self.source_image, heat, float(self.overlay_var.get()))
+                self.preview_refs = []
+                for label, preview in zip(self.panels, (self.source_image, heat, overlay)):
+                    photo = ImageTk.PhotoImage(self.fit_panel(preview, label))
+                    label.configure(image=photo)
+                    self.preview_refs.append(photo)
+                selected = float((detail_map >= 0.5).mean() * 100.0)
+                self.status.set(
+                    f"{self.source_path.name} — {self.source_image.width}x{self.source_image.height} — "
+                    f"{selected:.1f}% above 50% importance"
+                )
+            except Exception as exc:
+                self.status.set(f"Preview failed: {exc}")
+
+        def save_map(self):
+            if self.source_image is None:
+                messagebox.showinfo("No image", "Load an image first.")
+                return
+            path = filedialog.asksaveasfilename(
+                title="Save semantic map",
+                defaultextension=".png",
+                initialfile=f"{self.source_path.stem}_semantic.png",
+                filetypes=[("PNG image", "*.png")],
+            )
+            if path:
+                Image.fromarray(np.clip(self.make_map() * 255.0, 0, 255).astype(np.uint8), mode="L").save(path)
+                self.status.set(f"Saved semantic map: {path}")
+
+    root = tk.Tk()
+    SemanticPreviewApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    _run_semantic_preview_gui()

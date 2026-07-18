@@ -220,6 +220,8 @@
         "anima_loss_type": "MSE",
         "anima_memory_efficient_attention": "sdpa",
         "anima_timestep_mode": "Wave",
+        "anima_sigma_shift_enabled": true,
+        "anima_sigma_shift": 3.0,
         "anima_vae_normalization_mode": "scalar",
         "anima_vae_shift_factor": null,
         "anima_vae_scaling_factor": null,

@@ -4,6 +4,7 @@ import os
 import re
 import math
 import copy
+from . import gui_math
 import sys
 import shutil
 import ctypes
@@ -13,12 +14,15 @@ from pathlib import Path
 from collections import deque
 from datetime import datetime
 from bisect import bisect_left, bisect_right
+from difflib import SequenceMatcher
 
 from PyQt6 import QtWidgets, QtCore, QtGui
 from PyQt6.QtCore import QThread, pyqtSignal, QObject
 from PyQt6.QtWidgets import QFileIconProvider
 from PyQt6.QtCore import QFileInfo
 import subprocess
+
+from .gui_theme import THEME, make_stylesheet, set_role
 
 try:
     import config as default_config
@@ -30,22 +34,30 @@ except ImportError:
         OPTIMIZER_TYPE = "Raven"
         TIMESTEP_ALLOCATION = {"bin_size": 100, "counts": []}
 
-DARK_BG    = "#0d0f14"
-PANEL_BG   = "#141720"
-GRAPH_BG   = "#0e1016"
-BORDER     = "#252a38"
-ACCENT     = "#7c6af7"
-ACCENT2    = "#3ecfcf"
-TEXT_PRI   = "#e8eaf0"
-TEXT_SEC   = "#7a7f9a"
-DANGER     = "#f74b6a"
-SUCCESS    = "#3ef78e"
-WARN       = "#f7c948"
+# Compatibility aliases keep feature code readable while every value comes from
+# the single semantic palette in gui_theme.py.
+DARK_BG = THEME.window
+PANEL_BG = THEME.surface_raised
+NESTED_GROUP_BG = THEME.chart
+GRAPH_BG = THEME.canvas
+BORDER = THEME.border
+ACCENT = THEME.accent
+ACCENT2 = THEME.accent_alt
+TEXT_PRI = THEME.text
+TEXT_SEC = THEME.text_muted
+DANGER = THEME.danger
+SUCCESS = THEME.success
+WARN = THEME.warning
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
 TRAINING_MODE_ANIMA_DIT = "Anima DiT"
 DIT_AVAILABLE = importlib.util.find_spec("diffsynth") is not None
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+
+def report_gui_exception(context, exc):
+    print(f"GUI warning: {context}: {type(exc).__name__}: {exc}", file=sys.stderr)
 SDXL_PATH_KEYS = {
     "SINGLE_FILE_CHECKPOINT_PATH",
     "VAE_PATH",
@@ -72,198 +84,10 @@ ANIMA_LOCKED_WIDGET_KEYS = {
 }
 CAPTION_JSON_TYPES = ("tags", "nl", "tags_nl", "nl_tags")
 
-TEXT_MUTED   = "#383b4075"
-BORDER_MUTED = "#191c2675"
+TEXT_MUTED = THEME.text_disabled
+BORDER_MUTED = THEME.border_muted
 
-STYLESHEET = f"""
-QWidget {{
-    background-color: {DARK_BG};
-    color: {TEXT_PRI};
-    font-family: 'Consolas', 'Segoe UI', monospace;
-    font-size: 10pt;
-}}
-
-QGroupBox {{
-    border: 1px solid {BORDER};
-    border-radius: 6px;
-    margin-top: 16px;
-    padding: 10px 8px 8px 8px;
-    color: {TEXT_SEC};
-    font-size: 8pt;
-}}
-QGroupBox::title {{
-    subcontrol-origin: margin;
-    subcontrol-position: top left;
-    left: 10px;
-    padding: 0 4px;
-    color: {ACCENT};
-    font-weight: bold;
-    font-size: 10pt;
-}}
-QGroupBox:disabled {{ border: 1px solid {BORDER_MUTED}; background: transparent; }}
-QGroupBox:disabled::title {{ color: {TEXT_MUTED}; }}
-
-QPushButton {{
-    background: {PANEL_BG};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    color: {TEXT_PRI};
-    padding: 6px 14px;
-    min-height: 28px;
-    max-height: 36px;
-}}
-QPushButton:hover {{ border-color: {ACCENT}; color: {ACCENT}; }}
-QPushButton:pressed {{ background: {ACCENT}; color: white; }}
-QPushButton:disabled {{ color: {TEXT_MUTED}; background: transparent; border: 1px solid {BORDER_MUTED}; }}
-
-#StartButton {{ background: {ACCENT}; color: white; font-weight: bold; border-color: {ACCENT}; }}
-#StartButton:hover {{ background: #9580ff; }}
-#StopButton {{ background: {DANGER}; color: white; font-weight: bold; border-color: {DANGER}; }}
-#StopButton:hover {{ background: #ff6b85; }}
-#FollowOutputButton:checked {{
-    background: {ACCENT};
-    color: white;
-    border-color: {ACCENT};
-}}
-#FollowOutputButton:checked:hover {{ background: #9580ff; color: white; }}
-
-QLineEdit, QPlainTextEdit, QTextEdit, QComboBox {{
-    background: {PANEL_BG};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 5px 8px;
-    color: {TEXT_PRI};
-}}
-QLineEdit:focus, QPlainTextEdit:focus, QTextEdit:focus, QComboBox:on {{ border-color: {ACCENT}; }}
-QPlainTextEdit, QTextEdit {{ font-family: 'Consolas', monospace; padding: 4px; }}
-QComboBox {{ min-height: 28px; max-height: 36px; }}
-QComboBox::drop-down {{ border-left: 1px solid {BORDER}; width: 20px; }}
-QComboBox QAbstractItemView {{
-    background: {PANEL_BG};
-    border: 1px solid {ACCENT};
-    selection-background-color: {ACCENT};
-    selection-color: white;
-}}
-
-QLineEdit:disabled, QPlainTextEdit:disabled, QTextEdit:disabled, QComboBox:disabled {{
-    color: {TEXT_MUTED};
-    background: transparent;
-    border: 1px solid {BORDER_MUTED};
-}}
-QComboBox::drop-down:disabled {{ border-left: 1px solid {BORDER_MUTED}; }}
-
-QSpinBox, QDoubleSpinBox {{
-    background: {PANEL_BG};
-    border: 1px solid {BORDER};
-    border-radius: 4px;
-    padding: 5px 8px;
-    padding-right: 28px;
-    color: {TEXT_PRI};
-    min-height: 24px;
-}}
-QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
-QSpinBox::up-button, QDoubleSpinBox::up-button,
-QSpinBox::down-button, QDoubleSpinBox::down-button {{
-    width: 26px;
-    border-left: 1px solid {BORDER};
-    background: {PANEL_BG};
-}}
-QSpinBox::up-button {{ subcontrol-position: top right; border-top-right-radius: 4px; }}
-QSpinBox::down-button {{ subcontrol-position: bottom right; border-bottom-right-radius: 4px; }}
-QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
-QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{ background: {BORDER}; }}
-QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-bottom: 4px solid {TEXT_PRI}; width: 0; height: 0;
-}}
-QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{
-    border-left: 4px solid transparent; border-right: 4px solid transparent;
-    border-top: 4px solid {TEXT_PRI}; width: 0; height: 0;
-}}
-
-QSpinBox:disabled, QDoubleSpinBox:disabled {{
-    color: {TEXT_MUTED};
-    background: transparent;
-    border: 1px solid {BORDER_MUTED};
-}}
-QSpinBox::up-button:disabled, QDoubleSpinBox::up-button:disabled,
-QSpinBox::down-button:disabled, QDoubleSpinBox::down-button:disabled {{
-    background: transparent;
-    border-left: 1px solid {BORDER_MUTED};
-}}
-QSpinBox::up-arrow:disabled, QDoubleSpinBox::up-arrow:disabled {{ border-bottom-color: {TEXT_MUTED}; }}
-QSpinBox::down-arrow:disabled, QDoubleSpinBox::down-arrow:disabled {{ border-top-color: {TEXT_MUTED}; }}
-
-QCheckBox {{ spacing: 8px; color: {TEXT_PRI}; }}
-QCheckBox::indicator {{
-    width: 14px; height: 14px;
-    border: 1px solid {BORDER};
-    border-radius: 3px;
-    background: {PANEL_BG};
-}}
-QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; }}
-
-QCheckBox:disabled {{ color: {TEXT_MUTED}; }}
-QCheckBox::indicator:disabled {{
-    background: transparent;
-    border: 1px solid {BORDER_MUTED};
-}}
-QCheckBox::indicator:checked:disabled {{
-    background: {TEXT_MUTED};
-    border: 1px solid {BORDER_MUTED};
-}}
-
-QSlider::groove:horizontal {{ height: 4px; background: {BORDER}; border-radius: 2px; margin: 2px 0; }}
-QSlider::handle:horizontal {{
-    background: {ACCENT}; border: 1px solid {ACCENT};
-    width: 14px; height: 14px; margin: -5px 0; border-radius: 7px;
-}}
-QSlider::handle:horizontal:hover {{ background: white; }}
-QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
-
-QSlider::groove:horizontal:disabled {{ background: {BORDER_MUTED}; }}
-QSlider::handle:horizontal:disabled {{ background: {TEXT_MUTED}; border: none; }}
-QSlider::sub-page:horizontal:disabled {{ background: transparent; }}
-
-QLabel:disabled {{ color: {TEXT_MUTED}; }}
-#TitleLabel {{
-    color: {ACCENT};
-    font-size: 20pt;
-    font-weight: bold;
-    padding: 12px;
-    border-bottom: 1px solid {BORDER};
-    font-family: 'Consolas', monospace;
-}}
-
-QTabWidget::pane {{ border: 1px solid {BORDER}; border-top: none; }}
-QTabBar::tab {{
-    background: {DARK_BG};
-    border: 1px solid {BORDER};
-    border-bottom: none;
-    border-radius: 4px 4px 0 0;
-    padding: 8px 18px;
-    color: {TEXT_SEC};
-    font-weight: bold;
-    min-height: 36px;
-}}
-QTabBar::tab:selected {{ background: {PANEL_BG}; color: {ACCENT}; border-bottom: 2px solid {ACCENT}; }}
-QTabBar::tab:!selected:hover {{ background: {BORDER}; color: {TEXT_PRI}; }}
-QScrollArea {{ border: none; }}
-QHeaderView::section {{
-    background: {PANEL_BG};
-    color: {TEXT_PRI};
-    border: 1px solid {BORDER};
-    padding: 4px;
-}}
-QTableWidget {{ gridline-color: {BORDER}; background: {PANEL_BG}; }}
-QTableWidget::item:selected {{ background: {ACCENT}; color: white; }}
-
-QScrollBar:vertical {{ background: {DARK_BG}; width: 8px; border-radius: 4px; }}
-QScrollBar::handle:vertical {{ background: {BORDER}; border-radius: 4px; min-height: 20px; }}
-QScrollBar::handle:vertical:hover {{ background: {ACCENT}; }}
-QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
-QSplitter::handle {{ background: {BORDER}; }}
-"""
+STYLESHEET = make_stylesheet()
 
 
 def prevent_sleep(enable=True):
@@ -287,6 +111,130 @@ class NoScrollDoubleSpinBox(QtWidgets.QDoubleSpinBox):
 
 class NoScrollComboBox(QtWidgets.QComboBox):
     def wheelEvent(self, e): e.ignore()
+
+class NoScrollSlider(QtWidgets.QSlider):
+    def wheelEvent(self, e): e.ignore()
+
+
+class ResponsivePixmapLabel(QtWidgets.QLabel):
+    """A preview label that fits its source pixmap to the available layout space."""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._source_pixmap = QtGui.QPixmap()
+        self._fit_timer = QtCore.QTimer(self)
+        self._fit_timer.setSingleShot(True)
+        self._fit_timer.setInterval(60)
+        self._fit_timer.timeout.connect(self._fit_pixmap)
+        self.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+        self.setMinimumSize(160, 160)
+        self.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+
+    def set_source_pixmap(self, pixmap):
+        self._source_pixmap = QtGui.QPixmap(pixmap)
+        self._schedule_fit()
+
+    def clear(self):
+        self._fit_timer.stop()
+        self._source_pixmap = QtGui.QPixmap()
+        super().clear()
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._schedule_fit()
+
+    def sizeHint(self):
+        # A displayed pixmap must not feed its dimensions back into the layout.
+        return QtCore.QSize(640, 480)
+
+    def minimumSizeHint(self):
+        return QtCore.QSize(160, 160)
+
+    def _schedule_fit(self):
+        if not self._source_pixmap.isNull():
+            self._fit_timer.start()
+
+    def _fit_pixmap(self):
+        if self._source_pixmap.isNull() or self.width() <= 0 or self.height() <= 0:
+            super().clear()
+            return
+        fitted = self._source_pixmap.scaled(
+            self.size(),
+            QtCore.Qt.AspectRatioMode.KeepAspectRatio,
+            QtCore.Qt.TransformationMode.SmoothTransformation,
+        )
+        super().setPixmap(fitted)
+
+
+class ResizeSplitterHandle(QtWidgets.QSplitterHandle):
+    """Distinct resize gutter with an accent grip, unlike a scrollbar thumb."""
+    def __init__(self, orientation, parent):
+        super().__init__(orientation, parent)
+        self._hovered = False
+
+    def enterEvent(self, event):
+        self._hovered = True
+        self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event):
+        self._hovered = False
+        self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.fillRect(self.rect(), THEME.color("surface_hover" if self._hovered else "nested_group"))
+        painter.setPen(QtGui.QPen(THEME.color("border"), 1))
+        if self.orientation() == QtCore.Qt.Orientation.Horizontal:
+            painter.drawLine(0, 0, 0, self.height())
+            painter.drawLine(self.width() - 1, 0, self.width() - 1, self.height())
+            center = self.rect().center()
+            painter.setBrush(THEME.color("accent_hover" if self._hovered else "accent"))
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            for offset in (-9, 0, 9):
+                painter.drawEllipse(QtCore.QPointF(center.x(), center.y() + offset), 2.0, 2.0)
+        else:
+            painter.drawLine(0, 0, self.width(), 0)
+            painter.drawLine(0, self.height() - 1, self.width(), self.height() - 1)
+            center = self.rect().center()
+            painter.setBrush(THEME.color("accent_hover" if self._hovered else "accent"))
+            painter.setPen(QtCore.Qt.PenStyle.NoPen)
+            for offset in (-9, 0, 9):
+                painter.drawEllipse(QtCore.QPointF(center.x() + offset, center.y()), 2.0, 2.0)
+
+
+class ThemedSplitter(QtWidgets.QSplitter):
+    def __init__(self, orientation=QtCore.Qt.Orientation.Horizontal, parent=None):
+        super().__init__(orientation, parent)
+        self.setHandleWidth(10)
+
+    def createHandle(self):
+        return ResizeSplitterHandle(self.orientation(), self)
+
+
+class EmptyStateListWidget(QtWidgets.QListWidget):
+    def __init__(self, empty_text="", parent=None):
+        super().__init__(parent)
+        self.empty_text = empty_text
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if self.count() or not self.empty_text:
+            return
+        painter = QtGui.QPainter(self.viewport())
+        painter.setPen(THEME.color("text_muted"))
+        text_rect = self.viewport().rect().adjusted(16, 18, -16, -16)
+        painter.drawText(
+            text_rect,
+            QtCore.Qt.AlignmentFlag.AlignTop |
+            QtCore.Qt.AlignmentFlag.AlignHCenter |
+            QtCore.Qt.TextFlag.TextWordWrap,
+            self.empty_text,
+        )
 
 
 class NumericTableWidgetItem(QtWidgets.QTableWidgetItem):
@@ -327,6 +275,10 @@ def make_btn(text, callback=None, style=None):
     if style: b.setStyleSheet(style)
     return b
 
+def style_role(widget, role):
+    """Use a global theme variant; avoids per-widget QSS parsing."""
+    return set_role(widget, role)
+
 def make_label(text, color=None, bold=False, size=None):
     lbl = QtWidgets.QLabel(text)
     parts = []
@@ -342,8 +294,9 @@ def make_separator(horizontal=True):
     f.setStyleSheet(f"border: 1px solid {BORDER}; margin: 4px 0;")
     return f
 
-def group_box(title, layout_type=QtWidgets.QVBoxLayout):
+def group_box(title, layout_type=QtWidgets.QVBoxLayout, role="nested"):
     gb = QtWidgets.QGroupBox(title)
+    set_role(gb, role)
     lay = layout_type(gb)
     return gb, lay
 
@@ -493,7 +446,7 @@ class VirtualConsoleWidget(QtWidgets.QWidget):
         self.textbox.setMinimumHeight(200)
         self.textbox.setLineWrapMode(QtWidgets.QPlainTextEdit.LineWrapMode.NoWrap)
         self.textbox.setUndoRedoEnabled(False)
-        self.textbox.setStyleSheet(f"background: {DARK_BG}; color: {TEXT_PRI}; font-family: Consolas;")
+        set_role(self.textbox, "consoleText")
         self.textbox.viewport().installEventFilter(self)
         self.textbox.verticalScrollBar().valueChanged.connect(self._on_inner_scrollbar_changed)
 
@@ -683,7 +636,7 @@ class CustomFolderDialog(QtWidgets.QDialog):
             nav.addWidget(w) if w is not self.path_edit else nav.addWidget(w, 1)
         layout.addLayout(nav)
 
-        splitter = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        splitter = ThemedSplitter(QtCore.Qt.Orientation.Horizontal)
         splitter.setHandleWidth(1)
         splitter.setStyleSheet(f"QSplitter::handle {{ background: {BORDER}; }}")
 
@@ -731,7 +684,7 @@ class CustomFolderDialog(QtWidgets.QDialog):
         self.status_label = make_label("", color=TEXT_SEC)
         cancel_btn = make_btn("Cancel", self.reject)
         select_btn = make_btn("Select Current Folder", self.select_current)
-        select_btn.setStyleSheet(f"background: {ACCENT}; color: white; padding: 6px 15px;")
+        set_role(select_btn, "accent")
         bottom.addWidget(self.status_label)
         bottom.addStretch()
         bottom.addWidget(cancel_btn)
@@ -845,11 +798,11 @@ class GraphPanel(QtWidgets.QWidget):
         # The top band is a compact, Chart.js-style series legend.
         # It replaces the centered title and stays outside the plot area.
         self.padding = {'top': 42, 'bottom': 40, 'left': 70, 'right': 20}
-        self.bg_color = QtGui.QColor(PANEL_BG)
-        self.graph_bg_color = QtGui.QColor(GRAPH_BG)
-        self.grid_color = QtGui.QColor(BORDER)
-        self.text_color = QtGui.QColor(TEXT_PRI)
-        self.title_color = QtGui.QColor(ACCENT)
+        self.bg_color = THEME.color("canvas")
+        self.graph_bg_color = THEME.color("canvas")
+        self.grid_color = THEME.color("border")
+        self.text_color = THEME.color("text")
+        self.title_color = THEME.color("accent")
         self.x_min, self.x_max = 0, 100
         self.y_min, self.y_max = 0, 1
         self.data_x_min, self.data_x_max = 0, 100
@@ -1362,11 +1315,11 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
     def paintEvent(self, event):
         painter = QtGui.QPainter(self)
         painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
-        painter.fillRect(self.rect(), QtGui.QColor(PANEL_BG))
+        painter.fillRect(self.rect(), THEME.color("canvas"))
         rect = QtCore.QRect(self.padding['left'], self.padding['top'],
                             self.width() - self.padding['left'] - self.padding['right'],
                             self.height() - self.padding['top'] - self.padding['bottom'])
-        painter.fillRect(rect, QtGui.QColor(GRAPH_BG))
+        painter.fillRect(rect, THEME.color("canvas"))
         maximum = max(1, max(self.counts, default=0))
         painter.setPen(QtGui.QPen(QtGui.QColor(BORDER), 1))
         for value in self.y_grid_values(maximum):
@@ -1383,7 +1336,7 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
             height = count / maximum * rect.height()
             bar = QtCore.QRectF(rect.left() + index * width + 1, rect.bottom() - height,
                                 max(1, width - 2), height)
-            color = QtGui.QColor(ACCENT if index % 2 == 0 else "#5839b0")
+            color = THEME.color("accent" if index % 2 == 0 else "accent_deep")
             color.setAlpha(210)
             painter.setBrush(color)
             painter.drawRoundedRect(bar, 2, 2)
@@ -1411,7 +1364,7 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
         ])
         painter.setBrush(QtGui.QColor(ACCENT))
         painter.drawPolygon(top_right)
-        painter.setBrush(QtGui.QColor("#5839b0"))
+        painter.setBrush(THEME.color("accent_deep"))
         painter.drawPolygon(bottom_left)
         painter.restore()
         painter.setPen(QtGui.QColor(TEXT_PRI))
@@ -1477,7 +1430,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
 
     def _make_graph_container(self, name, title, y_label):
         gb, lay = group_box("")
-        gb.setStyleSheet("QGroupBox { margin-top: 0px; }")
+        set_role(gb, "flat")
         if name == "timestep":
             graph = LiveTimestepHistogram()
         elif name == "timestep_loss":
@@ -1543,11 +1496,11 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         main.addLayout(grid)
 
         for graph_name, line_name, color, width, line_style in [
-            ("step_loss", "Step Loss", "#4CAF50", 2, "solid"),
-            ("step_loss", "Loss EMA", "#4CAF50", 3, "solid"),
+            ("step_loss", "Step Loss", THEME.success, 2, "solid"),
+            ("step_loss", "Loss EMA", THEME.success, 3, "solid"),
             ("optim_loss", "Optimizer Loss", ACCENT, 2, "solid"),
             ("optim_loss", "Optimizer Loss EMA", ACCENT, 3, "solid"),
-            ("lr", "LR", "#6a48d7", 2, "solid"),
+            ("lr", "LR", THEME.accent_deep, 2, "solid"),
             ("grad_norm", "Raw", DANGER, 3, "solid"),
             ("grad_norm", "Clipped", WARN, 2, "dotted"),
         ]:
@@ -1672,14 +1625,14 @@ class LRCurveWidget(QtWidgets.QWidget):
         self.point_radius = 8
         self._dragging_point_index = -1
         self._selected_point_index = -1
-        self.bg_color = QtGui.QColor(GRAPH_BG)
-        self.grid_color = QtGui.QColor(BORDER)
-        self.epoch_grid_color = QtGui.QColor(TEXT_SEC)
-        self.line_color = QtGui.QColor(ACCENT)
-        self.point_color = QtGui.QColor(TEXT_PRI)
-        self.point_fill_color = QtGui.QColor(ACCENT)
-        self.selected_point_color = QtGui.QColor(WARN)
-        self.text_color = QtGui.QColor(TEXT_PRI)
+        self.bg_color = THEME.color("canvas")
+        self.grid_color = THEME.color("border")
+        self.epoch_grid_color = THEME.color("text_muted")
+        self.line_color = THEME.color("accent")
+        self.point_color = THEME.color("text")
+        self.point_fill_color = THEME.color("accent")
+        self.selected_point_color = THEME.color("warning")
+        self.text_color = THEME.color("text")
         self.setMouseTracking(True)
 
     def set_epoch_data(self, d):
@@ -1964,21 +1917,21 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setMinimumHeight(300)
-        self.padding = {'top': 40, 'bottom': 58, 'left': 58, 'right': 20}
+        self.setFixedHeight(240)
+        self.padding = {'top': 32, 'bottom': 52, 'left': 58, 'right': 20}
         self.bin_size = 100
         self.max_tickets = 1000
         self.counts = []
         self._dragging_bin_index = -1
-        self.bg_color = QtGui.QColor(GRAPH_BG)
-        self.bar_color_even = QtGui.QColor(ACCENT)
-        self.bar_color_odd  = QtGui.QColor("#5839b0")
-        self.bar_hover_color = QtGui.QColor(ACCENT2)
-        self.disabled_bar_color = QtGui.QColor(BORDER)
-        self.text_color = QtGui.QColor(TEXT_PRI)
-        self.grid_color = QtGui.QColor(BORDER)
-        self.alert_color = QtGui.QColor(DANGER)
-        self.disabled_text_color = QtGui.QColor(TEXT_SEC)
+        self.bg_color = THEME.color("canvas")
+        self.bar_color_even = THEME.color("accent")
+        self.bar_color_odd = THEME.color("accent_deep")
+        self.bar_hover_color = THEME.color("accent_alt")
+        self.disabled_bar_color = THEME.color("border")
+        self.text_color = THEME.color("text")
+        self.grid_color = THEME.color("border")
+        self.alert_color = THEME.color("danger")
+        self.disabled_text_color = THEME.color("text_muted")
         self.setMouseTracking(True)
         self._init_bins()
 
@@ -2040,7 +1993,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
         if n == 0: return QtCore.QRectF()
         bw = rect.width() / n
         x = rect.left() + idx * bw
-        y_scale = max((max(self.counts) if self.counts else 1) * 1.2, self.max_tickets * 0.2)
+        y_scale = max((max(self.counts) if self.counts else 1) * 1.35, 1.0)
         h = (self.counts[idx] / y_scale) * rect.height()
         return QtCore.QRectF(x, rect.bottom() - h, bw, h)
 
@@ -2129,7 +2082,7 @@ class TimestepHistogramWidget(QtWidgets.QWidget):
             return
         idx = self._dragging_bin_index
         if not (0 <= idx < n): return
-        y_scale = max((max(self.counts) if self.counts else 1) * 1.2, self.max_tickets * 0.2)
+        y_scale = max((max(self.counts) if self.counts else 1) * 1.35, 1.0)
         target = int(((rect.bottom() - event.pos().y()) / rect.height()) * y_scale)
         avail = self.max_tickets - (sum(self.counts) - self.counts[idx])
         new_val = max(0, min(target, avail))
@@ -2156,13 +2109,13 @@ class TimestepLossWeightCurveWidget(QtWidgets.QWidget):
         self._dragging_point_index = -1
         self._drag_had_motion = False
         self._selected_point_index = -1
-        self.bg_color = QtGui.QColor(GRAPH_BG)
-        self.grid_color = QtGui.QColor(BORDER)
-        self.line_color = QtGui.QColor(ACCENT2)
-        self.point_color = QtGui.QColor(TEXT_PRI)
-        self.point_fill_color = QtGui.QColor(ACCENT2)
-        self.selected_point_color = QtGui.QColor(WARN)
-        self.text_color = QtGui.QColor(TEXT_PRI)
+        self.bg_color = THEME.color("canvas")
+        self.grid_color = THEME.color("border")
+        self.line_color = THEME.color("accent_alt")
+        self.point_color = THEME.color("text")
+        self.point_fill_color = THEME.color("accent_alt")
+        self.selected_point_color = THEME.color("warning")
+        self.text_color = THEME.color("text")
         self.setMouseTracking(True)
 
     def set_points(self, points):
@@ -2468,6 +2421,8 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.parent_gui = parent_gui
         self.datasets = []
         self.dataset_widgets = []
+        self.dataset_nav_entries = []
+        self.active_dataset_index = 0
         self.loader_threads = []
         self._previews_active = True
         self._preview_queue = []
@@ -2481,32 +2436,129 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        top = QtWidgets.QHBoxLayout()
-        top.addWidget(make_btn("Add Folder (Standard)", self.add_dataset_folder_native))
-        smart_btn = make_btn("Add Folder (Smart)", self.add_dataset_folder_custom)
-        smart_btn.setStyleSheet(f"background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT};")
-        top.addWidget(smart_btn)
-        top.addWidget(make_label("Sort By:"))
+        dataset_tools = QtWidgets.QVBoxLayout()
+        dataset_tools.setContentsMargins(0, 0, 0, 0)
+        dataset_tools.setSpacing(5)
+        add_row = QtWidgets.QHBoxLayout()
+        add_row.setSpacing(5)
+        standard_btn = make_btn("Add Folder", self.add_dataset_folder_native)
+        smart_btn = make_btn("⌕", self.add_dataset_folder_custom)
+        set_role(standard_btn, "segmentLeft")
+        set_role(smart_btn, "segmentRight")
+        smart_btn.setToolTip("Smart folder browser")
+        standard_btn.setFixedHeight(24)
+        standard_btn.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        smart_btn.setFixedSize(34, 24)
+        add_folder_control = QtWidgets.QWidget()
+        add_folder_layout = QtWidgets.QHBoxLayout(add_folder_control)
+        add_folder_layout.setContentsMargins(0, 0, 0, 0)
+        add_folder_layout.setSpacing(0)
+        add_folder_layout.addWidget(standard_btn, 1)
+        add_folder_layout.addWidget(smart_btn, 0)
+        add_folder_control.setMinimumWidth(100)
+        add_folder_control.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        add_row.addWidget(add_folder_control, 1)
         self.sort_combo = make_combo(["Default (Order Added)", "Name (A-Z)", "Name (Z-A)",
                                       "Image Count (High → Low)", "Image Count (Low → High)"])
+        self.sort_combo.clear()
+        for label, key in [
+            ("Sort: Added", "default"),
+            ("Sort: Name A–Z", "name_asc"),
+            ("Sort: Name Z–A", "name_desc"),
+            ("Sort: Images ↓", "images_desc"),
+            ("Sort: Images ↑", "images_asc"),
+        ]:
+            self.sort_combo.addItem(label, key)
+        self.sort_combo.setMinimumWidth(100)
+        self.sort_combo.setFixedHeight(24)
+        self.sort_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Ignored,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         self.sort_combo.currentIndexChanged.connect(self.sort_datasets)
-        top.addWidget(self.sort_combo)
+        add_row.addWidget(self.sort_combo, 1)
+        dataset_tools.addLayout(add_row)
         self.loading_label = make_label("", color=WARN, bold=True)
-        top.addWidget(self.loading_label)
-        top.addStretch()
-        layout.addLayout(top)
+        self.loading_label.setVisible(False)
 
-        scroll = QtWidgets.QScrollArea()
-        scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+        content_row = QtWidgets.QHBoxLayout()
+        content_row.setContentsMargins(0, 0, 0, 0)
+        content_row.setSpacing(0)
+
+        self.dataset_content_splitter = ThemedSplitter(QtCore.Qt.Orientation.Horizontal)
+        self.dataset_content_splitter.setChildrenCollapsible(False)
+
+        focus_group, focus_lay = group_box("Dataset List")
+        set_role(focus_group, "datasetNavigator")
+        focus_group.setMinimumWidth(220)
+        focus_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        focus_lay.setContentsMargins(6, 10, 6, 6)
+        focus_lay.setSpacing(5)
+        focus_lay.addLayout(dataset_tools)
+        self.dataset_search = QtWidgets.QLineEdit()
+        self.dataset_search.setMinimumWidth(120)
+        self.dataset_search.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
+        self.dataset_search.setPlaceholderText("Search datasets...")
+        self.dataset_search.setClearButtonEnabled(True)
+        self.dataset_search.textChanged.connect(self._search_dataset_navigator)
+        focus_lay.addWidget(self.dataset_search)
+        focus_lay.addWidget(self.loading_label)
+        self.quick_focus_list = EmptyStateListWidget(
+            "No datasets detected. Click Add Folder to add one."
+        )
+        set_role(self.quick_focus_list, "quickFocus")
+        self.quick_focus_list.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.quick_focus_list.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.quick_focus_list.setTextElideMode(QtCore.Qt.TextElideMode.ElideRight)
+        self.quick_focus_list.setSelectionMode(
+            QtWidgets.QAbstractItemView.SelectionMode.ExtendedSelection
+        )
+        self.quick_focus_list.setContextMenuPolicy(QtCore.Qt.ContextMenuPolicy.CustomContextMenu)
+        self.quick_focus_list.itemClicked.connect(self._select_dataset_item)
+        self.quick_focus_list.customContextMenuRequested.connect(self._show_dataset_context_menu)
+        self.remove_selected_shortcut = QtGui.QShortcut(
+            QtGui.QKeySequence(QtCore.Qt.Key.Key_Delete), self.quick_focus_list
+        )
+        self.remove_selected_shortcut.activated.connect(self._remove_selected_datasets)
+        focus_lay.addWidget(self.quick_focus_list)
+
+        list_pane = QtWidgets.QWidget()
+        list_pane_layout = QtWidgets.QVBoxLayout(list_pane)
+        list_pane_layout.setContentsMargins(10, 15, 10, 15)
+        dataset_heading = make_label("Datasets", color=ACCENT, bold=True, size=12)
+        list_pane_layout.addWidget(dataset_heading)
+        list_pane_layout.addWidget(focus_group, 1)
+        self.dataset_content_splitter.addWidget(list_pane)
+
         self.grid_container = QtWidgets.QWidget()
         self.dataset_grid = QtWidgets.QGridLayout(self.grid_container)
         self.dataset_grid.setSpacing(15)
-        self.dataset_grid.setContentsMargins(5, 5, 5, 5)
-        scroll.setWidget(self.grid_container)
-        layout.addWidget(scroll)
+        self.dataset_grid.setContentsMargins(0, 0, 0, 0)
+        self.dataset_grid.setRowStretch(0, 1)
+        self.grid_container.setMinimumWidth(260)
 
-        bot = QtWidgets.QHBoxLayout()
+        detail_panel = QtWidgets.QWidget()
+        detail_layout = QtWidgets.QGridLayout(detail_panel)
+        detail_layout.setContentsMargins(0, 0, 0, 0)
+        detail_layout.setSpacing(0)
+        detail_layout.addWidget(self.grid_container, 0, 0)
+
+        totals_bar = QtWidgets.QWidget()
+        set_role(totals_bar, "chartOverlay")
+        bot = QtWidgets.QHBoxLayout(totals_bar)
+        bot.setContentsMargins(8, 4, 8, 6)
         bot.addStretch(1)
         self.total_label = make_label("0", color=ACCENT2, bold=True)
         self.total_repeats_label = make_label("0", color=ACCENT, bold=True)
@@ -2514,13 +2566,123 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             bot.addWidget(make_label(lbl))
             bot.addWidget(val)
         bot.addStretch()
-        layout.addLayout(bot)
+        detail_layout.addWidget(
+            totals_bar, 0, 0,
+            QtCore.Qt.AlignmentFlag.AlignLeft |
+            QtCore.Qt.AlignmentFlag.AlignRight |
+            QtCore.Qt.AlignmentFlag.AlignBottom,
+        )
 
-    def get_total_repeats(self): return sum(d["image_count"] * d["repeats"] for d in self.datasets)
+        detail_pane = QtWidgets.QWidget()
+        detail_pane_layout = QtWidgets.QVBoxLayout(detail_pane)
+        detail_pane_layout.setContentsMargins(10, 15, 15, 15)
+        detail_heading_spacer = QtWidgets.QWidget()
+        detail_heading_spacer.setFixedHeight(dataset_heading.sizeHint().height())
+        detail_pane_layout.addWidget(detail_heading_spacer)
+        detail_pane_layout.addWidget(detail_panel, 1)
+        self.dataset_content_splitter.addWidget(detail_pane)
+        self.dataset_content_splitter.setStretchFactor(0, 0)
+        self.dataset_content_splitter.setStretchFactor(1, 1)
+        self.dataset_content_splitter.setSizes([300, 885])
+        content_row.addWidget(self.dataset_content_splitter, 1)
+        layout.addLayout(content_row, 1)
+
+    def get_total_repeats(self): return gui_math.repeated_image_count(self.datasets)
     def get_datasets_config(self): return [{"path": d["path"], "repeats": d["repeats"]} for d in self.datasets]
+
+    def _select_dataset_item(self, item):
+        index = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if isinstance(index, int) and 0 <= index < len(self.datasets):
+            selected = self._selected_dataset_indices()
+            self.active_dataset_index = index if index in selected else (selected[0] if selected else index)
+            self.repopulate_dataset_grid(selected)
+
+    def _selected_dataset_indices(self):
+        return sorted({
+            index
+            for item in self.quick_focus_list.selectedItems()
+            for index in [item.data(QtCore.Qt.ItemDataRole.UserRole)]
+            if isinstance(index, int) and 0 <= index < len(self.datasets)
+        })
+
+    def _show_dataset_context_menu(self, position):
+        item = self.quick_focus_list.itemAt(position)
+        if item is None:
+            return
+        index = item.data(QtCore.Qt.ItemDataRole.UserRole)
+        if index not in self._selected_dataset_indices():
+            self.quick_focus_list.clearSelection()
+            item.setSelected(True)
+            self.quick_focus_list.setCurrentItem(item)
+        count = len(self._selected_dataset_indices())
+        menu = QtWidgets.QMenu(self.quick_focus_list)
+
+        action_panel = QtWidgets.QGroupBox("Dataset Actions")
+        action_panel.setProperty("density", "compact")
+        action_panel.setFixedWidth(250)
+        panel_layout = QtWidgets.QVBoxLayout(action_panel)
+        panel_layout.setContentsMargins(8, 10, 8, 8)
+        panel_layout.setSpacing(7)
+        selection_text = "1 dataset selected" if count == 1 else f"{count} datasets selected"
+        selection_label = make_label(selection_text, color=TEXT_SEC, size=8)
+        panel_layout.addWidget(selection_label)
+        remove_button = make_btn("Remove Dataset" if count == 1 else f"Remove {count} Datasets")
+        set_role(remove_button, "danger")
+        remove_button.setToolTip("Remove the selected dataset entries from this training configuration.")
+        remove_button.clicked.connect(menu.close)
+        remove_button.clicked.connect(self._remove_selected_datasets)
+        panel_layout.addWidget(remove_button)
+
+        panel_action = QtWidgets.QWidgetAction(menu)
+        panel_action.setDefaultWidget(action_panel)
+        menu.addAction(panel_action)
+        menu.exec(self.quick_focus_list.viewport().mapToGlobal(position))
+
+    def _remove_selected_datasets(self):
+        indices = self._selected_dataset_indices()
+        if not indices:
+            return
+        for index in reversed(indices):
+            del self.datasets[index]
+        self.active_dataset_index = min(indices[0], max(0, len(self.datasets) - 1))
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
+
+    def _search_dataset_navigator(self, text):
+        """Temporarily rank navigator entries without changing dataset order."""
+        if not hasattr(self, "quick_focus_list") or self.quick_focus_list.count() < 2:
+            return
+        query = str(text).strip().casefold()
+        active_item = None
+        for row in range(self.quick_focus_list.count()):
+            item = self.quick_focus_list.item(row)
+            index = item.data(QtCore.Qt.ItemDataRole.UserRole)
+            name = (Path(self.datasets[index]["path"]).name or self.datasets[index]["path"]).casefold()
+            if not query:
+                tier, position, distance = 0, 0, 0
+            else:
+                similarity = SequenceMatcher(None, query, name).ratio()
+                distance = int(round((1.0 - similarity) * 1_000_000))
+                if name == query:
+                    tier, position = 0, 0
+                elif name.startswith(query):
+                    tier, position = 1, 0
+                else:
+                    position = name.find(query)
+                    tier = 2 if position >= 0 else 3
+                    position = max(0, position)
+            # The custom entry widget covers this text; it exists only as a
+            # stable sort key, avoiding destructive item removal/reinsertion.
+            item.setText(f"{tier}:{position:06d}:{distance:07d}:{index:09d}")
+            if index == self.active_dataset_index:
+                active_item = item
+        self.quick_focus_list.sortItems(QtCore.Qt.SortOrder.AscendingOrder)
+        if active_item is not None:
+            self.quick_focus_list.setCurrentItem(active_item)
 
     def _start_loading_path(self, path, repeats=1):
         self.loading_label.setText(f"Scanning: {Path(path).name}...")
+        self.loading_label.setVisible(True)
         loader = DatasetLoaderThread(path)
         loader.repeats = repeats
         loader.finished.connect(self._on_loader_finished)
@@ -2531,7 +2693,9 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         sender = self.sender()
         repeats = getattr(sender, 'repeats', 1)
         if sender in self.loader_threads: self.loader_threads.remove(sender)
-        if not self.loader_threads: self.loading_label.setText("")
+        if not self.loader_threads:
+            self.loading_label.clear()
+            self.loading_label.setVisible(False)
         if not images_data:
             if self.isVisible(): QtWidgets.QMessageBox.warning(self, "No Images", f"No valid images found in {path}.")
             return
@@ -2540,15 +2704,27 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self.sort_datasets(); self.update_dataset_totals()
 
     def sort_datasets(self):
-        c = self.sort_combo.currentText()
-        if   "A-Z"   in c: self.datasets.sort(key=lambda x: Path(x['path']).name.lower())
-        elif "Z-A"   in c: self.datasets.sort(key=lambda x: Path(x['path']).name.lower(), reverse=True)
-        elif "High"  in c: self.datasets.sort(key=lambda x: x['image_count'], reverse=True)
-        elif "Low"   in c: self.datasets.sort(key=lambda x: x['image_count'])
+        active_path = None
+        if 0 <= self.active_dataset_index < len(self.datasets):
+            active_path = self.datasets[self.active_dataset_index]['path']
+        mode = self.sort_combo.currentData()
+        if mode == "name_asc":
+            self.datasets.sort(key=lambda x: Path(x['path']).name.lower())
+        elif mode == "name_desc":
+            self.datasets.sort(key=lambda x: Path(x['path']).name.lower(), reverse=True)
+        elif mode == "images_desc":
+            self.datasets.sort(key=lambda x: x['image_count'], reverse=True)
+        elif mode == "images_asc":
+            self.datasets.sort(key=lambda x: x['image_count'])
+        if active_path is not None:
+            self.active_dataset_index = next(
+                (i for i, ds in enumerate(self.datasets) if ds['path'] == active_path), 0
+            )
         self.repopulate_dataset_grid()
 
     def load_datasets_from_config(self, datasets_config):
         self.datasets = []
+        self.active_dataset_index = 0
         for t in self.loader_threads: t.quit()
         self.loader_threads = []
         self.repopulate_dataset_grid()
@@ -2572,7 +2748,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
         self._update_preview_for_card(idx)
 
     def _set_preview_placeholder(self, idx, text=""):
-        if idx >= len(self.dataset_widgets) or idx >= len(self.datasets): return
+        if idx >= len(self.dataset_widgets) or idx >= len(self.datasets) or self.dataset_widgets[idx] is None: return
         ds = self.datasets[idx]
         wdg = self.dataset_widgets[idx]
         wdg["preview_label"].clear()
@@ -2584,7 +2760,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             return
         if indices is None:
             indices = range(len(self.dataset_widgets))
-        self._preview_queue = [idx for idx in indices if idx < len(self.dataset_widgets)]
+        self._preview_queue = [idx for idx in indices if idx < len(self.dataset_widgets) and self.dataset_widgets[idx] is not None]
         for idx in self._preview_queue:
             self._set_preview_placeholder(idx, "Loading preview...")
         if self._preview_queue and not self._preview_timer.isActive():
@@ -2595,13 +2771,13 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             self._preview_timer.stop()
             return
         idx = self._preview_queue.pop(0)
-        if idx < len(self.dataset_widgets):
+        if idx < len(self.dataset_widgets) and self.dataset_widgets[idx] is not None:
             self._update_preview_for_card(idx)
         if not self._preview_queue:
             self._preview_timer.stop()
 
     def _update_preview_for_card(self, idx):
-        if idx >= len(self.dataset_widgets): return
+        if idx >= len(self.dataset_widgets) or self.dataset_widgets[idx] is None: return
         ds = self.datasets[idx]
         wdg = self.dataset_widgets[idx]
         if not self._previews_active:
@@ -2620,8 +2796,10 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                         parts = []
                         for key in CAPTION_JSON_TYPES:
                             value = payload.get(key, "") if isinstance(payload, dict) else ""
-                            parts.append(f"{key}: {str(value).strip() or '[missing]'}")
-                        data["caption"] = "\n\n".join(parts)
+                            value = str(value).strip()
+                            if value:
+                                parts.append(f"{key}: {value}")
+                        data["caption"] = "\n\n".join(parts) or "[No caption fields found]"
                     except Exception as e:
                         data["caption"] = f"[Error reading JSON caption: {e}]"
                 else:
@@ -2633,8 +2811,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             else: data["caption"] = "[No caption file]"
             data["caption_loaded"] = True
         px = QtGui.QPixmap(data["image_path"])
-        if not px.isNull(): px = px.scaled(183, 183, QtCore.Qt.AspectRatioMode.KeepAspectRatio, QtCore.Qt.TransformationMode.SmoothTransformation)
-        wdg["preview_label"].setPixmap(px)
+        wdg["preview_label"].set_source_pixmap(px)
         wdg["caption_text"].setPlainText(data["caption"])
         wdg["counter_label"].setText(f"{ds['current_preview_idx'] + 1}/{len(ds['images_data'])}")
 
@@ -2644,7 +2821,9 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             return
         self._previews_active = active
         if active:
-            QtCore.QTimer.singleShot(0, self._queue_preview_refresh)
+            # Let the tab, navigator, and card layouts reach their final sizes
+            # before decoding and displaying previews.
+            QtCore.QTimer.singleShot(75, self._queue_preview_refresh)
         else:
             self._preview_timer.stop()
             self._preview_queue = []
@@ -2652,6 +2831,8 @@ class DatasetManagerWidget(QtWidgets.QWidget):
 
     def release_preview_resources(self, clear_caption_cache=False):
         for wdg in self.dataset_widgets:
+            if wdg is None:
+                continue
             wdg["preview_label"].clear()
             wdg["caption_text"].clear()
         if clear_caption_cache:
@@ -2661,31 +2842,115 @@ class DatasetManagerWidget(QtWidgets.QWidget):
                         data["caption"] = ""
                         data["caption_loaded"] = False
 
-    def repopulate_dataset_grid(self):
+    def repopulate_dataset_grid(self, selected_indices=None):
         while self.dataset_grid.count():
             item = self.dataset_grid.takeAt(0)
             if item.widget(): item.widget().deleteLater()
         self.dataset_widgets = []
+        self.dataset_nav_entries = []
+        self.quick_focus_list.clear()
         n = len(self.datasets)
-        COLS = 1 if n == 1 else (2 if n == 2 else 3)
+        self.dataset_widgets = [None] * n
+        if n:
+            self.active_dataset_index = max(0, min(self.active_dataset_index, n - 1))
+        else:
+            self.active_dataset_index = 0
+        selected_indices = {
+            idx for idx in (selected_indices or [self.active_dataset_index]) if 0 <= idx < n
+        }
 
-        for idx, ds in enumerate(self.datasets):
-            card = QtWidgets.QGroupBox()
-            card.setStyleSheet(f"QGroupBox {{ border: 2px solid {BORDER}; border-radius: 8px; margin-top: 5px; padding: 12px; background: {DARK_BG}; }}")
+        for nav_idx, nav_ds in enumerate(self.datasets):
+            title = Path(nav_ds['path']).name or nav_ds['path']
+            focus_item = QtWidgets.QListWidgetItem()
+            focus_item.setData(QtCore.Qt.ItemDataRole.UserRole, nav_idx)
+            focus_item.setToolTip(nav_ds['path'])
+            focus_item.setSizeHint(QtCore.QSize(0, 76))
+            self.quick_focus_list.addItem(focus_item)
+
+            entry = QtWidgets.QWidget()
+            set_role(entry, "datasetEntry")
+            entry.setProperty("selected", nav_idx in selected_indices)
+            entry_lay = QtWidgets.QVBoxLayout(entry)
+            entry_lay.setContentsMargins(9, 7, 9, 7)
+            entry_lay.setSpacing(3)
+            title_lbl = make_label(title, color=ACCENT if nav_idx == self.active_dataset_index else TEXT_PRI, bold=True)
+            title_lbl.setToolTip(nav_ds['path'])
+            entry_lay.addWidget(title_lbl)
+            stats_lay = QtWidgets.QHBoxLayout()
+            stats_lay.setContentsMargins(0, 0, 0, 0)
+            stats_lay.setSpacing(10)
+            stats_lay.addWidget(make_label(f"Images: {nav_ds['image_count']}", color=TEXT_SEC, size=8))
+            effective_lbl = make_label(
+                f"With repeats: {nav_ds['image_count'] * nav_ds['repeats']}", color=TEXT_SEC, size=8
+            )
+            stats_lay.addWidget(effective_lbl)
+            stats_lay.addStretch(1)
+            entry_lay.addLayout(stats_lay)
+            self.quick_focus_list.setItemWidget(focus_item, entry)
+            self.dataset_nav_entries.append({"effective_label": effective_lbl})
+
+        if n:
+            for row in range(self.quick_focus_list.count()):
+                item = self.quick_focus_list.item(row)
+                item.setSelected(item.data(QtCore.Qt.ItemDataRole.UserRole) in selected_indices)
+            active_item = next(
+                (self.quick_focus_list.item(row) for row in range(self.quick_focus_list.count())
+                 if self.quick_focus_list.item(row).data(QtCore.Qt.ItemDataRole.UserRole) == self.active_dataset_index),
+                None,
+            )
+            if active_item is not None:
+                self.quick_focus_list.setCurrentItem(
+                    active_item, QtCore.QItemSelectionModel.SelectionFlag.NoUpdate
+                )
+            if self.dataset_search.text().strip():
+                self._search_dataset_navigator(self.dataset_search.text())
+
+        compact = False
+
+        if not n:
+            empty_preview_group = QtWidgets.QGroupBox("Dataset Preview")
+            set_role(empty_preview_group, "nested")
+            empty_preview_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            empty_preview_layout = QtWidgets.QVBoxLayout(empty_preview_group)
+            empty_preview_message = make_label(
+                "No datasets detected. Add a dataset folder to preview its images and settings.",
+                color=TEXT_SEC,
+                size=10,
+            )
+            empty_preview_message.setWordWrap(True)
+            empty_preview_message.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
+            empty_preview_layout.addStretch(1)
+            empty_preview_layout.addWidget(empty_preview_message)
+            empty_preview_layout.addStretch(1)
+            self.dataset_grid.addWidget(empty_preview_group, 0, 0)
+
+        active_indices = [self.active_dataset_index] if n else []
+        for idx in active_indices:
+            ds = self.datasets[idx]
+            card = QtWidgets.QGroupBox(Path(ds['path']).name or ds['path'])
+            set_role(card, "nested")
+            card.setProperty("density", "compact" if compact else "normal")
+            card.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
             cl = QtWidgets.QVBoxLayout(card)
-            cl.setSpacing(10)
+            cl.setContentsMargins(*(8, 10, 8, 8) if compact else (12, 14, 12, 12))
+            cl.setSpacing(8 if compact else 12)
 
-            preview_sec = QtWidgets.QVBoxLayout()
-            preview_sec.setSpacing(5)
-            img_h = QtWidgets.QHBoxLayout()
-            img_h.addStretch()
-            preview_lbl = QtWidgets.QLabel()
-            preview_lbl.setFixedSize(183, 183)
-            preview_lbl.setStyleSheet(f"border: 1px solid {BORDER}; background: {GRAPH_BG};")
-            preview_lbl.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-            img_h.addWidget(preview_lbl)
-            img_h.addStretch()
-            preview_sec.addLayout(img_h)
+            preview_group, preview_sec = group_box("Image Preview")
+            preview_group.setSizePolicy(
+                QtWidgets.QSizePolicy.Policy.Expanding,
+                QtWidgets.QSizePolicy.Policy.Expanding,
+            )
+            preview_sec.setContentsMargins(*(5, 7, 5, 5) if compact else (8, 10, 8, 8))
+            preview_sec.setSpacing(3 if compact else 5)
+            preview_lbl = ResponsivePixmapLabel()
+            set_role(preview_lbl, "preview")
+            preview_sec.addWidget(preview_lbl, 1)
 
             nav_h = QtWidgets.QHBoxLayout()
             nav_h.setSpacing(8)
@@ -2701,79 +2966,104 @@ class DatasetManagerWidget(QtWidgets.QWidget):
             right_btn.clicked.connect(lambda _, i=idx: self._cycle_preview(i, 1))
             nav_h.addWidget(left_btn); nav_h.addWidget(counter_lbl, 1); nav_h.addWidget(right_btn)
             preview_sec.addLayout(nav_h)
-            cl.addLayout(preview_sec)
+            cl.addWidget(preview_group)
+
+            details_panel = QtWidgets.QWidget()
+            set_role(details_panel, "transparent")
+            details_lay = QtWidgets.QHBoxLayout(details_panel)
+            details_lay.setContentsMargins(0, 0, 0, 0)
+            details_lay.setSpacing(6 if compact else 10)
 
             cap_container = QtWidgets.QWidget()
-            cap_container.setStyleSheet(f"QWidget {{ background: {GRAPH_BG}; border: 1px solid {BORDER}; border-radius: 4px; }}")
-            cap_container.setMinimumWidth(150)
+            set_role(cap_container, "panel")
+            cap_container.setMinimumWidth(130 if compact else 240)
             cap_container.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
             cap_layout = QtWidgets.QVBoxLayout(cap_container)
-            cap_layout.setContentsMargins(8, 8, 8, 8)
-            cap_layout.addWidget(make_label("<b>Caption Preview:</b>", color=ACCENT, size=11))
+            cap_layout.setContentsMargins(*(5, 5, 5, 5) if compact else (8, 8, 8, 8))
+            cap_layout.addWidget(make_label("<b>Caption Preview:</b>", color=ACCENT, size=9 if compact else 11))
             caption_text = QtWidgets.QTextEdit("Loading...")
             caption_text.setReadOnly(True)
             caption_text.setWordWrapMode(QtGui.QTextOption.WrapMode.WrapAtWordBoundaryOrAnywhere)
             caption_text.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Expanding)
-            caption_text.setMinimumHeight(115)
-            caption_text.setStyleSheet(f"QTextEdit {{ background: {GRAPH_BG}; color: {TEXT_PRI}; font-size: 9pt; border: none; }}")
+            caption_text.setMinimumHeight(70 if compact else 90)
+            caption_text.setProperty("uiRole", "caption")
             cap_layout.addWidget(caption_text, 1)
-            cl.addWidget(cap_container, 1)
-            cl.addWidget(make_separator())
+            details_lay.addWidget(cap_container, 2)
+
+            settings_group, settings_lay = group_box("Dataset Settings")
+            settings_lay.setContentsMargins(*(6, 7, 6, 6) if compact else (10, 12, 10, 10))
+            settings_lay.setSpacing(5 if compact else 8)
 
             path_short = (Path(ds['path']).name[:27] + "...") if len(Path(ds['path']).name) > 30 else Path(ds['path']).name
             path_lbl = make_label(f"<b>Folder:</b> {path_short}")
             path_lbl.setToolTip(ds['path'])
-            cl.addWidget(path_lbl)
-            cl.addWidget(make_label(f"<b>Images:</b> {ds['image_count']}"))
+            path_lbl.setWordWrap(True)
+            settings_lay.addWidget(path_lbl)
+            settings_lay.addWidget(make_separator())
+            settings_lay.addWidget(make_label(f"<b>Images:</b> {ds['image_count']}"))
             repeats_total_lbl = make_label(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}", color=ACCENT)
-            cl.addWidget(repeats_total_lbl)
+            settings_lay.addWidget(repeats_total_lbl)
 
             rep_h = QtWidgets.QHBoxLayout()
             rep_h.setContentsMargins(0, 5, 0, 0)
             rep_h.addWidget(make_label("Repeats:"))
             rep_spin = NoScrollSpinBox()
-            rep_spin.setStyleSheet(f"background: #080a0e; color: {TEXT_PRI}; border: 1px solid {BORDER}; border-radius: 4px; padding: 2px 4px;")
+            set_role(rep_spin, "compact")
             rep_spin.setRange(1, 10000); rep_spin.setValue(ds["repeats"])
             rep_spin.valueChanged.connect(lambda v, i=idx: self.update_repeats(i, v))
             rep_h.addWidget(rep_spin, 1)
-            cl.addLayout(rep_h)
+            settings_lay.addLayout(rep_h)
+            settings_lay.addStretch(1)
 
             btn_h = QtWidgets.QHBoxLayout()
             btn_h.setSpacing(5)
-            rm_btn = make_btn("Remove"); rm_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
+            rm_btn = make_btn("Remove Dataset")
+            set_role(rm_btn, "danger")
             rm_btn.clicked.connect(lambda _, i=idx: self.remove_dataset(i))
             clear_btn = make_btn("Clear Cache"); clear_btn.setStyleSheet("min-height: 24px; max-height: 24px; padding: 4px 15px;")
             clear_btn.clicked.connect(lambda _, p=ds["path"]: self.confirm_clear_cache(p))
             cache_exists = self._cache_exists(ds["path"])
             clear_btn.setEnabled(cache_exists)
             if not cache_exists: clear_btn.setToolTip("No cache found")
-            btn_h.addWidget(rm_btn); btn_h.addWidget(clear_btn)
-            cl.addLayout(btn_h)
+            btn_h.addWidget(clear_btn); btn_h.addWidget(rm_btn)
+            settings_lay.addLayout(btn_h)
+            details_lay.addWidget(settings_group, 1)
+            cl.addWidget(details_panel, 0)
+            cl.addSpacing(28)
 
-            row, col = divmod(idx, COLS)
-            self.dataset_grid.addWidget(card, row, col)
-            self.dataset_widgets.append({
+            self.dataset_grid.addWidget(card, 0, 0)
+            self.dataset_widgets[idx] = {
+                "card": card,
                 "preview_label": preview_lbl, "caption_text": caption_text,
                 "counter_label": counter_lbl, "repeats_total_label": repeats_total_lbl,
                 "clear_btn": clear_btn
-            })
+            }
             self._update_preview_for_card(idx)
 
-        if n % COLS != 0:
-            for ec in range(n % COLS, COLS): self.dataset_grid.setColumnStretch(ec, 1)
+        self.dataset_grid.setColumnStretch(0, 1)
 
     def _cache_exists(self, path):
         return any((Path(path) / name).is_dir() for name in self.parent_gui.get_current_cache_folder_names())
 
     def update_repeats(self, idx, val):
         self.datasets[idx]["repeats"] = val
-        if idx < len(self.dataset_widgets):
+        if idx < len(self.dataset_widgets) and self.dataset_widgets[idx] is not None:
             ds = self.datasets[idx]
             self.dataset_widgets[idx]["repeats_total_label"].setText(f"<b>Total (with repeats):</b> {ds['image_count'] * ds['repeats']}")
+        if idx < len(self.dataset_nav_entries):
+            ds = self.datasets[idx]
+            self.dataset_nav_entries[idx]["effective_label"].setText(
+                f"With repeats: {ds['image_count'] * ds['repeats']}"
+            )
         self.update_dataset_totals()
 
     def remove_dataset(self, idx):
-        del self.datasets[idx]; self.repopulate_dataset_grid(); self.update_dataset_totals()
+        del self.datasets[idx]
+        if self.active_dataset_index > idx:
+            self.active_dataset_index -= 1
+        self.active_dataset_index = min(self.active_dataset_index, max(0, len(self.datasets) - 1))
+        self.repopulate_dataset_grid()
+        self.update_dataset_totals()
 
     def update_dataset_totals(self):
         self.total_label.setText(str(sum(d["image_count"] for d in self.datasets)))
@@ -2804,7 +3094,7 @@ class DatasetManagerWidget(QtWidgets.QWidget):
 
     def refresh_cache_buttons(self):
         for idx, ds in enumerate(self.datasets):
-            if idx < len(self.dataset_widgets):
+            if idx < len(self.dataset_widgets) and self.dataset_widgets[idx] is not None:
                 exists = self._cache_exists(ds["path"])
                 btn = self.dataset_widgets[idx]["clear_btn"]
                 btn.setEnabled(exists)
@@ -2898,6 +3188,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self._initialize_configs()
         self._setup_ui()
+        self._mark_nested_groups()
 
         self.config_dropdown.blockSignals(True)
         last = self._load_gui_state()
@@ -2911,6 +3202,20 @@ class TrainingGUI(QtWidgets.QWidget):
         else:
             self._load_first_config()
         self.config_dropdown.blockSignals(False)
+
+    def _mark_nested_groups(self):
+        """Mark group hierarchy and terminal groups for reliable depth theming."""
+        for group in self.findChildren(QtWidgets.QGroupBox):
+            parent = group.parentWidget()
+            while parent is not None and not isinstance(parent, QtWidgets.QGroupBox):
+                parent = parent.parentWidget()
+            group.setProperty("nested", parent is not None)
+            is_leaf = not bool(group.findChildren(QtWidgets.QGroupBox))
+            group.setProperty("leaf", is_leaf)
+            if group.property("uiRole") == "nested" and is_leaf:
+                group.setProperty("groupSurface", "inner")
+                group.style().unpolish(group)
+                group.style().polish(group)
 
     def _create_training_mode_combo(self):
         self.training_mode_combo = make_combo([TRAINING_MODE_SDXL, TRAINING_MODE_ANIMA_DIT])
@@ -3123,6 +3428,8 @@ class TrainingGUI(QtWidgets.QWidget):
             self.dit_exclusion_group.setVisible(is_dit)
         if hasattr(self, "advanced_group"):
             self.advanced_group.setVisible(not is_dit)
+        if hasattr(self, "anima_sigma_shift_controls"):
+            self.anima_sigma_shift_controls.setVisible(is_dit)
         self._update_loss_controls()
 
         self._update_mode_locked_group_states()
@@ -3261,9 +3568,40 @@ class TrainingGUI(QtWidgets.QWidget):
             self._set_widget_row_visible(key, key not in hidden_keys)
 
     def _make_scroll_panel(self, widget, min_width=None, max_width=None):
+        # Make form-based sidebar content responsive instead of allowing wide
+        # label/field rows to paint beyond the viewport.
+        for form in widget.findChildren(QtWidgets.QFormLayout):
+            form.setRowWrapPolicy(QtWidgets.QFormLayout.RowWrapPolicy.WrapLongRows)
+            form.setFieldGrowthPolicy(QtWidgets.QFormLayout.FieldGrowthPolicy.AllNonFixedFieldsGrow)
+        responsive_fields = (
+            QtWidgets.QLineEdit,
+            QtWidgets.QPlainTextEdit,
+            QtWidgets.QTextEdit,
+            QtWidgets.QComboBox,
+            QtWidgets.QSpinBox,
+            QtWidgets.QDoubleSpinBox,
+        )
+        for field_type in responsive_fields:
+            for field in widget.findChildren(field_type):
+                field.setMinimumWidth(0)
+                field.setSizePolicy(
+                    QtWidgets.QSizePolicy.Policy.Ignored,
+                    field.sizePolicy().verticalPolicy(),
+                )
+        for label in widget.findChildren(QtWidgets.QLabel):
+            label.setWordWrap(True)
+
         scroll = QtWidgets.QScrollArea()
+        set_role(scroll, "settingsSidebar")
+        scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
         scroll.setWidgetResizable(True)
+        scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
         scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        scroll.setSizeAdjustPolicy(QtWidgets.QAbstractScrollArea.SizeAdjustPolicy.AdjustIgnored)
+        scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         if min_width: scroll.setMinimumWidth(min_width)
         if max_width: scroll.setMaximumWidth(max_width)
         scroll.setWidget(widget)
@@ -3272,34 +3610,62 @@ class TrainingGUI(QtWidgets.QWidget):
     def _setup_ui(self):
         main = QtWidgets.QVBoxLayout(self)
         main.setContentsMargins(5, 5, 5, 5)
+        main.setSpacing(0)
 
         self.log_textbox = VirtualConsoleWidget(visible_lines=900, clear_callback=self.clear_console_log)
-
-        self.tab_view = QtWidgets.QTabWidget()
         self._create_training_mode_combo()
+
+        # Shell layer 1: navigation owns only tabs and global configuration controls.
+        self.tabs_group = QtWidgets.QWidget()
+        set_role(self.tabs_group, "navigation")
+        tabs_layout = QtWidgets.QHBoxLayout(self.tabs_group)
+        tabs_layout.setContentsMargins(0, 0, 0, 0)
+        tabs_layout.setSpacing(0)
+        self.tab_bar = QtWidgets.QTabBar()
+        self.tab_bar.setExpanding(False)
+        self.tab_bar.setDrawBase(False)
+        tabs_layout.addWidget(self.tab_bar, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        tabs_layout.addStretch(1)
+        tabs_layout.addWidget(self._build_corner_widget(), 0)
+        main.addWidget(self.tabs_group, 0)
+
+        # Shell layer 2: one stable frame owns every page and all page splitters.
+        self.main_frame = QtWidgets.QFrame()
+        set_role(self.main_frame, "mainFrame")
+        frame_layout = QtWidgets.QVBoxLayout(self.main_frame)
+        frame_layout.setContentsMargins(0, 0, 0, 0)
+        frame_layout.setSpacing(0)
+        self.content_stack = QtWidgets.QStackedWidget()
+        self.tab_view = self.content_stack  # Compatibility for callers using currentIndex().
+        frame_layout.addWidget(self.content_stack, 1)
 
         for title_text, builder in [("Dataset", self._build_dataset_tab),
                                     ("Model && Training Parameters", self._build_model_training_tab)]:
             page = QtWidgets.QWidget()
             builder(page)
-            scroll = QtWidgets.QScrollArea()
-            scroll.setWidgetResizable(True)
-            scroll.setWidget(page)
-            self.tab_view.addTab(scroll, title_text)
+            self.tab_bar.addTab(title_text)
+            self.content_stack.addWidget(page)
 
         self.live_metrics_widget = LiveMetricsWidget()
-        self.tab_view.addTab(self.live_metrics_widget, "Live Metrics")
+        self.tab_bar.addTab("Live Metrics")
+        self.content_stack.addWidget(self.live_metrics_widget)
 
         console_widget = QtWidgets.QWidget()
         console_layout = QtWidgets.QVBoxLayout(console_widget)
         console_layout.setContentsMargins(15, 15, 15, 15)
         console_layout.addWidget(self.log_textbox, stretch=1)
-        self.tab_view.addTab(console_widget, "Training Console")
+        self.tab_bar.addTab("Training Console")
+        self.content_stack.addWidget(console_widget)
 
-        self.tab_view.currentChanged.connect(self._on_tab_changed)
-        main.addWidget(self.tab_view)
-        self._build_corner_widget()
-        self._build_bottom_bar()
+        self.tab_bar.currentChanged.connect(self.content_stack.setCurrentIndex)
+        self.tab_bar.currentChanged.connect(self._on_tab_changed)
+        self.content_stack.setCurrentIndex(self.tab_bar.currentIndex())
+        main.addWidget(self.main_frame, 1)
+
+        # Shell layer 3: footer is a sibling of navigation/content, never a page child.
+        self.footer_group = self._build_bottom_bar()
+        set_role(self.footer_group, "footer")
+        main.addWidget(self.footer_group, 0)
 
     def _on_tab_changed(self, index):
         if hasattr(self, "dataset_manager"):
@@ -3322,14 +3688,15 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addWidget(self.config_dropdown)
         lay.addWidget(make_btn("Save Config", self.save_config))
         lay.addWidget(make_btn("Save As...", self.save_as_config))
-        self.tab_view.setCornerWidget(corner, QtCore.Qt.Corner.TopRightCorner)
+        return corner
 
     def _build_bottom_bar(self):
-        lay = QtWidgets.QHBoxLayout()
+        footer = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(footer)
         lay.setContentsMargins(0, 5, 5, 5)
 
         calc_gb = QtWidgets.QGroupBox()
-        calc_gb.setStyleSheet(f"QGroupBox {{ margin-top: 0px; border: 1px solid {BORDER}; border-radius: 6px; padding: 0px 8px; }}")
+        set_role(calc_gb, "flat")
         calc_lay = QtWidgets.QHBoxLayout(calc_gb)
         calc_lay.setContentsMargins(0, 0, 0, 0)
         calc_lay.setSpacing(10)
@@ -3352,7 +3719,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.force_save_button = make_btn("Emergency Checkpoint", self.force_save_checkpoint)
         self.force_save_button.setObjectName("ForceSaveButton")
         self.force_save_button.setVisible(False)
-        self.force_save_button.setStyleSheet(f"background: {WARN}; color: {DARK_BG}; font-weight: bold; border-color: {WARN};")
+        set_role(self.force_save_button, "warning")
         
         self.stop_button = make_btn("Stop Training", self.stop_training)
         self.stop_button.setObjectName("StopButton")
@@ -3361,22 +3728,19 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addWidget(self.start_button)
         lay.addWidget(self.force_save_button)
         lay.addWidget(self.stop_button)
-        
-        self.layout().addLayout(lay)
+        return footer
 
     def _build_dataset_tab(self, parent):
         layout = QtWidgets.QVBoxLayout(parent)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split = ThemedSplitter(QtCore.Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
         settings_panel = QtWidgets.QWidget()
-        settings_panel.setMinimumWidth(300)
-        settings_panel.setMaximumWidth(380)
         settings_lay = QtWidgets.QVBoxLayout(settings_panel)
-        settings_lay.setContentsMargins(0, 0, 10, 0)
+        settings_lay.setContentsMargins(15, 15, 10, 15)
         settings_lay.setSpacing(10)
         settings_lay.addWidget(make_label("Dataset Settings", color=ACCENT, bold=True, size=12))
         settings_lay.addWidget(self._build_caption_source_group())
@@ -3390,15 +3754,21 @@ class TrainingGUI(QtWidgets.QWidget):
         ]:
             settings_lay.addWidget(self._form_group(title, keys))
         settings_lay.addStretch(1)
-        split.addWidget(self._make_scroll_panel(settings_panel, 320, 400))
+        settings_scroll = self._make_scroll_panel(settings_panel, 280, 700)
+        split.addWidget(settings_scroll)
 
         self.dataset_manager = DatasetManagerWidget(self)
+        self.dataset_manager.setMinimumWidth(320)
+        self.dataset_manager.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
         self.dataset_manager.datasetsChanged.connect(self._update_training_calculations)
         self.dataset_manager.datasetsChanged.connect(self._update_epoch_markers_on_graph)
         split.addWidget(self.dataset_manager)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([340, 980])
+        split.setSizes([400, 920])
         layout.addWidget(split, 1)
 
         if "MULTI_BUCKET_EXTRA_BUCKETS" in self.widgets:
@@ -3471,7 +3841,7 @@ class TrainingGUI(QtWidgets.QWidget):
         row_lay.setContentsMargins(0, 0, 0, 0)
         row_lay.setSpacing(8)
         row_lay.addWidget(make_label(label), 0)
-        slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        slider = NoScrollSlider(QtCore.Qt.Orientation.Horizontal)
         slider.setRange(0, 100)
         slider.setSingleStep(1)
         slider.setPageStep(5)
@@ -3553,17 +3923,15 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_model_training_tab(self, parent):
         layout = QtWidgets.QVBoxLayout(parent)
-        layout.setContentsMargins(15, 15, 15, 15)
-        layout.setSpacing(12)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
 
-        split = QtWidgets.QSplitter(QtCore.Qt.Orientation.Horizontal)
+        split = ThemedSplitter(QtCore.Qt.Orientation.Horizontal)
         split.setChildrenCollapsible(False)
 
         settings_panel = QtWidgets.QWidget()
-        settings_panel.setMinimumWidth(360)
-        settings_panel.setMaximumWidth(480)
         settings_lay = QtWidgets.QVBoxLayout(settings_panel)
-        settings_lay.setContentsMargins(0, 0, 10, 0)
+        settings_lay.setContentsMargins(15, 15, 10, 15)
         settings_lay.setSpacing(10)
         settings_lay.addWidget(make_label("Model Setup", color=ACCENT, bold=True, size=12))
         settings_lay.addWidget(self._build_architecture_group())
@@ -3578,18 +3946,25 @@ class TrainingGUI(QtWidgets.QWidget):
         self.advanced_group = self._build_advanced_group()
         settings_lay.addWidget(self.advanced_group)
         settings_lay.addStretch(1)
-        split.addWidget(self._make_scroll_panel(settings_panel, 380, 500))
+        settings_scroll = self._make_scroll_panel(settings_panel, 240, 700)
+        split.addWidget(settings_scroll)
 
         main_panel = QtWidgets.QWidget()
         main_lay = QtWidgets.QVBoxLayout(main_panel)
-        main_lay.setContentsMargins(10, 0, 0, 0)
+        main_lay.setSizeConstraint(QtWidgets.QLayout.SizeConstraint.SetNoConstraint)
+        main_panel.setMinimumWidth(320)
+        main_panel.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        main_lay.setContentsMargins(10, 15, 15, 15)
         main_lay.setSpacing(14)
         main_lay.addWidget(make_label("Training Parameters", color=ACCENT, bold=True, size=12))
 
         upper = QtWidgets.QHBoxLayout(); upper.setSpacing(20)
-        upper.addWidget(self._build_lr_scheduler_group(), 3)
+        upper.addWidget(self._build_lr_scheduler_group(), 1)
         self.timestep_group = self._build_timestep_group()
-        upper.addWidget(self.timestep_group, 2)
+        upper.addWidget(self.timestep_group, 1)
         main_lay.addLayout(upper)
 
         optimizer_row = QtWidgets.QHBoxLayout()
@@ -3599,10 +3974,22 @@ class TrainingGUI(QtWidgets.QWidget):
         optimizer_row.addWidget(self.loss_group, 1)
         main_lay.addLayout(optimizer_row)
         main_lay.addStretch(1)
-        split.addWidget(main_panel)
+        main_scroll = QtWidgets.QScrollArea()
+        set_role(main_scroll, "mainContent")
+        main_scroll.setFrameShape(QtWidgets.QFrame.Shape.NoFrame)
+        main_scroll.setWidgetResizable(True)
+        main_scroll.setVerticalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        main_scroll.setHorizontalScrollBarPolicy(QtCore.Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        main_scroll.setMinimumWidth(320)
+        main_scroll.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        main_scroll.setWidget(main_panel)
+        split.addWidget(main_scroll)
         split.setStretchFactor(0, 0)
         split.setStretchFactor(1, 1)
-        split.setSizes([460, 1040])
+        split.setSizes([400, 1100])
         layout.addWidget(split, 1)
 
         for args in [
@@ -3610,6 +3997,7 @@ class TrainingGUI(QtWidgets.QWidget):
             ("MAX_TRAIN_STEPS", "textChanged", self._update_training_calculations),
             ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_epoch_markers_on_graph),
             ("GRADIENT_ACCUMULATION_STEPS", "textChanged", self._update_training_calculations),
+            ("BATCH_SIZE", "valueChanged", self._update_epoch_markers_on_graph),
             ("BATCH_SIZE", "valueChanged", self._update_training_calculations),
         ]:
             self._connect_widget_signal(*args)
@@ -3675,7 +4063,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.tokenizer_paths_group, tokenizer_paths_lay = self._make_path_subgroup("Tokenizer Folders")
         tokenizer_help_btn = make_btn("!", self._show_anima_tokenizer_help)
         tokenizer_help_btn.setFixedSize(24, 24)
-        tokenizer_help_btn.setStyleSheet("padding: 0; min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px; font-weight: bold;")
+        set_role(tokenizer_help_btn, "icon")
         tokenizer_help_btn.setToolTip("Show Anima tokenizer download links")
         tokenizer_paths_lay.addWidget(self._make_compact_path_row("TOKENIZER_PATH", [tokenizer_help_btn]))
         tokenizer_paths_lay.addWidget(self._make_compact_path_row("TOKENIZER_T5XXL_PATH"))
@@ -3694,25 +4082,8 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _make_path_subgroup(self, title):
         gb = QtWidgets.QGroupBox(title)
+        set_role(gb, "nested")
         gb.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding, QtWidgets.QSizePolicy.Policy.Fixed)
-        gb.setStyleSheet(
-            f"QGroupBox {{ "
-            f"border: 1px solid {BORDER}; "
-            "border-radius: 5px; "
-            "margin-top: 12px; "
-            "padding: 8px 6px 6px 6px; "
-            f"background: {GRAPH_BG}; "
-            f"}} "
-            f"QGroupBox::title {{ "
-            "subcontrol-origin: margin; "
-            "subcontrol-position: top left; "
-            "left: 8px; "
-            "padding: 0 4px; "
-            f"color: {ACCENT}; "
-            "font-weight: bold; "
-            f"background: {DARK_BG}; "
-            f"}}"
-        )
         lay = QtWidgets.QVBoxLayout(gb)
         lay.setContentsMargins(6, 8, 6, 6)
         lay.setSpacing(3)
@@ -3829,7 +4200,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         browse = make_btn("+", lambda _, ft=file_type, le=line: self._browse_path(le, ft))
         browse.setFixedSize(24, 24)
-        browse.setStyleSheet("padding: 0; min-width: 24px; max-width: 24px; min-height: 24px; max-height: 24px; font-weight: bold;")
+        set_role(browse, "icon")
         browse.setToolTip(f"Select {label_text}")
         picker_lay.addWidget(browse)
         lay.addWidget(picker)
@@ -3856,16 +4227,54 @@ class TrainingGUI(QtWidgets.QWidget):
         self.widgets['LR_CUSTOM_CURVE'] = self.lr_curve_widget
         self.lr_curve_widget.pointsChanged.connect(lambda pts: self._sync_widget("LR_CUSTOM_CURVE"))
         self.lr_curve_widget.selectionChanged.connect(self._update_lr_button_states)
-        lay.addWidget(self.lr_curve_widget)
+        curve_group, curve_lay = group_box("Learning Rate Curve")
+        chart_stage = QtWidgets.QWidget()
+        chart_stack = QtWidgets.QGridLayout(chart_stage)
+        chart_stack.setContentsMargins(0, 0, 0, 0)
+        chart_stack.addWidget(self.lr_curve_widget, 0, 0)
+        button_overlay = QtWidgets.QWidget()
+        button_overlay.setObjectName("learningRatePointPill")
+        set_role(button_overlay, "chartOverlay")
+        btn_row = QtWidgets.QHBoxLayout(button_overlay)
+        btn_row.setContentsMargins(3, 3, 3, 3)
+        btn_row.setSpacing(2)
+        self.add_point_btn = make_btn("+", self.lr_curve_widget.add_point)
+        self.remove_point_btn = make_btn("−", self.lr_curve_widget.remove_selected_point)
+        self.add_point_btn.setToolTip("Add a point to the learning-rate curve.")
+        self.remove_point_btn.setToolTip("Remove the selected learning-rate point.")
+        for button in (self.add_point_btn, self.remove_point_btn):
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            button.setMinimumSize(32, 32)
+            button.setMaximumSize(32, 32)
+            button.resize(32, 32)
+            set_role(button, "icon")
+        btn_row.addWidget(self.add_point_btn); btn_row.addWidget(self.remove_point_btn)
+        chart_stack.addWidget(
+            button_overlay, 0, 0,
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom,
+        )
+        curve_lay.addWidget(chart_stage)
+        lay.addWidget(curve_group)
 
-        btn_row = QtWidgets.QHBoxLayout()
-        self.add_point_btn = make_btn("Add Point", self.lr_curve_widget.add_point)
-        self.remove_point_btn = make_btn("Remove Point", self.lr_curve_widget.remove_selected_point)
-        btn_row.addWidget(self.add_point_btn); btn_row.addWidget(self.remove_point_btn); btn_row.addStretch()
-        lay.addLayout(btn_row)
+        curve_settings, settings_lay = group_box("Curve Settings")
+        bounds_row = QtWidgets.QHBoxLayout()
+        bounds_row.setContentsMargins(0, 0, 0, 0)
+        bounds_row.setSpacing(10)
+        for key in ["LR_GRAPH_MIN", "LR_GRAPH_MAX"]:
+            col = QtWidgets.QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(3)
+            self._add_vertical_widget_key(col, key)
+            bounds_row.addLayout(col, 1)
+        settings_lay.addLayout(bounds_row)
+        curve_settings.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        lay.addWidget(curve_settings, 0)
 
-        pg = QtWidgets.QWidget()
-        pgrid = QtWidgets.QGridLayout(pg); pgrid.setContentsMargins(0,0,0,0); pgrid.setSpacing(8)
+        presets_group, pgrid = group_box("Schedule Presets", QtWidgets.QGridLayout)
+        pgrid.setSpacing(8)
         pgrid.addWidget(make_label("Restarts:"), 0, 0)
         restarts_spin = NoScrollSpinBox(); restarts_spin.setRange(1, 50); restarts_spin.setValue(1)
         pgrid.addWidget(restarts_spin, 0, 1)
@@ -3879,18 +4288,11 @@ class TrainingGUI(QtWidgets.QWidget):
             "Cosine", restarts_spin.value(), init_warmup.value() / 100, restart_ramp.value() / 100)), 3, 0)
         pgrid.addWidget(make_btn("Apply Linear", lambda: self.lr_curve_widget.set_generated_preset(
             "Linear", restarts_spin.value(), init_warmup.value() / 100, restart_ramp.value() / 100)), 3, 1)
-        lay.addWidget(pg)
-
-        bounds_row = QtWidgets.QHBoxLayout()
-        bounds_row.setContentsMargins(0, 0, 0, 0)
-        bounds_row.setSpacing(10)
-        for key in ["LR_GRAPH_MIN", "LR_GRAPH_MAX"]:
-            col = QtWidgets.QVBoxLayout()
-            col.setContentsMargins(0, 0, 0, 0)
-            col.setSpacing(3)
-            self._add_vertical_widget_key(col, key)
-            bounds_row.addLayout(col, 1)
-        lay.addLayout(bounds_row)
+        presets_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        lay.addWidget(presets_group, 1)
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return gb
@@ -3915,27 +4317,69 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_loss_group(self):
         gb, lay = group_box("Loss Configuration")
+        settings_group, settings_lay = group_box("Loss Settings")
         loss_form = QtWidgets.QFormLayout()
         loss_form.setContentsMargins(0, 0, 0, 0)
         self._add_form_keys(loss_form, ["LOSS_TYPE"])
-        lay.addLayout(loss_form)
+        settings_lay.addLayout(loss_form)
+        settings_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        lay.addWidget(settings_group, 0)
 
         self.timestep_loss_curve = TimestepLossWeightCurveWidget()
         self.widgets["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve
         self.timestep_loss_curve.pointsChanged.connect(lambda _: self._sync_widget("TIMESTEP_LOSS_WEIGHT_CURVE"))
         self.timestep_loss_curve.selectionChanged.connect(self._update_timestep_loss_button_states)
-        lay.addWidget(self.timestep_loss_curve)
-
-        loss_btn_row = QtWidgets.QHBoxLayout()
-        self.loss_weight_add_btn = make_btn("Add Point", self.timestep_loss_curve.add_point)
-        self.loss_weight_remove_btn = make_btn("Remove Point", self.timestep_loss_curve.remove_selected_point)
+        curve_group, curve_lay = group_box("Timestep Loss Weight Curve")
+        chart_stage = QtWidgets.QWidget()
+        chart_stack = QtWidgets.QGridLayout(chart_stage)
+        chart_stack.setContentsMargins(0, 0, 0, 0)
+        chart_stack.addWidget(self.timestep_loss_curve, 0, 0)
+        button_overlay = QtWidgets.QWidget()
+        button_overlay.setObjectName("timestepLossPointPill")
+        set_role(button_overlay, "chartOverlay")
+        loss_btn_row = QtWidgets.QHBoxLayout(button_overlay)
+        loss_btn_row.setContentsMargins(3, 3, 3, 3)
+        loss_btn_row.setSpacing(2)
+        self.loss_weight_add_btn = make_btn("+", self.timestep_loss_curve.add_point)
+        self.loss_weight_remove_btn = make_btn("−", self.timestep_loss_curve.remove_selected_point)
+        self.loss_weight_add_btn.setToolTip("Add a point to the timestep loss-weight curve.")
+        self.loss_weight_remove_btn.setToolTip("Remove the selected timestep loss-weight point.")
+        for button in (self.loss_weight_add_btn, self.loss_weight_remove_btn):
+            button.setSizePolicy(QtWidgets.QSizePolicy.Policy.Fixed, QtWidgets.QSizePolicy.Policy.Fixed)
+            button.setMinimumSize(32, 32)
+            button.setMaximumSize(32, 32)
+            button.resize(32, 32)
+            set_role(button, "icon")
         self.loss_weight_remove_btn.setEnabled(False)
         loss_btn_row.addWidget(self.loss_weight_add_btn)
         loss_btn_row.addWidget(self.loss_weight_remove_btn)
-        lay.addLayout(loss_btn_row)
+        chart_stack.addWidget(
+            button_overlay, 0, 0,
+            QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom,
+        )
+        curve_lay.addWidget(chart_stage)
+        curve_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Expanding,
+        )
+        lay.addWidget(curve_group, 1)
 
+        presets_group, presets_lay = group_box("Loss Weight Presets")
         preset_row = QtWidgets.QGridLayout()
         preset_row.setSpacing(8)
+        hysocs_flat_learning = [
+            [0.0, 0.4583], [0.025, 0.4583], [0.075, 0.5174],
+            [0.125, 0.6021], [0.175, 0.6956], [0.225, 0.8013],
+            [0.275, 0.9109], [0.325, 1.0093], [0.375, 1.0737],
+            [0.425, 1.1336], [0.475, 1.2181], [0.525, 1.3103],
+            [0.575, 1.3843], [0.625, 1.4146], [0.675, 1.4054],
+            [0.725, 1.3916], [0.775, 1.3926], [0.825, 1.3309],
+            [0.875, 1.1222], [0.9, 0.95], [0.925, 0.85],
+            [0.95, 0.7], [0.97, 0.55], [0.98, 0.25], [1.0, 0.14],
+        ]
         for idx, (label, points) in enumerate([
             ("Uniform", [[0.0, 1.0], [1.0, 1.0]]),
             ("Mid Boost", [[0.0, 1.0], [0.5, 2.0], [1.0, 1.0]]),
@@ -3943,6 +4387,7 @@ class TrainingGUI(QtWidgets.QWidget):
             ("Early Suppress", [[0.0, 0.5], [0.2, 1.0], [1.0, 1.0]]),
             ("Late Suppress", [[0.0, 1.0], [0.8, 1.0], [1.0, 0.5]]),
             ("Min-SNR-like", "min_snr_like"),
+            ("Timestep Balance", hysocs_flat_learning),
         ]):
             if label == "Soft Bell":
                 b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_bell_preset())
@@ -3950,9 +4395,18 @@ class TrainingGUI(QtWidgets.QWidget):
                 b = make_btn(label, lambda _=False: self.timestep_loss_curve.apply_min_snr_like_preset())
             else:
                 b = make_btn(label, lambda _, pts=points: self.timestep_loss_curve.apply_preset(pts))
-            b.setStyleSheet("padding: 4px; font-size: 8pt;")
+            if label == "Timestep Balance":
+                b.setToolTip(
+                    "Apply the Hysocs 25-point equalization curve for flatter learning across all timesteps."
+                )
+            set_role(b, "compact")
             preset_row.addWidget(b, idx // 3, idx % 3)
-        lay.addLayout(preset_row)
+        presets_lay.addLayout(preset_row)
+        presets_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        lay.addWidget(presets_group, 0)
         return gb
 
     def _build_optimizer_group(self):
@@ -3978,7 +4432,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_adam_optimizer_form(self, prefix):
         container = QtWidgets.QWidget()
-        lay = QtWidgets.QFormLayout(container); lay.setContentsMargins(0, 5, 0, 0)
+        lay = QtWidgets.QVBoxLayout(container); lay.setContentsMargins(0, 5, 0, 0); lay.setSpacing(8)
 
         for name, widget in [
             ("betas", QtWidgets.QLineEdit()),
@@ -3996,13 +4450,23 @@ class TrainingGUI(QtWidgets.QWidget):
         gc = self.widgets[f'{prefix}_use_grad_centralization']
         gca = self.widgets[f'{prefix}_gc_alpha']
         gc.stateChanged.connect(lambda s: gca.setEnabled(bool(s)))
+
+        core_group, core_lay = group_box("Core Optimizer Settings", QtWidgets.QFormLayout)
         for lbl, key in [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
                         ("Weight Decay:", f'{prefix}_weight_decay'), ("Debias Strength:", f'{prefix}_debias_strength')]:
-            lay.addRow(lbl, self.widgets[key])
+            core_lay.addRow(lbl, self.widgets[key])
+        lay.addWidget(core_group)
+
         if prefix in {"RAVEN", "TITAN"}:
-            lay.addRow("Momentum Precision:", self.widgets[f'{prefix}_momentum_dtype'])
-        lay.addRow(gc)
-        lay.addRow("GC Alpha:", gca)
+            momentum_group, momentum_lay = group_box("Momentum Precision", QtWidgets.QFormLayout)
+            momentum_lay.addRow(self.widgets[f'{prefix}_momentum_dtype'])
+            lay.addWidget(momentum_group)
+
+        gc_group, gc_lay = group_box("Gradient Centralization", QtWidgets.QFormLayout)
+        gc_lay.addRow(gc)
+        gc_lay.addRow("GC Alpha:", gca)
+        lay.addWidget(gc_group)
+        lay.addStretch(1)
         return container
     
     def _build_velorms_form(self):
@@ -4043,10 +4507,7 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addLayout(preset_grid)
         lay.addWidget(make_separator())
         detect_btn = make_btn("Run VAE Diagnostics", self.launch_vae_detector)
-        detect_btn.setStyleSheet(
-            f"QPushButton {{ background: {PANEL_BG}; color: {ACCENT}; border: 1px solid {ACCENT}; }}"
-            f"QPushButton:disabled {{ color: {TEXT_MUTED}; background: transparent; border: 1px solid {BORDER_MUTED}; }}"
-        )
+        set_role(detect_btn, "accent")
         lay.addWidget(detect_btn)
         return gb
 
@@ -4078,7 +4539,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg_path = os.path.join(self.config_dir, f"{key}.json")
         if not os.path.exists(cfg_path):
             QtWidgets.QMessageBox.critical(self, "Config Not Found", f"Save the configuration first.\n{cfg_path}"); return
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = str(PROJECT_ROOT)
         target = next((p for p in [os.path.join(script_dir, "vae_diagnostics.py"),
                                     os.path.join(script_dir, "tools", "vae_diagnostics.py")] if os.path.exists(p)), None)
         if not target: self.log("Error: 'vae_diagnostics.py' not found."); return
@@ -4097,8 +4558,11 @@ class TrainingGUI(QtWidgets.QWidget):
         self.timestep_histogram = TimestepHistogramWidget()
         self.widgets["TIMESTEP_ALLOCATION"] = self.timestep_histogram
         self.timestep_histogram.allocationChanged.connect(lambda _: self._sync_widget("TIMESTEP_ALLOCATION"))
-        lay.addWidget(self.timestep_histogram)
+        chart_group, chart_lay = group_box("Ticket Allocation Chart")
+        chart_lay.addWidget(self.timestep_histogram)
+        lay.addWidget(chart_group)
 
+        distribution_group, distribution_lay = group_box("Distribution Settings")
         r1 = QtWidgets.QHBoxLayout()
         r1.addWidget(make_label("Bin Size:"))
         self.bin_size_combo = make_combo(["30", "40", "50", "100", "200", "250", "500"])
@@ -4108,7 +4572,7 @@ class TrainingGUI(QtWidgets.QWidget):
         r1.addWidget(make_label("Distribution Mode:"))
         self.ts_mode_combo = make_combo(["Wave", "Logit-Normal", "Beta"])
         r1.addWidget(self.ts_mode_combo, 1)
-        lay.addLayout(r1)
+        distribution_lay.addLayout(r1)
 
         self.ts_slider_stack = QtWidgets.QStackedWidget()
 
@@ -4130,8 +4594,10 @@ class TrainingGUI(QtWidgets.QWidget):
         self.slider_beta_alpha, self.spin_beta_alpha = self._add_slider_row(bl, "Alpha:", 0.1, 10.0, 3.0, 100.0)
         self.slider_beta_beta, self.spin_beta_beta = self._add_slider_row(bl, "Beta:", 0.1, 10.0, 3.0, 100.0)
         self.ts_slider_stack.addWidget(beta_page)
-        lay.addWidget(self.ts_slider_stack)
+        distribution_lay.addWidget(self.ts_slider_stack)
+        lay.addWidget(distribution_group)
 
+        presets_group, presets_lay = group_box("Distribution Presets")
         self.ts_button_stack = QtWidgets.QStackedWidget()
         presets_by_mode = [
             [("Uniform (Flat)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
@@ -4145,19 +4611,58 @@ class TrainingGUI(QtWidgets.QWidget):
             pgrid = QtWidgets.QGridLayout(page); pgrid.setSpacing(8); pgrid.setContentsMargins(0, 0, 0, 0)
             for i, (label, preset_name) in enumerate(page_presets):
                 b = make_btn(label, lambda _, pn=preset_name: self._apply_timestep_preset(pn))
-                b.setStyleSheet("padding: 4px; font-size: 8pt;")
+                set_role(b, "compact")
                 pgrid.addWidget(b, i // 3, i % 3)
             self.ts_button_stack.addWidget(page)
-        lay.addWidget(self.ts_button_stack)
+        presets_lay.addWidget(self.ts_button_stack)
+        lay.addWidget(presets_group)
 
         self.bin_size_combo.currentTextChanged.connect(lambda t: (self.timestep_histogram.set_bin_size(int(t)), self._update_timestep_distribution()))
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(lambda _: self._update_timestep_distribution())
-        coverage_form = QtWidgets.QFormLayout()
-        coverage_form.setContentsMargins(0, 0, 0, 0)
+        self.timestep_coverage_controls = QtWidgets.QGroupBox("Timestep Coverage")
+        coverage_form = QtWidgets.QFormLayout(self.timestep_coverage_controls)
+        coverage_form.setContentsMargins(8, 6, 8, 6)
         self._add_form_keys(coverage_form, ["TIMESTEP_STRATIFIED_SAMPLING"])
-        lay.addLayout(coverage_form)
+        self.widgets["TIMESTEP_STRATIFIED_SAMPLING"].setText("Stratified Coverage")
+        self.anima_sigma_shift_controls = QtWidgets.QGroupBox("Anima Physical Sigma Shift")
+        shift_lay = QtWidgets.QFormLayout(self.anima_sigma_shift_controls)
+        shift_lay.setContentsMargins(8, 6, 8, 6)
+        self.anima_sigma_shift_enabled = QtWidgets.QCheckBox("Apply sigma shift")
+        self.anima_sigma_shift_enabled.setToolTip(
+            "Transform the physical flow sigma grid. This does not change ticket sampling or loss weighting."
+        )
+        self.anima_sigma_shift_enabled.setChecked(True)
+        self.widgets["ANIMA_SIGMA_SHIFT_ENABLED"] = self.anima_sigma_shift_enabled
+        shift_lay.addRow(self.anima_sigma_shift_enabled)
+        shift_row = QtWidgets.QWidget()
+        shift_row_lay = QtWidgets.QHBoxLayout(shift_row)
+        shift_row_lay.setContentsMargins(0, 0, 0, 0)
+        shift_row_lay.setSpacing(5)
+        shift_row_lay.addWidget(make_label("Value:"))
+        self.anima_sigma_shift_spin = NoScrollDoubleSpinBox()
+        self.anima_sigma_shift_spin.setRange(0.1, 10.0)
+        self.anima_sigma_shift_spin.setSingleStep(0.1)
+        self.anima_sigma_shift_spin.setDecimals(2)
+        self.anima_sigma_shift_spin.setValue(3.0)
+        self.anima_sigma_shift_spin.setFixedWidth(110)
+        shift_row_lay.addWidget(self.anima_sigma_shift_spin)
+        shift_row_lay.addStretch(1)
+        shift_lay.addRow(shift_row)
+        self.widgets["ANIMA_SIGMA_SHIFT"] = self.anima_sigma_shift_spin
+        self.anima_sigma_shift_enabled.toggled.connect(
+            lambda enabled: (
+                self.anima_sigma_shift_spin.setEnabled(enabled),
+                self._sync_widget("ANIMA_SIGMA_SHIFT_ENABLED"),
+            )
+        )
+        self.anima_sigma_shift_spin.valueChanged.connect(lambda _: self._sync_widget("ANIMA_SIGMA_SHIFT"))
+        bottom_controls = QtWidgets.QHBoxLayout()
+        bottom_controls.setSpacing(10)
+        bottom_controls.addWidget(self.timestep_coverage_controls, 1)
+        bottom_controls.addWidget(self.anima_sigma_shift_controls, 2)
+        lay.addLayout(bottom_controls)
         return gb
 
     def _update_timestep_loss_button_states(self, idx):
@@ -4169,7 +4674,7 @@ class TrainingGUI(QtWidgets.QWidget):
         h = QtWidgets.QHBoxLayout(container); h.setContentsMargins(0, 0, 0, 0)
         lbl = make_label(label_text); lbl.setFixedWidth(90)
         h.addWidget(lbl)
-        sl = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
+        sl = NoScrollSlider(QtCore.Qt.Orientation.Horizontal)
         sl.setRange(int(min_val * divider), int(max_val * divider))
         sl.setValue(int(default_val * divider))
         sp = NoScrollDoubleSpinBox(); sp.setRange(min_val, max_val); sp.setSingleStep(0.1)
@@ -4375,6 +4880,10 @@ class TrainingGUI(QtWidgets.QWidget):
             self.ts_mode_combo.blockSignals(True)
             self.ts_mode_combo.setCurrentText(ts_mode)
             self.ts_mode_combo.blockSignals(False)
+            if hasattr(self, "anima_sigma_shift_enabled"):
+                shift_enabled = bool(self.current_config.get("ANIMA_SIGMA_SHIFT_ENABLED", True))
+                self.anima_sigma_shift_enabled.setChecked(shift_enabled)
+                self.anima_sigma_shift_spin.setEnabled(shift_enabled)
 
             if hasattr(self, 'dataset_manager'):
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
@@ -4414,15 +4923,22 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["LOSS_TYPE"] = "MSE"
         cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
+        if is_dit and hasattr(self, "anima_sigma_shift_enabled"):
+            cfg["ANIMA_SIGMA_SHIFT_ENABLED"] = self.anima_sigma_shift_enabled.isChecked()
+            cfg["ANIMA_SIGMA_SHIFT"] = self.anima_sigma_shift_spin.value()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
         if hasattr(self, 'timestep_loss_curve'): cfg["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve.get_points()
 
         for prefix, key in [("RAVEN", "RAVEN_PARAMS"), ("TITAN", "TITAN_PARAMS")]:
             try:
                 betas = [float(x) for x in self.widgets[f"{prefix}_betas"].text().split(',')]
-            except: betas = [0.9, 0.999]
+            except Exception as exc:
+                report_gui_exception(f"invalid {prefix} betas; using defaults", exc)
+                betas = [0.9, 0.999]
             try: eps = float(self.widgets[f"{prefix}_eps"].text())
-            except: eps = 1e-8
+            except Exception as exc:
+                report_gui_exception(f"invalid {prefix} epsilon; using default", exc)
+                eps = 1e-8
             cfg[key] = {
                 "betas": betas, "eps": eps,
                 "weight_decay": self.widgets[f"{prefix}_weight_decay"].value(),
@@ -4436,7 +4952,9 @@ class TrainingGUI(QtWidgets.QWidget):
                 cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
 
         try: veps = float(self.widgets["VELORMS_eps"].text())
-        except: veps = 1e-8
+        except Exception as exc:
+            report_gui_exception("invalid VELORMS epsilon; using default", exc)
+            veps = 1e-8
         cfg["VELORMS_PARAMS"] = {
             "weight_decay": self.widgets["VELORMS_weight_decay"].value(),
             "eps": veps,
@@ -4459,9 +4977,9 @@ class TrainingGUI(QtWidgets.QWidget):
             grad_accum = int(self.widgets["GRADIENT_ACCUMULATION_STEPS"].text())
             batch = self.widgets["BATCH_SIZE"].value()
             total_images = self.dataset_manager.get_total_repeats()
-            opt_steps = max_steps // grad_accum if grad_accum else 0
-            steps_per_epoch = total_images // batch if total_images and batch else 0
-            epochs = max_steps / steps_per_epoch if steps_per_epoch else float('inf')
+            opt_steps, _steps_per_epoch, epochs = gui_math.training_calculations(
+                max_steps, grad_accum, batch, total_images
+            )
             self.optimizer_steps_label.setText(f"{opt_steps:,}")
             self.epochs_label.setText("∞" if epochs == float('inf') else f"{epochs:.2f}")
             if hasattr(self, 'timestep_histogram'): self.timestep_histogram.set_total_steps(max_steps)
@@ -4471,11 +4989,17 @@ class TrainingGUI(QtWidgets.QWidget):
     def _update_and_clamp_lr_graph(self):
         if not hasattr(self, 'lr_curve_widget'): return
         try: steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-        except: steps = 1
+        except Exception as exc:
+            report_gui_exception("invalid max training steps for LR graph; using 1", exc)
+            steps = 1
         try: min_lr = float(self.widgets["LR_GRAPH_MIN"].text())
-        except: min_lr = 0.0
+        except Exception as exc:
+            report_gui_exception("invalid LR graph minimum; using 0", exc)
+            min_lr = 0.0
         try: max_lr = float(self.widgets["LR_GRAPH_MAX"].text())
-        except: max_lr = 1e-6
+        except Exception as exc:
+            report_gui_exception("invalid LR graph maximum; using 1e-6", exc)
+            max_lr = 1e-6
         if "LR_CUSTOM_CURVE" in self.current_config:
             self.current_config["LR_CUSTOM_CURVE"] = [
                 [p[0], max(min_lr, min(max_lr, p[1]))] for p in self.current_config["LR_CUSTOM_CURVE"]]
@@ -4488,9 +5012,14 @@ class TrainingGUI(QtWidgets.QWidget):
         try:
             total = self.dataset_manager.get_total_repeats()
             max_steps = int(self.widgets["MAX_TRAIN_STEPS"].text())
-        except: self.lr_curve_widget.set_epoch_data([]); return
+            batch = self.widgets["BATCH_SIZE"].value()
+        except Exception as exc:
+            report_gui_exception("could not update epoch markers; clearing them", exc)
+            self.lr_curve_widget.set_epoch_data([])
+            return
         if total > 0 and max_steps > 0:
-            self.lr_curve_widget.set_epoch_interval(total, (max_steps - 1) // total)
+            interval, count = gui_math.epoch_marker_interval(max_steps, batch, total)
+            self.lr_curve_widget.set_epoch_interval(interval, count)
         else:
             self.lr_curve_widget.set_epoch_interval(0, 0)
 
@@ -4524,7 +5053,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.start_button.setVisible(False); self.stop_button.setVisible(True); self.force_save_button.setVisible(True)
         self.live_metrics_widget.clear_data()
 
-        script_dir = os.path.dirname(os.path.abspath(__file__))
+        script_dir = str(PROJECT_ROOT)
         stale_force_save_flag = os.path.join(script_dir, "force_save.flag")
         if os.path.exists(stale_force_save_flag):
             try:
@@ -4556,7 +5085,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def force_save_checkpoint(self):
         if self.process_runner and self.process_runner.isRunning():
-            flag_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "force_save.flag")
+            flag_path = str(PROJECT_ROOT / "force_save.flag")
             try:
                 with open(flag_path, 'w') as f:
                     f.write("1")
@@ -4617,9 +5146,13 @@ class TrainingGUI(QtWidgets.QWidget):
         self.style().drawPrimitive(QtWidgets.QStyle.PrimitiveElement.PE_Widget, opt, painter, self)
 
 
-if __name__ == "__main__":
+def main():
     app = QtWidgets.QApplication(sys.argv)
     app.setStyleSheet(STYLESHEET)
     win = TrainingGUI()
     win.show()
     sys.exit(app.exec())
+
+
+if __name__ == "__main__":
+    main()

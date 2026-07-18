@@ -87,7 +87,7 @@ from train import (
 AnimaImagePipeline = None
 ModelConfig = None
 
-
+#workaround for Comfy quantized DiT weights: dequantize to BF16 for DiffSynth computation
 ANIMA_QAT_TARGET_FORMAT = "bfp16"  # bf16/bfp16, nvfp4, int8, e4m3, or e5m2
 ANIMA_QAT_NVFP4_SCALE_MULTIPLIER = 1.0
 ANIMA_REPAIR_LINEART_LOSS_ENABLED = True
