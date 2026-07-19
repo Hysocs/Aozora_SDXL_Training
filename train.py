@@ -429,7 +429,12 @@ class AsyncReporter:
         eta_str = self._format_time(timing_data.get('eta'))
         loss_val = timing_data.get('loss', 0.0)
         timestep_val = timing_data.get('timestep', 'N/A')
-        prog_str = f'Training |{bar}| {global_step + 1}/{self.total_steps}[{percentage:.2%}][Loss: {loss_val:.4f}, Timestep: {timestep_val}][{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]'
+        sigma_val = timing_data.get('sigma')
+        sampling_text = (
+            f"Ticket: {timestep_val}, Sigma: {float(sigma_val):.6f}"
+            if sigma_val is not None else f"Timestep: {timestep_val}"
+        )
+        prog_str = f'Training |{bar}| {global_step + 1}/{self.total_steps}[{percentage:.2%}][Loss: {loss_val:.4f}, {sampling_text}][{s_per_step:.2f}s/step, ETA: {eta_str}, Elapsed: {time_spent_str}]'
         print('\r' + prog_str, end='', flush=True)
         self._last_line_len = len(prog_str)
 
@@ -2536,6 +2541,13 @@ def main():
     else:
         print(f"\n--- Using Rectified Flow ---")
 
+    # A common 0-1 telemetry value for the GUI. For DDPM this is the bounded
+    # noise coefficient used by add_noise; rectified flow reports its mix t.
+    scheduler_noise_sigmas = (
+        (1.0 - scheduler.alphas_cumprod.to(device=device, dtype=torch.float32)).clamp_min(0.0).sqrt()
+        if scheduler is not None else None
+    )
+
     print("\n--- Initializing Dataset ---")
     dataset   = ImageTextLatentDataset(config)
     print_dataset_resolution_sample(dataset, sample_count=5)
@@ -2653,10 +2665,12 @@ def main():
                     t_continuous = ((timesteps.float() + jitter) / 1000.0).clamp(0.0, 1.0)
 
                     t_exp = t_continuous.view(-1, 1, 1, 1)
+                    reported_sigmas = t_continuous
                     noisy_latents = (1 - t_exp) * latents + t_exp * noise
                     target = noise - latents
                     timesteps_conditioning = (t_continuous * 1000.0)
                 else:
+                    reported_sigmas = scheduler_noise_sigmas[timesteps.long()]
                     noisy_latents = scheduler.add_noise(latents, noise, timesteps)
                     target = (scheduler.get_velocity(latents, noise, timesteps)
                               if scheduler.config.prediction_type == "v_prediction" else noise)
@@ -2729,6 +2743,7 @@ def main():
                 'eta':           (config.MAX_TRAIN_STEPS - micro_step) * (sum(global_step_times) / len(global_step_times)) if global_step_times else 0,
                 'loss':          raw_loss_value,
                 'timestep':      timestep_str,
+                'sigma':         float(reported_sigmas[0].detach().float().item()),
             }, diag_data=diag_data_to_log)
 
     reporter.log_message("\nTraining complete.")

@@ -1991,9 +1991,11 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
 
 def safe_set_anima_scheduler_training(pipe):
     try:
-        pipe.scheduler.set_timesteps(1000, training=True)
-    except TypeError:
-        pipe.scheduler.set_timesteps(1000)
+        pipe.scheduler.set_timesteps(1000, training=True, shift=1.0)
+    except TypeError as exc:
+        raise RuntimeError(
+            "Update DiffSynth; Anima repair training requires an explicit scheduler shift of 1.0."
+        ) from exc
         try:
             pipe.scheduler.training = True
         except Exception:
@@ -2199,11 +2201,14 @@ def run_anima_dit_training(config):
         t5xxl_ids = batch["t5xxl_ids"].to(device=device, non_blocking=True)
 
         batch_size = input_latents.shape[0]
-        timestep_indices, timestep_str = timestep_sampler.sample(batch_size)
-        timestep_indices = timestep_indices.to(device=device)
-        timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-        sigmas = scheduler_sigmas[timestep_indices]
-        loss_weights = timestep_loss_weights[timestep_indices]
+        ticket_indices, timestep_str = timestep_sampler.sample(batch_size)
+        ticket_indices = ticket_indices.to(device=device)
+        # Tickets ascend from clean to noisy; DiffSynth's scheduler arrays are
+        # stored in the reverse order.
+        scheduler_indices = (total_scheduler_timesteps - 1) - ticket_indices
+        timesteps = scheduler_timesteps[scheduler_indices].to(device=device, dtype=config.compute_dtype)
+        sigmas = scheduler_sigmas[scheduler_indices]
+        loss_weights = timestep_loss_weights[ticket_indices]
         noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
 
         noisy_latents, training_target = flowmatch_noise_and_target(input_latents, noise, sigmas)
@@ -2289,6 +2294,7 @@ def run_anima_dit_training(config):
                 "eta": (config.MAX_TRAIN_STEPS - micro_step) * avg_step_time,
                 "loss": raw_loss_value,
                 "timestep": int(timestep_str),
+                "sigma": float(sigmas[0].detach().float().item()),
             },
             diag_data=diag_data_to_log,
         )

@@ -25,3 +25,20 @@ def epoch_marker_interval(max_steps, batch_size, total_images):
     _, steps_per_epoch, _ = training_calculations(max_steps, 1, batch_size, total_images)
     marker_count = (int(max_steps) - 1) // steps_per_epoch if max_steps > 0 and steps_per_epoch else 0
     return steps_per_epoch, marker_count
+
+
+def logit_shift_ticket_weights(bin_size, shift, total_timesteps=1000):
+    """Bin masses reproducing uniform tickets passed through a sigma shift."""
+    bin_size = max(1, int(bin_size))
+    total_timesteps = max(1, int(total_timesteps))
+    shift = max(0.01, float(shift))
+
+    def inverse_shift(y):
+        return y / (shift - (shift - 1.0) * y)
+
+    weights = []
+    for start in range(0, total_timesteps, bin_size):
+        y0 = start / total_timesteps
+        y1 = min(start + bin_size, total_timesteps) / total_timesteps
+        weights.append(max(0.0, inverse_shift(y1) - inverse_shift(y0)))
+    return weights

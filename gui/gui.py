@@ -1365,13 +1365,36 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
         super().__init__(parent)
         self.counts = [0] * bin_count
         self.y_axis_label = "Samples"
+        self.value_max = 1000.0
+        self.x_axis_label = "Timestep"
+        self.value_name = "Timestep"
         self.padding = {'top': 42, 'bottom': 40, 'left': 70, 'right': 20}
         self.setMinimumHeight(220)
 
     def append_value(self, value):
-        index = min(len(self.counts) - 1, max(0, int(float(value) / 1000.0 * len(self.counts))))
+        index = min(len(self.counts) - 1, max(0, int(float(value) / self.value_max * len(self.counts))))
         self.counts[index] += 1
         self.update()
+
+    def append_values(self, values):
+        for value in values:
+            index = min(len(self.counts) - 1, max(0, int(float(value) / self.value_max * len(self.counts))))
+            self.counts[index] += 1
+        self.update()
+
+    def set_bin_count(self, bin_count):
+        bin_count = max(1, int(bin_count))
+        if len(self.counts) != bin_count:
+            self.counts = [0] * bin_count
+            self.update()
+
+    def set_value_mode(self, mode):
+        value_max, label = (1.0, "Sigma") if mode == "sigma" else (1000.0, "Timestep")
+        if self.value_max != value_max or self.x_axis_label != label:
+            self.value_max = value_max
+            self.x_axis_label = label
+            self.value_name = label
+            self.clear_all_data()
 
     def clear_all_data(self):
         self.counts = [0] * len(self.counts)
@@ -1408,13 +1431,15 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
         painter.setPen(QtGui.QColor(TEXT_PRI))
         for i in range(6):
             x = rect.left() + i / 5 * rect.width()
+            axis_value = i / 5 * self.value_max
+            axis_text = f"{axis_value:.1f}" if self.value_max == 1.0 else str(round(axis_value))
             painter.drawText(QtCore.QRect(int(x - 30), rect.bottom() + 5, 60, 20),
-                             QtCore.Qt.AlignmentFlag.AlignCenter, str(i * 200))
+                             QtCore.Qt.AlignmentFlag.AlignCenter, axis_text)
         painter.save(); painter.translate(15, self.height() / 2); painter.rotate(-90)
         painter.drawText(QtCore.QRect(-50, -10, 100, 20), QtCore.Qt.AlignmentFlag.AlignCenter, self.y_axis_label)
         painter.restore()
         painter.drawText(QtCore.QRect(0, self.height() - 20, self.width(), 20),
-                         QtCore.Qt.AlignmentFlag.AlignCenter, "Timestep")
+                         QtCore.Qt.AlignmentFlag.AlignCenter, self.x_axis_label)
         swatch = QtCore.QRectF(self.padding['left'], 13, 10, 10)
         clip_path = QtGui.QPainterPath()
         clip_path.addRoundedRect(swatch, 2, 2)
@@ -1446,7 +1471,7 @@ class LiveTimestepHistogram(QtWidgets.QWidget):
         return str(round(value))
 
     def legend_text(self):
-        return f"Timestep Samples ({sum(self.counts):,} total)"
+        return f"{self.value_name} Samples ({sum(self.counts):,} total)"
 
 
 class LiveTimestepMeanLossHistogram(LiveTimestepHistogram):
@@ -1456,11 +1481,27 @@ class LiveTimestepMeanLossHistogram(LiveTimestepHistogram):
         self.sample_counts = [0] * bin_count
         self.y_axis_label = "Mean Loss"
 
+    def set_bin_count(self, bin_count):
+        bin_count = max(1, int(bin_count))
+        if len(self.counts) != bin_count:
+            self.counts = [0.0] * bin_count
+            self.loss_sums = [0.0] * bin_count
+            self.sample_counts = [0] * bin_count
+            self.update()
+
     def append_sample(self, timestep, loss):
-        index = min(len(self.counts) - 1, max(0, int(float(timestep) / 1000.0 * len(self.counts))))
+        index = min(len(self.counts) - 1, max(0, int(float(timestep) / self.value_max * len(self.counts))))
         self.loss_sums[index] += float(loss)
         self.sample_counts[index] += 1
         self.counts[index] = self.loss_sums[index] / self.sample_counts[index]
+        self.update()
+
+    def append_samples(self, values, loss):
+        for value in values:
+            index = min(len(self.counts) - 1, max(0, int(float(value) / self.value_max * len(self.counts))))
+            self.loss_sums[index] += float(loss)
+            self.sample_counts[index] += 1
+            self.counts[index] = self.loss_sums[index] / self.sample_counts[index]
         self.update()
 
     def clear_all_data(self):
@@ -1477,7 +1518,7 @@ class LiveTimestepMeanLossHistogram(LiveTimestepHistogram):
         return f"{value:.4f}" if value < 1 else f"{value:.3f}"
 
     def legend_text(self):
-        return f"Mean Loss by Timestep ({sum(self.sample_counts):,} samples)"
+        return f"Mean Loss by {self.value_name} ({sum(self.sample_counts):,} samples)"
 
 
 class LiveMetricsWidget(QtWidgets.QWidget):
@@ -1576,6 +1617,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         self.step_loss_ema = self.optim_loss_ema = None
 
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
+        self.latest_sigma = None
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
 
     def _on_pause_toggled(self, paused):
@@ -1584,14 +1626,30 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         elif self.pending_update:
             self._queue_update()
 
+    def set_timestep_bucket_size(self, bucket_size):
+        bucket_size = max(1, int(bucket_size))
+        bucket_count = math.ceil(1000 / bucket_size)
+        self.graphs['timestep']['widget'].set_bin_count(bucket_count)
+        self.graphs['timestep_loss']['widget'].set_bin_count(bucket_count)
+
     def parse_and_update(self, text):
         if self.pause_btn.isChecked(): return
         added = False
-        m = re.search(r'Training\s*\|.*\|\s*(\d+)/(\d+)\s*\[.*?\]\s*\[Loss:\s*([\d.e+-]+),\s*Timestep:\s*(\d+)\]', text)
+        anima_match = re.search(r'Training\s*\|.*\|\s*(\d+)/(\d+)\s*\[.*?\]\s*\[Loss:\s*([\d.e+-]+),\s*Ticket:\s*(\d+),\s*Sigma:\s*([\d.e+-]+)\]', text)
+        timestep_match = re.search(r'Training\s*\|.*\|\s*(\d+)/(\d+)\s*\[.*?\]\s*\[Loss:\s*([\d.e+-]+),\s*Timestep:\s*(\d+)\]', text)
+        m = anima_match or timestep_match
         if m:
-            step, loss, ts = int(m.group(1)) - 1, float(m.group(3)), int(m.group(4))
-            self.pending_data.append(('progress_step', step, loss, ts))
-            self.latest_global_step, self.latest_step_loss, self.latest_timestep = step, loss, ts
+            step, loss, ticket = int(m.group(1)) - 1, float(m.group(3)), int(m.group(4))
+            sigma = float(m.group(5)) if anima_match else None
+            # Anima stratification is defined in exact integer ticket space.
+            # Its BF16 training sigma can round across a visual bucket boundary
+            # (for example 0.08 -> 0.080078), so use the ticket-bin center for
+            # histogram placement while continuing to label the axis as Sigma.
+            graph_values = [((ticket + 0.5) / 1000.0) if sigma is not None else ticket]
+            graph_mode = 'sigma' if sigma is not None else 'timestep'
+            self.pending_data.append(('progress_step', step, loss, ticket, graph_values, graph_mode))
+            self.latest_global_step, self.latest_step_loss, self.latest_timestep = step, loss, ticket
+            self.latest_sigma = sigma
             added = True
         m = re.search(r'--- Optimizer Step:\s*(\d+)\s*\|\s*Loss:\s*([\d.e+-]+)\s*\|\s*LR:\s*([\d.e+-]+)\s*---', text)
         if m:
@@ -1622,12 +1680,14 @@ class LiveMetricsWidget(QtWidgets.QWidget):
             processed += 1
             t = data[0]
             if t == 'progress_step':
-                _, step, loss, ts = data
+                _, step, loss, ticket, graph_values, graph_mode = data
                 self.graphs['step_loss']['widget'].append_data(self.graphs['step_loss']['lines']['Step Loss'], step, loss)
                 self.step_loss_ema = loss if self.step_loss_ema is None else self.loss_ema_beta * self.step_loss_ema + (1.0 - self.loss_ema_beta) * loss
                 self.graphs['step_loss']['widget'].append_data(self.graphs['step_loss']['lines']['Loss EMA'], step, self.step_loss_ema)
-                self.graphs['timestep']['widget'].append_value(ts)
-                self.graphs['timestep_loss']['widget'].append_sample(ts, loss)
+                self.graphs['timestep']['widget'].set_value_mode(graph_mode)
+                self.graphs['timestep_loss']['widget'].set_value_mode(graph_mode)
+                self.graphs['timestep']['widget'].append_values(graph_values)
+                self.graphs['timestep_loss']['widget'].append_samples(graph_values, loss)
             elif t == 'optim_step':
                 _, step, avg_loss, lr = data
                 last_optim_step = step
@@ -1640,9 +1700,13 @@ class LiveMetricsWidget(QtWidgets.QWidget):
                 self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Raw'], last_optim_step, raw)
                 self.graphs['grad_norm']['widget'].append_data(self.graphs['grad_norm']['lines']['Clipped'], last_optim_step, clipped)
         self.latest_optim_step = last_optim_step
+        sampling_status = (
+            f"Ticket: {self.latest_timestep} | Sigma: {self.latest_sigma:.6f}"
+            if self.latest_sigma is not None else f"Timestep: {self.latest_timestep}"
+        )
         self.stats_label.setText(
             f"Step: {self.latest_global_step} | Loss: {self.latest_step_loss:.4f} | "
-            f"Timestep: {self.latest_timestep} | Optimizer Loss: {self.latest_optim_loss:.4f} | "
+            f"{sampling_status} | Optimizer Loss: {self.latest_optim_loss:.4f} | "
             f"LR: {self.latest_lr:.2e} | Grad: {self.latest_grad:.4f}")
         self.pending_update = bool(self.pending_data)
         if self.pending_update:
@@ -1655,6 +1719,7 @@ class LiveMetricsWidget(QtWidgets.QWidget):
         for gd in self.graphs.values():
             gd['widget'].clear_all_data()
         self.latest_global_step = self.latest_optim_step = self.latest_timestep = 0
+        self.latest_sigma = None
         self.latest_lr = self.latest_step_loss = self.latest_optim_loss = self.latest_grad = 0.0
         self.step_loss_ema = self.optim_loss_ema = None
         self.stats_label.setText("No data yet")
@@ -3511,8 +3576,6 @@ class TrainingGUI(QtWidgets.QWidget):
             self.dit_exclusion_group.setVisible(is_dit)
         if hasattr(self, "advanced_group"):
             self.advanced_group.setVisible(not is_dit)
-        if hasattr(self, "anima_sigma_shift_controls"):
-            self.anima_sigma_shift_controls.setVisible(is_dit)
         self._update_loss_controls()
 
         self._update_mode_locked_group_states()
@@ -4456,14 +4519,14 @@ class TrainingGUI(QtWidgets.QWidget):
         preset_row = QtWidgets.QGridLayout()
         preset_row.setSpacing(8)
         hysocs_flat_learning = [
-            [0.0, 0.4583], [0.025, 0.4583], [0.075, 0.5174],
-            [0.125, 0.6021], [0.175, 0.6956], [0.225, 0.8013],
-            [0.275, 0.9109], [0.325, 1.0093], [0.375, 1.0737],
-            [0.425, 1.1336], [0.475, 1.2181], [0.525, 1.3103],
-            [0.575, 1.3843], [0.625, 1.4146], [0.675, 1.4054],
-            [0.725, 1.3916], [0.775, 1.3926], [0.825, 1.3309],
-            [0.875, 1.1222], [0.9, 0.95], [0.925, 0.85],
-            [0.95, 0.7], [0.97, 0.55], [0.98, 0.25], [1.0, 0.14],
+            [0.0, 0.14], [0.02, 0.25], [0.03, 0.55], [0.05, 0.7],
+            [0.075, 0.85], [0.1, 0.95], [0.125, 1.1222],
+            [0.175, 1.3309], [0.225, 1.3926], [0.275, 1.3916],
+            [0.325, 1.4054], [0.375, 1.4146], [0.425, 1.3843],
+            [0.475, 1.3103], [0.525, 1.2181], [0.575, 1.1336],
+            [0.625, 1.0737], [0.675, 1.0093], [0.725, 0.9109],
+            [0.775, 0.8013], [0.825, 0.6956], [0.875, 0.6021],
+            [0.925, 0.5174], [0.975, 0.4583], [1.0, 0.4583],
         ]
         for idx, (label, points) in enumerate([
             ("Uniform", [[0.0, 1.0], [1.0, 1.0]]),
@@ -4628,12 +4691,12 @@ class TrainingGUI(QtWidgets.QWidget):
         distribution_group, distribution_lay = group_box("Distribution Settings")
         r1 = QtWidgets.QHBoxLayout()
         r1.addWidget(make_label("Bin Size:"))
-        self.bin_size_combo = make_combo(["30", "40", "50", "100", "200", "250", "500"])
+        self.bin_size_combo = make_combo(["20", "30", "40", "50", "100", "200", "250", "500"])
         self.bin_size_combo.setCurrentText("100")
         r1.addWidget(self.bin_size_combo)
         r1.addSpacing(20)
         r1.addWidget(make_label("Distribution Mode:"))
-        self.ts_mode_combo = make_combo(["Wave", "Logit-Normal", "Beta"])
+        self.ts_mode_combo = make_combo(["Wave", "Logit-Normal", "Beta", "Shift"])
         r1.addWidget(self.ts_mode_combo, 1)
         distribution_lay.addLayout(r1)
 
@@ -4657,10 +4720,48 @@ class TrainingGUI(QtWidgets.QWidget):
         self.slider_beta_alpha, self.spin_beta_alpha = self._add_slider_row(bl, "Alpha:", 0.1, 10.0, 3.0, 100.0)
         self.slider_beta_beta, self.spin_beta_beta = self._add_slider_row(bl, "Beta:", 0.1, 10.0, 3.0, 100.0)
         self.ts_slider_stack.addWidget(beta_page)
+
+        shift_page = QtWidgets.QWidget()
+        shift_layout = QtWidgets.QFormLayout(shift_page)
+        shift_layout.setContentsMargins(0, 0, 0, 0)
+        shift_control = QtWidgets.QWidget()
+        shift_control_layout = QtWidgets.QHBoxLayout(shift_control)
+        shift_control_layout.setContentsMargins(0, 0, 0, 0)
+        self.slider_ticket_shift = NoScrollSlider(QtCore.Qt.Orientation.Horizontal)
+        self.slider_ticket_shift.setRange(100, 1000)
+        self.slider_ticket_shift.setValue(300)
+        self.spin_ticket_shift = NoScrollDoubleSpinBox()
+        self.spin_ticket_shift.setRange(1.0, 10.0)
+        self.spin_ticket_shift.setSingleStep(0.1)
+        self.spin_ticket_shift.setDecimals(2)
+        self.spin_ticket_shift.setValue(3.0)
+        self.spin_ticket_shift.setFixedWidth(120)
+        self.slider_ticket_shift.valueChanged.connect(
+            lambda value: self.spin_ticket_shift.setValue(value / 100.0)
+        )
+        self.spin_ticket_shift.valueChanged.connect(
+            lambda value: self.slider_ticket_shift.setValue(round(value * 100))
+        )
+        shift_control_layout.addWidget(self.slider_ticket_shift)
+        shift_control_layout.addWidget(self.spin_ticket_shift)
+        shift_layout.addRow("Shift:", shift_control)
+        shift_note = make_label(
+            "Choose a DiffSynth-style logit shift, then apply it as a timestep-ticket density transform."
+        )
+        shift_note.setWordWrap(True)
+        shift_layout.addRow(shift_note)
+        apply_ticket_shift_btn = make_btn(
+            "Apply Shift to Tickets",
+            lambda: self._apply_timestep_preset("Apply Ticket Shift"),
+        )
+        set_role(apply_ticket_shift_btn, "accent")
+        shift_layout.addRow(apply_ticket_shift_btn)
+        self.ts_slider_stack.addWidget(shift_page)
         distribution_lay.addWidget(self.ts_slider_stack)
         lay.addWidget(distribution_group)
 
         presets_group, presets_lay = group_box("Distribution Presets")
+        self.timestep_presets_group = presets_group
         self.ts_button_stack = QtWidgets.QStackedWidget()
         presets_by_mode = [
             [("Uniform (Flat)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
@@ -4677,55 +4778,27 @@ class TrainingGUI(QtWidgets.QWidget):
                 set_role(b, "compact")
                 pgrid.addWidget(b, i // 3, i % 3)
             self.ts_button_stack.addWidget(page)
+        self.ts_button_stack.addWidget(QtWidgets.QWidget())
         presets_lay.addWidget(self.ts_button_stack)
         lay.addWidget(presets_group)
 
         self.bin_size_combo.currentTextChanged.connect(lambda t: (self.timestep_histogram.set_bin_size(int(t)), self._update_timestep_distribution()))
+        self.bin_size_combo.currentTextChanged.connect(
+            lambda _: self._update_shift_bin_availability(self.ts_mode_combo.currentText())
+        )
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(lambda _: self._update_timestep_distribution())
+        self.ts_mode_combo.currentTextChanged.connect(
+            lambda mode: self.timestep_presets_group.setVisible(mode != "Shift")
+        )
+        self.ts_mode_combo.currentTextChanged.connect(self._update_shift_bin_availability)
         self.timestep_coverage_controls = QtWidgets.QGroupBox("Timestep Coverage")
         coverage_form = QtWidgets.QFormLayout(self.timestep_coverage_controls)
         coverage_form.setContentsMargins(8, 6, 8, 6)
         self._add_form_keys(coverage_form, ["TIMESTEP_STRATIFIED_SAMPLING"])
         self.widgets["TIMESTEP_STRATIFIED_SAMPLING"].setText("Stratified Coverage")
-        self.anima_sigma_shift_controls = QtWidgets.QGroupBox("Anima Physical Sigma Shift")
-        shift_lay = QtWidgets.QFormLayout(self.anima_sigma_shift_controls)
-        shift_lay.setContentsMargins(8, 6, 8, 6)
-        self.anima_sigma_shift_enabled = QtWidgets.QCheckBox("Apply sigma shift")
-        self.anima_sigma_shift_enabled.setToolTip(
-            "Transform the physical flow sigma grid. This does not change ticket sampling or loss weighting."
-        )
-        self.anima_sigma_shift_enabled.setChecked(True)
-        self.widgets["ANIMA_SIGMA_SHIFT_ENABLED"] = self.anima_sigma_shift_enabled
-        shift_lay.addRow(self.anima_sigma_shift_enabled)
-        shift_row = QtWidgets.QWidget()
-        shift_row_lay = QtWidgets.QHBoxLayout(shift_row)
-        shift_row_lay.setContentsMargins(0, 0, 0, 0)
-        shift_row_lay.setSpacing(5)
-        shift_row_lay.addWidget(make_label("Value:"))
-        self.anima_sigma_shift_spin = NoScrollDoubleSpinBox()
-        self.anima_sigma_shift_spin.setRange(0.1, 10.0)
-        self.anima_sigma_shift_spin.setSingleStep(0.1)
-        self.anima_sigma_shift_spin.setDecimals(2)
-        self.anima_sigma_shift_spin.setValue(3.0)
-        self.anima_sigma_shift_spin.setFixedWidth(110)
-        shift_row_lay.addWidget(self.anima_sigma_shift_spin)
-        shift_row_lay.addStretch(1)
-        shift_lay.addRow(shift_row)
-        self.widgets["ANIMA_SIGMA_SHIFT"] = self.anima_sigma_shift_spin
-        self.anima_sigma_shift_enabled.toggled.connect(
-            lambda enabled: (
-                self.anima_sigma_shift_spin.setEnabled(enabled),
-                self._sync_widget("ANIMA_SIGMA_SHIFT_ENABLED"),
-            )
-        )
-        self.anima_sigma_shift_spin.valueChanged.connect(lambda _: self._sync_widget("ANIMA_SIGMA_SHIFT"))
-        bottom_controls = QtWidgets.QHBoxLayout()
-        bottom_controls.setSpacing(10)
-        bottom_controls.addWidget(self.timestep_coverage_controls, 1)
-        bottom_controls.addWidget(self.anima_sigma_shift_controls, 2)
-        lay.addLayout(bottom_controls)
+        lay.addWidget(self.timestep_coverage_controls)
         return gb
 
     def _update_timestep_loss_button_states(self, idx):
@@ -4750,6 +4823,19 @@ class TrainingGUI(QtWidgets.QWidget):
         return sl, sp
 
     def _apply_timestep_preset(self, name):
+        if name == "Apply Ticket Shift":
+            shift = self.spin_ticket_shift.value()
+            self.current_config["TIMESTEP_TICKET_SHIFT"] = shift
+            self.ts_mode_combo.setCurrentText("Shift")
+            weights = gui_math.logit_shift_ticket_weights(
+                int(self.bin_size_combo.currentText()), shift, 1000
+            )
+            self.timestep_histogram.generate_from_weights(weights)
+            self.log(
+                f"Applied timestep Shift {shift:g} ticket density."
+            )
+            return
+
         self.ts_mode_combo.blockSignals(True)
 
         mode_map = {
@@ -4785,7 +4871,9 @@ class TrainingGUI(QtWidgets.QWidget):
         target_mode = mode_map[name]
         vals = values[name]
 
-        mode_idx = {"Wave": 0, "Logit-Normal": 1, "Beta": 2}.get(target_mode, 0)
+        mode_idx = self.ts_mode_combo.findText(target_mode)
+        if mode_idx < 0:
+            mode_idx = 0
         self.ts_mode_combo.setCurrentIndex(mode_idx)
         self.ts_slider_stack.setCurrentIndex(mode_idx)
         self.ts_button_stack.setCurrentIndex(mode_idx)
@@ -4808,6 +4896,42 @@ class TrainingGUI(QtWidgets.QWidget):
             sl.blockSignals(False); sp.blockSignals(False)
 
         self._update_timestep_distribution()
+
+    def _update_shift_bin_availability(self, mode):
+        shift_mode = mode == "Shift"
+        allowed = {"20", "40", "50"}
+        for index in range(self.bin_size_combo.count()):
+            item = self.bin_size_combo.model().item(index)
+            if not item:
+                continue
+            text = self.bin_size_combo.itemText(index)
+            flags = item.flags()
+            enabled = not shift_mode or text in allowed
+            item.setFlags(
+                flags | QtCore.Qt.ItemFlag.ItemIsEnabled
+                if enabled else flags & ~QtCore.Qt.ItemFlag.ItemIsEnabled
+            )
+            item.setData(
+                None if enabled else QtGui.QBrush(QtGui.QColor(TEXT_MUTED)),
+                QtCore.Qt.ItemDataRole.ForegroundRole,
+            )
+            item.setToolTip(
+                "Shift mode uses evenly divisible bins of 20, 40, or 50 for accuracy."
+                if not enabled else ""
+            )
+        if shift_mode and self.bin_size_combo.currentText() not in allowed:
+            current_size = int(self.bin_size_combo.currentText())
+            closest_size = min((20, 40, 50), key=lambda size: (abs(size - current_size), size))
+            self.bin_size_combo.setCurrentText(str(closest_size))
+            shift = self.spin_ticket_shift.value()
+            self.timestep_histogram.generate_from_weights(
+                gui_math.logit_shift_ticket_weights(closest_size, shift, 1000)
+            )
+            self.current_config["TIMESTEP_TICKET_SHIFT"] = shift
+            self.log(
+                f"Shift mode changed bin size from {current_size} to {closest_size} "
+                "to avoid a partial final bin and preserve accuracy."
+            )
 
     def _update_timestep_distribution(self):
         mode = self.ts_mode_combo.currentText()
@@ -4835,8 +4959,8 @@ class TrainingGUI(QtWidgets.QWidget):
             for i in range(n):
                 x = max(1e-4, min(1 - 1e-4, ((i * bin_size) + bin_size / 2) / 1000))
                 weights.append(max(0.0, x ** (alpha - 1) * (1 - x) ** (beta - 1)))
-
-        self.timestep_histogram.generate_from_weights(weights)
+        if mode != "Shift":
+            self.timestep_histogram.generate_from_weights(weights)
 
     def _on_prediction_type_changed(self, text):
         if hasattr(self, 'dataset_manager'): 
@@ -4943,10 +5067,14 @@ class TrainingGUI(QtWidgets.QWidget):
             self.ts_mode_combo.blockSignals(True)
             self.ts_mode_combo.setCurrentText(ts_mode)
             self.ts_mode_combo.blockSignals(False)
-            if hasattr(self, "anima_sigma_shift_enabled"):
-                shift_enabled = bool(self.current_config.get("ANIMA_SIGMA_SHIFT_ENABLED", True))
-                self.anima_sigma_shift_enabled.setChecked(shift_enabled)
-                self.anima_sigma_shift_spin.setEnabled(shift_enabled)
+            mode_idx = max(0, self.ts_mode_combo.currentIndex())
+            self.ts_slider_stack.setCurrentIndex(mode_idx)
+            self.ts_button_stack.setCurrentIndex(mode_idx)
+            self.timestep_presets_group.setVisible(ts_mode != "Shift")
+            self.spin_ticket_shift.setValue(
+                float(self.current_config.get("TIMESTEP_TICKET_SHIFT", 3.0))
+            )
+            self._update_shift_bin_availability(ts_mode)
 
             if hasattr(self, 'dataset_manager'):
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
@@ -4986,9 +5114,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["LOSS_TYPE"] = "MSE"
         cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
-        if is_dit and hasattr(self, "anima_sigma_shift_enabled"):
-            cfg["ANIMA_SIGMA_SHIFT_ENABLED"] = self.anima_sigma_shift_enabled.isChecked()
-            cfg["ANIMA_SIGMA_SHIFT"] = self.anima_sigma_shift_spin.value()
+        cfg["TIMESTEP_TICKET_SHIFT"] = self.spin_ticket_shift.value()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
         if hasattr(self, 'timestep_loss_curve'): cfg["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve.get_points()
 
@@ -5114,6 +5240,8 @@ class TrainingGUI(QtWidgets.QWidget):
         if not os.path.exists(train_py_path): self.log(f"CRITICAL: {train_script} not found."); return
 
         self.start_button.setVisible(False); self.stop_button.setVisible(True); self.force_save_button.setVisible(True)
+        allocation = self.current_config.get("TIMESTEP_ALLOCATION") or {}
+        self.live_metrics_widget.set_timestep_bucket_size(allocation.get("bin_size", 50))
         self.live_metrics_widget.clear_data()
 
         script_dir = str(PROJECT_ROOT)

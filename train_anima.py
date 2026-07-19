@@ -1607,24 +1607,20 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
 
 
 def safe_set_anima_scheduler_training(pipe, config):
-    shift_enabled = bool(getattr(config, "ANIMA_SIGMA_SHIFT_ENABLED", True))
-    shift = max(0.01, float(getattr(config, "ANIMA_SIGMA_SHIFT", 3.0) or 3.0))
-    effective_shift = shift if shift_enabled else 1.0
-
-    # Let DiffSynth build the Z-Image training grid so sigma, timestep, and
-    # scheduler training-weight behavior remain identical to its inference path.
+    # Ticket allocation owns distribution shaping. Keep the physical scheduler
+    # linear so ticket 0..999 maps directly to sigma 0..1.
     try:
-        pipe.scheduler.set_timesteps(1000, training=True, shift=effective_shift)
+        pipe.scheduler.set_timesteps(1000, training=True, shift=1.0)
     except TypeError as exc:
         raise RuntimeError(
             "The installed Anima scheduler cannot accept an explicit shift. "
-            "Update DiffSynth before using the physical sigma-shift control."
+            "Update DiffSynth; Anima training requires an explicit scheduler shift of 1.0."
         ) from exc
 
     print(
-        f"INFO: Anima physical sigma shift: "
-        f"{'enabled' if shift_enabled else 'disabled'} (effective shift={effective_shift:.4g})."
+        "INFO: Anima physical sigma shift fixed at 1.0; distribution shaping uses tickets."
     )
+    print("INFO: Anima ticket coordinate: 0=clean/low noise, 999=noisy/high noise.")
 
 
 def run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config):
@@ -1802,11 +1798,15 @@ def run_anima_dit_training(config):
         t5xxl_ids = batch["t5xxl_ids"].to(device=device, non_blocking=True)
 
         batch_size = input_latents.shape[0]
-        timestep_indices, timestep_str = timestep_sampler.sample(batch_size)
-        timestep_indices = timestep_indices.to(device=device)
-        timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-        sigmas = scheduler_sigmas[timestep_indices]
-        loss_weights = timestep_loss_weights[timestep_indices]
+        ticket_indices, timestep_str = timestep_sampler.sample(batch_size)
+        ticket_indices = ticket_indices.to(device=device)
+        # GUI tickets use the conventional ascending noise coordinate, while
+        # DiffSynth stores its training schedule in descending-noise order.
+        scheduler_indices = (total_scheduler_timesteps - 1) - ticket_indices
+        timesteps = scheduler_timesteps[scheduler_indices].to(device=device, dtype=config.compute_dtype)
+        sigmas = scheduler_sigmas[scheduler_indices]
+        # Loss curves are authored in the same ascending coordinate as tickets.
+        loss_weights = timestep_loss_weights[ticket_indices]
         noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
 
         noisy_latents, training_target = flowmatch_noise_and_target(input_latents, noise, sigmas)
@@ -1885,6 +1885,7 @@ def run_anima_dit_training(config):
                 "eta": (config.MAX_TRAIN_STEPS - micro_step) * avg_step_time,
                 "loss": raw_loss_value,
                 "timestep": int(timestep_str),
+                "sigma": float(sigmas[0].detach().float().item()),
             },
             diag_data=diag_data_to_log,
         )
