@@ -82,9 +82,7 @@
             ],
             "eps": 1e-08,
             "weight_decay": 0.01,
-            "debias_strength": 0.6,
-            "use_grad_centralization": true,
-            "gc_alpha": 1.0
+            "debias_strength": 0.6
         },
         "sdxl_titan_params": {
             "betas": [
@@ -94,13 +92,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
-        },
-        "sdxl_velorms_params": {
-            "weight_decay": 0.01,
-            "eps": 1e-08
         },
         "sdxl_loss_type": "MSE",
         "sdxl_memory_efficient_attention": "xformers",
@@ -198,8 +190,6 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
         },
         "anima_titan_params": {
@@ -210,13 +200,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
-        },
-        "anima_velorms_params": {
-            "weight_decay": 0.01,
-            "eps": 1e-08
         },
         "anima_loss_type": "MSE",
         "anima_memory_efficient_attention": "sdpa",

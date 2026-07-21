@@ -30,8 +30,6 @@ class RavenAdamW(Optimizer):
         weight_decay: float = 0.06,
         eps: float = 1e-8,
         debias_strength: float = 0.9,
-        use_grad_centralization: bool = False,
-        gc_alpha: float = 0.9,
         momentum_dtype: torch.dtype = torch.bfloat16,
     ):
         if not 0.0 <= lr:
@@ -49,8 +47,6 @@ class RavenAdamW(Optimizer):
             weight_decay=weight_decay,
             eps=eps,
             debias_strength=debias_strength,
-            use_grad_centralization=use_grad_centralization,
-            gc_alpha=gc_alpha,
             momentum_dtype=momentum_dtype,
         )
         super(RavenAdamW, self).__init__(params, defaults)
@@ -97,8 +93,6 @@ class RavenAdamW(Optimizer):
             weight_decay = group["weight_decay"]
             eps = group["eps"]
             debias_strength = group["debias_strength"]
-            use_gc = group["use_grad_centralization"]
-            gc_alpha = group["gc_alpha"]
             momentum_dtype = group.get("momentum_dtype", self._momentum_dtype)
             wd_factor = 1.0 - lr * weight_decay if weight_decay != 0 else 1.0
 
@@ -108,10 +102,6 @@ class RavenAdamW(Optimizer):
 
                 buf_exp_avg, buf_exp_avg_sq, buf_p_fp32 = self._get_scratch_buffers(p)
                 grad = p.grad.float()
-
-                if use_gc and grad.dim() > 1:
-                    grad_mean = grad.mean(dim=tuple(range(1, grad.dim())), keepdim=True)
-                    grad.sub_(grad_mean, alpha=gc_alpha)
 
                 state = self.state[p]
 

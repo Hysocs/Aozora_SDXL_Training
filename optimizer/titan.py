@@ -1,4 +1,5 @@
 import math
+import weakref
 
 import torch
 from torch.optim import Optimizer
@@ -22,8 +23,6 @@ class TitanAdamW(Optimizer):
         weight_decay: float = 0.01,
         eps: float = 1e-8,
         debias_strength: float = 1.0,
-        use_grad_centralization: bool = False,
-        gc_alpha: float = 1.0,
         momentum_dtype: torch.dtype = torch.bfloat16,
     ):
         if not 0.0 <= lr:
@@ -41,8 +40,6 @@ class TitanAdamW(Optimizer):
             weight_decay=weight_decay,
             eps=eps,
             debias_strength=debias_strength,
-            use_grad_centralization=use_grad_centralization,
-            gc_alpha=gc_alpha,
             momentum_dtype=momentum_dtype,
         )
         super(TitanAdamW, self).__init__(params, defaults)
@@ -50,6 +47,10 @@ class TitanAdamW(Optimizer):
         self.max_numel = 0
         self.param_device = None
         self._momentum_dtype = momentum_dtype
+        self._cpu_grads = {}
+        self._cpu_grad_ready = set()
+        self._hook_handles = []
+        self._closed = False
 
         for group in self.param_groups:
             for p in group["params"]:
@@ -58,11 +59,39 @@ class TitanAdamW(Optimizer):
                 if self.param_device is None:
                     self.param_device = p.device
                 self.max_numel = max(self.max_numel, p.numel())
+                self._cpu_grads[p] = torch.empty_like(
+                    p,
+                    device="cpu",
+                    dtype=torch.float32,
+                    pin_memory=p.device.type == "cuda",
+                )
 
-                if not hasattr(p, "_titan_hook_registered"):
-                    if hasattr(p, "register_post_accumulate_grad_hook"):
-                        p.register_post_accumulate_grad_hook(self._cpu_offload_hook)
-                        p._titan_hook_registered = True
+                if not hasattr(p, "register_post_accumulate_grad_hook"):
+                    raise RuntimeError(
+                        "TitanAdamW requires Tensor.register_post_accumulate_grad_hook "
+                        "(PyTorch 2.0 or newer)."
+                    )
+
+                owner_ref = getattr(p, "_titan_optimizer_owner", None)
+                owner = owner_ref() if callable(owner_ref) else None
+                if owner is not None and owner is not self:
+                    self.close()
+                    raise RuntimeError(
+                        "A parameter is already owned by another live TitanAdamW. "
+                        "Close the old optimizer before creating a replacement."
+                    )
+
+                p._titan_optimizer_owner = weakref.ref(self)
+                optimizer_ref = weakref.ref(self)
+
+                def offload_hook(param, optimizer_ref=optimizer_ref):
+                    optimizer = optimizer_ref()
+                    if optimizer is not None:
+                        optimizer._offload_gradient(param)
+
+                self._hook_handles.append(
+                    p.register_post_accumulate_grad_hook(offload_hook)
+                )
 
         if self.max_numel > 0:
             self._scratch_buffer = torch.zeros(
@@ -81,49 +110,70 @@ class TitanAdamW(Optimizer):
             self._scratch_buffer[2 * numel:3 * numel].view_as(p),
         )
 
-    @staticmethod
-    def _cpu_offload_hook(param):
+    def _offload_gradient(self, param):
         if param.grad is None:
             return
 
-        grad_cpu = param.grad.detach().to(device="cpu", dtype=torch.float32)
-        if hasattr(param, "_cpu_grad") and param._cpu_grad is not None:
-            param._cpu_grad.add_(grad_cpu)
+        cpu_grad = self._cpu_grads[param]
+        if param in self._cpu_grad_ready:
+            # Accumulation requires a temporary transfer because the destination
+            # already contains gradients from earlier microsteps.
+            cpu_grad.add_(param.grad.detach().to(device="cpu", dtype=torch.float32))
         else:
-            param._cpu_grad = grad_cpu
+            cpu_grad.copy_(param.grad.detach(), non_blocking=False)
+            self._cpu_grad_ready.add(param)
         param.grad = None
 
+    def close(self):
+        """Remove autograd hooks and release optimizer-owned gradient buffers."""
+        if getattr(self, "_closed", True):
+            return
+        self._closed = True
+        for handle in self._hook_handles:
+            handle.remove()
+        self._hook_handles.clear()
+        for p in self._cpu_grads:
+            owner_ref = getattr(p, "_titan_optimizer_owner", None)
+            if callable(owner_ref) and owner_ref() is self:
+                delattr(p, "_titan_optimizer_owner")
+        self._cpu_grad_ready.clear()
+        self._cpu_grads.clear()
+
+    def __del__(self):
+        try:
+            self.close()
+        except Exception:
+            pass
+
     def zero_grad(self, set_to_none: bool = True):
-        for group in self.param_groups:
-            for p in group["params"]:
-                if hasattr(p, "_cpu_grad"):
-                    if set_to_none:
-                        p._cpu_grad = None
-                    elif p._cpu_grad is not None:
-                        p._cpu_grad.zero_()
+        if set_to_none:
+            self._cpu_grad_ready.clear()
+        else:
+            for p in self._cpu_grad_ready:
+                self._cpu_grads[p].zero_()
         super().zero_grad(set_to_none)
 
     def clip_grad_norm(self, max_norm, norm_type=2.0):
         params = [
             p for group in self.param_groups for p in group["params"]
-            if hasattr(p, "_cpu_grad") and p._cpu_grad is not None
+            if p in self._cpu_grad_ready
         ]
         if not params:
             return torch.tensor(0.0)
 
         norm_type = float(norm_type)
         if norm_type == float("inf"):
-            norms = [p._cpu_grad.abs().max() for p in params]
+            norms = [self._cpu_grads[p].abs().max() for p in params]
             total_norm = norms[0] if len(norms) == 1 else torch.max(torch.stack(norms))
         else:
-            norms = [torch.norm(p._cpu_grad, norm_type) for p in params]
+            norms = [torch.norm(self._cpu_grads[p], norm_type) for p in params]
             total_norm = torch.norm(torch.stack(norms), norm_type)
 
         if max_norm > 0:
             clip_coef = max_norm / (total_norm + 1e-6)
             if clip_coef < 1:
                 for p in params:
-                    p._cpu_grad.mul_(clip_coef)
+                    self._cpu_grads[p].mul_(clip_coef)
 
         return total_norm
 
@@ -184,25 +234,19 @@ class TitanAdamW(Optimizer):
             weight_decay = group["weight_decay"]
             eps = group["eps"]
             debias_strength = group["debias_strength"]
-            use_gc = group["use_grad_centralization"]
-            gc_alpha = group["gc_alpha"]
             momentum_dtype = group.get("momentum_dtype", self._momentum_dtype)
             wd_factor = 1.0 - lr * weight_decay if weight_decay != 0 else 1.0
 
             for p in group["params"]:
                 grad = None
-                if hasattr(p, "_cpu_grad") and p._cpu_grad is not None:
-                    grad = p._cpu_grad.to(self.param_device, non_blocking=True).float()
+                if p in self._cpu_grad_ready:
+                    grad = self._cpu_grads[p].to(self.param_device, non_blocking=True).float()
                 elif p.grad is not None:
                     grad = p.grad.float()
                 if grad is None:
                     continue
 
                 buf_exp_avg, buf_exp_avg_sq, buf_p_fp32 = self._get_scratch_buffers(p)
-
-                if use_gc and grad.dim() > 1:
-                    grad_mean = grad.mean(dim=tuple(range(1, grad.dim())), keepdim=True)
-                    grad.sub_(grad_mean, alpha=gc_alpha)
 
                 state = self.state[p]
                 if "step" not in state:

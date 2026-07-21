@@ -515,6 +515,73 @@ def ensure_anima_diffsynth_available():
     ModelConfig = _ModelConfig
 
 
+def configure_anima_selective_checkpointing(config):
+    if not bool(getattr(config, "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING", False)):
+        print("INFO: Anima selective checkpointing disabled (full block recomputation).")
+        return
+
+    ensure_anima_diffsynth_available()
+    import diffsynth.models.anima_dit as anima_dit_module
+    from torch.utils.checkpoint import (
+        CheckpointPolicy,
+        checkpoint,
+        create_selective_checkpoint_contexts,
+    )
+
+    original_checkpoint_forward = anima_dit_module.gradient_checkpoint_forward
+    mm_op = torch.ops.aten.mm.default
+
+    def conservative_policy(_ctx, op, *args, **_kwargs):
+        # Retain wide-to-narrow GEMM outputs, principally the 8192 -> 2048
+        # MLP down projection. Its output is much smaller than the preceding
+        # 2048 -> 8192 expansion, while recomputing it is expensive.
+        if op is mm_op and len(args) >= 2:
+            lhs, rhs = args[0], args[1]
+            if (
+                isinstance(lhs, torch.Tensor)
+                and isinstance(rhs, torch.Tensor)
+                and lhs.ndim >= 2
+                and rhs.ndim == 2
+                and lhs.shape[-1] >= 4096
+                and rhs.shape[-1] <= 2048
+            ):
+                return CheckpointPolicy.MUST_SAVE
+        return CheckpointPolicy.PREFER_RECOMPUTE
+
+    def selective_checkpoint_forward(
+        model,
+        use_gradient_checkpointing,
+        use_gradient_checkpointing_offload,
+        *args,
+        **kwargs,
+    ):
+        if not use_gradient_checkpointing or use_gradient_checkpointing_offload:
+            return original_checkpoint_forward(
+                model,
+                use_gradient_checkpointing,
+                use_gradient_checkpointing_offload,
+                *args,
+                **kwargs,
+            )
+
+        def context_fn():
+            return create_selective_checkpoint_contexts(conservative_policy)
+
+        return checkpoint(
+            model,
+            *args,
+            use_reentrant=False,
+            context_fn=context_fn,
+            **kwargs,
+        )
+
+    anima_dit_module.gradient_checkpoint_forward = selective_checkpoint_forward
+    print(
+        "INFO: Anima conservative selective checkpointing enabled "
+        "(cache wide-to-narrow MLP GEMM outputs)."
+    )
+
+
 def detect_anima_dit_key_prefix(path):
     prefixes = ("pipe.dit.", "dit.", "model.diffusion_model.", "diffusion_model.", "model.", "net.")
     counts = {prefix: 0 for prefix in prefixes}
@@ -1647,6 +1714,7 @@ def weighted_flowmatch_mse(model_pred, training_target, weights):
 
 def run_anima_dit_training(config):
     normalize_anima_config(config)
+    configure_anima_selective_checkpointing(config)
 
     is_resuming = getattr(config, "RESUME_TRAINING", False)
     required_paths = ["VAE_PATH", "TEXT_ENCODER_PATH"]

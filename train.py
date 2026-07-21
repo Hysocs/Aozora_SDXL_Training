@@ -33,7 +33,6 @@ import queue
 import tomesd
 from optimizer.raven import RavenAdamW
 from optimizer.titan import TitanAdamW
-from optimizer.velorms import VeloRMS
 import uuid
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
@@ -2259,15 +2258,31 @@ def create_optimizer(config, params_to_optimize):
         final_params = {**default_config.TITAN_PARAMS, **getattr(config, 'TITAN_PARAMS', {})}
         dtype_str = final_params.get('momentum_dtype', 'bfloat16')
         m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
-        return TitanAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0), momentum_dtype=m_dtype)
+        return TitanAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "raven":
         final_params = {**getattr(default_config, 'RAVEN_PARAMS', {}), **getattr(config, 'RAVEN_PARAMS', {})}
         dtype_str = final_params.get('momentum_dtype', 'bfloat16')
         m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
-        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), use_grad_centralization=final_params.get('use_grad_centralization', False), gc_alpha=final_params.get('gc_alpha', 1.0), momentum_dtype=m_dtype)
-    elif optimizer_type == "velorms":
-        final_params = {**getattr(default_config, 'VELORMS_PARAMS', {}), **getattr(config, 'VELORMS_PARAMS', {})}
-        return VeloRMS(params_to_optimize, lr=initial_lr, weight_decay=final_params.get('weight_decay', 0.01), eps=final_params.get('eps', 1e-8), verbose=False)
+        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
+    elif optimizer_type == "paged_adamw_8bit":
+        try:
+            import bitsandbytes as bnb
+        except ImportError as exc:
+            raise RuntimeError(
+                "PagedAdamW8bit requires bitsandbytes, but it is not installed."
+            ) from exc
+        final_params = {
+            **getattr(default_config, 'PAGED_ADAMW_8BIT_PARAMS', {}),
+            **getattr(config, 'PAGED_ADAMW_8BIT_PARAMS', {}),
+        }
+        return bnb.optim.PagedAdamW8bit(
+            params_to_optimize,
+            lr=initial_lr,
+            betas=tuple(final_params.get('betas', [0.9, 0.999])),
+            eps=final_params.get('eps', 1e-8),
+            weight_decay=final_params.get('weight_decay', 0.01),
+            min_8bit_size=4096,
+        )
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
 
 def bell_timestep_loss_curve(total_timestep_count, device=None, dtype=torch.float32):

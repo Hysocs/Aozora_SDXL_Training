@@ -4,16 +4,7 @@
     "sdxl": {
         "sdxl_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
         "sdxl_resume_training": false,
-        "sdxl_instance_datasets": [
-            {
-                "path": "C:/Users/Administrator/Pictures\\Gwen",
-                "repeats": 1
-            },
-            {
-                "path": "C:/Users/Administrator/Pictures\\Gwen Lucky Girl",
-                "repeats": 2
-            }
-        ],
+        "sdxl_instance_datasets": [],
         "sdxl_caching_batch_size": 1,
         "sdxl_text_cache_precision": "bfloat16",
         "sdxl_vae_cache_precision": "bfloat16",
@@ -108,9 +99,15 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
+        },
+        "sdxl_paged_adamw_8bit_params": {
+            "betas": [
+                0.9,
+                0.999
+            ],
+            "eps": 1e-08,
+            "weight_decay": 0.01
         },
         "sdxl_titan_params": {
             "betas": [
@@ -120,13 +117,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
-        },
-        "sdxl_velorms_params": {
-            "weight_decay": 0.01,
-            "eps": 1e-08
         },
         "sdxl_loss_type": "MSE",
         "sdxl_memory_efficient_attention": "sdpa",
@@ -148,7 +139,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:\\Users\\Administrator\\Pictures\\Game CG(ai_tagged)\\Tsundere Shoujo wa Oshiete Hoshiitsu",
+                "path": "C:\\Users\\Administrator\\Pictures\\Dan Artists\\uniel_ggg",
                 "repeats": 1
             }
         ],
@@ -169,22 +160,22 @@
         "anima_t5_token_dropout_max": 0.15000000000000002,
         "anima_caption_chunking_enabled": true,
         "anima_should_upscale": false,
-        "anima_caption_source_type": "json",
-        "anima_caption_tags_percent": 100,
-        "anima_caption_nl_percent": 0,
+        "anima_caption_source_type": "txt",
+        "anima_caption_tags_percent": 75,
+        "anima_caption_nl_percent": 25,
         "anima_caption_tags_nl_percent": 0,
         "anima_caption_nl_tags_percent": 0,
         "anima_max_bucket_resolution": "1152",
-        "anima_multi_bucket_enabled": false,
+        "anima_multi_bucket_enabled": true,
         "anima_multi_bucket_extra_buckets": 1,
         "anima_prediction_type": "epsilon",
-        "anima_max_train_steps": "700",
+        "anima_max_train_steps": "500",
         "anima_batch_size": 1,
-        "anima_gradient_accumulation_steps": "1",
+        "anima_gradient_accumulation_steps": "4",
         "anima_mixed_precision": "bfloat16",
         "anima_clip_grad_norm": "15.0",
         "anima_seed": "61",
-        "anima_save_every_n_steps": "1000",
+        "anima_save_every_n_steps": "2000",
         "anima_lr_custom_curve": [
             [
                 0.0,
@@ -207,58 +198,28 @@
         "anima_lr_graph_min": "1.0e-8",
         "anima_lr_graph_max": "5.0e-06",
         "anima_timestep_allocation": {
-            "bin_size": 20,
+            "bin_size": 50,
             "counts": [
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14,
-                14
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25,
+                25
             ]
         },
         "anima_timestep_stratified_sampling": true,
@@ -266,106 +227,14 @@
         "anima_timestep_loss_weight_curve": [
             [
                 0.0,
-                0.14
-            ],
-            [
-                0.02,
-                0.25
-            ],
-            [
-                0.03,
-                0.55
-            ],
-            [
-                0.05,
-                0.7
-            ],
-            [
-                0.075,
-                0.85
-            ],
-            [
-                0.1,
-                0.95
-            ],
-            [
-                0.125,
-                1.1222
-            ],
-            [
-                0.175,
-                1.3309
-            ],
-            [
-                0.225,
-                1.3926
-            ],
-            [
-                0.275,
-                1.3916
-            ],
-            [
-                0.325,
-                1.4054
-            ],
-            [
-                0.375,
-                1.4146
-            ],
-            [
-                0.425,
-                1.3843
-            ],
-            [
-                0.475,
-                1.3103
-            ],
-            [
-                0.525,
-                1.2181
-            ],
-            [
-                0.575,
-                1.1336
-            ],
-            [
-                0.625,
-                1.0737
-            ],
-            [
-                0.675,
-                1.0093
-            ],
-            [
-                0.725,
-                0.9109
-            ],
-            [
-                0.775,
-                0.8013
-            ],
-            [
-                0.825,
-                0.6956
-            ],
-            [
-                0.875,
-                0.6021
-            ],
-            [
-                0.925,
-                0.5174
-            ],
-            [
-                0.975,
-                0.4583
+                1.0
             ],
             [
                 1.0,
-                0.4583
+                1.0
             ]
         ],
-        "anima_optimizer_type": "raven",
+        "anima_optimizer_type": "paged_adamw_8bit",
         "anima_raven_params": {
             "betas": [
                 0.9,
@@ -374,9 +243,15 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 1.0,
-            "use_grad_centralization": false,
-            "gc_alpha": 0.5,
             "momentum_dtype": "bfloat16"
+        },
+        "anima_paged_adamw_8bit_params": {
+            "betas": [
+                0.9,
+                0.999
+            ],
+            "eps": 1e-08,
+            "weight_decay": 0.01
         },
         "anima_titan_params": {
             "betas": [
@@ -386,13 +261,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 1.0,
-            "use_grad_centralization": false,
-            "gc_alpha": 1.0,
             "momentum_dtype": "bfloat16"
-        },
-        "anima_velorms_params": {
-            "weight_decay": 0.01,
-            "eps": 1e-08
         },
         "anima_loss_type": "MSE",
         "anima_memory_efficient_attention": "sdpa",
@@ -414,6 +283,7 @@
         "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_1217.pt",
         "anima_dit_exclude_targets": "llm_adapter.*",
         "anima_cache_folder_name": ".precomputed_anima_dit_cache",
+        "anima_conservative_selective_checkpointing": false,
         "anima_vae_caching_tiled": true,
         "anima_vae_caching_tile_size": [
             96,
