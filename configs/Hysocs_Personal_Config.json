@@ -234,7 +234,7 @@
                 1.0
             ]
         ],
-        "anima_optimizer_type": "paged_adamw_8bit",
+        "anima_optimizer_type": "titan",
         "anima_raven_params": {
             "betas": [
                 0.9,

@@ -63,7 +63,6 @@ class TitanAdamW(Optimizer):
                     p,
                     device="cpu",
                     dtype=torch.float32,
-                    pin_memory=p.device.type == "cuda",
                 )
 
                 if not hasattr(p, "register_post_accumulate_grad_hook"):
