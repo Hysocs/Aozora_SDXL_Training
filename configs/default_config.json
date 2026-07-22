@@ -82,7 +82,9 @@
             ],
             "eps": 1e-08,
             "weight_decay": 0.01,
-            "debias_strength": 0.6
+            "debias_strength": 0.6,
+            "momentum_dtype": "bfloat16",
+            "use_pinned_memory": false
         },
         "sdxl_titan_params": {
             "betas": [
@@ -190,7 +192,8 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "momentum_dtype": "bfloat16"
+            "momentum_dtype": "bfloat16",
+            "use_pinned_memory": false
         },
         "anima_titan_params": {
             "betas": [

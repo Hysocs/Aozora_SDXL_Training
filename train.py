@@ -9,6 +9,9 @@ from collections import defaultdict, deque
 import random
 import time
 import math
+import re
+import secrets
+import string
 import torch
 import torch.nn.functional as F
 from torch.optim import Optimizer
@@ -32,8 +35,8 @@ import threading
 import queue
 import tomesd
 from optimizer.raven import RavenAdamW
+from optimizer.raven_pinned import RavenPinnedAdamW
 from optimizer.titan import TitanAdamW
-import uuid
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
     FusedAttnProcessor2_0
@@ -2263,7 +2266,8 @@ def create_optimizer(config, params_to_optimize):
         final_params = {**getattr(default_config, 'RAVEN_PARAMS', {}), **getattr(config, 'RAVEN_PARAMS', {})}
         dtype_str = final_params.get('momentum_dtype', 'bfloat16')
         m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
-        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
+        optimizer_class = RavenPinnedAdamW if final_params.get('use_pinned_memory', False) else RavenAdamW
+        return optimizer_class(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "paged_adamw_8bit":
         try:
             import bitsandbytes as bnb
@@ -2284,6 +2288,67 @@ def create_optimizer(config, params_to_optimize):
             min_8bit_size=4096,
         )
     raise ValueError(f"Unsupported optimizer type: '{config.OPTIMIZER_TYPE}'")
+
+
+def print_optimizer_summary(optimizer, config):
+    optimizer_key = str(config.OPTIMIZER_TYPE).lower()
+    raven_is_pinned = isinstance(optimizer, RavenPinnedAdamW)
+    group = optimizer.param_groups[0] if optimizer.param_groups else {}
+    params = [p for item in optimizer.param_groups for p in item.get("params", [])]
+    trainable_tensors = sum(1 for p in params if p.requires_grad)
+    trainable_elements = sum(p.numel() for p in params if p.requires_grad)
+    names = {
+        "raven": "RavenAdamW (Pinned CPU State)" if raven_is_pinned else "RavenAdamW",
+        "paged_adamw_8bit": "PagedAdamW8bit",
+        "titan": "TitanAdamW",
+    }
+
+    print("\n" + "=" * 58)
+    print("INFO: Optimizer Configuration")
+    print(f"  - Optimizer:           {names.get(optimizer_key, type(optimizer).__name__)}")
+    print(f"  - Config key:          {optimizer_key}")
+    print(f"  - Trainable tensors:   {trainable_tensors:,}")
+    print(f"  - Trainable elements:  {trainable_elements:,}")
+    print(f"  - Initial LR:          {group.get('lr', 0.0):.8g}")
+    print(f"  - Betas:               {tuple(group.get('betas', (0.9, 0.999)))}")
+    print(f"  - Epsilon:             {group.get('eps', 1e-8):.8g}")
+    print(f"  - Weight decay:        {group.get('weight_decay', 0.0):.8g}")
+
+    if optimizer_key == "paged_adamw_8bit":
+        print("  - Optimizer state:     paged blockwise 8-bit moments")
+        print(f"  - Minimum 8-bit size:  {group.get('min_8bit_size', 4096):,} elements")
+        print("  - Bias correction:     standard AdamW")
+        print("  - Parameter/grad dtype: unchanged from training configuration")
+    else:
+        momentum_dtype = group.get("momentum_dtype", getattr(optimizer, "_momentum_dtype", torch.bfloat16))
+        dtype_name = str(momentum_dtype).removeprefix("torch.")
+        print(f"  - Debias strength:     {group.get('debias_strength', 1.0):.8g}")
+        print(f"  - Momentum state:      CPU {dtype_name}")
+        print("  - Update math:         FP32 reusable GPU scratch buffer")
+        print(f"  - CPU state pinned:    {'yes' if raven_is_pinned else 'no'}")
+        if optimizer_key == "titan":
+            print("  - Gradient storage:    pageable CPU FP32 after backward")
+        else:
+            print("  - Gradient storage:    training device")
+    print("=" * 58 + "\n")
+
+
+def output_model_stem(config, source_path):
+    cached = getattr(config, "_RESOLVED_OUTPUT_STEM", None)
+    if cached:
+        return cached
+    requested = str(getattr(config, "OUTPUT_NAME", "auto") or "auto").strip()
+    if requested.lower() == "auto":
+        requested = f"{Path(source_path).stem}_trained_{{uuid}}"
+    run_uuid = "".join(secrets.choice(string.ascii_lowercase + string.digits) for _ in range(6))
+    requested = requested.replace("{uuid}", run_uuid)
+    requested = Path(requested).name
+    if requested.lower().endswith(".safetensors"):
+        requested = requested[:-len(".safetensors")]
+    requested = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", requested).strip(" .")
+    resolved = requested or f"{Path(source_path).stem}_trained_{run_uuid}"
+    config._RESOLVED_OUTPUT_STEM = resolved
+    return resolved
 
 def bell_timestep_loss_curve(total_timestep_count, device=None, dtype=torch.float32):
     steps = int(total_timestep_count)
@@ -2451,8 +2516,9 @@ def save_model(output_path, unet, base_checkpoint_path, compute_dtype):
 
 def save_checkpoint_pt(global_step, micro_step, unet, base_checkpoint_path, optimizer, lr_scheduler, scaler, sampler, config, timestep_sampler=None):
     output_dir = Path(config.OUTPUT_DIR)
-    model_filename = f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_step_{global_step}.safetensors"
-    state_filename = f"training_state_step_{global_step}.pt"
+    output_stem = output_model_stem(config, config.SINGLE_FILE_CHECKPOINT_PATH)
+    model_filename = f"{output_stem}_step_{global_step}.safetensors"
+    state_filename = f"{output_stem}_training_state_step_{global_step}.pt"
     save_model(output_dir / model_filename, unet, base_checkpoint_path, config.compute_dtype)
 
     optim_state = optimizer.save_cpu_state() if hasattr(optimizer, 'save_cpu_state') else optimizer.state_dict()
@@ -2623,6 +2689,8 @@ def main():
             except: pass
         lr_scheduler.step(micro_step)
 
+    print_optimizer_summary(optimizer, config)
+
     unet.train()
     diagnostics  = TrainingDiagnostics(config.GRADIENT_ACCUMULATION_STEPS)
     reporter     = AsyncReporter(total_steps=config.MAX_TRAIN_STEPS, test_param_name="conv_in" if hasattr(unet, 'conv_in') else "first param")
@@ -2764,7 +2832,7 @@ def main():
     reporter.log_message("\nTraining complete.")
     reporter.shutdown()
     save_model(
-        OUTPUT_DIR / f"{Path(config.SINGLE_FILE_CHECKPOINT_PATH).stem}_trained_unified_{str(uuid.uuid4())[:4]}.safetensors",
+        OUTPUT_DIR / f"{output_model_stem(config, config.SINGLE_FILE_CHECKPOINT_PATH)}.safetensors",
         unet, model_to_load, config.compute_dtype
     )
     print("All tasks complete. Final model saved.")

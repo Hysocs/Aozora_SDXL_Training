@@ -80,6 +80,12 @@ class RavenAdamW(Optimizer):
             self._scratch_buffer[2 * numel:3 * numel].view_as(p),
         )
 
+    def _new_cpu_state_tensor(self, p, dtype):
+        return torch.zeros_like(p, device="cpu", dtype=dtype)
+
+    def _restore_cpu_state_tensor(self, tensor):
+        return tensor.to(device="cpu", dtype=self._momentum_dtype)
+
     @torch.no_grad()
     def step(self, closure=None):
         loss = None
@@ -107,8 +113,8 @@ class RavenAdamW(Optimizer):
 
                 if "step" not in state:
                     state["step"] = 0
-                    state["exp_avg"] = torch.zeros_like(p, device="cpu", dtype=momentum_dtype)
-                    state["exp_avg_sq"] = torch.zeros_like(p, device="cpu", dtype=momentum_dtype)
+                    state["exp_avg"] = self._new_cpu_state_tensor(p, momentum_dtype)
+                    state["exp_avg_sq"] = self._new_cpu_state_tensor(p, momentum_dtype)
 
                 state["step"] += 1
                 step = state["step"]
@@ -179,11 +185,11 @@ class RavenAdamW(Optimizer):
             self.state[p] = {
                 "step": step,
                 "exp_avg": (
-                    exp_avg.to(device="cpu", dtype=self._momentum_dtype)
+                    self._restore_cpu_state_tensor(exp_avg)
                     if exp_avg is not None else None
                 ),
                 "exp_avg_sq": (
-                    exp_avg_sq.to(device="cpu", dtype=self._momentum_dtype)
+                    self._restore_cpu_state_tensor(exp_avg_sq)
                     if exp_avg_sq is not None else None
                 ),
             }

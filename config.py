@@ -18,6 +18,7 @@ MODE_LABELS = {
 SINGLE_FILE_CHECKPOINT_PATH = "./model.safetensors"
 VAE_PATH = ""
 OUTPUT_DIR = "./output"
+OUTPUT_NAME = "auto"
 
 # --- Architecture ---
 TRAINING_MODE = "Stable Diffusion XL (SDXL)"
@@ -123,7 +124,8 @@ RAVEN_PARAMS = {
     "eps": 1e-8,
     "weight_decay": 0.01,
     "debias_strength": 0.3,
-    "momentum_dtype": "bfloat16"
+    "momentum_dtype": "bfloat16",
+    "use_pinned_memory": False
 }
 PAGED_ADAMW_8BIT_PARAMS = {
     "betas": [0.9, 0.999],
@@ -159,7 +161,7 @@ VAE_LATENT_CHANNELS = None   # None = use model's channels, else force this
 
 
 FLAT_KEYS = [
-    "SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH", "OUTPUT_DIR", "TRAINING_MODE",
+    "SINGLE_FILE_CHECKPOINT_PATH", "VAE_PATH", "OUTPUT_DIR", "OUTPUT_NAME", "TRAINING_MODE",
     "DIT_PATH", "DIT_VAE_PATH", "ANIMA_DIT_SAVE_PREFIX",
     "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
     "RESUME_TRAINING", "RESUME_MODEL_PATH", "RESUME_STATE_PATH",
@@ -187,7 +189,7 @@ FLAT_KEYS = [
 ]
 
 PER_MODE_FLAT_KEYS = [
-    "OUTPUT_DIR", "RESUME_TRAINING", "INSTANCE_DATASETS", "CACHING_BATCH_SIZE",
+    "OUTPUT_DIR", "OUTPUT_NAME", "RESUME_TRAINING", "INSTANCE_DATASETS", "CACHING_BATCH_SIZE",
     "TEXT_CACHE_PRECISION", "VAE_CACHE_PRECISION", "NUM_WORKERS",
     "UNCONDITIONAL_DROPOUT", "UNCONDITIONAL_DROPOUT_CHANCE",
     "QWEN_NULL_DROPOUT_CHANCE", "T5_NULL_DROPOUT_CHANCE",

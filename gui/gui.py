@@ -31,7 +31,7 @@ try:
     import config as default_config
 except ImportError:
     class default_config:
-        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16"}
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16", "use_pinned_memory": False}
         PAGED_ADAMW_8BIT_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01}
         TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16"}
         OPTIMIZER_TYPE = "Raven"
@@ -548,6 +548,11 @@ class CompressedLogBuffer:
         ratio = 1.0 if self.uncompressed_bytes <= 0 else stored / self.uncompressed_bytes
         return stored, self.uncompressed_bytes, ratio
 
+    def get_all_text(self):
+        if self.line_count <= 0:
+            return ""
+        return "\n".join(self.get_lines(0, self.line_count))
+
     def _seal_current_block(self):
         if not self.current_lines:
             return
@@ -619,11 +624,18 @@ class VirtualConsoleWidget(QtWidgets.QWidget):
         self.clear_button.setToolTip("Clear the console output.")
         if self.clear_callback:
             self.clear_button.clicked.connect(self.clear_callback)
+        self.copy_button = QtWidgets.QPushButton("Copy Full Logs")
+        self.copy_button.setToolTip("Copy the complete log buffer, including lines not currently visible.")
+        self.copy_button.clicked.connect(self.copy_full_logs)
         footer.addWidget(self.status_label)
         footer.addStretch()
         footer.addWidget(self.follow_button)
+        footer.addWidget(self.copy_button)
         footer.addWidget(self.clear_button)
         root.addLayout(footer)
+
+    def copy_full_logs(self):
+        QtWidgets.QApplication.clipboard().setText(self.buffer.get_all_text())
 
     def eventFilter(self, obj, event):
         if obj is self.textbox.viewport() and event.type() == QtCore.QEvent.Type.Wheel:
@@ -2580,6 +2592,7 @@ class ProcessRunner(QThread):
         self.env = env
         self.creation_flags = creation_flags
         self.process = None
+        self.stop_requested = False
 
     @staticmethod
     def _clean_output_line(line):
@@ -2622,6 +2635,7 @@ class ProcessRunner(QThread):
 
     def stop(self):
         if self.process and self.process.poll() is None:
+            self.stop_requested = True
             if IS_WINDOWS:
                 self.process.terminate()
             else:
@@ -3346,6 +3360,7 @@ UI_DEFS = {
     "TOKENIZER_PATH":              ("Qwen Tokenizer Folder", "Local folder containing the Qwen tokenizer files for Anima.", "path", "folder"),
     "TOKENIZER_T5XXL_PATH":        ("T5XXL Tokenizer Folder", "Local folder containing the T5XXL tokenizer files for Anima.", "path", "folder"),
     "OUTPUT_DIR":                  ("Output Directory", "Folder where checkpoints will be saved.", "path", "folder"),
+    "OUTPUT_NAME":                 ("Output Filename", "Base filename without .safetensors. Insert {uuid} for one six-character lowercase ID per training run.", "line"),
     "ANIMA_STREAMING_SAVE":        ("Low-RAM Anima Save", "Save Anima DiT safetensors one tensor at a time to reduce peak system RAM during checkpoint saves.", "check"),
     "CACHING_BATCH_SIZE":          ("Caching Batch Size", "Adjust based on VRAM (e.g., 2-8).", "spin", 1, 64),
     "TEXT_CACHE_PRECISION":        ("Text Cache Precision", "Floating-point dtype used for cached text embeddings on disk.", "combo", ["float32", "bfloat16", "float16"]),
@@ -3408,7 +3423,7 @@ OPTIMIZER_INFO = {
         "details": (
             "RavenAdamW keeps the first and second Adam moments in system RAM, then transfers one "
             "parameter's state to a reusable GPU scratch buffer for FP32 update math. It supports "
-            "Raven's partial bias correction and selectable momentum precision.\n\n"
+            "Raven's partial bias correction, selectable momentum precision, and optional pinned CPU state.\n\n"
             "Best for: conservative full-parameter training where matching Raven's optimizer behavior matters.\n"
             "Tradeoff: large CPU↔GPU transfers make optimizer steps slower than paged 8-bit AdamW."
         ),
@@ -4414,14 +4429,68 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self.output_paths_group, output_paths_lay = self._make_path_subgroup("Output")
         output_paths_lay.addWidget(self._make_compact_path_row("OUTPUT_DIR"))
+        self.output_name_mode_combo = make_combo([
+            "Auto (selected model + _trained_{uuid})",
+            "Custom filename",
+        ])
+        self._add_vertical_field(
+            output_paths_lay,
+            make_label("Filename Mode"),
+            self.output_name_mode_combo,
+            "Auto names the file from the selected model and adds _trained_{uuid}.\n"
+            "Custom enables the Output Filename field so you can choose the name.\n\n"
+            "Place {uuid} anywhere in a custom name to generate one random "
+            "six-character lowercase ID for that training run. The same ID is "
+            "reused by its checkpoints and final model.\n\n"
+            "Example: portrait_{uuid}_v2 -> portrait_a7k3x9_v2.safetensors",
+        )
+        output_name_label, output_name_edit = self._make_widget("OUTPUT_NAME")
+        self._add_vertical_field(
+            output_paths_lay,
+            output_name_label,
+            output_name_edit,
+            output_name_label.toolTip(),
+        )
         self._add_vertical_widget_key(output_paths_lay, "ANIMA_STREAMING_SAVE")
         lay.addWidget(self.output_paths_group)
 
         self.model_load_strategy_combo.currentIndexChanged.connect(lambda _: self._update_path_mode_controls())
+        self.output_name_mode_combo.currentIndexChanged.connect(self._update_output_name_controls)
+        for source_key in ("SINGLE_FILE_CHECKPOINT_PATH", "RESUME_MODEL_PATH", "DIT_PATH", "ANIMA_RESUME_MODEL_PATH"):
+            self.widgets[source_key].textChanged.connect(lambda _: self._update_output_name_controls())
+        self.training_mode_combo.currentIndexChanged.connect(lambda _: self._update_output_name_controls())
+        self.model_load_strategy_combo.currentIndexChanged.connect(lambda _: self._update_output_name_controls())
         self.path_stacked_widget.currentChanged.connect(lambda _: self._sync_path_stack_height())
         self._update_path_mode_controls()
+        self._update_output_name_controls()
         self._sync_path_stack_height()
         return gb
+
+    def _suggest_output_name(self):
+        is_anima = default_config.mode_key_from_label(self.training_mode_combo.currentText()) == default_config.MODE_ANIMA
+        is_resume = self.model_load_strategy_combo.currentIndex() == 1
+        if is_anima:
+            source_key = "ANIMA_RESUME_MODEL_PATH" if is_resume else "DIT_PATH"
+        else:
+            source_key = "RESUME_MODEL_PATH" if is_resume else "SINGLE_FILE_CHECKPOINT_PATH"
+        source = self.widgets[source_key].text().strip()
+        stem = Path(source).stem if source else "model"
+        return f"{stem}_trained_{{uuid}}"
+
+    def _update_output_name_controls(self, _index=None):
+        if not hasattr(self, "output_name_mode_combo") or "OUTPUT_NAME" not in self.widgets:
+            return
+        name_edit = self.widgets["OUTPUT_NAME"]
+        automatic = self.output_name_mode_combo.currentIndex() == 0
+        previous = name_edit.blockSignals(True)
+        try:
+            if automatic:
+                name_edit.setText(self._suggest_output_name())
+            elif not name_edit.text().strip() or name_edit.text().strip().lower() == "auto":
+                name_edit.setText(self._suggest_output_name())
+            name_edit.setEnabled(not automatic)
+        finally:
+            name_edit.blockSignals(previous)
 
     def _make_path_subgroup(self, title):
         gb = QtWidgets.QGroupBox(title)
@@ -4817,6 +4886,14 @@ class TrainingGUI(QtWidgets.QWidget):
         if prefix in {"RAVEN", "TITAN"}:
             self.widgets[f'{prefix}_momentum_dtype'] = make_combo(["bfloat16", "float32"])
             self.widgets[f'{prefix}_momentum_dtype'].setCurrentText("bfloat16") 
+        if prefix == "RAVEN":
+            self.widgets["RAVEN_use_pinned_memory"] = QtWidgets.QCheckBox(
+                "Use pinned CPU momentum memory"
+            )
+            self.widgets["RAVEN_use_pinned_memory"].setToolTip(
+                "Page-lock Raven's CPU momentum buffers. This may change transfer timing, "
+                "but Windows can report the locked allocation as shared GPU memory."
+            )
 
         core_group, core_lay = group_box("Core Optimizer Settings", QtWidgets.QFormLayout)
         core_fields = [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
@@ -4830,6 +4907,8 @@ class TrainingGUI(QtWidgets.QWidget):
         if prefix in {"RAVEN", "TITAN"}:
             momentum_group, momentum_lay = group_box("Momentum Precision", QtWidgets.QFormLayout)
             momentum_lay.addRow(self.widgets[f'{prefix}_momentum_dtype'])
+            if prefix == "RAVEN":
+                momentum_lay.addRow(self.widgets["RAVEN_use_pinned_memory"])
             lay.addWidget(momentum_group)
 
         lay.addStretch(1)
@@ -5223,6 +5302,12 @@ class TrainingGUI(QtWidgets.QWidget):
                 if key in skip: continue
                 self._set_widget(key, self.current_config.get(key))
 
+            configured_output_name = str(self.current_config.get("OUTPUT_NAME", "auto") or "auto").strip()
+            self.output_name_mode_combo.blockSignals(True)
+            self.output_name_mode_combo.setCurrentIndex(0 if configured_output_name.lower() == "auto" else 1)
+            self.output_name_mode_combo.blockSignals(False)
+            self._update_output_name_controls()
+
             opt_type = self.current_config.get("OPTIMIZER_TYPE", default_config.OPTIMIZER_TYPE).lower()
             idx = self.widgets["OPTIMIZER_TYPE"].findData(opt_type)
             self.widgets["OPTIMIZER_TYPE"].setCurrentIndex(idx if idx >= 0 else 0)
@@ -5234,6 +5319,12 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets[f"{prefix}_eps"].setText(str(params.get("eps", 1e-8)))
                 self.widgets[f"{prefix}_weight_decay"].setValue(params.get("weight_decay", 0.01))
                 self.widgets[f"{prefix}_debias_strength"].setValue(params.get("debias_strength", 1.0))
+                if "momentum_dtype" in params:
+                    self.widgets[f"{prefix}_momentum_dtype"].setCurrentText(params["momentum_dtype"])
+                if prefix == "RAVEN":
+                    self.widgets["RAVEN_use_pinned_memory"].setChecked(
+                        bool(params.get("use_pinned_memory", False))
+                    )
 
             paged_defaults = getattr(default_config, "PAGED_ADAMW_8BIT_PARAMS", {})
             paged_params = {
@@ -5300,9 +5391,6 @@ class TrainingGUI(QtWidgets.QWidget):
             if "PREDICTION_TYPE" in self.widgets:
                 self._on_prediction_type_changed(self.widgets["PREDICTION_TYPE"].currentText())
 
-            if prefix in {"RAVEN", "TITAN"} and "momentum_dtype" in params:
-                self.widgets[f"{prefix}_momentum_dtype"].setCurrentText(params["momentum_dtype"])
-
         finally:
             for w in self.widgets.values(): w.blockSignals(False)
             self._applying_config = False
@@ -5324,6 +5412,12 @@ class TrainingGUI(QtWidgets.QWidget):
             if key in inactive_path_keys: continue
             if val is None: continue
             cfg[key] = [[round(p[0], 8), round(p[1], 10)] for p in val] if key == "LR_CUSTOM_CURVE" else val
+
+        cfg["OUTPUT_NAME"] = (
+            "auto"
+            if self.output_name_mode_combo.currentIndex() == 0
+            else self.widgets["OUTPUT_NAME"].text().strip() or self._suggest_output_name()
+        )
 
         cfg["RESUME_TRAINING"] = self.model_load_strategy_combo.currentIndex() == 1
         cfg["INSTANCE_DATASETS"] = self.dataset_manager.get_datasets_config()
@@ -5352,8 +5446,9 @@ class TrainingGUI(QtWidgets.QWidget):
             }
             
 
-            if prefix in {"RAVEN", "TITAN"}:
-                cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
+            cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
+            if prefix == "RAVEN":
+                cfg[key]["use_pinned_memory"] = self.widgets["RAVEN_use_pinned_memory"].isChecked()
 
         try:
             paged_betas = [float(x) for x in self.widgets["PAGED_ADAMW_8BIT_betas"].text().split(',')]
@@ -5532,9 +5627,15 @@ class TrainingGUI(QtWidgets.QWidget):
             self.log("No active training process to save.")
 
     def training_finished(self, exit_code=0):
+        stopped_by_user = bool(self.process_runner and self.process_runner.stop_requested)
         if self.process_runner: self.process_runner.quit(); self.process_runner.wait(); self.process_runner = None
-        status = "successfully" if exit_code == 0 else f"with error (Code: {exit_code})"
-        self.log("\n" + "=" * 50 + f"\nTraining finished {status}.\n" + "=" * 50)
+        if stopped_by_user:
+            result = "Training stopped by user."
+        elif exit_code == 0:
+            result = "Training finished successfully."
+        else:
+            result = f"Training finished with error (Code: {exit_code})."
+        self.log("\n" + "=" * 50 + f"\n{result}\n" + "=" * 50)
         self.start_button.setVisible(True); self.stop_button.setVisible(False); self.force_save_button.setVisible(False)
         if hasattr(self, 'dataset_manager'): self.dataset_manager.refresh_cache_buttons()
         prevent_sleep(False)

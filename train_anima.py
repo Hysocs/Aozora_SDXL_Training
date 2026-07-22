@@ -68,6 +68,8 @@ from train import (
     get_text_conditioning_scale_range,
     make_bucket_variant_metadata,
     null_conditioning_cache_needed,
+    output_model_stem,
+    print_optimizer_summary,
     set_seed,
     smart_resize,
     timestep_loss_curve_from_config,
@@ -1647,8 +1649,9 @@ def save_dit_model(output_path, dit, compute_dtype, key_prefix="", streaming_sav
 def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_scheduler, sampler, config, noise_generator=None, batch_sampler=None):
     output_dir = Path(config.OUTPUT_DIR)
     output_dir.mkdir(parents=True, exist_ok=True)
-    model_filename = f"{Path(config.DIT_PATH).stem}_step_{global_step}.safetensors"
-    state_filename = f"training_state_step_{global_step}.pt"
+    output_stem = output_model_stem(config, config.DIT_PATH)
+    model_filename = f"{output_stem}_step_{global_step}.safetensors"
+    state_filename = f"{output_stem}_training_state_step_{global_step}.pt"
     save_dit_model(
         output_dir / model_filename,
         dit,
@@ -1767,14 +1770,14 @@ def run_anima_dit_training(config):
     print("INFO: Precomputing Anima DiT cache if needed...")
     precompute_and_cache_anima(config, pipe, device)
 
-    print("INFO: Moving VAE/Text Encoder off GPU for DiT training...")
-    pipe.vae.cpu()
-    pipe.text_encoder.cpu()
+    dit = pipe.dit
+    print("INFO: Unloading VAE/Text Encoder after caching...")
+    pipe.vae = None
+    pipe.text_encoder = None
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.empty_cache()
 
-    dit = pipe.dit
     dit.to(device=device, dtype=config.compute_dtype)
     dit.train()
     freeze_dit_layers(dit, getattr(config, "DIT_EXCLUDE_TARGETS", []))
@@ -1789,6 +1792,8 @@ def run_anima_dit_training(config):
         except Exception as e:
             print(f"WARNING: Could not load optimizer state: {e}")
         lr_scheduler.step(micro_step)
+
+    print_optimizer_summary(optimizer, config)
 
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
@@ -1960,7 +1965,7 @@ def run_anima_dit_training(config):
 
     reporter.log_message("\nTraining complete.")
     reporter.shutdown()
-    final_path = output_dir / f"{Path(config.DIT_PATH).stem}_trained_full_{str(uuid.uuid4())[:4]}.safetensors"
+    final_path = output_dir / f"{output_model_stem(config, config.DIT_PATH)}.safetensors"
     save_dit_model(
         final_path,
         dit,
