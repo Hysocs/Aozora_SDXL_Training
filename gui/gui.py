@@ -31,7 +31,7 @@ try:
     import config as default_config
 except ImportError:
     class default_config:
-        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16", "use_pinned_memory": False}
+        RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16"}
         PAGED_ADAMW_8BIT_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01}
         TITAN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16"}
         OPTIMIZER_TYPE = "Raven"
@@ -3423,7 +3423,7 @@ OPTIMIZER_INFO = {
         "details": (
             "RavenAdamW keeps the first and second Adam moments in system RAM, then transfers one "
             "parameter's state to a reusable GPU scratch buffer for FP32 update math. It supports "
-            "Raven's partial bias correction, selectable momentum precision, and optional pinned CPU state.\n\n"
+            "Raven's partial bias correction and selectable momentum precision.\n\n"
             "Best for: conservative full-parameter training where matching Raven's optimizer behavior matters.\n"
             "Tradeoff: large CPU↔GPU transfers make optimizer steps slower than paged 8-bit AdamW."
         ),
@@ -4886,14 +4886,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if prefix in {"RAVEN", "TITAN"}:
             self.widgets[f'{prefix}_momentum_dtype'] = make_combo(["bfloat16", "float32"])
             self.widgets[f'{prefix}_momentum_dtype'].setCurrentText("bfloat16") 
-        if prefix == "RAVEN":
-            self.widgets["RAVEN_use_pinned_memory"] = QtWidgets.QCheckBox(
-                "Use pinned CPU momentum memory"
-            )
-            self.widgets["RAVEN_use_pinned_memory"].setToolTip(
-                "Page-lock Raven's CPU momentum buffers. This may change transfer timing, "
-                "but Windows can report the locked allocation as shared GPU memory."
-            )
 
         core_group, core_lay = group_box("Core Optimizer Settings", QtWidgets.QFormLayout)
         core_fields = [("Betas (b1, b2):", f'{prefix}_betas'), ("Epsilon:", f'{prefix}_eps'),
@@ -4907,8 +4899,6 @@ class TrainingGUI(QtWidgets.QWidget):
         if prefix in {"RAVEN", "TITAN"}:
             momentum_group, momentum_lay = group_box("Momentum Precision", QtWidgets.QFormLayout)
             momentum_lay.addRow(self.widgets[f'{prefix}_momentum_dtype'])
-            if prefix == "RAVEN":
-                momentum_lay.addRow(self.widgets["RAVEN_use_pinned_memory"])
             lay.addWidget(momentum_group)
 
         lay.addStretch(1)
@@ -5321,10 +5311,6 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.widgets[f"{prefix}_debias_strength"].setValue(params.get("debias_strength", 1.0))
                 if "momentum_dtype" in params:
                     self.widgets[f"{prefix}_momentum_dtype"].setCurrentText(params["momentum_dtype"])
-                if prefix == "RAVEN":
-                    self.widgets["RAVEN_use_pinned_memory"].setChecked(
-                        bool(params.get("use_pinned_memory", False))
-                    )
 
             paged_defaults = getattr(default_config, "PAGED_ADAMW_8BIT_PARAMS", {})
             paged_params = {
@@ -5447,8 +5433,6 @@ class TrainingGUI(QtWidgets.QWidget):
             
 
             cfg[key]["momentum_dtype"] = self.widgets[f"{prefix}_momentum_dtype"].currentText()
-            if prefix == "RAVEN":
-                cfg[key]["use_pinned_memory"] = self.widgets["RAVEN_use_pinned_memory"].isChecked()
 
         try:
             paged_betas = [float(x) for x in self.widgets["PAGED_ADAMW_8BIT_betas"].text().split(',')]

@@ -100,8 +100,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 0.3,
-            "momentum_dtype": "bfloat16",
-            "use_pinned_memory": false
+            "momentum_dtype": "bfloat16"
         },
         "sdxl_paged_adamw_8bit_params": {
             "betas": [
@@ -347,8 +346,7 @@
             "eps": 1e-08,
             "weight_decay": 0.01,
             "debias_strength": 1.0,
-            "momentum_dtype": "bfloat16",
-            "use_pinned_memory": false
+            "momentum_dtype": "bfloat16"
         },
         "anima_paged_adamw_8bit_params": {
             "betas": [

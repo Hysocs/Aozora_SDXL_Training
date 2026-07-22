@@ -124,8 +124,7 @@ RAVEN_PARAMS = {
     "eps": 1e-8,
     "weight_decay": 0.01,
     "debias_strength": 0.3,
-    "momentum_dtype": "bfloat16",
-    "use_pinned_memory": False
+    "momentum_dtype": "bfloat16"
 }
 PAGED_ADAMW_8BIT_PARAMS = {
     "betas": [0.9, 0.999],

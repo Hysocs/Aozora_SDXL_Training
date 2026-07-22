@@ -35,7 +35,6 @@ import threading
 import queue
 import tomesd
 from optimizer.raven import RavenAdamW
-from optimizer.raven_pinned import RavenPinnedAdamW
 from optimizer.titan import TitanAdamW
 from diffusers.models.attention_processor import (
     AttnProcessor2_0,
@@ -2266,8 +2265,7 @@ def create_optimizer(config, params_to_optimize):
         final_params = {**getattr(default_config, 'RAVEN_PARAMS', {}), **getattr(config, 'RAVEN_PARAMS', {})}
         dtype_str = final_params.get('momentum_dtype', 'bfloat16')
         m_dtype = torch.bfloat16 if dtype_str == "bfloat16" else torch.float32
-        optimizer_class = RavenPinnedAdamW if final_params.get('use_pinned_memory', False) else RavenAdamW
-        return optimizer_class(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
+        return RavenAdamW(params_to_optimize, lr=initial_lr, betas=tuple(final_params.get('betas', [0.9, 0.999])), eps=final_params.get('eps', 1e-8), weight_decay=final_params.get('weight_decay', 0.01), debias_strength=final_params.get('debias_strength', 1.0), momentum_dtype=m_dtype)
     elif optimizer_type == "paged_adamw_8bit":
         try:
             import bitsandbytes as bnb
@@ -2292,13 +2290,12 @@ def create_optimizer(config, params_to_optimize):
 
 def print_optimizer_summary(optimizer, config):
     optimizer_key = str(config.OPTIMIZER_TYPE).lower()
-    raven_is_pinned = isinstance(optimizer, RavenPinnedAdamW)
     group = optimizer.param_groups[0] if optimizer.param_groups else {}
     params = [p for item in optimizer.param_groups for p in item.get("params", [])]
     trainable_tensors = sum(1 for p in params if p.requires_grad)
     trainable_elements = sum(p.numel() for p in params if p.requires_grad)
     names = {
-        "raven": "RavenAdamW (Pinned CPU State)" if raven_is_pinned else "RavenAdamW",
+        "raven": "RavenAdamW",
         "paged_adamw_8bit": "PagedAdamW8bit",
         "titan": "TitanAdamW",
     }
@@ -2325,7 +2322,6 @@ def print_optimizer_summary(optimizer, config):
         print(f"  - Debias strength:     {group.get('debias_strength', 1.0):.8g}")
         print(f"  - Momentum state:      CPU {dtype_name}")
         print("  - Update math:         FP32 reusable GPU scratch buffer")
-        print(f"  - CPU state pinned:    {'yes' if raven_is_pinned else 'no'}")
         if optimizer_key == "titan":
             print("  - Gradient storage:    pageable CPU FP32 after backward")
         else:
