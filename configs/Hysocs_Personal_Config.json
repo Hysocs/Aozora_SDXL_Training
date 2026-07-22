@@ -137,7 +137,7 @@
     },
     "anima": {
         "anima_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained",
-        "anima_output_name": "adamw_8bit_paged_{uuid}",
+        "anima_output_name": "Raven2_{uuid}",
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {

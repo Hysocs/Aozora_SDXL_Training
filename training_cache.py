@@ -99,11 +99,26 @@ def save_cache_index(cache_dir, payload):
 
 
 def collect_image_paths(root):
-    return [
-        p
-        for ext in IMAGE_EXTENSIONS
-        for p in Path(root).rglob(f"*{ext}")
-    ]
+    root = Path(root)
+    return sorted(
+        (
+            p
+            for ext in IMAGE_EXTENSIONS
+            for p in root.rglob(f"*{ext}")
+        ),
+        key=lambda p: p.relative_to(root).as_posix().casefold(),
+    )
+
+
+def stable_cache_item_key(item):
+    """Order cached image/bucket variants independently of filesystem traversal."""
+    target_size = tuple(item.get("target_size", (0, 0)))
+    return (
+        str(item.get("relative_path", item.get("image_key", ""))).replace("\\", "/").casefold(),
+        int(item.get("bucket_variant_index", 0) or 0),
+        target_size,
+        str(item.get("lat_path", item.get("te_path", ""))).replace("\\", "/").casefold(),
+    )
 
 
 def file_stat_signature(path):

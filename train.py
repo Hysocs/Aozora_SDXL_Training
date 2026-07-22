@@ -67,6 +67,7 @@ from training_cache import (
     remove_cache_pair_for_te_path,
     save_cache_index,
     selected_caption_variant_path,
+    stable_cache_item_key,
     strip_json_caption_suffix,
     te_paths_for_index_item,
     text_cache_paths_for_index_item,
@@ -2006,8 +2007,9 @@ class ImageTextLatentDataset(Dataset):
                 index_data = load_cache_index(cache_dir)
                     
                 repeats = int(ds.get("repeats", 1))
+                stable_items = sorted(index_data["files"], key=stable_cache_item_key)
                 for _ in range(repeats):
-                    for item in index_data["files"]:
+                    for item in stable_items:
                         self.items.append(item)
                         self.bucket_keys.append(tuple(item["target_size"]))
             else:
