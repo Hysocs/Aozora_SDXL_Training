@@ -27,18 +27,20 @@ def epoch_marker_interval(max_steps, batch_size, total_images):
     return steps_per_epoch, marker_count
 
 
-def logit_shift_ticket_weights(bin_size, shift, total_timesteps=1000):
-    """Bin masses reproducing uniform tickets passed through a sigma shift."""
+def odds_scaled_ticket_weights(bin_size, scale, total_timesteps=1000):
+    """Bin masses from directional Z-Image-style log-odds scaling."""
     bin_size = max(1, int(bin_size))
     total_timesteps = max(1, int(total_timesteps))
-    shift = max(0.01, float(shift))
+    signed_scale = float(scale)
+    magnitude = max(1.0, abs(signed_scale))
+    scale = magnitude if signed_scale >= 0.0 else 1.0 / magnitude
 
-    def inverse_shift(y):
-        return y / (shift - (shift - 1.0) * y)
+    def inverse_odds_scale(y):
+        return y / (scale - (scale - 1.0) * y)
 
     weights = []
     for start in range(0, total_timesteps, bin_size):
         y0 = start / total_timesteps
         y1 = min(start + bin_size, total_timesteps) / total_timesteps
-        weights.append(max(0.0, inverse_shift(y1) - inverse_shift(y0)))
+        weights.append(max(0.0, inverse_odds_scale(y1) - inverse_odds_scale(y0)))
     return weights

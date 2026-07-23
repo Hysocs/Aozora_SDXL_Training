@@ -1,3 +1,7 @@
 {
-    "last_config": "Hysocs_Personal_Config"
+    "last_config": "Hysocs_Personal_Config",
+    "theme_colors": {
+        "primary": "#c1845b",
+        "secondary": "#c2ad55"
+    }
 }

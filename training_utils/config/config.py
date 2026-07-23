@@ -4,7 +4,7 @@ import copy
 # DEFAULT CONFIGURATION
 # ====================================================================================
 
-CONFIG_VERSION = 3
+CONFIG_VERSION = 4
 MODE_SDXL = "sdxl"
 MODE_ANIMA = "anima"
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
@@ -144,7 +144,7 @@ LOSS_TYPE = "MSE"
 # --- Advanced & Miscellaneous ---
 MEMORY_EFFICIENT_ATTENTION = "sdpa"
 TIMESTEP_MODE = "Wave"
-TIMESTEP_TICKET_SHIFT = 3.0
+TIMESTEP_ODDS_SCALE = 3.0
 # --- DiT / Anima Cache Configuration ---
 ANIMA_CACHE_FOLDER_NAME = ".precomputed_anima_dit_cache"
 VAE_CACHING_TILED = True
@@ -181,7 +181,7 @@ FLAT_KEYS = [
     "LR_CUSTOM_CURVE", "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX",
     "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "TIMESTEP_LOSS_WEIGHT_CURVE", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "PAGED_ADAMW_8BIT_PARAMS", "TITAN_PARAMS",
     "LOSS_TYPE",
-    "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE", "TIMESTEP_TICKET_SHIFT",
+    "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE", "TIMESTEP_ODDS_SCALE",
     "ANIMA_CACHE_FOLDER_NAME", "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE",
     "VAE_CACHING_TILE_STRIDE", "REBUILD_CACHE", "VAE_NORMALIZATION_MODE",
     "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR", "VAE_LATENT_CHANNELS",
@@ -204,7 +204,7 @@ PER_MODE_FLAT_KEYS = [
     "CLIP_GRAD_NORM", "SEED", "SAVE_EVERY_N_STEPS", "LR_CUSTOM_CURVE",
     "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX", "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "TIMESTEP_LOSS_WEIGHT_CURVE",
     "OPTIMIZER_TYPE", "RAVEN_PARAMS", "PAGED_ADAMW_8BIT_PARAMS", "TITAN_PARAMS",
-    "LOSS_TYPE", "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE", "TIMESTEP_TICKET_SHIFT",
+    "LOSS_TYPE", "MEMORY_EFFICIENT_ATTENTION", "TIMESTEP_MODE", "TIMESTEP_ODDS_SCALE",
     "VAE_NORMALIZATION_MODE", "VAE_SHIFT_FACTOR", "VAE_SCALING_FACTOR",
     "VAE_LATENT_CHANNELS", "REBUILD_CACHE",
 ]
@@ -303,12 +303,12 @@ def normalize_preset(config_data):
             }
             legacy_timestep_loss_key = f"{mode_key}_use_timestep_loss_weight"
             curve_key = nested_key_for(mode_key, "TIMESTEP_LOSS_WEIGHT_CURVE")
-            ticket_shift_key = nested_key_for(mode_key, "TIMESTEP_TICKET_SHIFT")
-            legacy_shift_keys = [f"{mode_key}_ticket_shift", f"{mode_key}_sigma_shift"]
-            if ticket_shift_key not in config_data[mode_key]:
-                for old_shift_key in legacy_shift_keys:
-                    if old_shift_key in config_data[mode_key]:
-                        preset[mode_key][ticket_shift_key] = copy.deepcopy(config_data[mode_key][old_shift_key])
+            odds_scale_key = nested_key_for(mode_key, "TIMESTEP_ODDS_SCALE")
+            legacy_odds_keys = [f"{mode_key}_timestep_ticket_shift", f"{mode_key}_ticket_shift", f"{mode_key}_sigma_shift"]
+            if odds_scale_key not in config_data[mode_key]:
+                for old_odds_key in legacy_odds_keys:
+                    if old_odds_key in config_data[mode_key]:
+                        preset[mode_key][odds_scale_key] = copy.deepcopy(config_data[mode_key][old_odds_key])
                         break
             if (
                 config_data[mode_key].get(legacy_timestep_loss_key)
@@ -320,6 +320,9 @@ def normalize_preset(config_data):
                 for key, value in config_data[mode_key].items()
                 if key in valid_keys
             })
+            timestep_mode_key = nested_key_for(mode_key, "TIMESTEP_MODE")
+            if preset[mode_key].get(timestep_mode_key) == "Shift":
+                preset[mode_key][timestep_mode_key] = "Odds-Scaled (Z-Image)"
     return preset
 
 

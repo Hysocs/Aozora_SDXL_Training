@@ -1,6 +1,6 @@
-# Aozora SDXL Trainer
+# Aozora Trainer
 
-Aozora SDXL Trainer is a GUI-based SDXL fine-tuning trainer focused on making full-model training practical on single consumer GPUs.
+Aozora Trainer is a GUI-based model fine-tuning trainer focused on making full-model training practical on single consumer GPUs.
 
 It is built for users who want more control than a preset-only trainer, but do not want to manage large JSON configs by hand. The goal is simple: train SDXL models efficiently on 12 GB class GPUs while keeping the important training controls visible, editable, and understandable.
 

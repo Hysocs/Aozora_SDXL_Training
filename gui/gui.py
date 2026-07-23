@@ -13,6 +13,7 @@ import zlib
 import importlib.util
 import signal
 import textwrap
+from dataclasses import replace
 from pathlib import Path
 from collections import deque
 from datetime import datetime
@@ -113,6 +114,17 @@ TEXT_MUTED = THEME.text_disabled
 BORDER_MUTED = THEME.border_muted
 
 STYLESHEET = make_stylesheet()
+
+DEFAULT_THEME_COLORS = {
+    "primary": THEME.accent,
+    "secondary": THEME.warning,
+}
+THEME_COLOR_PRESETS = [
+    ("Clay & Ochre", "#c1845b", "#c2ad55"),
+    ("Copper & Gold", "#ad7048", "#d0b44f"),
+    ("Rosewood & Sand", "#ad6670", "#c8ad72"),
+    ("Original Blue & Amber", "#6fa8c9", "#c9955a"),
+]
 
 _sleep_inhibitor_process = None
 
@@ -370,12 +382,96 @@ def style_role(widget, role):
 
 def make_label(text, color=None, bold=False, size=None):
     lbl = QtWidgets.QLabel(text)
+    role = None
+    for candidate, value in (
+        ("accent", ACCENT),
+        ("accent_alt", ACCENT2),
+        ("warning", WARN),
+        ("danger", DANGER),
+        ("success", SUCCESS),
+    ):
+        if color and QtGui.QColor(color) == QtGui.QColor(value):
+            role = candidate
+            break
+    if role:
+        lbl.setProperty("themeColorRole", role)
+        lbl.setProperty("themeBold", bool(bold))
+        lbl.setProperty("themePointSize", int(size or 0))
     parts = []
     if color: parts.append(f"color: {color};")
     if bold: parts.append("font-weight: bold;")
     if size: parts.append(f"font-size: {size}pt;")
     if parts: lbl.setStyleSheet(" ".join(parts))
     return lbl
+
+
+class ThemeSwatchButton(QtWidgets.QAbstractButton):
+    """Compact stacked theme swatches attached to the tab strip."""
+
+    def __init__(self, primary, secondary, parent=None):
+        super().__init__(parent)
+        self.primary = QtGui.QColor(primary)
+        self.secondary = QtGui.QColor(secondary)
+        self.setFixedSize(20, 20)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+        self.setToolTip("Choose GUI colors")
+
+    def set_colors(self, primary, secondary):
+        self.primary = QtGui.QColor(primary)
+        self.secondary = QtGui.QColor(secondary)
+        self.update()
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        painter.setPen(QtGui.QPen(THEME.color("accent") if self.underMouse() else THEME.color("border"), 1))
+        painter.setBrush(THEME.color("window"))
+        painter.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 4, 4)
+        swatch = QtCore.QRectF(2.5, 2.5, 15, 15)
+        clip = QtGui.QPainterPath()
+        clip.addRoundedRect(swatch, 2, 2)
+        painter.save()
+        painter.setClipPath(clip)
+        painter.setPen(QtCore.Qt.PenStyle.NoPen)
+        painter.setBrush(self.primary)
+        painter.drawPolygon(QtGui.QPolygonF([
+            swatch.topLeft(), swatch.topRight(), swatch.bottomLeft(),
+        ]))
+        painter.setBrush(self.secondary)
+        painter.drawPolygon(QtGui.QPolygonF([
+            swatch.topRight(), swatch.bottomRight(), swatch.bottomLeft(),
+        ]))
+        painter.restore()
+
+
+class ThemePresetButton(QtWidgets.QAbstractButton):
+    """Popup row showing a preset name and its two colors."""
+
+    def __init__(self, text, primary, secondary, parent=None):
+        super().__init__(parent)
+        self.text = text
+        self.primary = QtGui.QColor(primary)
+        self.secondary = QtGui.QColor(secondary)
+        self.setFixedHeight(34)
+        self.setMinimumWidth(235)
+        self.setCursor(QtCore.Qt.CursorShape.PointingHandCursor)
+
+    def paintEvent(self, event):
+        painter = QtGui.QPainter(self)
+        painter.setRenderHint(QtGui.QPainter.RenderHint.Antialiasing)
+        if self.underMouse():
+            painter.fillRect(self.rect(), THEME.color("surface_hover"))
+        painter.setPen(THEME.color("text"))
+        painter.drawText(
+            self.rect().adjusted(10, 0, -58, 0),
+            QtCore.Qt.AlignmentFlag.AlignVCenter | QtCore.Qt.AlignmentFlag.AlignLeft,
+            self.text,
+        )
+        painter.setPen(QtGui.QPen(THEME.color("border"), 1))
+        painter.setBrush(self.primary)
+        painter.drawRoundedRect(QtCore.QRectF(self.width() - 50, 8, 18, 18), 3, 3)
+        painter.setBrush(self.secondary)
+        painter.drawRoundedRect(QtCore.QRectF(self.width() - 27, 8, 18, 18), 3, 3)
 
 def make_separator(horizontal=True):
     f = QtWidgets.QFrame()
@@ -3478,11 +3574,22 @@ class TrainingGUI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
         self.setObjectName("TrainingGUI")
-        self.setWindowTitle("AOZORA SDXL Trainer")
+        self.setWindowTitle("AOZORA Trainer")
         self.setMinimumSize(1000, 800)
         self.resize(1500, 1000)
         self.config_dir = str(PROJECT_ROOT / "configs")
         self.state_file = os.path.join(self.config_dir, "gui_state.json")
+        saved_state = self._read_gui_state()
+        saved_colors = saved_state.get("theme_colors", {})
+        self.theme_colors = {
+            "primary": saved_colors.get("primary", DEFAULT_THEME_COLORS["primary"]),
+            "secondary": saved_colors.get("secondary", DEFAULT_THEME_COLORS["secondary"]),
+        }
+        self._apply_theme_colors(
+            self.theme_colors["primary"],
+            self.theme_colors["secondary"],
+            save=False,
+        )
         self.widgets = {}
         self.process_runner = None
         self.current_config = {}
@@ -3502,7 +3609,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self._mark_nested_groups()
 
         self.config_dropdown.blockSignals(True)
-        last = self._load_gui_state()
+        last = saved_state.get("last_config")
         if last and last in self.presets:
             idx = self.config_dropdown.findData(last)
             if idx != -1:
@@ -3556,21 +3663,173 @@ class TrainingGUI(QtWidgets.QWidget):
                 except Exception as e:
                     self.log(f"Warning: Could not load '{fn}': {e}")
 
-    def _load_gui_state(self):
+    def _read_gui_state(self):
         try:
             if os.path.exists(self.state_file):
-                with open(self.state_file, 'r') as f: return json.load(f).get("last_config")
+                with open(self.state_file, 'r') as f:
+                    state = json.load(f)
+                    return state if isinstance(state, dict) else {}
         except Exception: pass
-        return None
+        return {}
+
+    def _load_gui_state(self):
+        return self._read_gui_state().get("last_config")
 
     def _save_gui_state(self):
         try:
+            state = self._read_gui_state()
             idx = self.config_dropdown.currentIndex()
             if idx >= 0:
                 key = self.config_dropdown.itemData(idx) or self.config_dropdown.itemText(idx).replace(" ", "_").lower()
-                os.makedirs(self.config_dir, exist_ok=True)
-                with open(self.state_file, 'w') as f: json.dump({"last_config": key}, f, indent=4)
+                state["last_config"] = key
+            state["theme_colors"] = dict(self.theme_colors)
+            os.makedirs(self.config_dir, exist_ok=True)
+            with open(self.state_file, 'w') as f:
+                json.dump(state, f, indent=4)
         except Exception as e: self.log(f"Warning: Could not save GUI state: {e}")
+
+    @staticmethod
+    def _normalized_theme_color(value, fallback):
+        color = QtGui.QColor(str(value))
+        return color.name() if color.isValid() else fallback
+
+    def _apply_theme_colors(self, primary, secondary, save=True):
+        global THEME, STYLESHEET, ACCENT, ACCENT2, WARN
+
+        primary = self._normalized_theme_color(primary, DEFAULT_THEME_COLORS["primary"])
+        secondary = self._normalized_theme_color(secondary, DEFAULT_THEME_COLORS["secondary"])
+        primary_color = QtGui.QColor(primary)
+        secondary_color = QtGui.QColor(secondary)
+        THEME = replace(
+            THEME,
+            accent=primary,
+            accent_alt=primary,
+            accent_hover=primary_color.lighter(116).name(),
+            accent_deep=primary_color.darker(150).name(),
+            warning=secondary,
+            warning_hover=secondary_color.lighter(112).name(),
+            warning_deep=secondary_color.darker(150).name(),
+        )
+        ACCENT = THEME.accent
+        ACCENT2 = THEME.accent_alt
+        WARN = THEME.warning
+        STYLESHEET = make_stylesheet(THEME)
+        self.theme_colors = {"primary": primary, "secondary": secondary}
+
+        app = QtWidgets.QApplication.instance()
+        if app is not None:
+            app.setStyleSheet(STYLESHEET)
+        if hasattr(self, "theme_swatch_button"):
+            self.theme_swatch_button.set_colors(primary, secondary)
+        if hasattr(self, "widgets"):
+            self._refresh_runtime_theme_colors()
+        if save and hasattr(self, "config_dropdown"):
+            self._save_gui_state()
+
+    def _refresh_runtime_theme_colors(self):
+        for label in self.findChildren(QtWidgets.QLabel):
+            role = label.property("themeColorRole")
+            if not role:
+                continue
+            parts = [f"color: {getattr(THEME, role)};"]
+            if label.property("themeBold"):
+                parts.append("font-weight: bold;")
+            point_size = int(label.property("themePointSize") or 0)
+            if point_size:
+                parts.append(f"font-size: {point_size}pt;")
+            label.setStyleSheet(" ".join(parts))
+
+        if hasattr(self, "lr_curve_widget"):
+            self.lr_curve_widget.line_color = THEME.color("accent_alt")
+            self.lr_curve_widget.point_fill_color = THEME.color("accent_alt")
+            self.lr_curve_widget.selected_point_color = THEME.color("warning")
+            self.lr_curve_widget.update()
+        if hasattr(self, "timestep_histogram"):
+            self.timestep_histogram.bar_color_even = THEME.color("warning")
+            self.timestep_histogram.bar_color_odd = THEME.color("warning_deep")
+            self.timestep_histogram.bar_hover_color = THEME.color("warning_hover")
+            self.timestep_histogram.update()
+        if hasattr(self, "timestep_loss_curve"):
+            self.timestep_loss_curve.line_color = THEME.color("warning")
+            self.timestep_loss_curve.point_fill_color = THEME.color("warning")
+            self.timestep_loss_curve.selected_point_color = THEME.color("accent_alt")
+            self.timestep_loss_curve.update()
+        if hasattr(self, "live_metrics_widget"):
+            for histogram in self.live_metrics_widget.findChildren(LiveTimestepHistogram):
+                if isinstance(histogram, LiveTimestepMeanLossHistogram):
+                    histogram.bar_color = THEME.color("warning")
+                    histogram.bar_color_alt = THEME.color("warning_deep")
+                else:
+                    histogram.bar_color = THEME.color("accent_alt")
+                    histogram.bar_color_alt = THEME.color("accent_deep")
+                histogram.update()
+            for graph in self.live_metrics_widget.findChildren(GraphPanel):
+                graph.title_color = THEME.color("accent")
+                graph.update()
+        self.update()
+
+    def _show_theme_menu(self):
+        menu = QtWidgets.QMenu(self)
+        menu.setToolTipsVisible(True)
+
+        for name, primary, secondary in THEME_COLOR_PRESETS:
+            button = ThemePresetButton(name, primary, secondary)
+            action = QtWidgets.QWidgetAction(menu)
+            action.setDefaultWidget(button)
+            menu.addAction(action)
+            button.clicked.connect(
+                lambda _=False, p=primary, s=secondary, m=menu: (
+                    self._apply_theme_colors(p, s),
+                    m.close(),
+                )
+            )
+
+        menu.addSeparator()
+        custom = QtWidgets.QWidget()
+        custom_layout = QtWidgets.QVBoxLayout(custom)
+        custom_layout.setContentsMargins(9, 7, 9, 9)
+        custom_layout.setSpacing(6)
+        custom_layout.addWidget(make_label("Custom Colors", color=TEXT_SEC, bold=True))
+        custom_row = QtWidgets.QHBoxLayout()
+        custom_row.setSpacing(8)
+        primary_button = QtWidgets.QPushButton("Primary")
+        secondary_button = QtWidgets.QPushButton("Transformed")
+        for button in (primary_button, secondary_button):
+            button.setMinimumSize(105, 42)
+        primary_button.setStyleSheet(
+            f"background:{self.theme_colors['primary']}; color:{THEME.text}; border:1px solid {THEME.border};"
+        )
+        secondary_button.setStyleSheet(
+            f"background:{self.theme_colors['secondary']}; color:{THEME.window}; border:1px solid {THEME.border};"
+        )
+        primary_button.clicked.connect(lambda: self._choose_custom_theme_color("primary", primary_button, secondary_button))
+        secondary_button.clicked.connect(lambda: self._choose_custom_theme_color("secondary", primary_button, secondary_button))
+        custom_row.addWidget(primary_button)
+        custom_row.addWidget(secondary_button)
+        custom_layout.addLayout(custom_row)
+        custom_action = QtWidgets.QWidgetAction(menu)
+        custom_action.setDefaultWidget(custom)
+        menu.addAction(custom_action)
+
+        position = self.theme_swatch_button.mapToGlobal(
+            QtCore.QPoint(0, self.theme_swatch_button.height() + 3)
+        )
+        menu.exec(position)
+
+    def _choose_custom_theme_color(self, role, primary_button, secondary_button):
+        current = self.theme_colors[role]
+        color = QtWidgets.QColorDialog.getColor(QtGui.QColor(current), self, f"Choose {role.title()} Color")
+        if not color.isValid():
+            return
+        updated = dict(self.theme_colors)
+        updated[role] = color.name()
+        self._apply_theme_colors(updated["primary"], updated["secondary"])
+        primary_button.setStyleSheet(
+            f"background:{updated['primary']}; color:{THEME.text}; border:1px solid {THEME.border};"
+        )
+        secondary_button.setStyleSheet(
+            f"background:{updated['secondary']}; color:{THEME.window}; border:1px solid {THEME.border};"
+        )
 
     def _load_first_config(self):
         if self.config_dropdown.count() > 0:
@@ -3961,6 +4220,12 @@ class TrainingGUI(QtWidgets.QWidget):
         self.tab_bar.setExpanding(False)
         self.tab_bar.setDrawBase(False)
         tabs_layout.addWidget(self.tab_bar, 0, QtCore.Qt.AlignmentFlag.AlignBottom)
+        self.theme_swatch_button = ThemeSwatchButton(
+            self.theme_colors["primary"],
+            self.theme_colors["secondary"],
+        )
+        self.theme_swatch_button.clicked.connect(self._show_theme_menu)
+        tabs_layout.addWidget(self.theme_swatch_button, 0, QtCore.Qt.AlignmentFlag.AlignVCenter)
         tabs_layout.addStretch(1)
         tabs_layout.addWidget(self._build_corner_widget(), 0)
         main.addWidget(self.tabs_group, 0)
@@ -4972,7 +5237,12 @@ class TrainingGUI(QtWidgets.QWidget):
         r1.addWidget(self.bin_size_combo)
         r1.addSpacing(20)
         r1.addWidget(make_label("Distribution Mode:"))
-        self.ts_mode_combo = make_combo(["Wave", "Logit-Normal", "Beta", "Shift"])
+        self.ts_mode_combo = make_combo([
+            "Wave",
+            "Logit-Normal",
+            "Beta",
+            "Odds-Scaled (Z-Image)",
+        ])
         r1.addWidget(self.ts_mode_combo, 1)
         distribution_lay.addLayout(r1)
 
@@ -4997,42 +5267,40 @@ class TrainingGUI(QtWidgets.QWidget):
         self.slider_beta_beta, self.spin_beta_beta = self._add_slider_row(bl, "Beta:", 0.1, 10.0, 3.0, 100.0)
         self.ts_slider_stack.addWidget(beta_page)
 
-        shift_page = QtWidgets.QWidget()
-        shift_layout = QtWidgets.QFormLayout(shift_page)
-        shift_layout.setContentsMargins(0, 0, 0, 0)
-        shift_control = QtWidgets.QWidget()
-        shift_control_layout = QtWidgets.QHBoxLayout(shift_control)
-        shift_control_layout.setContentsMargins(0, 0, 0, 0)
-        self.slider_ticket_shift = NoScrollSlider(QtCore.Qt.Orientation.Horizontal)
-        set_semantic_color(self.slider_ticket_shift, "transformed")
-        self.slider_ticket_shift.setRange(100, 1000)
-        self.slider_ticket_shift.setValue(300)
-        self.spin_ticket_shift = NoScrollDoubleSpinBox()
-        self.spin_ticket_shift.setRange(1.0, 10.0)
-        self.spin_ticket_shift.setSingleStep(0.1)
-        self.spin_ticket_shift.setDecimals(2)
-        self.spin_ticket_shift.setValue(3.0)
-        self.spin_ticket_shift.setFixedWidth(120)
-        self.slider_ticket_shift.valueChanged.connect(
-            lambda value: self.spin_ticket_shift.setValue(value / 100.0)
+        odds_page = QtWidgets.QWidget()
+        odds_layout = QtWidgets.QFormLayout(odds_page)
+        odds_layout.setContentsMargins(0, 0, 0, 0)
+        odds_control = QtWidgets.QWidget()
+        odds_control_layout = QtWidgets.QHBoxLayout(odds_control)
+        odds_control_layout.setContentsMargins(0, 0, 0, 0)
+        self.slider_odds_scale = NoScrollSlider(QtCore.Qt.Orientation.Horizontal)
+        set_semantic_color(self.slider_odds_scale, "transformed")
+        self.slider_odds_scale.setRange(-1000, 1000)
+        self.slider_odds_scale.setValue(300)
+        self.spin_odds_scale = NoScrollDoubleSpinBox()
+        self.spin_odds_scale.setRange(-10.0, 10.0)
+        self.spin_odds_scale.setSingleStep(0.1)
+        self.spin_odds_scale.setDecimals(2)
+        self.spin_odds_scale.setValue(3.0)
+        self.spin_odds_scale.setFixedWidth(120)
+        self.slider_odds_scale.valueChanged.connect(
+            lambda value: self.spin_odds_scale.setValue(value / 100.0)
         )
-        self.spin_ticket_shift.valueChanged.connect(
-            lambda value: self.slider_ticket_shift.setValue(round(value * 100))
+        self.spin_odds_scale.valueChanged.connect(
+            lambda value: self.slider_odds_scale.setValue(round(value * 100))
         )
-        shift_control_layout.addWidget(self.slider_ticket_shift)
-        shift_control_layout.addWidget(self.spin_ticket_shift)
-        shift_layout.addRow("Shift:", shift_control)
-        shift_note = make_label(
-            "Choose a logit shift, then apply it as a timestep-ticket density transform."
+        self.slider_odds_scale.valueChanged.connect(lambda _: self._update_timestep_distribution())
+        self.spin_odds_scale.valueChanged.connect(lambda _: self._update_timestep_distribution())
+        odds_control_layout.addWidget(self.slider_odds_scale)
+        odds_control_layout.addWidget(self.spin_odds_scale)
+        odds_layout.addRow("Odds Scale:", odds_control)
+        odds_note = make_label(
+            "Directional Z-Image-style odds scaling: positive biases right, negative biases left; "
+            "values from -1 to 1 are uniform."
         )
-        shift_note.setWordWrap(True)
-        shift_layout.addRow(shift_note)
-        apply_ticket_shift_btn = make_btn(
-            "Apply Shift to Tickets",
-            lambda: self._apply_timestep_preset("Apply Ticket Shift"),
-        )
-        shift_layout.addRow(apply_ticket_shift_btn)
-        self.ts_slider_stack.addWidget(shift_page)
+        odds_note.setWordWrap(True)
+        odds_layout.addRow(odds_note)
+        self.ts_slider_stack.addWidget(odds_page)
         distribution_lay.addWidget(self.ts_slider_stack)
         lay.addWidget(distribution_group)
 
@@ -5042,7 +5310,9 @@ class TrainingGUI(QtWidgets.QWidget):
         presets_by_mode = [
             [("Uniform (Flat)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
             [("Bell Curve", "Bell Curve"), ("Detail (Early)", "Detail"), ("Structure (Late)", "Structure"),
-             ("Logit-Normal (RF/SD3 Recommended)", "Logit-Normal (RF/SD3 Recommended)")],
+             ("Logit-Normal (RF/SD3 Recommended)", "Logit-Normal (RF/SD3 Recommended)"),
+             ("Anima Default (1.0)", "Anima Logit Default"),
+             ("Anima Style LoRA (1.3)", "Anima Logit Style LoRA")],
             [("Symmetric (3,3)", "Beta Symmetric"), ("Right Skew (2,5)", "Beta Right Skew"),
              ("Left Skew (5,2)", "Beta Left Skew"), ("U-Shape (0.5,0.5)", "Beta U-Shape")],
         ]
@@ -5059,16 +5329,12 @@ class TrainingGUI(QtWidgets.QWidget):
         lay.addWidget(presets_group)
 
         self.bin_size_combo.currentTextChanged.connect(lambda t: (self.timestep_histogram.set_bin_size(int(t)), self._update_timestep_distribution()))
-        self.bin_size_combo.currentTextChanged.connect(
-            lambda _: self._update_shift_bin_availability(self.ts_mode_combo.currentText())
-        )
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_slider_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(self.ts_button_stack.setCurrentIndex)
         self.ts_mode_combo.currentIndexChanged.connect(lambda _: self._update_timestep_distribution())
         self.ts_mode_combo.currentTextChanged.connect(
-            lambda mode: self.timestep_presets_group.setVisible(mode != "Shift")
+            lambda mode: self.timestep_presets_group.setVisible(mode != "Odds-Scaled (Z-Image)")
         )
-        self.ts_mode_combo.currentTextChanged.connect(self._update_shift_bin_availability)
         self.timestep_coverage_controls = QtWidgets.QGroupBox("Timestep Coverage")
         set_semantic_color(self.timestep_coverage_controls, "transformed")
         coverage_form = QtWidgets.QFormLayout(self.timestep_coverage_controls)
@@ -5101,19 +5367,6 @@ class TrainingGUI(QtWidgets.QWidget):
         return sl, sp
 
     def _apply_timestep_preset(self, name):
-        if name == "Apply Ticket Shift":
-            shift = self.spin_ticket_shift.value()
-            self.current_config["TIMESTEP_TICKET_SHIFT"] = shift
-            self.ts_mode_combo.setCurrentText("Shift")
-            weights = gui_math.logit_shift_ticket_weights(
-                int(self.bin_size_combo.currentText()), shift, 1000
-            )
-            self.timestep_histogram.generate_from_weights(weights)
-            self.log(
-                f"Applied timestep Shift {shift:g} ticket density."
-            )
-            return
-
         self.ts_mode_combo.blockSignals(True)
 
         mode_map = {
@@ -5124,6 +5377,8 @@ class TrainingGUI(QtWidgets.QWidget):
             "Detail":          "Logit-Normal",
             "Structure":       "Logit-Normal",
             "Logit-Normal (RF/SD3 Recommended)": "Logit-Normal",
+            "Anima Logit Default": "Logit-Normal",
+            "Anima Logit Style LoRA": "Logit-Normal",
             "Beta Symmetric":  "Beta",
             "Beta Right Skew": "Beta",
             "Beta Left Skew":  "Beta",
@@ -5137,6 +5392,8 @@ class TrainingGUI(QtWidgets.QWidget):
             "Detail":          dict(ln_mu=-1.0, ln_sigma=0.8),
             "Structure":       dict(ln_mu=1.0, ln_sigma=0.8),
             "Logit-Normal (RF/SD3 Recommended)": dict(ln_mu=-0.5, ln_sigma=1.0),
+            "Anima Logit Default": dict(ln_mu=0.0, ln_sigma=1.0),
+            "Anima Logit Style LoRA": dict(ln_mu=0.0, ln_sigma=1.3),
             "Beta Symmetric":  dict(beta_alpha=3.0, beta_beta=3.0),
             "Beta Right Skew": dict(beta_alpha=2.0, beta_beta=5.0),
             "Beta Left Skew":  dict(beta_alpha=5.0, beta_beta=2.0),
@@ -5175,42 +5432,6 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self._update_timestep_distribution()
 
-    def _update_shift_bin_availability(self, mode):
-        shift_mode = mode == "Shift"
-        allowed = {"20", "40", "50"}
-        for index in range(self.bin_size_combo.count()):
-            item = self.bin_size_combo.model().item(index)
-            if not item:
-                continue
-            text = self.bin_size_combo.itemText(index)
-            flags = item.flags()
-            enabled = not shift_mode or text in allowed
-            item.setFlags(
-                flags | QtCore.Qt.ItemFlag.ItemIsEnabled
-                if enabled else flags & ~QtCore.Qt.ItemFlag.ItemIsEnabled
-            )
-            item.setData(
-                None if enabled else QtGui.QBrush(QtGui.QColor(TEXT_MUTED)),
-                QtCore.Qt.ItemDataRole.ForegroundRole,
-            )
-            item.setToolTip(
-                "Shift mode uses evenly divisible bins of 20, 40, or 50 for accuracy."
-                if not enabled else ""
-            )
-        if shift_mode and self.bin_size_combo.currentText() not in allowed:
-            current_size = int(self.bin_size_combo.currentText())
-            closest_size = min((20, 40, 50), key=lambda size: (abs(size - current_size), size))
-            self.bin_size_combo.setCurrentText(str(closest_size))
-            shift = self.spin_ticket_shift.value()
-            self.timestep_histogram.generate_from_weights(
-                gui_math.logit_shift_ticket_weights(closest_size, shift, 1000)
-            )
-            self.current_config["TIMESTEP_TICKET_SHIFT"] = shift
-            self.log(
-                f"Shift mode changed bin size from {current_size} to {closest_size} "
-                "to avoid a partial final bin and preserve accuracy."
-            )
-
     def _update_timestep_distribution(self):
         mode = self.ts_mode_combo.currentText()
         n = max(math.ceil(1000 / int(self.bin_size_combo.currentText())), 1)
@@ -5237,8 +5458,13 @@ class TrainingGUI(QtWidgets.QWidget):
             for i in range(n):
                 x = max(1e-4, min(1 - 1e-4, ((i * bin_size) + bin_size / 2) / 1000))
                 weights.append(max(0.0, x ** (alpha - 1) * (1 - x) ** (beta - 1)))
-        if mode != "Shift":
-            self.timestep_histogram.generate_from_weights(weights)
+        elif mode == "Odds-Scaled (Z-Image)":
+            weights = gui_math.odds_scaled_ticket_weights(
+                int(self.bin_size_combo.currentText()),
+                self.spin_odds_scale.value(),
+                1000,
+            )
+        self.timestep_histogram.generate_from_weights(weights)
 
     def _on_prediction_type_changed(self, text):
         if hasattr(self, 'dataset_manager'): 
@@ -5357,17 +5583,22 @@ class TrainingGUI(QtWidgets.QWidget):
             if hasattr(self, "timestep_loss_curve"):
                 self.timestep_loss_curve.set_points(loss_curve or [[0.0, 1.0], [1.0, 1.0]])
             ts_mode = self.current_config.get("TIMESTEP_MODE", "Wave")
+            if ts_mode == "Shift":
+                ts_mode = "Odds-Scaled (Z-Image)"
             self.ts_mode_combo.blockSignals(True)
             self.ts_mode_combo.setCurrentText(ts_mode)
             self.ts_mode_combo.blockSignals(False)
             mode_idx = max(0, self.ts_mode_combo.currentIndex())
             self.ts_slider_stack.setCurrentIndex(mode_idx)
             self.ts_button_stack.setCurrentIndex(mode_idx)
-            self.timestep_presets_group.setVisible(ts_mode != "Shift")
-            self.spin_ticket_shift.setValue(
-                float(self.current_config.get("TIMESTEP_TICKET_SHIFT", 3.0))
-            )
-            self._update_shift_bin_availability(ts_mode)
+            self.timestep_presets_group.setVisible(ts_mode != "Odds-Scaled (Z-Image)")
+            self.spin_odds_scale.blockSignals(True)
+            self.slider_odds_scale.blockSignals(True)
+            odds_scale = float(self.current_config.get("TIMESTEP_ODDS_SCALE", 3.0))
+            self.spin_odds_scale.setValue(odds_scale)
+            self.slider_odds_scale.setValue(round(odds_scale * 100))
+            self.slider_odds_scale.blockSignals(False)
+            self.spin_odds_scale.blockSignals(False)
 
             if hasattr(self, 'dataset_manager'):
                 self.dataset_manager.load_datasets_from_config(self.current_config.get("INSTANCE_DATASETS", []))
@@ -5411,7 +5642,7 @@ class TrainingGUI(QtWidgets.QWidget):
         cfg["LOSS_TYPE"] = "MSE"
         cfg["NOISE_MODE"] = "normal"
         cfg["TIMESTEP_MODE"] = self.ts_mode_combo.currentText()
-        cfg["TIMESTEP_TICKET_SHIFT"] = self.spin_ticket_shift.value()
+        cfg["TIMESTEP_ODDS_SCALE"] = self.spin_odds_scale.value()
         if hasattr(self, 'timestep_histogram'): cfg["TIMESTEP_ALLOCATION"] = self.timestep_histogram.get_allocation()
         if hasattr(self, 'timestep_loss_curve'): cfg["TIMESTEP_LOSS_WEIGHT_CURVE"] = self.timestep_loss_curve.get_points()
 

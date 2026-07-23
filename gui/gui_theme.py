@@ -26,16 +26,16 @@ class Theme:
     text: str = "#e6e9f0"
     text_muted: str = "#8991a7"
     text_disabled: str = "#50586b"
-    accent: str = "#6fa8c9"
-    accent_hover: str = "#88bdd8"
-    accent_deep: str = "#527f9b"
-    accent_alt: str = "#6fa8c9"
+    accent: str = "#c1845b"
+    accent_hover: str = "#d59a72"
+    accent_deep: str = "#805039"
+    accent_alt: str = "#c1845b"
     danger: str = "#f05b72"
     danger_hover: str = "#ff7187"
     success: str = "#49d98a"
-    warning: str = "#c9955a"
-    warning_hover: str = "#dbaa70"
-    warning_deep: str = "#9d7040"
+    warning: str = "#c2ad55"
+    warning_hover: str = "#d5c36c"
+    warning_deep: str = "#80702f"
 
     @property
     def chart(self) -> str:

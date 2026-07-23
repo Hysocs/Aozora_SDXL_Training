@@ -1,4 +1,4 @@
-# Copyright 2026 Aozora SDXL Training contributors
+# Copyright 2026 Aozora Trainer contributors
 # Portions derived from ModelScope DiffSynth-Studio 2.0.16 and modified for Aozora.
 # Licensed under the Apache License, Version 2.0. See the repository LICENSE.
 # SPDX-License-Identifier: Apache-2.0
