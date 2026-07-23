@@ -22,7 +22,7 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from training_cache import (
+from training_utils.caching.cache import (
     CAPTION_JSON_PRIMARY_TYPE,
     CACHE_IMAGE_LAYOUT_OPTION_KEYS,
     cache_image_layout_options_match,
@@ -503,16 +503,16 @@ def make_anima_tokenizer_config(path, label):
     return ModelConfig(path=local_path, skip_download=True)
 
 
-def ensure_anima_tools_available():
+def ensure_training_utils_available():
     global AnimaImagePipeline, ModelConfig
     if AnimaImagePipeline is not None and ModelConfig is not None:
         return
     try:
-        from anima_tools import AnimaImagePipeline as _AnimaImagePipeline
-        from anima_tools import ModelConfig as _ModelConfig
+        from training_utils.anima import AnimaImagePipeline as _AnimaImagePipeline
+        from training_utils.anima import ModelConfig as _ModelConfig
     except Exception as e:
         raise RuntimeError(
-            "Anima DiT training could not import the local anima_tools package."
+            "Anima DiT training could not import the local training_utils package."
         ) from e
     AnimaImagePipeline = _AnimaImagePipeline
     ModelConfig = _ModelConfig
@@ -523,8 +523,8 @@ def configure_anima_selective_checkpointing(config):
         print("INFO: Anima selective checkpointing disabled (full block recomputation).")
         return
 
-    ensure_anima_tools_available()
-    import anima_tools.models.anima_dit as anima_dit_module
+    ensure_training_utils_available()
+    import training_utils.anima.models.anima_dit as anima_dit_module
     from torch.utils.checkpoint import (
         CheckpointPolicy,
         checkpoint,
@@ -603,7 +603,7 @@ def detect_anima_dit_key_prefix(path):
 
 
 def load_anima_pipe(config, device):
-    ensure_anima_tools_available()
+    ensure_training_utils_available()
 
     original_dit_path = config.DIT_PATH
     model_configs = [

@@ -28,7 +28,7 @@ import subprocess
 from .gui_theme import THEME, make_stylesheet, set_role
 
 try:
-    import config as default_config
+    from training_utils.config import config as default_config
 except ImportError:
     class default_config:
         RAVEN_PARAMS = {"betas": [0.9, 0.999], "eps": 1e-8, "weight_decay": 0.01, "debias_strength": 1.0, "momentum_dtype": "bfloat16"}
@@ -55,7 +55,7 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
 TRAINING_MODE_ANIMA_DIT = "Anima DiT"
-DIT_AVAILABLE = importlib.util.find_spec("anima_tools") is not None
+DIT_AVAILABLE = importlib.util.find_spec("training_utils.anima") is not None
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
@@ -3537,7 +3537,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.training_mode_combo,
                 TRAINING_MODE_ANIMA_DIT,
                 False,
-                "The bundled anima_tools package is required for Anima DiT training.",
+                "The bundled training_utils package is required for Anima DiT training.",
             )
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
 
@@ -3751,7 +3751,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.training_mode_combo.setCurrentText(TRAINING_MODE_SDXL)
             self.training_mode_combo.blockSignals(False)
             is_dit = False
-            self.log("Anima DiT mode is unavailable because the bundled anima_tools package could not be loaded.")
+            self.log("Anima DiT mode is unavailable because the bundled training_utils package could not be loaded.")
 
         self._update_path_mode_controls()
         if hasattr(self, "unet_exclusion_group"):

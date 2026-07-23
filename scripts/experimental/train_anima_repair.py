@@ -29,8 +29,8 @@ from safetensors import safe_open
 from safetensors.torch import save_file
 from torch.utils.data import DataLoader, Dataset
 from tqdm.auto import tqdm
-from tools.semantic import generate_lineart_loss_map
-from training_cache import (
+from scripts.semantic import generate_lineart_loss_map
+from training_utils.caching.cache import (
     CAPTION_JSON_PRIMARY_TYPE,
     CACHE_IMAGE_LAYOUT_OPTION_KEYS,
     cache_image_layout_options_match,
@@ -519,16 +519,16 @@ def make_anima_tokenizer_config(path, label):
     return ModelConfig(path=local_path, skip_download=True)
 
 
-def ensure_anima_tools_available():
+def ensure_training_utils_available():
     global AnimaImagePipeline, ModelConfig
     if AnimaImagePipeline is not None and ModelConfig is not None:
         return
     try:
-        from anima_tools import AnimaImagePipeline as _AnimaImagePipeline
-        from anima_tools import ModelConfig as _ModelConfig
+        from training_utils.anima import AnimaImagePipeline as _AnimaImagePipeline
+        from training_utils.anima import ModelConfig as _ModelConfig
     except Exception as e:
         raise RuntimeError(
-            "Anima DiT repair training requires the bundled anima_tools package."
+            "Anima DiT repair training requires the bundled training_utils package."
         ) from e
     AnimaImagePipeline = _AnimaImagePipeline
     ModelConfig = _ModelConfig
@@ -568,7 +568,7 @@ def _prepare_quantized_training_view(config, quant_path):
     """Dequantize supported Comfy quantized weights for local Anima computation."""
     if not _anima_checkpoint_has_comfy_quant(quant_path):
         raise ValueError("The experimental Anima repair trainer expects a Comfy-quantized DIT_PATH/resume checkpoint.")
-    from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight, dequantize_nvfp4_tensor, write_streaming_safetensors
+    from scripts.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight, dequantize_nvfp4_tensor, write_streaming_safetensors
     quant_path = Path(quant_path)
     view_dir = Path(config.OUTPUT_DIR) / ".aozora_projected_quant_view"
     view_dir.mkdir(parents=True, exist_ok=True)
@@ -605,7 +605,7 @@ def _prepare_quantized_training_view(config, quant_path):
     config.ANIMA_PROJECTED_QUANT_SOURCE = str(quant_path)
     return str(view_path)
 def load_anima_pipe(config, device):
-    ensure_anima_tools_available()
+    ensure_training_utils_available()
 
     original_dit_path = config.DIT_PATH
     target_format = _anima_qat_target_format(config)
@@ -640,7 +640,7 @@ def load_anima_pipe(config, device):
         if "Cannot detect the model type" not in message:
             raise
         raise RuntimeError(
-            "The selected Anima DiT file could not be loaded by anima_tools. "
+            "The selected Anima DiT file could not be loaded by training_utils. "
             "The file is likely missing required architecture metadata or was saved in an unsupported/corrupted format. "
             "Repair or re-export the DiT checkpoint with proper Anima metadata, then select the repaired file."
         ) from e
@@ -656,7 +656,7 @@ def load_anima_pipe(config, device):
     if missing_components:
         details = ", ".join(f"{name} from {required_components[name]}" for name in missing_components)
         raise RuntimeError(
-            "anima_tools loaded the Anima pipeline, but one or more required components are missing: "
+            "training_utils loaded the Anima pipeline, but one or more required components are missing: "
             f"{details}. Check that each selected file is the correct Anima component type."
         )
 
@@ -1497,7 +1497,7 @@ def _anima_qat_scale_multiplier(config):
 class AnimaProjectedQuantController:
     """Owns projected quantized state and floating error-feedback residuals."""
     def __init__(self, dit, config):
-        from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
+        from scripts.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
         self.format = _anima_qat_target_format(config)
         self.scale_multiplier = _anima_qat_scale_multiplier(config)
         self.source_path = Path(getattr(config, "ANIMA_PROJECTED_QUANT_SOURCE", config.DIT_PATH))
@@ -1551,7 +1551,7 @@ class AnimaProjectedQuantController:
 
     @torch.no_grad()
     def project_after_step(self):
-        from tools.convert_anima_to_quants import comfy_quant_info_tensor, dequantize_nvfp4_tensor, quantize_nvfp4_tensor, scaled_quant_tensor
+        from scripts.convert_anima_to_quants import comfy_quant_info_tensor, dequantize_nvfp4_tensor, quantize_nvfp4_tensor, scaled_quant_tensor
         changed = total = 0
         for name, module in self.modules.items():
             residual_gpu = self.residuals[name].to(device=module.weight.device, dtype=module.weight.dtype)
@@ -1601,7 +1601,7 @@ class AnimaProjectedQuantController:
                 self.residuals[name].copy_(value.to(self.residuals[name].device, self.residuals[name].dtype))
 
     def save_quantized(self, output_path, dit, key_prefix=""):
-        from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
+        from scripts.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight
         output_path = Path(output_path)
         key_prefix = "" if str(key_prefix).lower() == "auto" else str(key_prefix or "")
         print(f"SAVE [1/4] Preparing exact packed checkpoint: {output_path}", flush=True)

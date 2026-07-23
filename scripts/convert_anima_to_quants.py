@@ -844,7 +844,7 @@ class LayerProfile:
 
 def load_anima_config_from_json(config_path: str, dit_path: Path):
     from train import TrainingConfig
-    import config as default_config
+    from training_utils.config import config as default_config
 
     cfg = TrainingConfig()
     path = Path(config_path)

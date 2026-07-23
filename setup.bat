@@ -24,7 +24,8 @@ SET XFORMERS_VERSION=0.0.33.post2
 
 :: Flash Attention Wheel (Validated for PyTorch 2.9.1 + CUDA 12.8 + Python 3.11)
 SET FLASH_ATTN_FILENAME=flash_attn-2.8.3+cu128torch2.9-cp311-cp311-win_amd64.whl
-SET FLASH_ATTN_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/%FLASH_ATTN_FILENAME%  
+SET FLASH_ATTN_URL=https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.13/%FLASH_ATTN_FILENAME%
+SET FLASH_PATH=%WHEELS_DIR%\%FLASH_ATTN_FILENAME%
 
 :: --- MENU ---
 :MENU
@@ -136,17 +137,51 @@ ECHO.
 
 :: --- Deferred Flash Attention install ---
 IF "%INSTALL_MODE%"=="FLASH" (
-    ECHO [INFO] Running standalone Flash Attention installer as final dependency step...
-    IF NOT EXIST install_flash_attn.bat (
-        ECHO [ERROR] install_flash_attn.bat not found.
-        GOTO FATAL_ERROR
+    ECHO [INFO] Installing Flash Attention as the final dependency step...
+
+    IF NOT EXIST "%WHEELS_DIR%" (
+        ECHO [INFO] Creating wheel cache: %WHEELS_DIR%
+        MKDIR "%WHEELS_DIR%"
+        IF ERRORLEVEL 1 (
+            ECHO [ERROR] Failed to create wheel cache.
+            GOTO FATAL_ERROR
+        )
     )
-    CALL install_flash_attn.bat NOPAUSE
+
+    IF NOT EXIST "%FLASH_PATH%" (
+        ECHO [INFO] Downloading Flash Attention wheel...
+        curl -L --fail --show-error --progress-bar -o "%FLASH_PATH%" "%FLASH_ATTN_URL%"
+        IF ERRORLEVEL 1 (
+            ECHO [ERROR] Flash Attention wheel download failed.
+            ECHO Check GitHub access, antivirus, or whether the release URL changed.
+            GOTO FATAL_ERROR
+        )
+    ) ELSE (
+        ECHO [INFO] Using cached wheel: %FLASH_PATH%
+    )
+
+    ECHO [INFO] Installing Flash Attention from wheel...
+    python -m pip install --force-reinstall --no-deps "%FLASH_PATH%"
     IF ERRORLEVEL 1 (
-        ECHO [ERROR] Flash Attention standalone installer failed.
+        ECHO [ERROR] Flash Attention pip installation failed.
         GOTO FATAL_ERROR
     )
-    ECHO [OK] Flash Attention standalone installer completed.
+
+    ECHO [INFO] Verifying Flash Attention package metadata...
+    python -m pip show flash-attn
+    IF ERRORLEVEL 1 (
+        ECHO [ERROR] pip cannot find flash-attn after installation.
+        GOTO FATAL_ERROR
+    )
+
+    ECHO [INFO] Verifying Flash Attention import...
+    python -c "import flash_attn; print('flash_attn:', flash_attn.__version__); print('path:', flash_attn.__file__)"
+    IF ERRORLEVEL 1 (
+        ECHO [ERROR] Flash Attention import failed after installation.
+        GOTO FATAL_ERROR
+    )
+
+    ECHO [OK] Flash Attention installed and verified.
     ECHO.
 )
 
