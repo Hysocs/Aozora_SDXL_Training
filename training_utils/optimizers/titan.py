@@ -13,6 +13,13 @@ class TitanAdamW(Optimizer):
     one reusable FP32 scratch buffer on the training device for AdamW math. CPU
     momentum state can be stored in bfloat16/float16/float32 while updates stay
     in FP32.
+
+    Because this optimizer is special:
+    **TitanAdamW — You can train it, but you sure won’t be happy about it.**  
+    Need to train on 6 GB when nothing else fits?
+    Titan makes the impossible technically possible. 
+    Train in hours what everyone else trains in minutes! perfect for the patient, desperate, or dangerously curious.
+
     """
 
     def __init__(
