@@ -54,7 +54,7 @@ SUCCESS = THEME.success
 WARN = THEME.warning
 ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
-TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
+TRAINING_MODE_SDXL = "SDXL"
 TRAINING_MODE_ANIMA_DIT = "Anima DiT"
 DIT_AVAILABLE = importlib.util.find_spec("training_utils.anima") is not None
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
@@ -3638,7 +3638,13 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _create_training_mode_combo(self):
         self.training_mode_combo = make_combo([TRAINING_MODE_SDXL, TRAINING_MODE_ANIMA_DIT])
-        self.training_mode_combo.setMinimumWidth(185)
+        self.training_mode_combo.setSizeAdjustPolicy(
+            QtWidgets.QComboBox.SizeAdjustPolicy.AdjustToContents
+        )
+        self.training_mode_combo.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Fixed,
+            QtWidgets.QSizePolicy.Policy.Fixed,
+        )
         if not DIT_AVAILABLE:
             self._set_combo_item_enabled(
                 self.training_mode_combo,

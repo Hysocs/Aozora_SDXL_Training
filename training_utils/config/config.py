@@ -7,7 +7,7 @@ import copy
 CONFIG_VERSION = 4
 MODE_SDXL = "sdxl"
 MODE_ANIMA = "anima"
-TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
+TRAINING_MODE_SDXL = "SDXL"
 TRAINING_MODE_ANIMA = "Anima DiT"
 MODE_LABELS = {
     MODE_SDXL: TRAINING_MODE_SDXL,
@@ -21,7 +21,7 @@ OUTPUT_DIR = "./output"
 OUTPUT_NAME = "auto"
 
 # --- Architecture ---
-TRAINING_MODE = "Stable Diffusion XL (SDXL)"
+TRAINING_MODE = "SDXL"
 DIT_PATH = ""
 DIT_VAE_PATH = ""
 ANIMA_DIT_SAVE_PREFIX = "auto"
