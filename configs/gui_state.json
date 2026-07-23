@@ -1,7 +1,18 @@
 {
     "last_config": "Hysocs_Personal_Config",
     "theme_colors": {
-        "primary": "#c1845b",
-        "secondary": "#c2ad55"
+        "primary": "#7c6af7",
+        "secondary": "#5839b0"
+    },
+    "chart_colors": {
+        "loss_ema": "#3d8943",
+        "sigma_samples": "#7c6af7",
+        "mean_loss_by_sigma": "#7c6af7",
+        "learning_rate": "#45aeb4",
+        "gradient_norm": "#7c6af7",
+        "clipped_gradient": "#5839b0",
+        "lr_scheduler": "#45aeb4",
+        "ticket_allocator": "#7c6af7",
+        "loss_weight": "#3d8943"
     }
 }

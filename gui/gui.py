@@ -119,11 +119,31 @@ DEFAULT_THEME_COLORS = {
     "primary": THEME.accent,
     "secondary": THEME.warning,
 }
+DEFAULT_CHART_COLORS = {
+    "loss_ema": "#c2ad55",
+    "sigma_samples": "#c1845b",
+    "mean_loss_by_sigma": "#c2ad55",
+    "learning_rate": "#c1845b",
+    "gradient_norm": "#c1845b",
+    "clipped_gradient": "#c2ad55",
+    "lr_scheduler": "#c1845b",
+    "ticket_allocator": "#c2ad55",
+    "loss_weight": "#c2ad55",
+}
+PURPLE_CHART_COLORS = {
+    "loss_ema": "#3d8943",
+    "sigma_samples": "#7c6af7",
+    "mean_loss_by_sigma": "#7c6af7",
+    "learning_rate": "#45aeb4",
+    "gradient_norm": "#7c6af7",
+    "clipped_gradient": "#5839b0",
+    "lr_scheduler": "#45aeb4",
+    "ticket_allocator": "#7c6af7",
+    "loss_weight": "#3d8943",
+}
 THEME_COLOR_PRESETS = [
-    ("Clay & Ochre", "#c1845b", "#c2ad55"),
-    ("Copper & Gold", "#ad7048", "#d0b44f"),
-    ("Rosewood & Sand", "#ad6670", "#c8ad72"),
-    ("Original Blue & Amber", "#6fa8c9", "#c9955a"),
+    ("Clay & Ochre", "#c1845b", "#c2ad55", DEFAULT_CHART_COLORS),
+    ("Violet & Amethyst", "#7c6af7", "#5839b0", PURPLE_CHART_COLORS),
 ]
 
 _sleep_inhibitor_process = None
@@ -3585,6 +3605,11 @@ class TrainingGUI(QtWidgets.QWidget):
             "primary": saved_colors.get("primary", DEFAULT_THEME_COLORS["primary"]),
             "secondary": saved_colors.get("secondary", DEFAULT_THEME_COLORS["secondary"]),
         }
+        saved_chart_colors = saved_state.get("chart_colors", {})
+        self.chart_colors = {
+            role: saved_chart_colors.get(role, fallback)
+            for role, fallback in DEFAULT_CHART_COLORS.items()
+        }
         self._apply_theme_colors(
             self.theme_colors["primary"],
             self.theme_colors["secondary"],
@@ -3606,6 +3631,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
         self._initialize_configs()
         self._setup_ui()
+        self._refresh_runtime_theme_colors()
         self._mark_nested_groups()
 
         self.config_dropdown.blockSignals(True)
@@ -3689,6 +3715,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 key = self.config_dropdown.itemData(idx) or self.config_dropdown.itemText(idx).replace(" ", "_").lower()
                 state["last_config"] = key
             state["theme_colors"] = dict(self.theme_colors)
+            state["chart_colors"] = dict(self.chart_colors)
             os.makedirs(self.config_dir, exist_ok=True)
             with open(self.state_file, 'w') as f:
                 json.dump(state, f, indent=4)
@@ -3732,6 +3759,32 @@ class TrainingGUI(QtWidgets.QWidget):
         if save and hasattr(self, "config_dropdown"):
             self._save_gui_state()
 
+    def _apply_chart_colors(self, colors, save=True):
+        updated = dict(self.chart_colors)
+        for role, fallback in DEFAULT_CHART_COLORS.items():
+            if role in colors:
+                updated[role] = self._normalized_theme_color(colors[role], fallback)
+        self.chart_colors = updated
+        if hasattr(self, "widgets"):
+            self._refresh_runtime_theme_colors()
+        if save and hasattr(self, "config_dropdown"):
+            self._save_gui_state()
+
+    def _apply_theme_preset(self, primary, secondary, chart_colors):
+        charts = chart_colors or {
+            "loss_ema": secondary,
+            "sigma_samples": primary,
+            "mean_loss_by_sigma": secondary,
+            "learning_rate": primary,
+            "gradient_norm": primary,
+            "clipped_gradient": secondary,
+            "lr_scheduler": primary,
+            "ticket_allocator": secondary,
+            "loss_weight": secondary,
+        }
+        self._apply_theme_colors(primary, secondary, save=False)
+        self._apply_chart_colors(charts)
+
     def _refresh_runtime_theme_colors(self):
         for label in self.findChildren(QtWidgets.QLabel):
             role = label.property("themeColorRole")
@@ -3745,30 +3798,52 @@ class TrainingGUI(QtWidgets.QWidget):
                 parts.append(f"font-size: {point_size}pt;")
             label.setStyleSheet(" ".join(parts))
 
+        loss_ema = QtGui.QColor(self.chart_colors["loss_ema"])
+        sigma_samples = QtGui.QColor(self.chart_colors["sigma_samples"])
+        mean_loss = QtGui.QColor(self.chart_colors["mean_loss_by_sigma"])
+        learning_rate = QtGui.QColor(self.chart_colors["learning_rate"])
+        gradient_norm = QtGui.QColor(self.chart_colors["gradient_norm"])
+        clipped_gradient = QtGui.QColor(self.chart_colors["clipped_gradient"])
+        lr_scheduler = QtGui.QColor(self.chart_colors["lr_scheduler"])
+        ticket_allocator = QtGui.QColor(self.chart_colors["ticket_allocator"])
+        loss_weight = QtGui.QColor(self.chart_colors["loss_weight"])
+
         if hasattr(self, "lr_curve_widget"):
-            self.lr_curve_widget.line_color = THEME.color("accent_alt")
-            self.lr_curve_widget.point_fill_color = THEME.color("accent_alt")
+            self.lr_curve_widget.line_color = lr_scheduler
+            self.lr_curve_widget.point_fill_color = lr_scheduler
             self.lr_curve_widget.selected_point_color = THEME.color("warning")
             self.lr_curve_widget.update()
         if hasattr(self, "timestep_histogram"):
-            self.timestep_histogram.bar_color_even = THEME.color("warning")
-            self.timestep_histogram.bar_color_odd = THEME.color("warning_deep")
-            self.timestep_histogram.bar_hover_color = THEME.color("warning_hover")
+            self.timestep_histogram.bar_color_even = ticket_allocator
+            self.timestep_histogram.bar_color_odd = ticket_allocator.darker(150)
+            self.timestep_histogram.bar_hover_color = ticket_allocator.lighter(112)
             self.timestep_histogram.update()
         if hasattr(self, "timestep_loss_curve"):
-            self.timestep_loss_curve.line_color = THEME.color("warning")
-            self.timestep_loss_curve.point_fill_color = THEME.color("warning")
+            self.timestep_loss_curve.line_color = loss_weight
+            self.timestep_loss_curve.point_fill_color = loss_weight
             self.timestep_loss_curve.selected_point_color = THEME.color("accent_alt")
             self.timestep_loss_curve.update()
         if hasattr(self, "live_metrics_widget"):
-            for histogram in self.live_metrics_widget.findChildren(LiveTimestepHistogram):
-                if isinstance(histogram, LiveTimestepMeanLossHistogram):
-                    histogram.bar_color = THEME.color("warning")
-                    histogram.bar_color_alt = THEME.color("warning_deep")
-                else:
-                    histogram.bar_color = THEME.color("accent_alt")
-                    histogram.bar_color_alt = THEME.color("accent_deep")
-                histogram.update()
+            metrics = self.live_metrics_widget
+            sample_histogram = metrics.graphs["timestep"]["widget"]
+            sample_histogram.bar_color = sigma_samples
+            sample_histogram.bar_color_alt = sigma_samples.darker(150)
+            sample_histogram.update()
+            mean_histogram = metrics.graphs["timestep_loss"]["widget"]
+            mean_histogram.bar_color = mean_loss
+            mean_histogram.bar_color_alt = mean_loss.darker(150)
+            mean_histogram.update()
+            for graph_name, line_names, color in (
+                ("step_loss", ("Loss EMA",), loss_ema),
+                ("optim_loss", ("Optimizer Loss EMA",), loss_ema),
+                ("lr", ("LR",), learning_rate),
+                ("grad_norm", ("Raw",), gradient_norm),
+                ("grad_norm", ("Clipped",), clipped_gradient),
+            ):
+                graph_data = metrics.graphs[graph_name]
+                for line_name in line_names:
+                    line_index = graph_data["lines"][line_name]
+                    graph_data["widget"].lines[line_index]["color"] = color
             for graph in self.live_metrics_widget.findChildren(GraphPanel):
                 graph.title_color = THEME.color("accent")
                 graph.update()
@@ -3778,26 +3853,37 @@ class TrainingGUI(QtWidgets.QWidget):
         menu = QtWidgets.QMenu(self)
         menu.setToolTipsVisible(True)
 
-        for name, primary, secondary in THEME_COLOR_PRESETS:
+        preset_container = QtWidgets.QWidget()
+        preset_container_layout = QtWidgets.QVBoxLayout(preset_container)
+        preset_container_layout.setContentsMargins(9, 7, 9, 7)
+        preset_group = QtWidgets.QGroupBox("Color Presets")
+        preset_layout = QtWidgets.QVBoxLayout(preset_group)
+        preset_layout.setContentsMargins(8, 8, 8, 8)
+        preset_layout.setSpacing(4)
+        for name, primary, secondary, chart_colors in THEME_COLOR_PRESETS:
             button = ThemePresetButton(name, primary, secondary)
-            action = QtWidgets.QWidgetAction(menu)
-            action.setDefaultWidget(button)
-            menu.addAction(action)
+            preset_layout.addWidget(button)
             button.clicked.connect(
-                lambda _=False, p=primary, s=secondary, m=menu: (
-                    self._apply_theme_colors(p, s),
+                lambda _=False, p=primary, s=secondary, c=chart_colors, m=menu: (
+                    self._apply_theme_preset(p, s, c),
                     m.close(),
                 )
             )
+        preset_container_layout.addWidget(preset_group)
+        preset_action = QtWidgets.QWidgetAction(menu)
+        preset_action.setDefaultWidget(preset_container)
+        menu.addAction(preset_action)
 
         menu.addSeparator()
         custom = QtWidgets.QWidget()
         custom_layout = QtWidgets.QVBoxLayout(custom)
         custom_layout.setContentsMargins(9, 7, 9, 9)
-        custom_layout.setSpacing(6)
-        custom_layout.addWidget(make_label("Custom Colors", color=TEXT_SEC, bold=True))
-        custom_row = QtWidgets.QHBoxLayout()
-        custom_row.setSpacing(8)
+        custom_layout.setSpacing(8)
+
+        interface_group = QtWidgets.QGroupBox("Interface")
+        interface_row = QtWidgets.QHBoxLayout(interface_group)
+        interface_row.setContentsMargins(8, 8, 8, 8)
+        interface_row.setSpacing(8)
         primary_button = QtWidgets.QPushButton("Primary")
         secondary_button = QtWidgets.QPushButton("Transformed")
         for button in (primary_button, secondary_button):
@@ -3810,9 +3896,47 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         primary_button.clicked.connect(lambda: self._choose_custom_theme_color("primary", primary_button, secondary_button))
         secondary_button.clicked.connect(lambda: self._choose_custom_theme_color("secondary", primary_button, secondary_button))
-        custom_row.addWidget(primary_button)
-        custom_row.addWidget(secondary_button)
-        custom_layout.addLayout(custom_row)
+        interface_row.addWidget(primary_button)
+        interface_row.addWidget(secondary_button)
+        custom_layout.addWidget(interface_group)
+
+        def add_chart_group(title, entries):
+            group = QtWidgets.QGroupBox(title)
+            row = QtWidgets.QHBoxLayout(group)
+            row.setContentsMargins(8, 8, 8, 8)
+            row.setSpacing(8)
+            for role, label in entries:
+                button = QtWidgets.QPushButton(label)
+                button.setMinimumSize(105, 42)
+                self._style_color_button(button, self.chart_colors[role])
+                button.clicked.connect(
+                    lambda _=False, r=role, b=button: self._choose_custom_chart_color(r, b)
+                )
+                row.addWidget(button)
+            if len(entries) == 1:
+                row.addStretch(1)
+            custom_layout.addWidget(group)
+
+        add_chart_group("Loss", (
+            ("loss_ema", "Loss EMA"),
+            ("loss_weight", "Loss Weight"),
+        ))
+        add_chart_group("Sigma", (
+            ("sigma_samples", "Samples"),
+            ("mean_loss_by_sigma", "Mean Loss"),
+        ))
+        add_chart_group("Learning Rate", (
+            ("learning_rate", "Live"),
+            ("lr_scheduler", "Scheduler"),
+        ))
+        add_chart_group("Gradient Norm", (
+            ("gradient_norm", "Raw"),
+            ("clipped_gradient", "Clipped"),
+        ))
+        add_chart_group("Allocation", (
+            ("ticket_allocator", "Ticket Allocator"),
+        ))
+
         custom_action = QtWidgets.QWidgetAction(menu)
         custom_action.setDefaultWidget(custom)
         menu.addAction(custom_action)
@@ -3821,6 +3945,13 @@ class TrainingGUI(QtWidgets.QWidget):
             QtCore.QPoint(0, self.theme_swatch_button.height() + 3)
         )
         menu.exec(position)
+
+    @staticmethod
+    def _style_color_button(button, color):
+        foreground = "#ffffff" if QtGui.QColor(color).lightness() < 145 else "#11151c"
+        button.setStyleSheet(
+            f"background:{color}; color:{foreground}; border:1px solid {THEME.border};"
+        )
 
     def _choose_custom_theme_color(self, role, primary_button, secondary_button):
         current = self.theme_colors[role]
@@ -3836,6 +3967,15 @@ class TrainingGUI(QtWidgets.QWidget):
         secondary_button.setStyleSheet(
             f"background:{updated['secondary']}; color:{THEME.window}; border:1px solid {THEME.border};"
         )
+
+    def _choose_custom_chart_color(self, role, button):
+        current = self.chart_colors[role]
+        title = role.replace("_", " ").title()
+        color = QtWidgets.QColorDialog.getColor(QtGui.QColor(current), self, f"Choose {title} Color")
+        if not color.isValid():
+            return
+        self._apply_chart_colors({role: color.name()})
+        self._style_color_button(button, color.name())
 
     def _load_first_config(self):
         if self.config_dropdown.count() > 0:
