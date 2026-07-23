@@ -4,7 +4,7 @@ import copy
 # DEFAULT CONFIGURATION
 # ====================================================================================
 
-CONFIG_VERSION = 4
+CONFIG_VERSION = 5
 MODE_SDXL = "sdxl"
 MODE_ANIMA = "anima"
 TRAINING_MODE_SDXL = "SDXL"
@@ -82,7 +82,7 @@ GRADIENT_ACCUMULATION_STEPS = 4
 MIXED_PRECISION = "bfloat16"
 CLIP_GRAD_NORM = 1.0
 SEED = 42
-ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING = False
+ANIMA_GRADIENT_CHECKPOINTING_MODE = "Full"
 
 # --- Saving ---
 SAVE_EVERY_N_STEPS = 1000
@@ -176,7 +176,7 @@ FLAT_KEYS = [
     "CAPTION_NL_PERCENT", "CAPTION_TAGS_NL_PERCENT", "CAPTION_NL_TAGS_PERCENT",
     "SHOULD_UPSCALE", "MAX_BUCKET_RESOLUTION", "MULTI_BUCKET_ENABLED", "MULTI_BUCKET_EXTRA_BUCKETS",
     "PREDICTION_TYPE", "MAX_TRAIN_STEPS", "BATCH_SIZE",
-    "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING",
+    "GRADIENT_ACCUMULATION_STEPS", "MIXED_PRECISION", "CLIP_GRAD_NORM", "ANIMA_GRADIENT_CHECKPOINTING_MODE",
     "SEED", "SAVE_EVERY_N_STEPS", "ANIMA_STREAMING_SAVE", "UNET_EXCLUDE_TARGETS", "DIT_EXCLUDE_TARGETS",
     "LR_CUSTOM_CURVE", "LEARNING_RATE", "LR_GRAPH_MIN", "LR_GRAPH_MAX",
     "TIMESTEP_ALLOCATION", "TIMESTEP_STRATIFIED_SAMPLING", "TIMESTEP_FORCE_IMAGE_BIN_SPREAD", "TIMESTEP_LOSS_WEIGHT_CURVE", "OPTIMIZER_TYPE", "RAVEN_PARAMS", "PAGED_ADAMW_8BIT_PARAMS", "TITAN_PARAMS",
@@ -218,7 +218,7 @@ MODE_SPECIFIC_FLAT_KEYS = {
         "DIT_PATH", "DIT_VAE_PATH", "ANIMA_DIT_SAVE_PREFIX", "ANIMA_STREAMING_SAVE",
         "TEXT_ENCODER_PATH", "TOKENIZER_PATH", "TOKENIZER_T5XXL_PATH",
         "ANIMA_RESUME_MODEL_PATH", "ANIMA_RESUME_STATE_PATH",
-        "DIT_EXCLUDE_TARGETS", "ANIMA_CACHE_FOLDER_NAME", "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING",
+        "DIT_EXCLUDE_TARGETS", "ANIMA_CACHE_FOLDER_NAME", "ANIMA_GRADIENT_CHECKPOINTING_MODE",
         "VAE_CACHING_TILED", "VAE_CACHING_TILE_SIZE", "VAE_CACHING_TILE_STRIDE",
     ],
 }
@@ -279,6 +279,7 @@ def default_preset():
 
 
 def nest_flat_config(flat_config, mode_key=None, base_preset=None):
+    flat_config = copy.deepcopy(flat_config)
     mode_key = mode_key_from_label(mode_key or flat_config.get("TRAINING_MODE"))
     preset = copy.deepcopy(base_preset) if base_preset else default_preset()
     preset["config_version"] = CONFIG_VERSION
@@ -305,6 +306,7 @@ def normalize_preset(config_data):
             curve_key = nested_key_for(mode_key, "TIMESTEP_LOSS_WEIGHT_CURVE")
             odds_scale_key = nested_key_for(mode_key, "TIMESTEP_ODDS_SCALE")
             legacy_odds_keys = [f"{mode_key}_timestep_ticket_shift", f"{mode_key}_ticket_shift", f"{mode_key}_sigma_shift"]
+            checkpoint_mode_key = nested_key_for(mode_key, "ANIMA_GRADIENT_CHECKPOINTING_MODE")
             if odds_scale_key not in config_data[mode_key]:
                 for old_odds_key in legacy_odds_keys:
                     if old_odds_key in config_data[mode_key]:
@@ -320,6 +322,15 @@ def normalize_preset(config_data):
                 for key, value in config_data[mode_key].items()
                 if key in valid_keys
             })
+            if mode_key == MODE_ANIMA:
+                checkpoint_mode = str(
+                    preset[mode_key].get(checkpoint_mode_key, "Full")
+                ).strip().title()
+                preset[mode_key][checkpoint_mode_key] = (
+                    checkpoint_mode
+                    if checkpoint_mode in {"Full", "Conservative"}
+                    else "Full"
+                )
             timestep_mode_key = nested_key_for(mode_key, "TIMESTEP_MODE")
             if preset[mode_key].get(timestep_mode_key) == "Shift":
                 preset[mode_key][timestep_mode_key] = "Odds-Scaled (Z-Image)"

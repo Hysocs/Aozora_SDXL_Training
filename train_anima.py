@@ -519,8 +519,16 @@ def ensure_training_utils_available():
 
 
 def configure_anima_selective_checkpointing(config):
-    if not bool(getattr(config, "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING", False)):
-        print("INFO: Anima selective checkpointing disabled (full block recomputation).")
+    configured_mode = getattr(config, "ANIMA_GRADIENT_CHECKPOINTING_MODE", "Full")
+    mode = str(configured_mode).strip().lower()
+    if mode not in {"full", "conservative"}:
+        print(
+            f"WARNING: Unknown Anima gradient checkpointing mode {configured_mode!r}; "
+            "using Full."
+        )
+        mode = "full"
+    if mode == "full":
+        print("INFO: Anima gradient checkpointing: Full (full block recomputation).")
         return
 
     ensure_training_utils_available()
@@ -580,8 +588,8 @@ def configure_anima_selective_checkpointing(config):
 
     anima_dit_module.gradient_checkpoint_forward = selective_checkpoint_forward
     print(
-        "INFO: Anima conservative selective checkpointing enabled "
-        "(cache wide-to-narrow MLP GEMM outputs)."
+        "INFO: Anima gradient checkpointing: Conservative "
+        "(cache MLP down-projection outputs)."
     )
 
 

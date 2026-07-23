@@ -521,7 +521,7 @@ TRANSFORMED_CHECKBOX_KEYS = {
     "TIMESTEP_STRATIFIED_SAMPLING",
 }
 RAW_CHECKBOX_KEYS = {
-    "ANIMA_STREAMING_SAVE", "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING",
+    "ANIMA_STREAMING_SAVE",
 }
 
 def set_semantic_color(widget, semantic):
@@ -2220,44 +2220,34 @@ class LRCurveWidget(QtWidgets.QWidget):
 
     def apply_preset(self, pts): self.set_points(pts); self.pointsChanged.emit(pts)
 
-    def set_generated_preset(self, mode, num_restarts, warmup_pct, restart_rampup_pct):
-        num_restarts = max(1, int(num_restarts))
-        warmup_pct = max(0.0, min(1.0, float(warmup_pct)))
-        restart_rampup_pct = max(0.0, min(1.0, float(restart_rampup_pct)))
-        eps = 1e-5
+    def set_standard_preset(self, mode):
         min_lr, max_lr = self.min_lr_bound, self.max_lr_bound
-        points = []
-        seg_len = 1.0 / num_restarts
+        warmup_end = 0.05
 
-        for i in range(num_restarts):
-            seg_start = i * seg_len
-            seg_end = (i + 1) * seg_len
-            wp = warmup_pct if i == 0 else restart_rampup_pct
-            warmup_len = max(eps, min(seg_len * wp, seg_len))
-            decay_len = seg_len - warmup_len
-            peak_x = min(seg_start + warmup_len, seg_end)
-            points.append([seg_start, min_lr])
-            points.append([peak_x, max_lr])
-            if decay_len > eps:
-                if mode == "Cosine":
-                    for j in range(1, 21):
-                        t = j / 20
-                        x = peak_x + t * decay_len
-                        y = min_lr + (max_lr - min_lr) * 0.5 * (1 + math.cos(math.pi * t))
-                        points.append([x, y])
-                else:
-                    points.append([seg_end, min_lr])
-            else:
-                points.append([seg_end, max_lr])
+        if mode == "Constant":
+            points = [
+                [0.0, min_lr],
+                [warmup_end, max_lr],
+                [0.95, max_lr],
+                [1.0, min_lr],
+            ]
+        elif mode == "Linear":
+            points = [
+                [0.0, min_lr],
+                [warmup_end, max_lr],
+                [1.0, min_lr],
+            ]
+        elif mode == "Cosine":
+            points = [[0.0, min_lr], [warmup_end, max_lr]]
+            for index in range(1, 21):
+                progress = index / 20
+                x = warmup_end + progress * (1.0 - warmup_end)
+                y = min_lr + (max_lr - min_lr) * 0.5 * (1.0 + math.cos(math.pi * progress))
+                points.append([x, y])
+        else:
+            raise ValueError(f"Unknown learning-rate preset: {mode}")
 
-        final, last_x = [], -1.0
-        for p in sorted(points, key=lambda p: p[0]):
-            x = max(0.0, min(1.0, p[0]))
-            y = max(min_lr, min(max_lr, p[1]))
-            if x > last_x + 1e-9: final.append([x, y]); last_x = x
-        if not final or final[0][0] != 0.0: final.insert(0, [0.0, min_lr])
-        if final[-1][0] < 1.0: final.append([1.0, final[-1][1]])
-        self.apply_preset(final)
+        self.apply_preset(points)
 
 
 class TimestepHistogramWidget(QtWidgets.QWidget):
@@ -3511,7 +3501,12 @@ UI_DEFS = {
     "GRADIENT_ACCUMULATION_STEPS": ("Gradient Accumulation", "Simulates a larger batch size.", "line"),
     "MIXED_PRECISION":             ("Mixed Precision", "bfloat16 for modern GPUs, float16 for older.", "combo", ["bfloat16", "float16"]),
     "CLIP_GRAD_NORM":              ("Gradient Clipping", "Maximum gradient norm. 0 to disable.", "line"),
-    "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING": ("Selective Checkpointing", "Use about 1 GB more VRAM to cache conservative Anima MLP results and reduce training step time.", "check"),
+    "ANIMA_GRADIENT_CHECKPOINTING_MODE": (
+        "Grad Checkpointing",
+        "Full uses the least VRAM and recomputes complete blocks. Conservative uses more VRAM to cache Anima MLP down projections and reduce training step time.",
+        "combo",
+        ["Full", "Conservative"],
+    ),
     "SEED":                        ("Seed", "Ensures reproducible training.", "line"),
     "RESUME_MODEL_PATH":           ("SDXL Resume Model", "The SDXL .safetensors checkpoint file.", "path", "file_safetensors"),
     "RESUME_STATE_PATH":           ("SDXL Resume State", "The SDXL .pt optimizer state file.", "path", "file_pt"),
@@ -4177,7 +4172,7 @@ class TrainingGUI(QtWidgets.QWidget):
         if "T5_TOKEN_DROPOUT_ENABLED" in self.widgets:
             self._set_widget_row_visible("T5_TOKEN_DROPOUT_ENABLED", is_dit)
             self._update_t5_token_dropout_controls()
-        self._set_widget_row_visible("ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING", is_dit)
+        self._set_widget_row_visible("ANIMA_GRADIENT_CHECKPOINTING_MODE", is_dit)
         if not is_dit:
             self._update_vae_normalization_controls()
         if hasattr(self, "dataset_manager"):
@@ -4731,18 +4726,26 @@ class TrainingGUI(QtWidgets.QWidget):
         main_lay.setSpacing(14)
         main_lay.addWidget(make_label("Training Parameters", color=ACCENT2, bold=True, size=12))
 
-        upper = QtWidgets.QHBoxLayout(); upper.setSpacing(20)
-        upper.addWidget(self._build_lr_scheduler_group(), 1)
-        self.timestep_group = self._build_timestep_group()
-        upper.addWidget(self.timestep_group, 1)
-        main_lay.addLayout(upper)
+        parameter_columns = QtWidgets.QHBoxLayout()
+        parameter_columns.setSpacing(20)
 
-        optimizer_row = QtWidgets.QHBoxLayout()
-        optimizer_row.setSpacing(20)
-        optimizer_row.addWidget(self._build_optimizer_group(), 1)
+        left_column = QtWidgets.QVBoxLayout()
+        left_column.setSpacing(14)
+        left_column.addWidget(self._build_lr_scheduler_group())
         self.loss_group = self._build_loss_group()
-        optimizer_row.addWidget(self.loss_group, 1)
-        main_lay.addLayout(optimizer_row)
+        left_column.addWidget(self.loss_group)
+        left_column.addStretch(1)
+        parameter_columns.addLayout(left_column, 1)
+
+        right_column = QtWidgets.QVBoxLayout()
+        right_column.setSpacing(14)
+        self.timestep_group = self._build_timestep_group()
+        right_column.addWidget(self.timestep_group)
+        right_column.addWidget(self._build_optimizer_group())
+        right_column.addStretch(1)
+        parameter_columns.addLayout(right_column, 1)
+
+        main_lay.addLayout(parameter_columns)
         main_lay.addStretch(1)
         main_scroll = QtWidgets.QScrollArea()
         set_role(main_scroll, "mainContent")
@@ -5043,7 +5046,7 @@ class TrainingGUI(QtWidgets.QWidget):
 
     def _build_runtime_group(self):
         gb, lay = group_box("Runtime", QtWidgets.QFormLayout)
-        self._add_form_keys(lay, ["MIXED_PRECISION", "CLIP_GRAD_NORM", "ANIMA_CONSERVATIVE_SELECTIVE_CHECKPOINTING"])
+        self._add_form_keys(lay, ["MIXED_PRECISION", "CLIP_GRAD_NORM", "ANIMA_GRADIENT_CHECKPOINTING_MODE"])
         return gb
     
     def _build_lr_scheduler_group(self):
@@ -5079,7 +5082,11 @@ class TrainingGUI(QtWidgets.QWidget):
             QtCore.Qt.AlignmentFlag.AlignRight | QtCore.Qt.AlignmentFlag.AlignBottom,
         )
         curve_lay.addWidget(chart_stage)
-        lay.addWidget(curve_group)
+        curve_group.setSizePolicy(
+            QtWidgets.QSizePolicy.Policy.Preferred,
+            QtWidgets.QSizePolicy.Policy.Maximum,
+        )
+        lay.addWidget(curve_group, 0)
 
         curve_settings, settings_lay = group_box("Curve Settings")
         bounds_row = QtWidgets.QHBoxLayout()
@@ -5098,26 +5105,21 @@ class TrainingGUI(QtWidgets.QWidget):
         )
         lay.addWidget(curve_settings, 0)
 
-        presets_group, pgrid = group_box("Schedule Presets", QtWidgets.QGridLayout)
-        pgrid.setSpacing(8)
-        pgrid.addWidget(make_label("Restarts:"), 0, 0)
-        restarts_spin = NoScrollSpinBox(); restarts_spin.setRange(1, 50); restarts_spin.setValue(1)
-        pgrid.addWidget(restarts_spin, 0, 1)
-        pgrid.addWidget(make_label("Initial Warmup %:"), 1, 0)
-        init_warmup = NoScrollDoubleSpinBox(); init_warmup.setRange(0, 100); init_warmup.setValue(5.0); init_warmup.setSuffix("%")
-        pgrid.addWidget(init_warmup, 1, 1)
-        pgrid.addWidget(make_label("Restart Rampup %:"), 2, 0)
-        restart_ramp = NoScrollDoubleSpinBox(); restart_ramp.setRange(0, 100); restart_ramp.setValue(0.0); restart_ramp.setSuffix("%")
-        pgrid.addWidget(restart_ramp, 2, 1)
-        pgrid.addWidget(make_btn("Apply Cosine", lambda: self.lr_curve_widget.set_generated_preset(
-            "Cosine", restarts_spin.value(), init_warmup.value() / 100, restart_ramp.value() / 100)), 3, 0)
-        pgrid.addWidget(make_btn("Apply Linear", lambda: self.lr_curve_widget.set_generated_preset(
-            "Linear", restarts_spin.value(), init_warmup.value() / 100, restart_ramp.value() / 100)), 3, 1)
+        presets_group, preset_lay = group_box("Schedule Presets", QtWidgets.QHBoxLayout)
+        preset_lay.setSpacing(8)
+        for label, mode in (("Constant (Default)", "Constant"), ("Cosine", "Cosine"), ("Linear", "Linear")):
+            button = make_btn(label, lambda _checked=False, name=mode: self.lr_curve_widget.set_standard_preset(name))
+            if mode == "Constant":
+                button.setToolTip("5% warmup, 90% constant learning rate, then 5% decay.")
+            else:
+                button.setToolTip(f"5% warmup followed by {mode.lower()} decay.")
+            preset_lay.addWidget(button, 1)
         presets_group.setSizePolicy(
             QtWidgets.QSizePolicy.Policy.Preferred,
-            QtWidgets.QSizePolicy.Policy.Expanding,
+            QtWidgets.QSizePolicy.Policy.Maximum,
         )
-        lay.addWidget(presets_group, 1)
+        lay.addWidget(presets_group, 0)
+        lay.addStretch(1)
         self.widgets["LR_GRAPH_MIN"].textChanged.connect(self._update_and_clamp_lr_graph)
         self.widgets["LR_GRAPH_MAX"].textChanged.connect(self._update_and_clamp_lr_graph)
         return gb
@@ -5206,7 +5208,7 @@ class TrainingGUI(QtWidgets.QWidget):
             [0.925, 0.5174], [0.975, 0.4583], [1.0, 0.4583],
         ]
         for idx, (label, points) in enumerate([
-            ("Uniform", [[0.0, 1.0], [1.0, 1.0]]),
+            ("Uniform (Default)", [[0.0, 1.0], [1.0, 1.0]]),
             ("Mid Boost", [[0.0, 1.0], [0.5, 2.0], [1.0, 1.0]]),
             ("Soft Bell", None),
             ("Early Suppress", [[0.0, 0.5], [0.2, 1.0], [1.0, 1.0]]),
@@ -5455,7 +5457,7 @@ class TrainingGUI(QtWidgets.QWidget):
         self.timestep_presets_group = presets_group
         self.ts_button_stack = QtWidgets.QStackedWidget()
         presets_by_mode = [
-            [("Uniform (Flat)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
+            [("Uniform (Default)", "Uniform"), ("Peak Ends", "Peak Ends"), ("Peak Middle", "Peak Middle")],
             [("Bell Curve", "Bell Curve"), ("Detail (Early)", "Detail"), ("Structure (Late)", "Structure"),
              ("Logit-Normal (RF/SD3 Recommended)", "Logit-Normal (RF/SD3 Recommended)"),
              ("Anima Default (1.0)", "Anima Logit Default"),

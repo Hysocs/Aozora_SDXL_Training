@@ -1,5 +1,5 @@
 {
-    "config_version": 4,
+    "config_version": 5,
     "active_mode": "anima",
     "sdxl": {
         "sdxl_output_dir": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/StableDiffusion/Trained",
@@ -141,7 +141,7 @@
         "anima_resume_training": false,
         "anima_instance_datasets": [
             {
-                "path": "C:\\Users\\Administrator\\Pictures\\Dan Artists\\myapanpan",
+                "path": "C:\\Users\\Administrator\\Pictures\\Dan Artists\\audirenze",
                 "repeats": 1
             }
         ],
@@ -382,7 +382,7 @@
         "anima_resume_state_path": "C:/Users/Administrator/Desktop/StabilityMatrix-win-x64/Data/Models/DiffusionModels/Trained/training_state_step_1217.pt",
         "anima_dit_exclude_targets": "llm_adapter.*",
         "anima_cache_folder_name": ".precomputed_anima_dit_cache",
-        "anima_conservative_selective_checkpointing": true,
+        "anima_gradient_checkpointing_mode": "Conservative",
         "anima_vae_caching_tiled": true,
         "anima_vae_caching_tile_size": [
             96,
