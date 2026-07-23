@@ -116,10 +116,10 @@ BORDER_MUTED = THEME.border_muted
 STYLESHEET = make_stylesheet()
 
 DEFAULT_THEME_COLORS = {
-    "primary": THEME.accent,
-    "secondary": THEME.warning,
+    "primary": "#7c6af7",
+    "secondary": "#5839b0",
 }
-DEFAULT_CHART_COLORS = {
+CLAY_CHART_COLORS = {
     "loss_ema": "#c2ad55",
     "sigma_samples": "#c1845b",
     "mean_loss_by_sigma": "#c2ad55",
@@ -141,8 +141,9 @@ PURPLE_CHART_COLORS = {
     "ticket_allocator": "#7c6af7",
     "loss_weight": "#3d8943",
 }
+DEFAULT_CHART_COLORS = PURPLE_CHART_COLORS
 THEME_COLOR_PRESETS = [
-    ("Clay & Ochre", "#c1845b", "#c2ad55", DEFAULT_CHART_COLORS),
+    ("Clay & Ochre", "#c1845b", "#c2ad55", CLAY_CHART_COLORS),
     ("Violet & Amethyst", "#7c6af7", "#5839b0", PURPLE_CHART_COLORS),
 ]
 
