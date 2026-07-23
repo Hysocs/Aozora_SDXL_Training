@@ -306,12 +306,43 @@ This is important for long training runs, unstable beta testing, or recovering f
 ### Linux
 
 Linux support expects an NVIDIA driver and a CUDA-compatible PyTorch installation.
+The PyQt GUI is not currently validated on Linux, so the configuration-file CLI
+is the recommended route.
 
 1. Create and activate a virtual environment (for example, `.venv`).
 2. Install the PyTorch build appropriate for your CUDA/driver combination.
 3. Run `python -m pip install -r requirements.txt`.
-4. Launch with `bash start_gui.sh`.
-5. Select Linux-native model, dataset, tokenizer, and output paths in the GUI.
+4. Continue with the command-line instructions below.
+
+## Command-line training
+
+Select or copy a JSON preset, then edit its model, dataset, tokenizer, and output
+paths for the current machine. Use `train.py` for SDXL and `train_anima.py` for
+Anima.
+
+### Windows CLI
+
+Run `setup.bat` first, then open a terminal in the repository:
+
+```bat
+REM SDXL
+portable_Venv\Scripts\python.exe train.py --config "C:\path\to\config.json"
+
+REM Anima
+portable_Venv\Scripts\python.exe train_anima.py --config "C:\path\to\config.json"
+```
+
+### Linux CLI
+
+Activate the environment created during Linux setup, then run:
+
+```bash
+# SDXL
+python train.py --config /path/to/config.json
+
+# Anima
+python train_anima.py --config /path/to/config.json
+```
 
 Absolute paths are OS-specific. A config copied from Windows can still be opened on
 Linux, but paths such as `C:\\models\\model.safetensors` must be selected again on
@@ -321,7 +352,7 @@ Checkpoints are saved to:
 
 ```txt
 output/checkpoints/
-````
+```
 
 If training crashes or you stop the run, resume from the latest saved `.pt` state file and matching model checkpoint.
 
@@ -415,6 +446,4 @@ Future improvements should keep that same direction:
 * better defaults
 * cleaner debugging
 * practical full-model SDXL training on single GPUs
-
-```
 
