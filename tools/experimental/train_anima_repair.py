@@ -17,6 +17,10 @@ from multiprocessing import Pool, cpu_count
 from pathlib import Path
 from types import SimpleNamespace
 
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import numpy as np
 import torch
 import torch.nn.functional as F
@@ -87,7 +91,7 @@ from train import (
 AnimaImagePipeline = None
 ModelConfig = None
 
-#workaround for Comfy quantized DiT weights: dequantize to BF16 for DiffSynth computation
+# Workaround for Comfy quantized DiT weights: dequantize to BF16 for local Anima computation.
 ANIMA_QAT_TARGET_FORMAT = "bfp16"  # bf16/bfp16, nvfp4, int8, e4m3, or e5m2
 ANIMA_QAT_NVFP4_SCALE_MULTIPLIER = 1.0
 ANIMA_REPAIR_LINEART_LOSS_ENABLED = True
@@ -515,16 +519,16 @@ def make_anima_tokenizer_config(path, label):
     return ModelConfig(path=local_path, skip_download=True)
 
 
-def ensure_anima_diffsynth_available():
+def ensure_anima_tools_available():
     global AnimaImagePipeline, ModelConfig
     if AnimaImagePipeline is not None and ModelConfig is not None:
         return
     try:
-        from diffsynth.pipelines.anima_image import AnimaImagePipeline as _AnimaImagePipeline
-        from diffsynth.pipelines.anima_image import ModelConfig as _ModelConfig
+        from anima_tools import AnimaImagePipeline as _AnimaImagePipeline
+        from anima_tools import ModelConfig as _ModelConfig
     except Exception as e:
         raise RuntimeError(
-            "Anima DiT training requires diffsynth. Install/enable diffsynth, or use the SDXL architecture mode."
+            "Anima DiT repair training requires the bundled anima_tools package."
         ) from e
     AnimaImagePipeline = _AnimaImagePipeline
     ModelConfig = _ModelConfig
@@ -561,9 +565,9 @@ def _quant_payload(tensor):
 
 
 def _prepare_quantized_training_view(config, quant_path):
-    """Dequantize supported Comfy quantized weights for DiffSynth computation."""
+    """Dequantize supported Comfy quantized weights for local Anima computation."""
     if not _anima_checkpoint_has_comfy_quant(quant_path):
-        raise ValueError("train_anima_repair.py expects a Comfy-quantized DIT_PATH/resume checkpoint.")
+        raise ValueError("The experimental Anima repair trainer expects a Comfy-quantized DIT_PATH/resume checkpoint.")
     from tools.convert_anima_to_quants import comfy_quant_key_for_weight, comfy_scale2_key_for_weight, comfy_scale_key_for_weight, dequantize_nvfp4_tensor, write_streaming_safetensors
     quant_path = Path(quant_path)
     view_dir = Path(config.OUTPUT_DIR) / ".aozora_projected_quant_view"
@@ -601,7 +605,7 @@ def _prepare_quantized_training_view(config, quant_path):
     config.ANIMA_PROJECTED_QUANT_SOURCE = str(quant_path)
     return str(view_path)
 def load_anima_pipe(config, device):
-    ensure_anima_diffsynth_available()
+    ensure_anima_tools_available()
 
     original_dit_path = config.DIT_PATH
     target_format = _anima_qat_target_format(config)
@@ -636,7 +640,7 @@ def load_anima_pipe(config, device):
         if "Cannot detect the model type" not in message:
             raise
         raise RuntimeError(
-            "The selected Anima DiT file could not be loaded because DiffSynth cannot detect its model type. "
+            "The selected Anima DiT file could not be loaded by anima_tools. "
             "The file is likely missing required architecture metadata or was saved in an unsupported/corrupted format. "
             "Repair or re-export the DiT checkpoint with proper Anima metadata, then select the repaired file."
         ) from e
@@ -652,7 +656,7 @@ def load_anima_pipe(config, device):
     if missing_components:
         details = ", ".join(f"{name} from {required_components[name]}" for name in missing_components)
         raise RuntimeError(
-            "DiffSynth loaded the Anima pipeline, but one or more required components are missing: "
+            "anima_tools loaded the Anima pipeline, but one or more required components are missing: "
             f"{details}. Check that each selected file is the correct Anima component type."
         )
 
@@ -1989,17 +1993,17 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
     print(f"STATE [2/2] Training state saved in {time.time()-state_started:.1f}s: {output_dir / state_filename}", flush=True)
 
 
-def safe_set_anima_scheduler_training(pipe):
-    try:
-        pipe.scheduler.set_timesteps(1000, training=True, shift=1.0)
-    except TypeError as exc:
-        raise RuntimeError(
-            "Update DiffSynth; Anima repair training requires an explicit scheduler shift of 1.0."
-        ) from exc
-        try:
-            pipe.scheduler.training = True
-        except Exception:
-            pass
+_ANIMA_LINEAR_SCHEDULE_CACHE = {}
+
+
+def anima_ticket_to_sigma_timestep(ticket_indices, dtype):
+    cache_key = (ticket_indices.device, dtype)
+    if cache_key not in _ANIMA_LINEAR_SCHEDULE_CACHE:
+        sigmas = torch.linspace(1.0, 0.0, 1001, device=ticket_indices.device)[:-1]
+        _ANIMA_LINEAR_SCHEDULE_CACHE[cache_key] = (sigmas.to(dtype), (sigmas * 1000).to(dtype))
+    sigmas, timesteps = _ANIMA_LINEAR_SCHEDULE_CACHE[cache_key]
+    schedule_indices = 999 - ticket_indices
+    return sigmas[schedule_indices], timesteps[schedule_indices]
 
 
 def run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config):
@@ -2083,7 +2087,6 @@ def run_anima_dit_training(config):
 
     print("INFO: Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
 
     print("INFO: Precomputing Anima DiT cache if needed...")
     precompute_and_cache_anima(config, pipe, device)
@@ -2100,7 +2103,7 @@ def run_anima_dit_training(config):
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
     print_anima_dataset_resolution_sample(dataset, sample_count=5)
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     if saved_timestep_sampler_state is not None:
         timestep_sampler.load_state_dict(saved_timestep_sampler_state)
@@ -2132,8 +2135,6 @@ def run_anima_dit_training(config):
     if is_resuming and len(dataloader) <= 0:
         print("WARNING: Resume requested but Anima dataloader is empty; starting without batch skipping.")
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     timestep_loss_weights = timestep_loss_curve_from_config(
         config,
         total_scheduler_timesteps,
@@ -2203,11 +2204,7 @@ def run_anima_dit_training(config):
         batch_size = input_latents.shape[0]
         ticket_indices, timestep_str = timestep_sampler.sample(batch_size)
         ticket_indices = ticket_indices.to(device=device)
-        # Tickets ascend from clean to noisy; DiffSynth's scheduler arrays are
-        # stored in the reverse order.
-        scheduler_indices = (total_scheduler_timesteps - 1) - ticket_indices
-        timesteps = scheduler_timesteps[scheduler_indices].to(device=device, dtype=config.compute_dtype)
-        sigmas = scheduler_sigmas[scheduler_indices]
+        sigmas, timesteps = anima_ticket_to_sigma_timestep(ticket_indices, config.compute_dtype)
         loss_weights = timestep_loss_weights[ticket_indices]
         noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
 

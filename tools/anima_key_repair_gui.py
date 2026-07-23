@@ -110,7 +110,7 @@ def stream_tensor_to_file(handle, tensor: torch.Tensor) -> None:
     tensor.reshape(-1).view(torch.uint8).numpy().tofile(handle)
 
 
-def diffsynth_hash_from_records(records: list[dict], key_name: str = "new_key") -> str:
+def structural_hash_from_records(records: list[dict], key_name: str = "new_key") -> str:
     keys = []
     for record in records:
         key = record[key_name]
@@ -157,8 +157,8 @@ def analyze_checkpoint(path: Path) -> dict:
     dominant_prefix, dominant_count = max(prefix_counts.items(), key=lambda item: item[1])
     dominant_prefix = dominant_prefix if dominant_count / len(records) >= 0.8 else ""
     looks_like_anima = marker_count / len(records) >= 0.8
-    original_hash = diffsynth_hash_from_records(records, key_name="old_key")
-    repaired_hash = diffsynth_hash_from_records(records, key_name="new_key")
+    original_hash = structural_hash_from_records(records, key_name="old_key")
+    repaired_hash = structural_hash_from_records(records, key_name="new_key")
     changed = sum(1 for record in records if record["old_key"] != record["new_key"])
 
     return {
@@ -184,8 +184,8 @@ def write_repaired_checkpoint(input_path: Path, output_path: Path, analysis: dic
     metadata.update(
         {
             "aozora_anima_key_repair": "1",
-            "aozora_original_diffsynth_hash": analysis["original_hash"],
-            "aozora_repaired_diffsynth_hash": analysis["repaired_hash"],
+            "aozora_original_structural_hash": analysis["original_hash"],
+            "aozora_repaired_structural_hash": analysis["repaired_hash"],
             "aozora_original_key_prefix": analysis["dominant_prefix"] or "none",
         }
     )
@@ -226,50 +226,15 @@ def write_repaired_checkpoint(input_path: Path, output_path: Path, analysis: dic
         raise
 
 
-def diffsynth_model_configs_path() -> Path:
-    return Path(__file__).resolve().parents[1] / "portable_Venv" / "Lib" / "site-packages" / "diffsynth" / "configs" / "model_configs.py"
-
-
-def register_hash_with_diffsynth(model_hash: str) -> str:
-    config_path = diffsynth_model_configs_path()
-    if not config_path.exists():
-        raise FileNotFoundError(f"DiffSynth model_configs.py was not found: {config_path}")
-
-    text = config_path.read_text(encoding="utf-8")
-    if f'"model_hash": "{model_hash}"' in text:
-        return f"DiffSynth already has hash {model_hash}."
-
-    marker = "\n]\n\nmova_series = ["
-    start = text.find("anima_series = [")
-    if start < 0:
-        raise RuntimeError("Could not find anima_series in DiffSynth model_configs.py.")
-    end = text.find(marker, start)
-    if end < 0:
-        raise RuntimeError("Could not find the end of anima_series in DiffSynth model_configs.py.")
-
-    entry = f''',
-    {{
-        # Added by Aozora Anima key repair tool.
-        "model_hash": "{model_hash}",
-        "model_name": "anima_dit",
-        "model_class": "diffsynth.models.anima_dit.AnimaDiT",
-        "state_dict_converter": "diffsynth.utils.state_dict_converters.anima_dit.AnimaDiTStateDictConverter",
-    }}'''
-    text = text[:end] + entry + text[end:]
-    config_path.write_text(text, encoding="utf-8")
-    return f"Registered repaired hash {model_hash} in {config_path}."
-
-
 class RepairWorker(QtCore.QObject):
     progress = QtCore.pyqtSignal(int, str)
     message = QtCore.pyqtSignal(str)
     finished = QtCore.pyqtSignal(bool, str)
 
-    def __init__(self, input_path: Path, output_path: Path, register_hash: bool):
+    def __init__(self, input_path: Path, output_path: Path):
         super().__init__()
         self.input_path = input_path
         self.output_path = output_path
-        self.register_hash = register_hash
 
     @QtCore.pyqtSlot()
     def run(self):
@@ -289,8 +254,6 @@ class RepairWorker(QtCore.QObject):
 
             write_repaired_checkpoint(self.input_path, self.output_path, analysis, progress=progress)
             self.message.emit(f"Saved repaired checkpoint: {self.output_path}")
-            if self.register_hash:
-                self.message.emit(register_hash_with_diffsynth(analysis["repaired_hash"]))
             self.finished.emit(True, "Repair complete.")
         except Exception as exc:
             self.finished.emit(False, str(exc))
@@ -325,13 +288,6 @@ class MainWindow(QtWidgets.QWidget):
         paths_layout.addWidget(output_btn, 1, 2)
         root.addWidget(paths_group)
 
-        options_group = QtWidgets.QGroupBox("Repair")
-        options_layout = QtWidgets.QVBoxLayout(options_group)
-        self.register_check = QtWidgets.QCheckBox("Register repaired hash with local DiffSynth")
-        self.register_check.setChecked(True)
-        options_layout.addWidget(self.register_check)
-        root.addWidget(options_group)
-
         actions = QtWidgets.QHBoxLayout()
         self.analyze_btn = QtWidgets.QPushButton("Analyze")
         self.repair_btn = QtWidgets.QPushButton("Repair")
@@ -358,7 +314,7 @@ class MainWindow(QtWidgets.QWidget):
         if path:
             self.input_edit.setText(path)
             input_path = Path(path)
-            self.output_edit.setText(str(input_path.with_name(input_path.stem + "_diffsynth.safetensors")))
+            self.output_edit.setText(str(input_path.with_name(input_path.stem + "_aozora.safetensors")))
             self.analyze()
 
     def browse_output(self):
@@ -377,8 +333,8 @@ class MainWindow(QtWidgets.QWidget):
             self.log_line(f"Keys changed: {self.analysis['changed_count']}")
             self.log_line(f"Dominant prefix: {self.analysis['dominant_prefix'] or 'none'}")
             self.log_line(f"Looks like Anima DiT: {self.analysis['looks_like_anima']}")
-            self.log_line(f"Original DiffSynth hash: {self.analysis['original_hash']}")
-            self.log_line(f"Repaired DiffSynth hash: {self.analysis['repaired_hash']}")
+            self.log_line(f"Original structural hash: {self.analysis['original_hash']}")
+            self.log_line(f"Repaired structural hash: {self.analysis['repaired_hash']}")
             self.log_line(f"Bundled Anima hash match: {self.analysis['repaired_hash'] == KNOWN_ANIMA_DIT_HASH}")
             if self.analysis["duplicates"]:
                 self.log_line(f"Duplicate repaired key: {self.analysis['duplicates'][0]}")
@@ -399,7 +355,7 @@ class MainWindow(QtWidgets.QWidget):
         self.repair_btn.setEnabled(False)
         self.analyze_btn.setEnabled(False)
         self.thread = QtCore.QThread(self)
-        self.worker = RepairWorker(input_path, output_path, self.register_check.isChecked())
+        self.worker = RepairWorker(input_path, output_path)
         self.worker.moveToThread(self.thread)
         self.thread.started.connect(self.worker.run)
         self.worker.progress.connect(lambda value, key: self.progress.setValue(value))
@@ -434,16 +390,13 @@ def run_cli(args) -> int:
         return 0
     write_repaired_checkpoint(input_path, output_path, analysis)
     print(f"Saved repaired checkpoint: {output_path}")
-    if args.register_hash:
-        print(register_hash_with_diffsynth(analysis["repaired_hash"]))
     return 0
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Repair Anima DiT safetensors keys for DiffSynth loading.")
+    parser = argparse.ArgumentParser(description="Repair Anima DiT safetensors keys for Aozora loading.")
     parser.add_argument("--input", help="Input .safetensors checkpoint")
     parser.add_argument("--output", help="Output repaired .safetensors checkpoint")
-    parser.add_argument("--register-hash", action="store_true", help="Register the repaired structural hash in local DiffSynth")
     parser.add_argument("--analyze-only", action="store_true", help="Analyze input and print hashes without writing output")
     args = parser.parse_args()
     if args.input or args.output:

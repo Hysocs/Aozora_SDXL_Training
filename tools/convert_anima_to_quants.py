@@ -882,7 +882,7 @@ def calibrated_profile(
         normalize_anima_config,
         precompute_and_cache_anima,
         run_dit_forward,
-        safe_set_anima_scheduler_training,
+        anima_ticket_to_sigma_timestep,
     )
 
     input_path = Path(args.input)
@@ -920,7 +920,6 @@ def calibrated_profile(
 
     log("Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
 
     log("Preparing/reusing Anima cache...")
     precompute_and_cache_anima(config, pipe, device)
@@ -972,7 +971,7 @@ def calibrated_profile(
     dataset = AnimaCachedDataset(config)
     if len(dataset) <= 0:
         raise RuntimeError("No cached Anima dataset items found for calibration.")
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     steps = max(1, int(getattr(args, "calibration_steps", 16) or 16))
     image_schedule = build_image_batch_schedule(
@@ -993,8 +992,6 @@ def calibrated_profile(
         collate_fn=anima_collate_fn,
     )
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
 
@@ -1011,8 +1008,7 @@ def calibrated_profile(
             batch_size = input_latents.shape[0]
             timestep_indices, _ = timestep_sampler.sample(batch_size)
             timestep_indices = timestep_indices.to(device=device)
-            timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-            sigmas = scheduler_sigmas[timestep_indices]
+            sigmas, timesteps = anima_ticket_to_sigma_timestep(timestep_indices, config.compute_dtype)
             noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
             noisy_latents, _ = flowmatch_noise_and_target(input_latents, noise, sigmas)
             run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config)
@@ -1103,7 +1099,7 @@ def mixed_precision_profile(
         normalize_anima_config,
         precompute_and_cache_anima,
         run_dit_forward,
-        safe_set_anima_scheduler_training,
+        anima_ticket_to_sigma_timestep,
     )
 
     input_path = Path(args.input)
@@ -1164,7 +1160,6 @@ def mixed_precision_profile(
 
     log("Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
 
     log("Preparing/reusing Anima cache...")
     precompute_and_cache_anima(config, pipe, device)
@@ -1199,7 +1194,7 @@ def mixed_precision_profile(
     dataset = AnimaCachedDataset(config)
     if len(dataset) <= 0:
         raise RuntimeError("No cached Anima dataset items found for dynamic profiling.")
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     steps = max(1, int(getattr(args, "calibration_steps", 16) or 16))
     image_schedule = build_image_batch_schedule(
@@ -1220,8 +1215,6 @@ def mixed_precision_profile(
         collate_fn=anima_collate_fn,
     )
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
 
@@ -1269,8 +1262,7 @@ def mixed_precision_profile(
             batch_size = input_latents.shape[0]
             timestep_indices, _ = timestep_sampler.sample(batch_size)
             timestep_indices = timestep_indices.to(device=device)
-            timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-            sigmas = scheduler_sigmas[timestep_indices]
+            sigmas, timesteps = anima_ticket_to_sigma_timestep(timestep_indices, config.compute_dtype)
             noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
             noisy_latents, _ = flowmatch_noise_and_target(input_latents, noise, sigmas)
 
@@ -1713,7 +1705,7 @@ def fast_mixed_precision_profile(
         normalize_anima_config,
         precompute_and_cache_anima,
         run_dit_forward,
-        safe_set_anima_scheduler_training,
+        anima_ticket_to_sigma_timestep,
     )
 
     input_path = Path(args.input)
@@ -1766,7 +1758,6 @@ def fast_mixed_precision_profile(
 
     log("Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
 
     log("Preparing/reusing Anima cache...")
     precompute_and_cache_anima(config, pipe, device)
@@ -1919,7 +1910,7 @@ def fast_mixed_precision_profile(
     dataset = AnimaCachedDataset(config)
     if len(dataset) <= 0:
         raise RuntimeError("No cached Anima dataset items found for fast dynamic profiling.")
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     steps = max(1, int(getattr(args, "calibration_steps", 16) or 16))
     image_schedule = build_image_batch_schedule(
@@ -1940,8 +1931,6 @@ def fast_mixed_precision_profile(
         collate_fn=anima_collate_fn,
     )
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
 
@@ -1986,8 +1975,7 @@ def fast_mixed_precision_profile(
             batch_size = input_latents.shape[0]
             timestep_indices, _ = timestep_sampler.sample(batch_size)
             timestep_indices = timestep_indices.to(device=device)
-            timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-            sigmas = scheduler_sigmas[timestep_indices]
+            sigmas, timesteps = anima_ticket_to_sigma_timestep(timestep_indices, config.compute_dtype)
             noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
             noisy_latents, _ = flowmatch_noise_and_target(input_latents, noise, sigmas)
             sample = {
@@ -2253,7 +2241,7 @@ def global_forward_mixed_precision_profile(
         normalize_anima_config,
         precompute_and_cache_anima,
         run_dit_forward,
-        safe_set_anima_scheduler_training,
+        anima_ticket_to_sigma_timestep,
     )
 
     input_path = Path(args.input)
@@ -2298,7 +2286,6 @@ def global_forward_mixed_precision_profile(
 
     log("Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
 
     log("Preparing/reusing Anima cache...")
     precompute_and_cache_anima(config, pipe, device)
@@ -2391,7 +2378,7 @@ def global_forward_mixed_precision_profile(
     dataset = AnimaCachedDataset(config)
     if len(dataset) <= 0:
         raise RuntimeError("No cached Anima dataset items found for fast dynamic profiling.")
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     steps = max(1, int(getattr(args, "calibration_steps", 16) or 16))
     image_schedule = build_image_batch_schedule(
@@ -2412,8 +2399,6 @@ def global_forward_mixed_precision_profile(
         collate_fn=anima_collate_fn,
     )
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
 
@@ -2478,8 +2463,7 @@ def global_forward_mixed_precision_profile(
                 batch_size = input_latents.shape[0]
                 timestep_indices, _ = timestep_sampler.sample(batch_size)
                 timestep_indices = timestep_indices.to(device=device)
-                timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-                sigmas = scheduler_sigmas[timestep_indices]
+                sigmas, timesteps = anima_ticket_to_sigma_timestep(timestep_indices, config.compute_dtype)
                 noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
                 noisy_latents, _ = flowmatch_noise_and_target(input_latents, noise, sigmas)
                 sample = {
@@ -2849,7 +2833,7 @@ def compression_first_profile(
         normalize_anima_config,
         precompute_and_cache_anima,
         run_dit_forward,
-        safe_set_anima_scheduler_training,
+        anima_ticket_to_sigma_timestep,
     )
 
     input_path = Path(args.input)
@@ -2916,7 +2900,6 @@ def compression_first_profile(
 
     log("Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe)
     log("Preparing/reusing Anima cache...")
     precompute_and_cache_anima(config, pipe, device)
     pipe.vae.cpu()
@@ -3060,7 +3043,7 @@ def compression_first_profile(
     dataset = AnimaCachedDataset(config)
     if len(dataset) <= 0:
         raise RuntimeError("No cached Anima dataset items found for compression-first profiling.")
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     steps = max(1, int(getattr(args, "calibration_steps", 8) or 8))
     image_schedule = build_image_batch_schedule(
@@ -3080,8 +3063,6 @@ def compression_first_profile(
         pin_memory=True,
         collate_fn=anima_collate_fn,
     )
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     generator = torch.Generator(device=device)
     generator.manual_seed(config.SEED if config.SEED else 42)
 
@@ -3103,8 +3084,7 @@ def compression_first_profile(
                 batch_size = input_latents.shape[0]
                 timestep_indices, _ = timestep_sampler.sample(batch_size)
                 timestep_indices = timestep_indices.to(device=device)
-                timesteps = scheduler_timesteps[timestep_indices].to(device=device, dtype=config.compute_dtype)
-                sigmas = scheduler_sigmas[timestep_indices]
+                sigmas, timesteps = anima_ticket_to_sigma_timestep(timestep_indices, config.compute_dtype)
                 noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
                 noisy_latents, _ = flowmatch_noise_and_target(input_latents, noise, sigmas)
                 sample = {

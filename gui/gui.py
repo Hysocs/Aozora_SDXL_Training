@@ -55,7 +55,7 @@ ANSI_ESCAPE_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 
 TRAINING_MODE_SDXL = "Stable Diffusion XL (SDXL)"
 TRAINING_MODE_ANIMA_DIT = "Anima DiT"
-DIT_AVAILABLE = importlib.util.find_spec("diffsynth") is not None
+DIT_AVAILABLE = importlib.util.find_spec("anima_tools") is not None
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IS_WINDOWS = os.name == "nt"
 IS_LINUX = sys.platform.startswith("linux")
@@ -3537,7 +3537,7 @@ class TrainingGUI(QtWidgets.QWidget):
                 self.training_mode_combo,
                 TRAINING_MODE_ANIMA_DIT,
                 False,
-                "Install/enable diffsynth to use Anima DiT training.",
+                "The bundled anima_tools package is required for Anima DiT training.",
             )
         self.training_mode_combo.currentTextChanged.connect(self._on_training_mode_changed)
 
@@ -3751,7 +3751,7 @@ class TrainingGUI(QtWidgets.QWidget):
             self.training_mode_combo.setCurrentText(TRAINING_MODE_SDXL)
             self.training_mode_combo.blockSignals(False)
             is_dit = False
-            self.log("Anima DiT mode is unavailable because diffsynth is not installed/enabled.")
+            self.log("Anima DiT mode is unavailable because the bundled anima_tools package could not be loaded.")
 
         self._update_path_mode_controls()
         if hasattr(self, "unet_exclusion_group"):
@@ -5023,7 +5023,7 @@ class TrainingGUI(QtWidgets.QWidget):
         shift_control_layout.addWidget(self.spin_ticket_shift)
         shift_layout.addRow("Shift:", shift_control)
         shift_note = make_label(
-            "Choose a DiffSynth-style logit shift, then apply it as a timestep-ticket density transform."
+            "Choose a logit shift, then apply it as a timestep-ticket density transform."
         )
         shift_note.setWordWrap(True)
         shift_layout.addRow(shift_note)

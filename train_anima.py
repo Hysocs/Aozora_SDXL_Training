@@ -503,16 +503,16 @@ def make_anima_tokenizer_config(path, label):
     return ModelConfig(path=local_path, skip_download=True)
 
 
-def ensure_anima_diffsynth_available():
+def ensure_anima_tools_available():
     global AnimaImagePipeline, ModelConfig
     if AnimaImagePipeline is not None and ModelConfig is not None:
         return
     try:
-        from diffsynth.pipelines.anima_image import AnimaImagePipeline as _AnimaImagePipeline
-        from diffsynth.pipelines.anima_image import ModelConfig as _ModelConfig
+        from anima_tools import AnimaImagePipeline as _AnimaImagePipeline
+        from anima_tools import ModelConfig as _ModelConfig
     except Exception as e:
         raise RuntimeError(
-            "Anima DiT training requires diffsynth. Install/enable diffsynth, or use the SDXL architecture mode."
+            "Anima DiT training could not import the local anima_tools package."
         ) from e
     AnimaImagePipeline = _AnimaImagePipeline
     ModelConfig = _ModelConfig
@@ -523,8 +523,8 @@ def configure_anima_selective_checkpointing(config):
         print("INFO: Anima selective checkpointing disabled (full block recomputation).")
         return
 
-    ensure_anima_diffsynth_available()
-    import diffsynth.models.anima_dit as anima_dit_module
+    ensure_anima_tools_available()
+    import anima_tools.models.anima_dit as anima_dit_module
     from torch.utils.checkpoint import (
         CheckpointPolicy,
         checkpoint,
@@ -603,7 +603,7 @@ def detect_anima_dit_key_prefix(path):
 
 
 def load_anima_pipe(config, device):
-    ensure_anima_diffsynth_available()
+    ensure_anima_tools_available()
 
     original_dit_path = config.DIT_PATH
     model_configs = [
@@ -629,7 +629,7 @@ def load_anima_pipe(config, device):
         if "Cannot detect the model type" not in message:
             raise
         raise RuntimeError(
-            "The selected Anima DiT file could not be loaded because DiffSynth cannot detect its model type. "
+            "The selected Anima DiT file could not be loaded because its model type was not recognized. "
             "The file is likely missing required architecture metadata or was saved in an unsupported/corrupted format. "
             "Repair or re-export the DiT checkpoint with proper Anima metadata, then select the repaired file."
         ) from e
@@ -645,7 +645,7 @@ def load_anima_pipe(config, device):
     if missing_components:
         details = ", ".join(f"{name} from {required_components[name]}" for name in missing_components)
         raise RuntimeError(
-            "DiffSynth loaded the Anima pipeline, but one or more required components are missing: "
+            "The local Anima loader is missing one or more required components: "
             f"{details}. Check that each selected file is the correct Anima component type."
         )
 
@@ -1678,21 +1678,17 @@ def save_anima_checkpoint_pt(global_step, micro_step, dit, optimizer, lr_schedul
     }, output_dir / state_filename)
 
 
-def safe_set_anima_scheduler_training(pipe, config):
-    # Ticket allocation owns distribution shaping. Keep the physical scheduler
-    # linear so ticket 0..999 maps directly to sigma 0..1.
-    try:
-        pipe.scheduler.set_timesteps(1000, training=True, shift=1.0)
-    except TypeError as exc:
-        raise RuntimeError(
-            "The installed Anima scheduler cannot accept an explicit shift. "
-            "Update DiffSynth; Anima training requires an explicit scheduler shift of 1.0."
-        ) from exc
+_ANIMA_LINEAR_SCHEDULE_CACHE = {}
 
-    print(
-        "INFO: Anima physical sigma shift fixed at 1.0; distribution shaping uses tickets."
-    )
-    print("INFO: Anima ticket coordinate: 0=clean/low noise, 999=noisy/high noise.")
+
+def anima_ticket_to_sigma_timestep(ticket_indices, dtype):
+    cache_key = (ticket_indices.device, dtype)
+    if cache_key not in _ANIMA_LINEAR_SCHEDULE_CACHE:
+        sigmas = torch.linspace(1.0, 0.0, 1001, device=ticket_indices.device)[:-1]
+        _ANIMA_LINEAR_SCHEDULE_CACHE[cache_key] = (sigmas.to(dtype), (sigmas * 1000).to(dtype))
+    sigmas, timesteps = _ANIMA_LINEAR_SCHEDULE_CACHE[cache_key]
+    schedule_indices = 999 - ticket_indices
+    return sigmas[schedule_indices], timesteps[schedule_indices]
 
 
 def run_dit_forward(dit, noisy_latents, timesteps, prompt_emb, t5xxl_ids, config):
@@ -1767,7 +1763,6 @@ def run_anima_dit_training(config):
 
     print("INFO: Loading Anima pipeline components on CPU...")
     pipe = load_anima_pipe(config, torch.device("cpu"))
-    safe_set_anima_scheduler_training(pipe, config)
 
     print("INFO: Precomputing Anima DiT cache if needed...")
     precompute_and_cache_anima(config, pipe, device)
@@ -1800,7 +1795,7 @@ def run_anima_dit_training(config):
     dataset = AnimaCachedDataset(config)
     print(f"INFO: Cached Anima DiT dataset items: {len(dataset)}")
     print_anima_dataset_resolution_sample(dataset, sample_count=5)
-    total_scheduler_timesteps = len(pipe.scheduler.timesteps)
+    total_scheduler_timesteps = 1000
     timestep_sampler = AnimaTimestepSampler(config, total_scheduler_timesteps)
     if saved_timestep_sampler_state is not None:
         timestep_sampler.load_state_dict(saved_timestep_sampler_state)
@@ -1832,8 +1827,6 @@ def run_anima_dit_training(config):
     if is_resuming and len(dataloader) <= 0:
         print("WARNING: Resume requested but Anima dataloader is empty; starting without batch skipping.")
 
-    scheduler_timesteps = pipe.scheduler.timesteps.to(device=device)
-    scheduler_sigmas = pipe.scheduler.sigmas.to(device=device, dtype=config.compute_dtype)
     timestep_loss_weights = timestep_loss_curve_from_config(
         config,
         total_scheduler_timesteps,
@@ -1875,11 +1868,7 @@ def run_anima_dit_training(config):
         batch_size = input_latents.shape[0]
         ticket_indices, timestep_str = timestep_sampler.sample(batch_size)
         ticket_indices = ticket_indices.to(device=device)
-        # GUI tickets use the conventional ascending noise coordinate, while
-        # DiffSynth stores its training schedule in descending-noise order.
-        scheduler_indices = (total_scheduler_timesteps - 1) - ticket_indices
-        timesteps = scheduler_timesteps[scheduler_indices].to(device=device, dtype=config.compute_dtype)
-        sigmas = scheduler_sigmas[scheduler_indices]
+        sigmas, timesteps = anima_ticket_to_sigma_timestep(ticket_indices, config.compute_dtype)
         # Loss curves are authored in the same ascending coordinate as tickets.
         loss_weights = timestep_loss_weights[ticket_indices]
         noise = torch.randn(input_latents.shape, device=device, dtype=config.compute_dtype, generator=generator)
